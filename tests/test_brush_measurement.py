@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 
 from app.brush_calibration import (
     BrushResponse,
+    BrushResponseSet,
     build_brush_response,
     prime_sweeps,
     probe_sites,
@@ -155,10 +156,14 @@ def test_measuring_paints_probes_and_reads_the_brush_off_the_canvas() -> None:
     assert painter.wait(20.0 * _TIMEOUT_SCALE)
 
     assert painter.state is PainterState.COMPLETED
-    response = painter.brush_response
-    assert response is not None
-    assert len(response.samples) == PROBES
-    for fraction, diameter in response.samples:
+    measured = painter.brush_responses
+    assert measured is not None
+    # No shape buttons are calibrated, so one curve covers whatever brush Rust
+    # has selected - which is the brush every pass will use.
+    assert measured.shapes == (None,)
+    curve = measured.for_shape(None)
+    assert curve is not None and len(curve.samples) == PROBES
+    for fraction, diameter in curve.samples:
         assert diameter == pytest.approx(round(4 + fraction * 60), abs=1.5)
     assert not controller.held_buttons
 
@@ -197,3 +202,48 @@ def test_a_measured_curve_replaces_the_preview_search_while_painting() -> None:
     assert slider_x, "the Size track was never clicked"
     fraction = (slider_x[-1] - 1700) / 239.0
     assert fraction == pytest.approx(0.24, abs=0.05)
+
+
+def test_each_calibrated_shape_gets_its_own_curve() -> None:
+    # A shape change can render a different footprint at the same slider
+    # position, so a square measurement must never be reused for the circle.
+    profile = _profile()
+    profile.square_shape_button = ScreenRect(1700, 460, 40, 40)
+    profile.circle_shape_button = ScreenRect(1750, 460, 40, 40)
+    sites = probe_sites(CANVAS, PROBES * 2)
+    shape_of = {}
+    for index, site in enumerate(sites):
+        shape_of[site.point] = "square" if index < PROBES else "circle"
+    painted = {}
+    for index, site in enumerate(sites):
+        fraction = FRACTIONS[index % PROBES]
+        # The circle reads two pixels narrower at every position.
+        offset = 0 if shape_of[site.point] == "square" else -2
+        painted[site.point] = round(6 + fraction * 60) + offset
+    controller = MockInputController()
+    painter = Painter(controller, screen_capture=_canvas_capture(painted))
+
+    painter.configure_brush_measurement(profile, _settings(), probe_count=PROBES)
+    assert painter.start()
+    assert painter.wait(30.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    measured = painter.brush_responses
+    assert measured is not None
+    assert measured.shapes == ("square", "circle")
+    square = measured.for_shape("square")
+    circle = measured.for_shape("circle")
+    assert square is not None and circle is not None
+    assert square.largest_diameter - circle.largest_diameter == pytest.approx(2, abs=1)
+    # With both shapes on file there is no honest answer for an unknown shape.
+    assert measured.for_shape(None) is None
+
+
+def test_a_pass_is_sized_from_its_own_shape_curve() -> None:
+    square = build_brush_response([(0.0, 4.0), (1.0, 64.0)], shape="square")
+    circle = build_brush_response([(0.0, 4.0), (1.0, 24.0)], shape="circle")
+    measured = BrushResponseSet((square, circle))
+
+    # 18px wants a third of the square track but well past half the circle's.
+    assert measured.for_shape("square").fraction_for(18.0) == pytest.approx(0.2333, abs=0.01)
+    assert measured.for_shape("circle").fraction_for(18.0) == pytest.approx(0.7, abs=0.01)

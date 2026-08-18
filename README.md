@@ -274,13 +274,19 @@ measuring what Rust actually paints:
    one dab in each at a different Size-track position, and reads back how wide
    each dab came out. The probes crowd the low end of the track, where a
    mis-sized brush does the most damage.
-4. The measured curve is stored on the profile.
+4. With both shape buttons calibrated the grid runs twice, once per shape,
+   because the same slider position can render a different footprint as a
+   square than as a circle. A measurement taken under one shape is never
+   reused for the other; a pass whose shape has no curve falls back to the
+   preview search.
+5. The measured curves are stored on the profile.
 
 Painting then sets the brush straight from that curve. Nothing has to be
 measured mid-job, so a run never pauses to hunt the slider, and the measurement
 includes the brush's soft edge rather than modelling it. **Clear Measurement**
-returns to the preview-tile search. Re-measure after changing sign type, brush
-shape, or the canvas calibration.
+returns to the preview-tile search. Re-measure after changing sign type or the
+canvas calibration, and after calibrating a shape button that was not set when
+you last measured.
 
 ## Sign color correction
 

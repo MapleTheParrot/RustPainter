@@ -309,6 +309,64 @@ class BrushResponse:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BrushResponseSet:
+    """Every curve measured for a profile, one per brush shape.
+
+    A shape change can render a different footprint at the same Size-track
+    position, which is why the painter treats shape and diameter as one key.
+    Keeping the curves separate means a measurement taken under the square
+    brush is never quietly reused for the circle.
+    """
+
+    curves: tuple[BrushResponse, ...]
+
+    def __post_init__(self) -> None:
+        if not self.curves:
+            raise ValueError("A brush response set needs at least one curve")
+        shapes = [curve.shape for curve in self.curves]
+        if len(set(shapes)) != len(shapes):
+            raise ValueError("Brush response curves must each cover a distinct shape")
+
+    def for_shape(self, shape: str | None) -> BrushResponse | None:
+        """The curve to size a pass of ``shape`` with, or None to fall back."""
+
+        for curve in self.curves:
+            if curve.shape == shape:
+                return curve
+        # A profile with no shape buttons calibrated measures whatever brush
+        # Rust has selected and paints with that same brush throughout, so its
+        # single curve is the right one.  With several curves on file the shape
+        # is genuinely ambiguous, and guessing is worse than measuring again.
+        if shape is None and len(self.curves) == 1:
+            return self.curves[0]
+        return None
+
+    @property
+    def shapes(self) -> tuple[str | None, ...]:
+        return tuple(curve.shape for curve in self.curves)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": BRUSH_RESPONSE_SCHEMA,
+            "curves": [curve.to_dict() for curve in self.curves],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "BrushResponseSet":
+        raw = value.get("curves")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            return cls(
+                curves=tuple(
+                    BrushResponse.from_dict(curve)
+                    for curve in raw
+                    if isinstance(curve, Mapping)
+                )
+            )
+        # A document written before curves were kept per shape.
+        return cls(curves=(BrushResponse.from_dict(value),))
+
+
 def build_brush_response(
     samples: Sequence[tuple[float, float]], *, shape: str | None = None
 ) -> BrushResponse:
@@ -328,6 +386,7 @@ __all__ = [
     "BRUSH_RESPONSE_SCHEMA",
     "BrushFootprint",
     "BrushResponse",
+    "BrushResponseSet",
     "ProbeSite",
     "build_brush_response",
     "measure_brush_footprint",

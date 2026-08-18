@@ -71,7 +71,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.brush_calibration import BrushResponse
+from app.brush_calibration import BrushResponseSet
 from app.color_calibration import ColorCorrectionModel
 from app.image_processing import process_image, quantize_image
 from app.calibration import (
@@ -3078,10 +3078,14 @@ class MainWindow(QMainWindow):
         stored_brush = profile.metadata.get("brush_response") if profile else None
         if isinstance(stored_brush, dict):
             try:
-                measured = BrushResponse.from_dict(stored_brush)
+                measured = BrushResponseSet.from_dict(stored_brush)
                 self.brush_response_status.setText(
-                    f"Brush measured on canvas • {measured.smallest_diameter:.0f}"
-                    f"–{measured.largest_diameter:.0f} px across the Size track"
+                    "Brush measured on canvas • "
+                    + "; ".join(
+                        f"{curve.shape or 'current shape'} "
+                        f"{curve.smallest_diameter:.0f}–{curve.largest_diameter:.0f} px"
+                        for curve in measured.curves
+                    )
                 )
             except (TypeError, ValueError):
                 self.brush_response_status.setText(
@@ -3736,7 +3740,7 @@ class MainWindow(QMainWindow):
         """Store the completed measurement on the profile."""
 
         painter = self._painter
-        response = getattr(painter, "brush_response", None)
+        response = getattr(painter, "brush_responses", None)
         profile = self._current_profile
         if response is None or profile is None:
             QMessageBox.warning(
@@ -3752,20 +3756,21 @@ class MainWindow(QMainWindow):
             self._current_profile = self._profile_store.save(candidate)
             self._refresh_profile_ui()
             LOGGER.info(
-                "Stored brush response: %s",
-                ", ".join(
-                    f"{fraction:.2f}->{diameter:.0f}px"
-                    for fraction, diameter in response.samples
-                ),
+                "Stored brush response for %s",
+                ", ".join(shape or "the current shape" for shape in response.shapes),
+            )
+            ranges = "; ".join(
+                f"{curve.shape or 'current shape'}: "
+                f"{curve.smallest_diameter:.0f}-{curve.largest_diameter:.0f} px"
+                for curve in response.curves
             )
             QMessageBox.information(
                 self,
                 "Brush measured",
-                "The Size track paints between "
-                f"{response.smallest_diameter:.0f} and {response.largest_diameter:.0f} "
-                "pixels on this sign. Painting now sizes the brush from these "
-                "measurements instead of the preview tile, and no longer stops to "
-                "measure mid-job.",
+                f"What the Size track paints on this sign - {ranges}. "
+                "Painting "
+                "now sizes the brush from these measurements instead of the preview "
+                "tile, and no longer stops to measure mid-job.",
             )
         except Exception as exc:
             LOGGER.exception("Could not store the measured brush")
