@@ -62,6 +62,7 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     window.quality_combo.setCurrentText("Custom")
     window.logical_width_spin.setValue(128)
     assert window.text_edit.isEnabled()
+    assert not window.text_font_combo.isEditable()
     window.text_edit.setText("RUST")
     window.text_size_spin.setValue(30)
     window.text_color_button.set_color("#FFFFFF", emit=True)
