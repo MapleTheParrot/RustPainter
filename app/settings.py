@@ -52,6 +52,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "background_mode": "unpainted",
         "background_color": "#FFFFFF",
         "transparent_pixels": "leave_unpainted",
+        "text_overlay": {
+            "enabled": False,
+            "text": "",
+            "font_family": "",
+            "font_size": 24,
+            "color": "#FFFFFF",
+            "position": "center",
+            "bold": False,
+            "italic": False,
+        },
     },
     "painting": {
         "brush_size": 0.15,
@@ -181,6 +191,32 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "transparent_pixels"
     ) not in {"leave_unpainted", "use_background"}:
         raise SettingsError("image.transparent_pixels is invalid")
+    text_overlay = image.get("text_overlay")
+    if not isinstance(text_overlay, Mapping):
+        raise SettingsError("image.text_overlay must be a JSON object")
+    if not isinstance(text_overlay.get("enabled"), bool):
+        raise SettingsError("image.text_overlay.enabled must be true or false")
+    text = text_overlay.get("text")
+    if not isinstance(text, str) or len(text) > 500:
+        raise SettingsError("image.text_overlay.text must contain at most 500 characters")
+    font_family = text_overlay.get("font_family")
+    if not isinstance(font_family, str) or len(font_family) > 200:
+        raise SettingsError("image.text_overlay.font_family must be text")
+    font_size = text_overlay.get("font_size")
+    if (
+        isinstance(font_size, bool)
+        or not isinstance(font_size, int)
+        or not 4 <= font_size <= 256
+    ):
+        raise SettingsError("image.text_overlay.font_size must be an integer from 4 to 256")
+    text_color = text_overlay.get("color")
+    if not isinstance(text_color, str) or _HEX_COLOR.fullmatch(text_color) is None:
+        raise SettingsError("image.text_overlay.color must use #RRGGBB format")
+    if text_overlay.get("position") not in {"top", "center", "bottom"}:
+        raise SettingsError("image.text_overlay.position is invalid")
+    for key in ("bold", "italic"):
+        if not isinstance(text_overlay.get(key), bool):
+            raise SettingsError(f"image.text_overlay.{key} must be true or false")
 
     assert isinstance(painting, Mapping)
     nonnegative = {

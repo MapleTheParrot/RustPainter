@@ -38,6 +38,16 @@ def test_default_settings_returns_independent_documents() -> None:
     second = default_settings()
     first["image"]["color_count"] = 8
     assert second["image"]["color_count"] == 32
+    assert second["image"]["text_overlay"] == {
+        "enabled": False,
+        "text": "",
+        "font_family": "",
+        "font_size": 24,
+        "color": "#FFFFFF",
+        "position": "center",
+        "bold": False,
+        "italic": False,
+    }
 
 
 def test_settings_store_surfaces_corruption_and_invalid_values(tmp_path) -> None:
@@ -83,6 +93,9 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
         ({"image": {"background_mode": "purple"}}, "background_mode"),
         ({"image": {"background_color": "white"}}, "background_color"),
         ({"image": {"transparent_pixels": "discard"}}, "transparent_pixels"),
+        ({"image": {"text_overlay": {"font_size": 2}}}, "font_size"),
+        ({"image": {"text_overlay": {"color": "white"}}}, "text_overlay.color"),
+        ({"image": {"text_overlay": {"position": "left"}}}, "position"),
         ({"painting": {"brush_size": 1.01}}, "brush_size"),
         (
             {"painting": {"stroke_speed_pixels_per_second": float("nan")}},

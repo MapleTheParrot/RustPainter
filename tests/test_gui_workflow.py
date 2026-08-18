@@ -51,6 +51,38 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
     assert window.start_button.isEnabled()
 
 
+def test_text_overlay_is_editable_and_included_in_paint_plan(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    source_path = tmp_path / "text-background.png"
+    Image.new("RGB", (128, 64), (0, 0, 0)).save(source_path)
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(128)
+    window.text_enabled_check.setChecked(True)
+    window.text_edit.setText("RUST")
+    window.text_size_spin.setValue(30)
+    window.text_color_button.set_color("#FFFFFF", emit=True)
+    window.text_bold_check.setChecked(True)
+
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
+
+    assert window.text_options_panel.isEnabled()
+    assert window.text_font_combo.currentFont().family()
+    assert window._processed is not None
+    pixels = np.asarray(window._processed.image.convert("RGB"))
+    assert np.any(pixels > 128)
+    assert len(window._plan.color_groups) >= 2
+
+
+def test_dithering_uses_a_single_labeled_checkbox(window: MainWindow) -> None:
+    assert window.dither_check.text() == "Dithering"
+    assert not any(
+        label.text() == "Enabled"
+        for label in window.findChildren(main_window_module.QLabel)
+    )
+
+
 def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     window: MainWindow,
 ) -> None:

@@ -124,9 +124,16 @@ class ColorButton(QPushButton):
 
     colorChanged = Signal(QColor)
 
-    def __init__(self, color: QColor | str = "#ffffff", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        color: QColor | str = "#ffffff",
+        parent: QWidget | None = None,
+        *,
+        dialog_title: str = "Choose background color",
+    ) -> None:
         super().__init__(parent)
         self._color = QColor(color)
+        self._dialog_title = dialog_title
         self.clicked.connect(self._choose)
         self._refresh()
 
@@ -144,7 +151,7 @@ class ColorButton(QPushButton):
             self.colorChanged.emit(QColor(self._color))
 
     def _choose(self) -> None:
-        chosen = QColorDialog.getColor(self._color, self, "Choose background color")
+        chosen = QColorDialog.getColor(self._color, self, self._dialog_title)
         if chosen.isValid():
             self.set_color(chosen, emit=True)
 

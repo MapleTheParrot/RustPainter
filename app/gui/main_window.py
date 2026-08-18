@@ -32,8 +32,10 @@ from PySide6.QtGui import (
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QImage,
     QKeySequence,
+    QPainter,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -65,7 +68,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.image_processing import process_image
+from app.image_processing import process_image, quantize_image
 from app.calibration import (
     CalibrationPreviewOverlay,
     capture_display_metadata,
@@ -197,6 +200,19 @@ class _PendingPaint:
     display_snapshot: Any = None
 
 
+@dataclass(frozen=True, slots=True)
+class _TextOverlayOptions:
+    """A small, worker-safe snapshot of the text controls."""
+
+    text: str
+    font_family: str
+    font_size: int
+    color: tuple[int, int, int]
+    position: str = "center"
+    bold: bool = False
+    italic: bool = False
+
+
 class _WorkerSignals(QObject):
     completed = Signal(object)
     failed = Signal(int, str)
@@ -220,6 +236,60 @@ def _build_simulation_image(processed: ProcessedImage) -> Image.Image:
     return Image.fromarray(checker, mode="RGB")
 
 
+def _apply_text_overlay(
+    processed: ProcessedImage,
+    overlay_options: _TextOverlayOptions | None,
+) -> ProcessedImage:
+    """Render text in logical-pixel space before the final palette pass."""
+
+    if overlay_options is None or not overlay_options.text.strip():
+        return processed
+
+    width, height = processed.size
+    overlay_qt = QImage(width, height, QImage.Format.Format_RGBA8888)
+    overlay_qt.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(overlay_qt)
+    try:
+        font = QFont(overlay_options.font_family)
+        font.setPixelSize(max(1, overlay_options.font_size))
+        font.setBold(overlay_options.bold)
+        font.setItalic(overlay_options.italic)
+        painter.setFont(font)
+        painter.setPen(QColor(*overlay_options.color))
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        margin = max(2, round(min(width, height) * 0.04))
+        bounds = overlay_qt.rect().adjusted(margin, margin, -margin, -margin)
+        vertical_alignment = {
+            "top": Qt.AlignmentFlag.AlignTop,
+            "center": Qt.AlignmentFlag.AlignVCenter,
+            "bottom": Qt.AlignmentFlag.AlignBottom,
+        }.get(overlay_options.position, Qt.AlignmentFlag.AlignVCenter)
+        flags = (
+            int(Qt.AlignmentFlag.AlignHCenter)
+            | int(vertical_alignment)
+            | int(Qt.TextFlag.TextWordWrap)
+        )
+        painter.drawText(bounds, flags, overlay_options.text)
+    finally:
+        painter.end()
+
+    overlay = ImageQt.fromqimage(overlay_qt).convert("RGBA")
+    overlay_mask = np.asarray(overlay.getchannel("A"), dtype=np.uint8) > 0
+    if not np.any(overlay_mask):
+        return processed
+
+    combined_mask = np.asarray(processed.paint_mask, dtype=np.bool_).copy()
+    combined_mask |= overlay_mask
+    composited = Image.alpha_composite(processed.image.convert("RGBA"), overlay)
+    quantized = quantize_image(
+        composited,
+        processed.requested_colors,
+        paint_mask=combined_mask,
+    )
+    return ProcessedImage(quantized, combined_mask, processed.requested_colors)
+
+
 class _ImageWorker(QRunnable):
     """Run resampling, quantization, and plan generation off the GUI thread."""
 
@@ -229,18 +299,21 @@ class _ImageWorker(QRunnable):
         image: Image.Image,
         options: ImageProcessOptions,
         overpaint_gap: int | None = 0,
+        text_overlay: _TextOverlayOptions | None = None,
     ) -> None:
         super().__init__()
         self.serial = serial
         self.image = image
         self.options = options
         self.overpaint_gap = overpaint_gap
+        self.text_overlay = text_overlay
         self.signals = _WorkerSignals()
 
     @Slot()
     def run(self) -> None:
         try:
             processed = process_image(self.image, self.options)
+            processed = _apply_text_overlay(processed, self.text_overlay)
             plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
             if self.overpaint_gap == 0:
                 unmerged_stroke_count = plan.stroke_count
@@ -830,7 +903,7 @@ class MainWindow(QMainWindow):
             combo.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
             )
-        self.dither_check = QCheckBox("Enabled")
+        self.dither_check = QCheckBox("Dithering")
         self.dither_check.setToolTip(
             "Dithering improves gradients but usually creates many more strokes."
         )
@@ -840,9 +913,13 @@ class MainWindow(QMainWindow):
             quick_grid.addWidget(QLabel(label), 0, column)
             quick_grid.addWidget(control, 1, column)
         quick_grid.addWidget(QLabel("Crop alignment"), 2, 0)
-        quick_grid.addWidget(QLabel("Dithering"), 2, 1)
         quick_grid.addWidget(self.crop_alignment_combo, 3, 0)
-        quick_grid.addWidget(self.dither_check, 3, 1)
+        quick_grid.addWidget(
+            self.dither_check,
+            3,
+            1,
+            alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
 
         self.custom_resolution_panel = QFrame()
         self.custom_resolution_panel.setObjectName("inlinePanel")
@@ -870,6 +947,68 @@ class MainWindow(QMainWindow):
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)
+
+        text_heading = QHBoxLayout()
+        text_title = QLabel("Text overlay")
+        text_title.setObjectName("sectionTitle")
+        self.text_enabled_check = QCheckBox("Add text")
+        self.text_enabled_check.setToolTip(
+            "Place editable text over the artwork before it is converted into a paint plan."
+        )
+        text_heading.addWidget(text_title)
+        text_heading.addStretch(1)
+        text_heading.addWidget(self.text_enabled_check)
+        image_layout.addLayout(text_heading)
+
+        self.text_options_panel = QFrame()
+        self.text_options_panel.setObjectName("inlinePanel")
+        text_grid = QGridLayout(self.text_options_panel)
+        text_grid.setContentsMargins(10, 9, 10, 9)
+        text_grid.setHorizontalSpacing(8)
+        text_grid.setVerticalSpacing(7)
+        self.text_edit = QLineEdit()
+        self.text_edit.setPlaceholderText("Type text for the image")
+        self.text_edit.setMaxLength(500)
+        self.text_font_combo = QFontComboBox()
+        self.text_font_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.text_size_spin = NoWheelSpinBox()
+        self.text_size_spin.setRange(4, 256)
+        self.text_size_spin.setValue(24)
+        self.text_size_spin.setSuffix(" px")
+        self.text_color_button = ColorButton(
+            "#ffffff", dialog_title="Choose text color"
+        )
+        self.text_position_combo = NoWheelComboBox()
+        self.text_position_combo.addItem("Top", "top")
+        self.text_position_combo.addItem("Center", "center")
+        self.text_position_combo.addItem("Bottom", "bottom")
+        self._set_combo_data(self.text_position_combo, "center")
+        self.text_bold_check = QCheckBox("Bold")
+        self.text_italic_check = QCheckBox("Italic")
+        text_style_layout = QHBoxLayout()
+        text_style_layout.setContentsMargins(0, 0, 0, 0)
+        text_style_layout.setSpacing(12)
+        text_style_layout.addWidget(self.text_bold_check)
+        text_style_layout.addWidget(self.text_italic_check)
+        text_style_layout.addStretch(1)
+
+        text_grid.addWidget(QLabel("Text"), 0, 0)
+        text_grid.addWidget(self.text_edit, 0, 1, 1, 3)
+        text_grid.addWidget(QLabel("Font"), 1, 0)
+        text_grid.addWidget(self.text_font_combo, 1, 1, 1, 3)
+        text_grid.addWidget(QLabel("Size"), 2, 0)
+        text_grid.addWidget(self.text_size_spin, 2, 1)
+        text_grid.addWidget(QLabel("Color"), 2, 2)
+        text_grid.addWidget(self.text_color_button, 2, 3)
+        text_grid.addWidget(QLabel("Position"), 3, 0)
+        text_grid.addWidget(self.text_position_combo, 3, 1)
+        text_grid.addLayout(text_style_layout, 3, 2, 1, 2)
+        text_grid.setColumnStretch(1, 1)
+        text_grid.setColumnStretch(3, 1)
+        self.text_options_panel.setEnabled(False)
+        image_layout.addWidget(self.text_options_panel)
         layout.addWidget(image_group)
 
         profile_group, profile_layout = self._step_panel(2, "Rust setup")
@@ -1217,6 +1356,14 @@ class MainWindow(QMainWindow):
         self.color_count_combo.currentIndexChanged.connect(self._schedule_processing)
         self.dither_check.toggled.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
+        self.text_enabled_check.toggled.connect(self._on_text_enabled_toggled)
+        self.text_edit.textChanged.connect(self._schedule_processing)
+        self.text_font_combo.currentFontChanged.connect(self._schedule_processing)
+        self.text_size_spin.valueChanged.connect(self._schedule_processing)
+        self.text_color_button.colorChanged.connect(self._schedule_processing)
+        self.text_position_combo.currentIndexChanged.connect(self._schedule_processing)
+        self.text_bold_check.toggled.connect(self._schedule_processing)
+        self.text_italic_check.toggled.connect(self._schedule_processing)
         self.speed_preset_combo.currentIndexChanged.connect(self._apply_speed_preset)
         for timing in (
             self.stroke_speed_spin,
@@ -1245,6 +1392,11 @@ class MainWindow(QMainWindow):
 
     def _current_overpaint_gap(self) -> int | None:
         return MERGE_MODE_GAPS.get(str(self.merge_combo.currentData()), 6)
+
+    @Slot(bool)
+    def _on_text_enabled_toggled(self, enabled: bool) -> None:
+        self.text_options_panel.setEnabled(enabled)
+        self._schedule_processing()
 
     def _speed_preset_values(self) -> dict[str, float]:
         return {
@@ -1533,6 +1685,20 @@ class MainWindow(QMainWindow):
             alpha_threshold=0,
         )
 
+    def _text_overlay_options(self) -> _TextOverlayOptions | None:
+        if not self.text_enabled_check.isChecked() or not self.text_edit.text().strip():
+            return None
+        color = self.text_color_button.color()
+        return _TextOverlayOptions(
+            text=self.text_edit.text(),
+            font_family=self.text_font_combo.currentFont().family(),
+            font_size=self.text_size_spin.value(),
+            color=(color.red(), color.green(), color.blue()),
+            position=str(self.text_position_combo.currentData() or "center"),
+            bold=self.text_bold_check.isChecked(),
+            italic=self.text_italic_check.isChecked(),
+        )
+
     @Slot()
     def _start_processing(self) -> None:
         if self._original_image is None:
@@ -1548,6 +1714,7 @@ class MainWindow(QMainWindow):
             self._original_image,
             self._processing_options(),
             self._current_overpaint_gap(),
+            self._text_overlay_options(),
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
@@ -1775,6 +1942,14 @@ class MainWindow(QMainWindow):
             self.color_count_combo,
             self.dither_check,
             self.merge_combo,
+            self.text_enabled_check,
+            self.text_edit,
+            self.text_font_combo,
+            self.text_size_spin,
+            self.text_color_button,
+            self.text_position_combo,
+            self.text_bold_check,
+            self.text_italic_check,
             self.show_calibration_check,
             self.background_color_button,
             self.pixel_spacing_spin,
@@ -1850,6 +2025,21 @@ class MainWindow(QMainWindow):
                 self.transparency_combo,
                 image.get("transparent_pixels", "leave_unpainted"),
             )
+            text_overlay = image.get("text_overlay", {})
+            self.text_enabled_check.setChecked(
+                bool(text_overlay.get("enabled", False))
+            )
+            self.text_edit.setText(str(text_overlay.get("text", "")))
+            font_family = str(text_overlay.get("font_family", ""))
+            if font_family:
+                self.text_font_combo.setCurrentFont(QFont(font_family))
+            self.text_size_spin.setValue(int(text_overlay.get("font_size", 24)))
+            self.text_color_button.set_color(text_overlay.get("color", "#ffffff"))
+            self._set_combo_data(
+                self.text_position_combo, text_overlay.get("position", "center")
+            )
+            self.text_bold_check.setChecked(bool(text_overlay.get("bold", False)))
+            self.text_italic_check.setChecked(bool(text_overlay.get("italic", False)))
 
             self.pixel_spacing_spin.setValue(
                 float(painting.get("logical_pixel_spacing", 1.0))
@@ -1919,6 +2109,7 @@ class MainWindow(QMainWindow):
             else logging.INFO
         )
         self._on_transparency_changed()
+        self._on_text_enabled_toggled(self.text_enabled_check.isChecked())
 
     def _settings_document(self) -> dict[str, Any]:
         current = self._settings.copy()
@@ -1934,6 +2125,16 @@ class MainWindow(QMainWindow):
             "background_mode": self.background_combo.currentData(),
             "background_color": self.background_color_button.color().name().upper(),
             "transparent_pixels": self.transparency_combo.currentData(),
+            "text_overlay": {
+                "enabled": self.text_enabled_check.isChecked(),
+                "text": self.text_edit.text(),
+                "font_family": self.text_font_combo.currentFont().family(),
+                "font_size": self.text_size_spin.value(),
+                "color": self.text_color_button.color().name().upper(),
+                "position": self.text_position_combo.currentData(),
+                "bold": self.text_bold_check.isChecked(),
+                "italic": self.text_italic_check.isChecked(),
+            },
         }
         current["painting"] = {
             **current.get("painting", {}),
