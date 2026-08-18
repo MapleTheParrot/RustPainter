@@ -16,9 +16,18 @@ from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import MainWindow, _PendingPaint
+from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
 from app.input_controller import MockInputController
-from app.models import ColorGroup, PaintPlan, ScreenRect, ScaleMode, Stroke, TransparencyMode
+from app.models import (
+    ColorGroup,
+    PaintPlan,
+    ProcessedImage,
+    ScreenRect,
+    ScaleMode,
+    Stroke,
+    TransparencyMode,
+)
 from app.painter import Painter, PainterState
 from app.profiles import DisplayMetadata, Profile
 from app.screen import VirtualScreen
@@ -885,6 +894,56 @@ def test_processing_and_preview_generation_run_off_the_gui_thread(
 
     assert processing_threads and all(value != gui_thread for value in processing_threads)
     assert simulation_threads and all(value != gui_thread for value in simulation_threads)
+
+
+def test_preview_renders_artwork_through_the_measured_sign_response() -> None:
+    # A sign measured at 60% brightness: a mid gray survives the correction
+    # round trip untouched, but white is out of reach, and the preview has to
+    # show the color the material will really produce rather than promise one.
+    model = ColorCorrectionModel(
+        forward_matrix=(
+            (0.6, 0.0, 0.0, 0.0),
+            (0.0, 0.6, 0.0, 0.0),
+            (0.0, 0.0, 0.6, 0.0),
+        ),
+        fit_rmse=0.01,
+        sample_count=32,
+        captured_at="2026-01-01T00:00:00+00:00",
+    )
+    image = Image.new("RGBA", (2, 1))
+    image.putdata([(120, 120, 120, 255), (255, 255, 255, 255)])
+    processed = ProcessedImage(image, np.ones((1, 2), dtype=bool), 2)
+
+    plain = main_window_module._build_simulation_image(processed)
+    corrected = main_window_module._build_simulation_image(processed, model)
+
+    assert plain.getpixel((0, 0)) == (120, 120, 120)
+    assert plain.getpixel((1, 0)) == (255, 255, 255)
+    assert corrected.getpixel((0, 0)) == (120, 120, 120)
+    assert corrected.getpixel((1, 0))[0] == pytest.approx(153, abs=2)
+
+
+def test_preview_ignores_the_correction_while_the_chart_is_loaded(
+    window: MainWindow, tmp_path: Path
+) -> None:
+    profile = window._current_profile
+    profile.metadata["color_correction"] = {
+        "forwardMatrix": [[0.6, 0, 0, 0], [0, 0.6, 0, 0], [0, 0, 0.6, 0]],
+        "fitRmse": 0.01,
+        "sampleCount": 32,
+        "capturedAt": "2026-01-01T00:00:00+00:00",
+    }
+    assert window._color_correction_model() is not None
+
+    # The chart measures the raw material response and must not be shown, or
+    # painted, through an earlier measurement of itself.
+    chart = tmp_path / "chart.png"
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(chart)
+    window._color_chart_profile_id = profile.id
+    window._color_chart_path = chart
+    window._image_path = chart
+
+    assert window._color_correction_model() is None
 
 
 def test_custom_resolution_tracks_both_canvas_axes(window: MainWindow) -> None:

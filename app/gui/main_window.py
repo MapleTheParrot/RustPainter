@@ -11,7 +11,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 from PIL import Image, ImageOps, ImageQt
@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.color_calibration import ColorCorrectionModel
 from app.image_processing import process_image, quantize_image
 from app.calibration import (
     CalibrationPreviewOverlay,
@@ -241,7 +242,39 @@ class _WorkerSignals(QObject):
     failed = Signal(int, str)
 
 
-def _build_simulation_image(processed: ProcessedImage) -> Image.Image:
+def _predicted_sign_colors(
+    rgb: np.ndarray, mask: np.ndarray, correction: ColorCorrectionModel
+) -> np.ndarray:
+    """Render painted colors as the measured sign response will return them.
+
+    Painting sends ``correct(color)`` to the picker, so anything the material
+    can reach comes back unchanged and the preview is left alone.  What this
+    does surface is the colors that clip: outside the measured gamut the
+    inverse is unreachable, and the preview stops promising a color the sign
+    will never produce.
+    """
+
+    painted = rgb[mask]
+    if painted.size == 0:
+        return rgb
+    # At most a palette's worth of distinct colors, so the per-color model calls
+    # stay cheap however large the canvas is.
+    unique, inverse = np.unique(painted.reshape(-1, 3), axis=0, return_inverse=True)
+    predicted = np.array(
+        [
+            correction.predict(correction.correct(tuple(int(v) for v in color)))
+            for color in unique
+        ],
+        dtype=np.uint8,
+    )
+    result = rgb.copy()
+    result[mask] = predicted[inverse.reshape(-1)]
+    return result
+
+
+def _build_simulation_image(
+    processed: ProcessedImage, correction: ColorCorrectionModel | None = None
+) -> Image.Image:
     """Build the checker-backed preview without touching Qt GUI objects."""
 
     width, height = processed.image.size
@@ -255,6 +288,8 @@ def _build_simulation_image(processed: ProcessedImage) -> Image.Image:
     checker[dark_tiles] = (58, 61, 56)
     source = np.asarray(processed.image.convert("RGB"), dtype=np.uint8)
     mask = np.asarray(processed.paint_mask, dtype=np.bool_)
+    if correction is not None:
+        source = _predicted_sign_colors(source, mask, correction)
     checker[mask] = source[mask]
     return Image.fromarray(checker, mode="RGB")
 
@@ -320,6 +355,7 @@ class _ImageWorker(QRunnable):
         options: ImageProcessOptions,
         overpaint_gap: int | None = 0,
         text_overlays: tuple[_TextOverlayOptions, ...] = (),
+        color_correction: ColorCorrectionModel | None = None,
     ) -> None:
         super().__init__()
         self.serial = serial
@@ -327,6 +363,7 @@ class _ImageWorker(QRunnable):
         self.options = options
         self.overpaint_gap = overpaint_gap
         self.text_overlays = text_overlays
+        self.color_correction = color_correction
         self.signals = _WorkerSignals()
 
     @Slot()
@@ -346,7 +383,7 @@ class _ImageWorker(QRunnable):
                 )
             # Text stays as live vector items in the editor preview. The paint
             # plan above still uses the composited, palette-limited result.
-            simulation = _build_simulation_image(base_processed)
+            simulation = _build_simulation_image(base_processed, self.color_correction)
             stroke_pixel_steps = sum(
                 max(0, stroke.pixel_count - 1)
                 for group in plan.color_groups
@@ -481,6 +518,7 @@ class MainWindow(QMainWindow):
         self._settings_store: Any = None
         self._settings: dict[str, Any] = default_settings()
         self._current_profile: Any = None
+        self._preview_correction: Any = None
         self._painter: Any = None
         self._paint_generation = 0
         self._pending_paint: _PendingPaint | None = None
@@ -2087,6 +2125,36 @@ class MainWindow(QMainWindow):
     def _text_overlay_options(self) -> tuple[_TextOverlayOptions, ...]:
         return tuple(self._text_layers)
 
+    def _painting_calibration_chart(self, profile: Any = None) -> bool:
+        """Whether the loaded image is the chart prepared for ``profile``.
+
+        The chart exists to measure the raw Rust material response, so it is
+        both painted and previewed with any earlier correction out of the way.
+        """
+
+        target = self._current_profile if profile is None else profile
+        return bool(
+            isinstance(target, Profile)
+            and self._color_chart_profile_id == target.id
+            and self._color_chart_path is not None
+            and self._image_path == self._color_chart_path
+        )
+
+    def _color_correction_model(self) -> ColorCorrectionModel | None:
+        """The active profile's measured sign response, when it is usable."""
+
+        if self._painting_calibration_chart():
+            return None
+        profile = self._current_profile
+        stored = profile.metadata.get("color_correction") if profile else None
+        if not isinstance(stored, Mapping):
+            return None
+        try:
+            return ColorCorrectionModel.from_dict(stored)
+        except (TypeError, ValueError):
+            LOGGER.warning("Ignoring an unreadable stored color correction")
+            return None
+
     @Slot()
     def _start_processing(self) -> None:
         if self._original_image is None:
@@ -2103,6 +2171,7 @@ class MainWindow(QMainWindow):
             self._processing_options(),
             self._current_overpaint_gap(),
             self._text_overlay_options(),
+            self._color_correction_model(),
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
@@ -2733,6 +2802,11 @@ class MainWindow(QMainWindow):
             if profile and isinstance(profile.metadata, dict)
             else None
         )
+        # The preview renders artwork through this model, so a measured, cleared,
+        # or switched-to correction has to rebuild it.
+        if correction != self._preview_correction:
+            self._preview_correction = deepcopy(correction)
+            self._schedule_processing()
         if isinstance(correction, dict):
             try:
                 error = float(correction.get("fitRmse", 0.0)) * 255.0
@@ -2745,12 +2819,7 @@ class MainWindow(QMainWindow):
                 self.color_correction_status.setText(
                     "Stored correction is invalid • clear it and measure again"
                 )
-        elif (
-            profile
-            and self._color_chart_profile_id == profile.id
-            and self._color_chart_path is not None
-            and self._image_path == self._color_chart_path
-        ):
+        elif self._painting_calibration_chart(profile):
             self.color_correction_status.setText(
                 "Chart prepared • paint it, then click Measure Painted Chart"
             )
@@ -3708,12 +3777,7 @@ class MainWindow(QMainWindow):
                 if isinstance(target_profile, Profile)
                 else target_profile
             )
-            if (
-                isinstance(profile_snapshot, Profile)
-                and self._color_chart_profile_id == profile_snapshot.id
-                and self._color_chart_path is not None
-                and self._image_path == self._color_chart_path
-            ):
+            if self._painting_calibration_chart(profile_snapshot):
                 # Calibration charts measure the raw Rust material response;
                 # never feed an earlier correction back into its own chart.
                 profile_snapshot.metadata.pop("color_correction", None)

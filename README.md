@@ -220,6 +220,8 @@ The Paint Simulation uses ordinary RGB, while Rust renders paint through the sig
 5. Focus Rust during the capture countdown. The app samples 32 large swatches, rejects inconsistent captures, and saves the measured correction to that profile.
 6. Reset/use a fresh sign and reload the artwork. Correction is applied automatically to future paint jobs.
 
+Once measured, the Rust preview renders artwork through the model as well, so the preview and the sign agree. Colors the material can reach look unchanged; colors outside its measured gamut show as the muted version Rust will actually produce instead of a promise it cannot keep.
+
 The chart deliberately consumes paint on one test sign. Re-measure after changing sign material, display/graphics color behavior, or the main canvas/picker calibration. **Clear Color Correction** restores direct RGB-to-picker mapping.
 
 ## Safety behavior
@@ -285,7 +287,7 @@ Profiles, settings, calibration reference captures, and logs are stored under `%
 - The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient. Calibration and small test strokes are required.
 - `SendInput` may be ignored by exclusive fullscreen, elevated, protected, or anti-cheat-managed windows. The utility does not work around those restrictions.
 - Horizontal runs are deliberately prioritized for reliability; complex images can still require many strokes.
-- Color accuracy is approximate because the displayed picker, monitor color, sign material, lighting, and in-game rendering can alter the result.
+- Color accuracy is approximate because the displayed picker, monitor color, sign material, lighting, and in-game rendering can alter the result. Without a measured correction the preview shows the commanded RGB, which is what the picker is asked for and not what the lit sign returns.
 - Measured correction compensates the average captured material response, but cannot remove physical plank seams, spatial lighting variation, or colors outside Rust's available gamut.
 - Simple reference-image comparison catches large layout changes but not every wrong state.
 
