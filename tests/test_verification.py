@@ -211,3 +211,73 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
     assert (center(40, 40), center(40, 40)) in spans
     # The main plan painted 55 row strokes; only two touch-up strokes follow.
     assert len(spans) == 57
+
+
+def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:
+    """A lit sign compresses and tints everything; verification must see past it.
+
+    Live testing: a painting that matched its plan perfectly classified 76%
+    wrong because the material squeezed the dark palette together.  One global
+    transform, fitted from the capture itself, absorbs exactly that.
+    """
+
+    from app.verification import normalize_capture_lighting
+
+    rng = np.random.default_rng(7)
+    # As tight as the real sign's palette: dark purples a few units apart.
+    palette = np.array(
+        [[20, 10, 40], [32, 22, 58], [45, 30, 90], [26, 40, 52]], dtype=np.uint8
+    )
+    indices = rng.integers(0, len(palette), (30, 40)).astype(np.int32)
+    truth = palette[indices].astype(np.float32)
+    # The material response: crush the darks toward a warm ambient and mix
+    # channels, which reorders which palette entry each cell sits closest to.
+    captured = truth * 0.3 + np.array([95.0, 78.0, 70.0])
+    captured[..., 0] += truth[..., 2] * 0.35
+    captured[..., 2] -= truth[..., 1] * 0.2
+
+    raw_wrong = mismatched_cells(captured, indices, palette).sum()
+    corrected = normalize_capture_lighting(captured, indices, palette)
+    fixed_wrong = mismatched_cells(corrected, indices, palette).sum()
+
+    assert raw_wrong > indices.size * 0.3  # the shift really broke classification
+    assert fixed_wrong == 0
+
+
+def test_lighting_normalization_cannot_hide_genuinely_wrong_cells() -> None:
+    """Twelve parameters cannot bend individual cells onto their targets."""
+
+    from app.verification import normalize_capture_lighting
+
+    rng = np.random.default_rng(11)
+    palette = np.array(
+        [[20, 10, 40], [45, 30, 90], [80, 60, 150], [200, 190, 210]], dtype=np.uint8
+    )
+    indices = rng.integers(0, len(palette), (30, 40)).astype(np.int32)
+    truth = palette[indices].astype(np.float32)
+    captured = truth * 0.55 + np.array([60.0, 45.0, 40.0])
+    # A block of cells was painted the wrong color entirely.
+    wrong_block = np.zeros(indices.shape, dtype=np.bool_)
+    wrong_block[5:10, 5:15] = True
+    swapped = palette[(indices + 2) % len(palette)].astype(np.float32)
+    captured[wrong_block] = swapped[wrong_block] * 0.55 + np.array([60.0, 45.0, 40.0])
+
+    corrected = normalize_capture_lighting(captured, indices, palette)
+    mismatch = mismatched_cells(corrected, indices, palette)
+
+    inside = mismatch[wrong_block].mean()
+    outside = mismatch[~wrong_block].mean()
+    assert inside > 0.9  # the wrong block is still caught
+    assert outside < 0.05  # the correct cells are not dragged down with it
+
+
+def test_lighting_normalization_leaves_tiny_captures_untouched() -> None:
+    from app.verification import normalize_capture_lighting
+
+    palette = np.array([[10, 10, 10], [200, 200, 200]], dtype=np.uint8)
+    indices = np.zeros((2, 3), dtype=np.int32)
+    sampled = np.full((2, 3, 3), 90.0, dtype=np.float32)
+
+    corrected = normalize_capture_lighting(sampled, indices, palette)
+
+    assert np.array_equal(corrected, sampled)

@@ -97,6 +97,48 @@ def sample_cell_colors(
     return np.median(neighborhood, axis=0)
 
 
+def normalize_capture_lighting(
+    sampled: np.ndarray, indices: np.ndarray, palette: np.ndarray
+) -> np.ndarray:
+    """Undo the sign's global material response before classifying cells.
+
+    Live testing showed a painting that matched its plan perfectly still
+    classified 76% wrong: the lit sign compresses dark colors, and with a
+    tightly clustered palette that compression pushes a correct cell closer to
+    a neighbouring palette entry than to its own.  One global affine transform
+    fitted from the capture itself absorbs lighting and material - it cannot
+    absorb per-cell painting mistakes, because twelve parameters cannot bend
+    thousands of cells individually.
+
+    The fit runs twice, the second time without the worst quartile of
+    residuals, so a minority of genuinely wrong cells does not drag the
+    transform toward hiding themselves.
+    """
+
+    covered = indices >= 0
+    count = int(covered.sum())
+    if count < 24 or len(palette) < 2:
+        return sampled
+    captured = sampled[covered].reshape(-1, 3).astype(np.float64)
+    wanted = palette[indices[covered]].astype(np.float64)
+    design = np.hstack([captured, np.ones((len(captured), 1))])
+
+    def fit(rows: np.ndarray) -> np.ndarray:
+        coefficients, *_ = np.linalg.lstsq(design[rows], wanted[rows], rcond=None)
+        return coefficients
+
+    everything = np.ones(len(captured), dtype=np.bool_)
+    coefficients = fit(everything)
+    residuals = np.linalg.norm(design @ coefficients - wanted, axis=1)
+    keep = residuals <= np.percentile(residuals, 75)
+    if keep.sum() >= 24:
+        coefficients = fit(keep)
+
+    corrected = sampled.astype(np.float64).copy()
+    corrected[covered] = np.clip(design @ coefficients, 0.0, 255.0)
+    return corrected.astype(np.float32)
+
+
 def mismatched_cells(
     sampled: np.ndarray,
     indices: np.ndarray,
@@ -153,6 +195,7 @@ __all__ = [
     "CLASSIFICATION_MARGIN_DELTA_E",
     "UNRELIABLE_CAPTURE_FRACTION",
     "mismatched_cells",
+    "normalize_capture_lighting",
     "plan_expectations",
     "sample_cell_colors",
     "touch_up_plan",

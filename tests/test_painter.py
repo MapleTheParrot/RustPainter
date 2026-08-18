@@ -874,7 +874,9 @@ def test_brush_measurement_probes_around_the_brush_the_plan_needs() -> None:
     assert painter.state is PainterState.COMPLETED
     typed = _typed_values(controller)
     assert typed[0] == "24"  # the scout, which is never fitted
-    assert typed[1:] == ["20", "10", "5", "2.5"]
+    # 8x through 0.5x of the wanted size, so multi-cell fill brushes are
+    # measured rather than extrapolated to.
+    assert typed[1:] == ["40", "20", "10", "5", "2.5"]
     model = painter.measured_brush_size_model
     assert model is not None
     # The simulator rounds bands to whole pixels, which feeds a small

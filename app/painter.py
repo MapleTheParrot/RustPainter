@@ -1065,11 +1065,13 @@ class Painter:
     _BRUSH_SCOUT_SIZE = 24.0
 
     # Probes are placed at these multiples of the brush one logical cell needs,
-    # which brackets the working size from both sides.  Fitting a line and then
-    # reading it far below its data is what made an earlier version answer 2
-    # where 5 was wanted: a couple of pixels of error is nothing at size 60 and
-    # is the entire answer at size 2.
-    _BRUSH_PROBE_MULTIPLES = (4.0, 2.0, 1.0, 0.5)
+    # which brackets both the detail brush and the optimizer's multi-cell fill
+    # passes (up to 7 cells).  Fitting a line and then reading it far outside
+    # its data is what made an earlier version answer 2 where 5 was wanted: a
+    # couple of pixels of error is nothing at size 60 and is the entire answer
+    # at size 2.  A probe that runs off the sign is skipped as clipped, so the
+    # wide end costs nothing on a close-up sign.
+    _BRUSH_PROBE_MULTIPLES = (8.0, 4.0, 2.0, 1.0, 0.5)
 
     # Fallback ladder for a measurement with no resolution to aim at.
     _BRUSH_FALLBACK_SIZES = (32.0, 16.0, 8.0, 4.0)
@@ -1233,7 +1235,8 @@ class Painter:
         """Move the cursor off the sign, let Rust settle, then capture it."""
 
         self._move(park, epoch)
-        self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+        if self.input.emits_real_input:
+            self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
         self._checkpoint(epoch=epoch, check_focus=True)
         return self._screen_capture(canvas)
 
@@ -1368,6 +1371,7 @@ class Painter:
         import numpy as np
 
         from .verification import (
+            normalize_capture_lighting,
             UNRELIABLE_CAPTURE_FRACTION,
             mismatched_cells,
             plan_expectations,
@@ -1414,6 +1418,11 @@ class Painter:
                     plan.width,
                     plan.height,
                 )
+                # The lit sign compresses and tints every color it shows, so
+                # the comparison first removes the one global transform the
+                # material applies - otherwise a perfectly painted dark image
+                # reads as mostly wrong and verification gives up.
+                sampled = normalize_capture_lighting(sampled, indices, palette)
                 mismatch = mismatched_cells(sampled, indices, palette)
                 wrong = int(mismatch.sum())
                 if wrong == 0:
