@@ -4,47 +4,55 @@ RustPainter is a local Windows 10/11 desktop utility that recreates an image in 
 
 The application keeps all profiles and settings on your PC. Every coordinate used for painting comes from a rectangle that you calibrate on your own display.
 
-## Features
+## Quick start
 
-- Streamlined dark workspace for the everyday image → calibration → paint flow, with advanced controls grouped in Settings
-- PNG, JPEG, WebP, BMP, TIFF, and other Pillow-supported images (browse or drag & drop)
-- Fit, fill/crop, and stretch composition with a live paint simulation
-- Configurable logical painting resolution, palette size, dithering, transparency, and fit background
-- Named profiles for different signs and UI layouts; new profiles inherit the current profile's calibration
-- Full-screen drag calibration for the sign canvas, saturation/value box, hue bar, optional Size track, and brush-preview tile
-- Optional always-on-top overlay that outlines every calibrated rectangle in labeled red boxes
-- Picker mapping fixed to the current Rust layout shown during calibration
-- Palette-grouped horizontal stroke plans with estimated stroke count and duration
-- Overpaint stroke merging: early colors paint straight through pixels that later colors repaint, typically removing 10–40% of all strokes without changing the finished image
-- One-click painting speed presets (Relaxed / Standard / Fast / Turbo) on top of fully adjustable advanced timing
-- 1 ms Windows timer resolution while painting, so configured delays are not silently rounded up to the ~15.6 ms scheduler quantum
-- Per-profile measured color correction from a painted 32-swatch Rust chart
-- Windows `SendInput`, global start/pause/abort hotkeys, countdown, dry run, foreground-window guard, and corner abort
-- Pause/resume that preserves plan progress; abort always releases the mouse button
-- Debug moves and small test strokes for validating a profile before a long paint
-- Local JSON settings/profiles and rotating application logs
-
-## Install and run from source
-
-Use a 64-bit Python installation on Windows. Python 3.11–3.14 works with the listed package versions (this project was verified on Python 3.14).
+**You need:** Windows 10/11, 64-bit Python 3.11-3.14, and Rust running in
+borderless or windowed mode (not exclusive fullscreen).
 
 ```powershell
-cd C:\path\to\RustPainter
+git clone https://github.com/YeheyaMohammad01/RustPainter.git
+cd RustPainter
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-For tests and packaging:
+Then paint a sign in six steps:
 
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest
-```
+1. **Open the sign** in Rust and leave its painting interface stationary.
+2. **Calibrate.** In RustPainter, drag a box around each of three regions on
+   your screen: the sign **canvas**, the **color box** (the large
+   white-to-color-to-black square), and the **hue bar** (the narrow rainbow
+   strip). Drag just inside each region - do not include its border.
+3. **Load an image.** Browse or drag & drop. The defaults are ready to use.
+4. **Check the preview.** The paint simulation shows what will be painted,
+   plus the stroke count and estimated time.
+5. **Dry run first.** Tick **Dry run**, press **F8**, and focus Rust during the
+   countdown. Progress should complete without any clicks reaching the game.
+6. **Paint.** Untick Dry run and start with a small, low-color test image.
 
-## First-use workflow
+**Hotkeys:** `F8` start/resume, `F9` pause, `F10` abort. Abort immediately
+releases any held mouse button.
+
+Keep a hand near **F10** during your first runs, and do not leave the tool
+painting unattended. Everything below is detail you only need when tuning.
+
+## Features
+
+- Dark workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
+- Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by browse or drag & drop
+- Fit, fill/crop, and stretch composition with a live paint simulation
+- Adjustable painting resolution, palette size, dithering, transparency, and fit background
+- Named profiles per sign/UI layout, each inheriting the current calibration
+- Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
+- Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
+- Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
+- Per-profile color correction measured from a painted 32-swatch chart
+- Safety throughout: countdown, dry run, foreground-window guard, corner abort, pause/resume, and an abort that always releases the mouse
+- Local JSON profiles/settings and rotating logs; nothing leaves your PC
+
+## Detailed setup and first paint
 
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
 2. Open the target sign's painting interface and leave it stationary.
