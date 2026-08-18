@@ -295,8 +295,7 @@ class CalibrationProfile:
     canvas: Rect | None = None
     color_box: Rect | None = None
     hue_bar: Rect | None = None
-    brush_slider: Rect | None = None
-    brush_preview: Rect | None = None
+    brush_size_box: Rect | None = None
     hue_direction: str = HueDirection.BOTTOM_TO_TOP.value
     saturation_direction: str = SaturationDirection.LEFT_LOW.value
     value_direction: str = ValueDirection.TOP_BRIGHT.value
@@ -348,8 +347,7 @@ class CalibrationProfile:
             "canvas": self.canvas is not None,
             "color_box": self.color_box is not None,
             "hue_bar": self.hue_bar is not None,
-            "brush_slider": self.brush_slider is not None,
-            "brush_preview": self.brush_preview is not None,
+            "brush_size_box": self.brush_size_box is not None,
         }
 
     @property
@@ -378,8 +376,7 @@ class CalibrationProfile:
             "canvas": _rect_dict(self.canvas),
             "colorBox": _rect_dict(self.color_box),
             "hueBar": _rect_dict(self.hue_bar),
-            "brushSlider": _rect_dict(self.brush_slider),
-            "brushPreview": _rect_dict(self.brush_preview),
+            "brushSizeBox": _rect_dict(self.brush_size_box),
             "pickerDirections": {
                 "hue": self.hue_direction,
                 "saturation": self.saturation_direction,
@@ -406,14 +403,9 @@ class CalibrationProfile:
                 _first(value, "colorBox", "color_box"), "color box", optional=True
             ),
             hue_bar=_rect_from(_first(value, "hueBar", "hue_bar"), "hue bar", optional=True),
-            brush_slider=_rect_from(
-                _first(value, "brushSlider", "brush_slider"),
-                "brush slider",
-                optional=True,
-            ),
-            brush_preview=_rect_from(
-                _first(value, "brushPreview", "brush_preview"),
-                "brush preview",
+            brush_size_box=_rect_from(
+                _first(value, "brushSizeBox", "brush_size_box"),
+                "brush size box",
                 optional=True,
             ),
             hue_direction=_first(

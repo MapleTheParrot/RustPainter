@@ -39,10 +39,11 @@ from .paint_plan import (
 )
 
 
-# A brush this many physical pixels across is comfortably within Rust's Size
-# slider everywhere it has been observed; larger targets risk the slider
-# maxing out below the planned footprint and leaving seams.
-_MAX_BRUSH_PIXELS = 64.0
+# Fallback ceiling for profiles whose brush reach has not been measured yet.
+# Once ``BrushCapabilities.max_brush_pixels`` is known it replaces this
+# entirely, because the measured value is what the Size field can really do
+# rather than what has been observed to work elsewhere.
+_ASSUMED_MAX_BRUSH_PIXELS = 64.0
 
 # Rough cost of one extra stroke in cells of mouse travel: the inter-stroke
 # delay, the button press, and the hop to the stroke's start point.
@@ -53,14 +54,17 @@ _STROKE_OVERHEAD_CELLS = 10
 class BrushCapabilities:
     """What the calibrated profile lets the planner physically do.
 
-    ``sizing`` requires the Size track and brush preview calibrations plus the
-    automatic-brush-sizing option; without it every stroke stays one cell.
-    ``cell_pixels`` is the physical size of one logical cell, used to keep a
-    planned brush inside the slider's realistic range; zero means unknown.
+    ``sizing`` requires the calibrated Size value box and a measured brush
+    model plus the automatic-brush-sizing option; without it every stroke stays
+    one cell.  ``cell_pixels`` is the physical size of one logical cell and
+    ``max_brush_pixels`` the widest band the profile actually measured Rust
+    painting, which together keep every planned brush inside what the Size
+    field can reach.  Zero means unknown for either.
     """
 
     sizing: bool = False
     cell_pixels: float = 0.0
+    max_brush_pixels: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +376,7 @@ def absorb_insignificant_regions(
 
 
 def _brush_is_achievable(diameter: int, capabilities: BrushCapabilities) -> bool:
-    """Whether the physical Size track can render a ``diameter``-cell pass.
+    """Whether Rust's Size field can render a ``diameter``-cell pass.
 
     With no cell size known there is nothing to compare against, so every
     candidate stays.
@@ -381,7 +385,10 @@ def _brush_is_achievable(diameter: int, capabilities: BrushCapabilities) -> bool
     cell = capabilities.cell_pixels
     if cell <= 0:
         return True
-    return diameter * cell <= _MAX_BRUSH_PIXELS
+    ceiling = capabilities.max_brush_pixels
+    if ceiling <= 0:
+        ceiling = _ASSUMED_MAX_BRUSH_PIXELS
+    return diameter * cell <= ceiling
 
 
 def _safety_offsets(diameter: int) -> np.ndarray:
@@ -614,8 +621,9 @@ def optimize_paint_plan(
 
     groups: list[ColorGroup] = []
     last_diameter = 1
-    # Mirrors the painter's per-diameter slider cache: the first use of a
-    # diameter is a full search, returning to it later is a single click.
+    # Mirrors the painter's brush changes: each switch to a new diameter costs
+    # a click and a typed number, so the planner only pays for one when the
+    # wider brush saves more travel than the switch costs.
     searched_diameters: set[int] = set()
     for color_index, color in enumerate(colors):
         allowed = index_map >= color_index

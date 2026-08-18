@@ -225,6 +225,9 @@ class _PendingPaint:
     settings: dict[str, Any]
     dry_run: bool
     display_snapshot: Any = None
+    # "paint" runs the plan; "measure_brush" paints probe strokes instead and
+    # fits what Rust's Size numbers cover on this sign.
+    mode: str = "paint"
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,6 +599,9 @@ class MainWindow(QMainWindow):
         self._painter: Any = None
         self._paint_generation = 0
         self._pending_paint: _PendingPaint | None = None
+        # Which kind of job the live painter is running, so completion knows
+        # whether a measurement result is waiting to be stored.
+        self._pending_mode = "paint"
         self._pending_start_cancelled = False
         self._color_chart_profile_id: str | None = None
         self._color_chart_path: Path | None = None
@@ -1456,22 +1462,19 @@ class MainWindow(QMainWindow):
         self.canvas_status = CalibrationStatus("Canvas")
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
-        self.brush_slider_status = CalibrationStatus("Size track", optional=True)
-        self.brush_preview_status = CalibrationStatus("Brush preview", optional=True)
+        self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
-        self.calibrate_brush_preview_button = QPushButton("Set")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
             (self.hue_bar_status, self.calibrate_hue_bar_button, "Calibrate hue bar"),
-            (self.brush_slider_status, self.calibrate_brush_button, "Calibrate size track"),
             (
-                self.brush_preview_status,
-                self.calibrate_brush_preview_button,
-                "Calibrate brush preview",
+                self.brush_size_box_status,
+                self.calibrate_brush_button,
+                "Calibrate the numeric Size field beside Rust's size slider",
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -1485,8 +1488,8 @@ class MainWindow(QMainWindow):
 
         self.apply_brush_check = QCheckBox("Automatic brush sizing")
         self.apply_brush_check.setToolTip(
-            "Sizes the brush to a logical image cell before painting. Needs the "
-            "Size track and the Brush preview tile calibrated."
+            "Types the Size number that paints exactly one logical image cell. "
+            "Needs the Size value box calibrated and Measure Brush Size run once."
         )
         self.show_calibration_check = QCheckBox("Show boxes on screen")
         self.show_calibration_check.setToolTip(
@@ -1495,6 +1498,27 @@ class MainWindow(QMainWindow):
             "are click-through and hide automatically while painting."
         )
         profile_layout.addWidget(self.apply_brush_check)
+        self.brush_model_status = QLabel("Brush size not measured")
+        self.brush_model_status.setObjectName("muted")
+        self.brush_model_status.setWordWrap(True)
+        self.measure_brush_button = QPushButton("Measure Brush Size")
+        self.measure_brush_button.setToolTip(
+            "Paints a few probe strokes on the sign and reads back how much of it "
+            "each Size number really covers.\nThe result is a fraction of the sign "
+            "rather than a pixel count, so it survives zooming, a different\n"
+            "painting resolution, and a different monitor - measure once per sign "
+            "type."
+        )
+        self.clear_brush_model_button = QPushButton("Clear")
+        self.clear_brush_model_button.setToolTip(
+            "Forget the measured brush model for this profile"
+        )
+        brush_model_row = QHBoxLayout()
+        brush_model_row.setContentsMargins(0, 0, 0, 0)
+        brush_model_row.addWidget(self.measure_brush_button, 1)
+        brush_model_row.addWidget(self.clear_brush_model_button)
+        profile_layout.addWidget(self.brush_model_status)
+        profile_layout.addLayout(brush_model_row)
         profile_layout.addWidget(self.show_calibration_check)
         self.canvas_geometry_label = QLabel("Canvas: not calibrated  •  Aspect: —")
         self.canvas_geometry_label.setObjectName("muted")
@@ -1861,27 +1885,53 @@ class MainWindow(QMainWindow):
     def _brush_capabilities(self) -> BrushCapabilities:
         """What the optimizer may plan with, given the current calibration."""
 
-        slider = self._profile_rect("brush_slider")
-        preview = self._profile_rect("brush_preview")
+        size_box = self._profile_rect("brush_size_box")
+        model = self._brush_size_model()
         canvas = self._profile_rect("canvas")
         cell_pixels = 0.0
+        max_brush_pixels = 0.0
         if canvas is not None:
             cell_pixels = min(
                 canvas.width / max(1, self.logical_width_spin.value()),
                 canvas.height / max(1, self.logical_height_spin.value()),
             )
+            if model is not None:
+                # The widest band the Size field can reach on this sign, in the
+                # same physical pixels the cell size is measured in, so the
+                # planner never offers a brush the painter would have to clamp.
+                max_brush_pixels = model.largest_fraction * canvas.height
         return BrushCapabilities(
             sizing=bool(
                 self.apply_brush_check.isChecked()
-                and slider is not None
-                and preview is not None
+                and size_box is not None
+                and model is not None
                 # Spacing above 1.0 spreads stroke geometry while the brush
                 # stays capped at one unspaced cell, so multi-cell bands would
                 # leave unpainted rows; keep those plans single-cell.
                 and self.pixel_spacing_spin.value() <= 1.0
             ),
             cell_pixels=cell_pixels,
+            max_brush_pixels=max_brush_pixels,
         )
+
+    def _brush_size_model(self) -> Any:
+        """The profile's measured Size-number model, or ``None`` if unmeasured."""
+
+        profile = self._current_profile
+        stored = (
+            profile.metadata.get("brush_size_model")
+            if profile is not None and isinstance(profile.metadata, dict)
+            else None
+        )
+        if not isinstance(stored, dict):
+            return None
+        from app.brush_calibration import BrushSizeModel
+
+        try:
+            return BrushSizeModel.from_dict(stored)
+        except (KeyError, TypeError, ValueError):
+            LOGGER.warning("Stored brush size model is invalid", exc_info=True)
+            return None
 
     @Slot()
     def _on_paint_mode_changed(self, *_args: Any) -> None:
@@ -2630,18 +2680,17 @@ class MainWindow(QMainWindow):
             )
         travel = stroke_pixel_steps * cell_width
         # One walk over the groups tracks everything the painter tracks: the
-        # picker is selected once per run of same-color groups, and the slider
-        # cache is keyed by diameter.
+        # picker is selected once per run of same-color groups, and the brush is
+        # retyped whenever the diameter changes.
         sizing = (
             self.apply_brush_check.isChecked()
-            and self._profile_rect("brush_slider") is not None
-            and self._profile_rect("brush_preview") is not None
+            and self._profile_rect("brush_size_box") is not None
+            and self._brush_size_model() is not None
         )
         selections = 0
         previous_color: tuple[int, int, int] | None = None
-        searched: set[int] = set()
         previous_diameter: int | None = None
-        revisits = 0
+        size_changes = 0
         for group in plan.color_groups:
             if group.color != previous_color:
                 selections += 1
@@ -2649,20 +2698,13 @@ class MainWindow(QMainWindow):
             if sizing:
                 diameter = max(1, group.brush_diameter)
                 if diameter != previous_diameter:
-                    if diameter in searched:
-                        revisits += 1
-                    else:
-                        searched.add(diameter)
+                    size_changes += 1
                     previous_diameter = diameter
-        # A fresh diameter binary-searches the slider with ~7 preview
-        # measurements, each of which also selects a temporary color; a
-        # revisit replays one remembered click.
-        settle = max(self.brush_delay_spin.value() / 1000.0, 0.16)
+        # The Size number is computed, not searched for, so a change costs one
+        # click into the field, a dozen keystrokes, and two settles.
+        settle = max(self.brush_delay_spin.value() / 1000.0, 0.05)
         click = self.dot_duration_spin.value() / 1000.0
-        brush_seconds = len(searched) * 7 * (settle + click) + revisits * (
-            settle + click
-        )
-        selections += len(searched)
+        brush_seconds = size_changes * (2 * settle + click + 12 * 0.01)
         color_ms = selections * (
             self.hue_delay_spin.value()
             + self.sv_delay_spin.value()
@@ -2769,13 +2811,12 @@ class MainWindow(QMainWindow):
             lambda: self._begin_calibration("hue_bar", "vertical hue bar")
         )
         self.calibrate_brush_button.clicked.connect(
-            lambda: self._begin_calibration("brush_slider", "clickable Size track")
-        )
-        self.calibrate_brush_preview_button.clicked.connect(
             lambda: self._begin_calibration(
-                "brush_preview", "gray brush-preview tile"
+                "brush_size_box", "numeric Size field beside the size slider"
             )
         )
+        self.measure_brush_button.clicked.connect(self._measure_brush_size)
+        self.clear_brush_model_button.clicked.connect(self._clear_brush_size_model)
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
@@ -3209,12 +3250,10 @@ class MainWindow(QMainWindow):
         self.color_box_status.set_calibrated(bool(status.get("color_box")))
         self.hue_bar_status.set_calibrated(bool(status.get("hue_bar")))
         brush_optional = not self.apply_brush_check.isChecked()
-        self.brush_slider_status.set_calibrated(
-            bool(status.get("brush_slider")), brush_optional
+        self.brush_size_box_status.set_calibrated(
+            bool(status.get("brush_size_box")), brush_optional
         )
-        self.brush_preview_status.set_calibrated(
-            bool(status.get("brush_preview")), brush_optional
-        )
+        self._refresh_brush_model_status()
         correction = (
             profile.metadata.get("color_correction")
             if profile and isinstance(profile.metadata, dict)
@@ -3272,18 +3311,14 @@ class MainWindow(QMainWindow):
                     "canvas",
                     "color_box",
                     "hue_bar",
-                    "brush_slider",
-                    "brush_preview",
+                    "brush_size_box",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
-                if (
-                    isinstance(source.metadata, dict)
-                    and "color_correction" in source.metadata
-                ):
-                    candidate.metadata["color_correction"] = deepcopy(
-                        source.metadata["color_correction"]
-                    )
+                if isinstance(source.metadata, dict):
+                    for key in ("color_correction", "brush_size_model"):
+                        if key in source.metadata:
+                            candidate.metadata[key] = deepcopy(source.metadata[key])
                 profile = self._profile_store.save(candidate)
                 LOGGER.info(
                     "New profile %s inherited calibration from %s",
@@ -3388,8 +3423,7 @@ class MainWindow(QMainWindow):
                 "canvas",
                 "color_box",
                 "hue_bar",
-                "brush_slider",
-                "brush_preview",
+                "brush_size_box",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -3400,6 +3434,12 @@ class MainWindow(QMainWindow):
             removed_reference = candidate.metadata.pop("ui_reference", None)
         if field in {"canvas", "color_box", "hue_bar"}:
             candidate.metadata.pop("color_correction", None)
+        if field == "canvas" and self._canvas_shape_changed(rectangle):
+            # The brush model is a fraction of the sign, so re-framing the same
+            # sign keeps it valid however the zoom changed.  A different aspect
+            # ratio means a different sign, whose texture resolution the old
+            # measurement says nothing about.
+            candidate.metadata.pop("brush_size_model", None)
         try:
             candidate.display = current_display
             self._current_profile = self._profile_store.save(candidate)
@@ -3432,8 +3472,8 @@ class MainWindow(QMainWindow):
         self._refresh_profile_ui()
         if field == "canvas":
             self._update_quality_dimensions()
-        elif field in {"brush_slider", "brush_preview"}:
-            # These calibrations change what the optimizer may plan with.
+        elif field == "brush_size_box":
+            # This calibration changes what the optimizer may plan with.
             self._schedule_processing()
 
     def _refresh_display_warning(self) -> None:
@@ -3527,7 +3567,7 @@ class MainWindow(QMainWindow):
         source, target = mismatch
         candidate = Profile.from_dict(profile.to_dict())
         moved: list[str] = []
-        for name in ("canvas", "color_box", "hue_bar", "brush_slider", "brush_preview"):
+        for name in ("canvas", "color_box", "hue_bar", "brush_size_box"):
             rect = getattr(candidate, name, None)
             if rect is None:
                 continue
@@ -3576,8 +3616,7 @@ class MainWindow(QMainWindow):
                     ("Canvas", getattr(profile, "canvas", None)),
                     ("Color box", getattr(profile, "color_box", None)),
                     ("Hue bar", getattr(profile, "hue_bar", None)),
-                    ("Size track", getattr(profile, "brush_slider", None)),
-                    ("Brush preview", getattr(profile, "brush_preview", None)),
+                    ("Size value box", getattr(profile, "brush_size_box", None)),
                 )
                 if rect is not None
             ]
@@ -3893,6 +3932,164 @@ class MainWindow(QMainWindow):
             LOGGER.exception("Could not clear color correction")
             QMessageBox.warning(self, "Could not clear correction", str(exc))
 
+    def _refresh_brush_model_status(self) -> None:
+        """Describe the measured brush model, or say what is still missing."""
+
+        model = self._brush_size_model()
+        has_box = self._profile_rect("brush_size_box") is not None
+        if model is not None:
+            rows = model.sign_pixel_rows
+            self.brush_model_status.setText(
+                f"Measured: size 1 covers {model.smallest_fraction * 100:.2f}% of the "
+                f"sign (about {rows:.0f} rows tall)"
+            )
+        elif not has_box:
+            self.brush_model_status.setText(
+                "Brush size not measured - calibrate the Size value box first"
+            )
+        else:
+            self.brush_model_status.setText(
+                "Brush size not measured - run Measure Brush Size once for this sign"
+            )
+
+    def _canvas_shape_changed(self, rectangle: Any) -> bool:
+        """Whether a new canvas rectangle describes a differently shaped sign.
+
+        Standing closer scales both sides together and leaves the aspect ratio
+        alone, which is exactly the case the brush model is built to survive.
+        A changed ratio means a different sign, so its measurement cannot carry
+        over.
+        """
+
+        previous = self._profile_rect("canvas")
+        if previous is None or previous.height <= 0 or rectangle.height <= 0:
+            return False
+        before = previous.width / previous.height
+        after = rectangle.width / rectangle.height
+        return abs(before - after) > before * 0.05
+
+    @Slot()
+    def _clear_brush_size_model(self) -> None:
+        profile = self._current_profile
+        if profile is None or "brush_size_model" not in profile.metadata:
+            return
+        try:
+            candidate = Profile.from_dict(profile.to_dict())
+            candidate.metadata.pop("brush_size_model", None)
+            self._current_profile = self._profile_store.save(candidate)
+            self._refresh_profile_ui()
+            self._schedule_processing()
+            self.statusBar().showMessage("Brush size measurement cleared", 5000)
+        except Exception as exc:
+            LOGGER.exception("Could not clear the brush size model")
+            QMessageBox.warning(self, "Could not clear the measurement", str(exc))
+
+    @Slot()
+    def _measure_brush_size(self) -> None:
+        """Paint probe strokes on the sign to learn what its Size numbers cover."""
+
+        profile = self._current_profile
+        if profile is None or not profile.is_ready:
+            QMessageBox.information(
+                self,
+                "Calibration incomplete",
+                "Measuring the brush needs a calibrated canvas, color box, and hue bar.",
+            )
+            return
+        if profile.brush_size_box is None:
+            QMessageBox.information(
+                self,
+                "Calibrate the Size value box",
+                "Calibrate Rust's numeric Size field before measuring what its "
+                "numbers paint.",
+            )
+            return
+        if self._painter_is_active() or self._debug_running:
+            QMessageBox.warning(
+                self,
+                "Painting is still active",
+                "Wait for the current job to finish before measuring the brush.",
+            )
+            return
+        if not self._emergency_hotkey_available():
+            QMessageBox.critical(
+                self,
+                "Emergency hotkey unavailable",
+                "Measuring paints on the sign, so it needs the global abort hotkey.",
+            )
+            return
+        try:
+            self._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Calibration is invalid", str(exc))
+            return
+        if (
+            QMessageBox.warning(
+                self,
+                "Measure brush size",
+                "This paints three short strokes across the middle of the sign and "
+                "reads back how wide each one came out.\n\nThe strokes stay on the "
+                "sign - paint over them afterwards, or clear the sign in Rust.\n\n"
+                "Focus Rust with the sign open, then continue.",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            != QMessageBox.StandardButton.Ok
+        ):
+            return
+        try:
+            settings = self._settings_document()
+            settings["safety"]["countdown_seconds"] = 0
+            self._pending_paint = _PendingPaint(
+                plan=self._plan or PaintPlan(width=1, height=1, color_groups=()),
+                profile=Profile.from_dict(profile.to_dict()),
+                settings=settings,
+                dry_run=False,
+                display_snapshot=capture_display_metadata(),
+                mode="measure_brush",
+            )
+            self._pending_start_cancelled = False
+        except Exception as exc:
+            LOGGER.exception("Could not prepare the brush measurement")
+            QMessageBox.critical(self, "Could not prepare the measurement", str(exc))
+            return
+        self._launch_countdown(
+            3,
+            self._begin_paint_after_countdown,
+            hint=f"{self.abort_hotkey_combo.currentText()} cancels",
+        )
+
+    def _store_measured_brush_model(self) -> None:
+        """Persist the model the finished measurement job fitted."""
+
+        painter = self._painter
+        profile = self._current_profile
+        model = painter.measured_brush_size_model if painter is not None else None
+        if model is None or profile is None:
+            LOGGER.warning("Brush measurement finished without a model")
+            self.progress_detail_label.setText("Brush measurement produced no model")
+            return
+        try:
+            candidate = Profile.from_dict(profile.to_dict())
+            candidate.metadata["brush_size_model"] = model.to_dict()
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not save the brush size model")
+            QMessageBox.warning(self, "Could not save the measurement", str(exc))
+            return
+        LOGGER.info(
+            "Brush size measured: %.6f of the sign per unit (~%.0f rows)",
+            model.slope,
+            model.sign_pixel_rows,
+        )
+        self._refresh_profile_ui()
+        self._schedule_processing()
+        self.progress_state_label.setText("Brush measured")
+        self.statusBar().showMessage(
+            f"Brush measured: this sign is about {model.sign_pixel_rows:.0f} rows tall",
+            8000,
+        )
+
     @Slot()
     def _register_hotkeys(self, *_args: Any) -> None:
         self._refresh_hotkey_labels()
@@ -4146,7 +4343,7 @@ class MainWindow(QMainWindow):
             self.calibrate_color_box_button,
             self.calibrate_hue_bar_button,
             self.calibrate_brush_button,
-            self.calibrate_brush_preview_button,
+            self.measure_brush_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -4166,6 +4363,11 @@ class MainWindow(QMainWindow):
         )
         for control in controls:
             control.setEnabled(not locked)
+        # Clearing needs something measured to clear, so it answers to the
+        # profile as well as to the lock.
+        self.clear_brush_model_button.setEnabled(
+            not locked and self._brush_size_model() is not None
+        )
         if not locked:
             is_fit = self.scale_mode_combo.currentData() == ScaleMode.FIT.value
             is_fill = self.scale_mode_combo.currentData() == ScaleMode.FILL.value
@@ -4352,14 +4554,14 @@ class MainWindow(QMainWindow):
         desktop = get_virtual_screen()
         names = ["canvas", "color_box", "hue_bar"]
         if apply_brush_size:
-            names.extend(("brush_slider", "brush_preview"))
+            names.append("brush_size_box")
         for name in names:
             rectangle = getattr(profile, name, None)
             if rectangle is None:
-                if name in {"brush_slider", "brush_preview"}:
+                if name == "brush_size_box":
                     raise ValueError(
-                        "Automatic brush sizing requires both the Size slider and "
-                        "gray brush-preview tile to be calibrated."
+                        "Automatic brush sizing requires Rust's numeric Size field "
+                        "to be calibrated."
                     )
                 continue
             if not (
@@ -4497,7 +4699,10 @@ class MainWindow(QMainWindow):
             )
             # Publish only a configured READY painter. The hotkey thread can
             # then abort it atomically even before its worker thread starts.
-            painter.configure(pending.plan, pending.profile, settings)
+            if pending.mode == "measure_brush":
+                painter.configure_brush_measurement(pending.profile, settings)
+            else:
+                painter.configure(pending.plan, pending.profile, settings)
             if self._pending_start_cancelled:
                 painter.shutdown(timeout=0.5)
                 self._set_idle_ui("Start cancelled")
@@ -4513,12 +4718,16 @@ class MainWindow(QMainWindow):
                     self._set_idle_ui("Start cancelled")
                     return
                 raise RuntimeError("The configured paint worker could not be started")
-            LOGGER.info(
-                "%s started: %d colors, %d strokes",
-                "Dry run" if dry_run else "Painting",
-                len(pending.plan.color_groups),
-                pending.plan.stroke_count,
-            )
+            self._pending_mode = pending.mode
+            if pending.mode == "measure_brush":
+                LOGGER.info("Brush size measurement started")
+            else:
+                LOGGER.info(
+                    "%s started: %d colors, %d strokes",
+                    "Dry run" if dry_run else "Painting",
+                    len(pending.plan.color_groups),
+                    pending.plan.stroke_count,
+                )
             self._update_start_availability()
         except Exception as exc:
             LOGGER.exception("Could not start painting")
@@ -4538,8 +4747,8 @@ class MainWindow(QMainWindow):
             canvas=ScreenRect(0, 0, max(1, plan.width), max(1, plan.height)),
             color_box=ScreenRect(0, 0, 101, 101),
             hue_bar=ScreenRect(102, 0, 7, 360),
-            brush_slider=None,
-            brush_preview=None,
+            brush_size_box=None,
+            metadata={},
             hue_direction="bottom_to_top",
             saturation_direction="left_low",
             value_direction="top_bright",
@@ -4652,6 +4861,11 @@ class MainWindow(QMainWindow):
         self.progress_state_label.setText("Completed")
         self._set_active_progress_visible(False)
         self._set_state_badge("completed", "COMPLETE")
+        if self._pending_mode == "measure_brush":
+            self._pending_mode = "paint"
+            self._store_measured_brush_model()
+            self._update_start_availability()
+            return
         LOGGER.info("Paint plan completed")
         if self._painter is not None and getattr(self._painter.input, "is_dry_run", False):
             LOGGER.info(
@@ -4680,6 +4894,10 @@ class MainWindow(QMainWindow):
         if self._timelapse_recorder is not None or self._closing:
             return
         if not self.timelapse_check.isChecked():
+            return
+        if self._pending_mode == "measure_brush":
+            # A measurement paints three throwaway probe strokes; recording them
+            # would open a timelapse of work nobody wants to watch back.
             return
         painter = self._painter
         if painter is None or not getattr(painter.input, "emits_real_input", True):

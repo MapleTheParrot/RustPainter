@@ -44,8 +44,7 @@ def _complete_profile() -> Profile:
         canvas=Rect(-1500, 250, 1048, 526),
         color_box=Rect(1680, 610, 254, 252),
         hue_bar=Rect(1937, 610, 40, 252),
-        brush_slider=Rect(1760, 392, 265, 34),
-        brush_preview=Rect(1400, 970, 160, 160),
+        brush_size_box=Rect(1760, 392, 62, 26),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -71,8 +70,7 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "canvas": True,
         "color_box": True,
         "hue_bar": True,
-        "brush_slider": True,
-        "brush_preview": True,
+        "brush_size_box": True,
     }
     assert restored.display is not None
     assert restored.display.virtual_screen == Rect(-1920, 0, 4480, 1440)
@@ -84,7 +82,7 @@ def test_profile_deserializer_accepts_legacy_names_and_rect_edges() -> None:
         "canvas": {"x": -10, "y": 20, "right": 90, "bottom": 70},
         "color_box": {"left": 100, "top": 200, "width": 300, "height": 250},
         "hue_bar": {"left": 410, "top": 200, "width": 25, "height": 250},
-        "brush_slider": None,
+        "brush_size_box": None,
         "hue_direction": "top_bottom",
         "saturation_direction": "left_low_right_high",
         "value_direction": "top_bright_bottom_dark",
@@ -98,8 +96,7 @@ def test_profile_deserializer_accepts_legacy_names_and_rect_edges() -> None:
     assert profile.hue_direction == "bottom_to_top"
     assert profile.saturation_direction == "left_low"
     assert profile.value_direction == "top_bright"
-    assert profile.brush_slider is None
-    assert profile.brush_preview is None
+    assert profile.brush_size_box is None
 
 
 def test_profile_store_crud_and_default_survive_reload(tmp_path) -> None:

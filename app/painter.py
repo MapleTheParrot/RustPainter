@@ -16,7 +16,11 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Iterator
 
-from .brush_calibration import BrushFootprint, measure_brush_footprint
+from .brush_calibration import (
+    BrushSizeModel,
+    fit_brush_size_model,
+    measure_stroke_band,
+)
 from .color_calibration import ColorCorrectionModel
 from .color_mapping import map_rgb_to_picker
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
@@ -132,10 +136,10 @@ class PaintingTarget:
     canvas: RectangleLike
     color_box: RectangleLike
     hue_bar: RectangleLike
-    brush_slider: RectangleLike | None = None
+    brush_size_box: RectangleLike | None = None
     picker_directions: PickerDirections = PickerDirections()
-    brush_preview: RectangleLike | None = None
     color_correction: ColorCorrectionModel | None = None
+    brush_size_model: BrushSizeModel | None = None
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -154,18 +158,26 @@ class PaintingTarget:
             if isinstance(correction_value, Mapping)
             else None
         )
+        sizing_value = (
+            metadata.get("brush_size_model") if isinstance(metadata, Mapping) else None
+        )
+        brush_size_model = (
+            BrushSizeModel.from_dict(sizing_value)
+            if isinstance(sizing_value, Mapping)
+            else None
+        )
         return cls(
             canvas=canvas,
             color_box=color_box,
             hue_bar=hue_bar,
-            brush_slider=getattr(profile, "brush_slider", None),
+            brush_size_box=getattr(profile, "brush_size_box", None),
             picker_directions=PickerDirections(
                 hue="bottom_to_top",
                 saturation="left_low",
                 value="top_bright",
             ),
-            brush_preview=getattr(profile, "brush_preview", None),
             color_correction=correction,
+            brush_size_model=brush_size_model,
         )
 
 
@@ -354,6 +366,9 @@ class _Job:
     plan: PaintPlan
     target: PaintingTarget
     settings: PainterSettings
+    # "paint" runs the plan; "measure_brush" paints probe strokes instead and
+    # fits what Rust's Size numbers actually cover.
+    mode: str = "paint"
 
 
 class _AbortRequested(Exception):
@@ -419,10 +434,7 @@ class Painter:
         )
         self._mouse_drift_pixels = 0.0
         self._mouse_drift_started = 0.0
-        # Slider fractions the binary search already found this job, keyed by
-        # diameter in logical cells, so returning to a diameter is one
-        # deterministic click, not a fresh search.
-        self._brush_fractions: dict[int, float] = {}
+        self._measured_brush_size_model: BrushSizeModel | None = None
         self._last_progress_emit = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
@@ -478,8 +490,8 @@ class Painter:
         canvas: RectangleLike | None = None,
         color_box: RectangleLike | None = None,
         hue_bar: RectangleLike | None = None,
-        brush_slider: RectangleLike | None = None,
-        brush_preview: RectangleLike | None = None,
+        brush_size_box: RectangleLike | None = None,
+        brush_size_model: BrushSizeModel | None = None,
         picker_directions: PickerDirections | None = None,
     ) -> None:
         """Prepare a job without starting it, suitable for an F8 callback."""
@@ -494,9 +506,9 @@ class Painter:
                     canvas=canvas,
                     color_box=color_box,
                     hue_bar=hue_bar,
-                    brush_slider=brush_slider,
+                    brush_size_box=brush_size_box,
                     picker_directions=picker_directions or PickerDirections(),
-                    brush_preview=brush_preview,
+                    brush_size_model=brush_size_model,
                 )
         resolved_settings = (
             settings
@@ -534,6 +546,58 @@ class Painter:
 
     prepare = configure
 
+    def configure_brush_measurement(
+        self,
+        profile: object | None = None,
+        settings: PainterSettings | Mapping[str, Any] | None = None,
+        *,
+        target: PaintingTarget | None = None,
+    ) -> None:
+        """Prepare a job that measures Rust's Size numbers instead of painting.
+
+        The job paints its own probe strokes on the calibrated sign, so it
+        carries a placeholder plan purely to satisfy the shared machinery that
+        every job runs through.
+        """
+
+        if target is None:
+            if profile is None:
+                raise ValueError("Provide a calibrated profile or a painting target")
+            target = PaintingTarget.from_profile(profile)
+        if target.brush_size_box is None:
+            raise ValueError(
+                "Calibrate Rust's Size value box before measuring what its numbers paint"
+            )
+        resolved_settings = (
+            settings
+            if isinstance(settings, PainterSettings)
+            else PainterSettings.from_mapping(settings) if settings is not None else PainterSettings()
+        )
+        placeholder = PaintPlan(width=1, height=1, color_groups=())
+        with self._condition:
+            if self._state in self._ACTIVE_STATES or (
+                self._thread is not None and self._thread.is_alive()
+            ):
+                raise RuntimeError("Cannot replace a paint job while one is active")
+            self._job = _Job(placeholder, target, resolved_settings, mode="measure_brush")
+            self._measured_brush_size_model = None
+            self._abort_requested = False
+            self._abort_event.clear()
+            self._pause_event.clear()
+            self._pause_generation = 0
+            self._state_before_pause = PainterState.RUNNING
+            self._progress = PaintProgress(
+                PainterState.READY, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None, "Ready to measure"
+            )
+            self._transition(PainterState.READY, "configured")
+
+    @property
+    def measured_brush_size_model(self) -> BrushSizeModel | None:
+        """The model fitted by the last completed measurement job, if any."""
+
+        with self._condition:
+            return self._measured_brush_size_model
+
     def start(
         self,
         plan: PaintPlan | None = None,
@@ -568,7 +632,6 @@ class Painter:
             self._last_focus_check = 0.0
             self._last_corner_check = 0.0
             self._reset_mouse_movement_baseline()
-            self._brush_fractions.clear()
             self._last_progress_emit = 0.0
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
@@ -703,28 +766,28 @@ class Painter:
             if rect.width <= 0 or rect.height <= 0:
                 raise ValueError(f"{label} calibration must have positive dimensions")
         if settings.apply_brush_size:
-            if target.brush_slider is None:
+            if target.brush_size_box is None:
                 raise ValueError(
-                    "Brush-size application is enabled, but no brush slider is calibrated"
-                )
-            if target.brush_preview is None:
-                raise ValueError(
-                    "Automatic brush sizing is enabled, but the brush preview tile "
+                    "Automatic brush sizing is enabled, but Rust's Size value box "
                     "is not calibrated"
                 )
-            if target.brush_slider.width <= 0 or target.brush_slider.height <= 0:
-                raise ValueError("brush slider calibration must have positive dimensions")
-            if target.brush_preview.width <= 0 or target.brush_preview.height <= 0:
-                raise ValueError("brush preview calibration must have positive dimensions")
+            if target.brush_size_box.width <= 0 or target.brush_size_box.height <= 0:
+                raise ValueError("Size value box calibration must have positive dimensions")
+            if target.brush_size_model is None:
+                raise ValueError(
+                    "Automatic brush sizing is enabled, but this profile has not "
+                    "measured what Rust's Size numbers paint. Run Measure Brush Size."
+                )
+            self._validate_brush_reach(plan, target, settings, target.brush_size_model)
         # A dry run only visualizes the plan, so it may carry brush metadata
         # that real input could not honor with the current calibration.
         if getattr(self.input, "emits_real_input", True):
             if any(group.brush_diameter > 1 for group in plan.color_groups) and not (
-                settings.apply_brush_size and target.brush_slider
+                settings.apply_brush_size and target.brush_size_box
             ):
                 raise ValueError(
                     "This plan uses multiple brush sizes, which needs automatic brush "
-                    "sizing enabled with the Size track calibrated"
+                    "sizing enabled with the Size value box calibrated"
                 )
             if (
                 any(group.brush_diameter > 1 for group in plan.color_groups)
@@ -735,6 +798,55 @@ class Painter:
                 # unpainted rows between their sweeps.
                 raise ValueError(
                     "Multi-cell brush passes need Logical spacing at 1.0 or below"
+                )
+
+    # The plan treats a cell as final once its color's last stroke lands, so a
+    # brush that spills half a cell each side starts destroying finished
+    # neighbours.  Below this ratio the spill stays inside the seams the plan
+    # already tolerates; above it the painted sign visibly diverges from the
+    # preview, and refusing beats quietly painting the wrong image.
+    _DETAIL_OVERSHOOT_LIMIT = 1.5
+
+    def _validate_brush_reach(
+        self,
+        plan: PaintPlan,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        model: BrushSizeModel,
+    ) -> None:
+        """Refuse plans asking for footprints Rust's Size field cannot reach.
+
+        Every number this job would type is known before a single stroke is
+        painted, so an unreachable brush is reported while the sign is still
+        blank rather than halfway through covering it.
+        """
+
+        canvas = target.canvas
+        pitch = min(canvas.width / plan.width, canvas.height / plan.height)
+        diameters = {max(1, int(group.brush_diameter)) for group in plan.color_groups}
+        for diameter in sorted(diameters):
+            wanted = self._brush_target_fraction(
+                target, plan, diameter, settings.logical_pixel_spacing
+            )
+            size = model.clamped_size_for_fraction(wanted)
+            painted = model.fraction_for_size(size) * canvas.height
+            nominal = pitch * diameter
+            if diameter == 1 and painted > nominal * self._DETAIL_OVERSHOOT_LIMIT:
+                rows = max(1, int(model.sign_pixel_rows))
+                raise ValueError(
+                    f"Rust's smallest brush covers {painted / pitch:.1f} logical cells "
+                    "here, so detail strokes would overwrite their neighbours. This "
+                    f"sign is about {rows} rows tall - lower the painting resolution "
+                    f"to {rows} rows or fewer, or calibrate a larger sign."
+                )
+            # Adjacent multi-cell bands overlap one row, which tolerates a brush
+            # up to one cell under its nominal footprint; anything narrower
+            # leaves stripes the plan already counts as covered.
+            if diameter > 1 and painted < nominal * (diameter - 1) / diameter:
+                raise ValueError(
+                    f"A {diameter}-cell brush needs {nominal:.0f}px but the Size field "
+                    f"reaches only {painted:.0f}px here. Choose a lower optimization "
+                    "mode or a higher painting resolution."
                 )
 
     def _run(self) -> None:
@@ -758,14 +870,24 @@ class Painter:
             # can still enter the ordinary PAUSED state when focus is wrong.
             self._checkpoint(check_focus=True)
             job.target = self._measured_picker_target(job.target)
-            self._update_progress_state(PainterState.RUNNING, "Painting")
-            self._execute_plan(job)
-            self._verify_and_touch_up(job)
+            if job.mode == "measure_brush":
+                measured = self._measure_brush_size_model(job)
+                with self._condition:
+                    self._measured_brush_size_model = measured
+            else:
+                self._update_progress_state(PainterState.RUNNING, "Painting")
+                self._execute_plan(job)
+                self._verify_and_touch_up(job)
             self._checkpoint(check_focus=False)
             self._finish_completed()
             self._update_progress_state(PainterState.COMPLETED, "Completed")
             final_progress = self.progress
-            LOGGER.info("Painting completed: %d strokes", final_progress.completed_strokes)
+            if job.mode == "measure_brush":
+                LOGGER.info("Brush measurement completed")
+            else:
+                LOGGER.info(
+                    "Painting completed: %d strokes", final_progress.completed_strokes
+                )
             self._safe_callback(self._on_complete, final_progress, label="completion")
         except _AbortRequested:
             if self.state != PainterState.ABORTED:
@@ -799,157 +921,194 @@ class Painter:
             remaining -= slice_seconds
 
     @staticmethod
-    def _slider_point(slider: RectangleLike, fraction: float) -> tuple[float, float]:
-        """The click point for a Size-track fraction, whatever its orientation."""
-
-        if slider.width >= slider.height:
-            return normalized_point(slider, fraction, 0.5)
-        return normalized_point(slider, 0.5, fraction)
-
-    def _apply_brush_size(
-        self,
-        job: _Job,
+    def _brush_target_fraction(
+        target: PaintingTarget,
+        plan: PaintPlan,
         diameter_cells: int,
-        epoch: int,
-    ) -> bool:
-        """Size the brush to ``diameter_cells`` logical cells.
+        spacing: float,
+    ) -> float:
+        """The canvas-height fraction a ``diameter_cells`` brush should paint.
 
-        Every input is guarded by ``epoch``: a pause raises ``_RetryAction`` to
-        the caller's stroke loop, which re-applies size and color once painting
-        resumes.
-
-        Returns ``True`` when the preview had to be measured (which selects a
-        temporary color), ``False`` when a cached slider fraction was reused.
+        The plan is stretched across the whole canvas, so one row is
+        ``1/height`` of it and one column ``1/width``.  A round or square brush
+        spans the same distance both ways and therefore has to respect
+        whichever pitch is tighter.  The result is expressed against the canvas
+        height because that is the axis brush calibration measured.
         """
 
-        settings = job.settings
-        slider = job.target.brush_slider
-        preview = job.target.brush_preview
-        if not settings.apply_brush_size or slider is None or preview is None:
-            return False
-        cell = min(
-            job.target.canvas.width / job.plan.width,
-            job.target.canvas.height / job.plan.height,
-        )
+        canvas = target.canvas
+        pitch = min(canvas.width / plan.width, canvas.height / plan.height)
+        span = pitch * diameter_cells * min(spacing, 1.0)
         if diameter_cells <= 1:
             # Slightly underfilling a cell is safer than overwriting both
             # adjacent rows. Rust's sign texture visually hides the small seam.
-            target_diameter = cell * min(settings.logical_pixel_spacing, 1.0) * 0.90
-        else:
-            target_diameter = (
-                cell * min(settings.logical_pixel_spacing, 1.0) * diameter_cells
-            )
-        preview_settle_seconds = (
-            max(settings.delay_after_brush_seconds, 0.16)
+            span *= 0.90
+        return span / canvas.height
+
+    def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:
+        """Type the Size number that paints ``diameter_cells`` logical cells.
+
+        Rust sizes the brush in the sign's own texture pixels, so the profile's
+        measured model turns a wanted footprint straight into a number.  There
+        is nothing to search for and nothing to capture: the value is computed,
+        typed, and committed.  ``_validate_job`` has already confirmed the plan
+        only asks for footprints the field can actually reach.
+        """
+
+        settings = job.settings
+        box = job.target.brush_size_box
+        model = job.target.brush_size_model
+        if not settings.apply_brush_size or box is None or model is None:
+            return
+        fraction = self._brush_target_fraction(
+            job.target, job.plan, diameter_cells, settings.logical_pixel_spacing
+        )
+        size = model.clamped_size_for_fraction(fraction)
+        self._update_progress_state(
+            PainterState.RUNNING,
+            f"Brush size {size} for {diameter_cells} logical "
+            f"cell{'s' if diameter_cells != 1 else ''}",
+        )
+        self._write_brush_size(box, size, settings, epoch)
+        LOGGER.info(
+            "Brush size %d typed for %d cell(s): wanted %.5f of the sign, paints %.5f",
+            size,
+            diameter_cells,
+            fraction,
+            model.fraction_for_size(size),
+        )
+
+    def _write_brush_size(
+        self,
+        box: RectangleLike,
+        size: int,
+        settings: PainterSettings,
+        epoch: int,
+    ) -> None:
+        """Focus Rust's Size field, replace its contents, and commit with Enter."""
+
+        settle = (
+            max(settings.delay_after_brush_seconds, 0.05)
             if self.input.emits_real_input
             else 0.0
         )
-        cached_fraction = self._brush_fractions.get(diameter_cells)
-        if cached_fraction is not None:
-            # The Size track is click-to-set, so repeating the exact click the
-            # earlier search settled on restores that diameter without a single
-            # preview measurement.
-            self._safe_click(self._slider_point(slider, cached_fraction), epoch)
-            self._interruptible_sleep(
-                preview_settle_seconds, epoch=epoch, check_focus=True
-            )
-            return False
-        self._update_progress_state(
-            PainterState.RUNNING,
-            f"Matching brush to {target_diameter:.1f}px "
-            f"({diameter_cells} logical cell{'s' if diameter_cells != 1 else ''})",
-        )
-
-        # Use a high-contrast temporary color so the footprint can be separated
-        # reliably from the gray preview background. The next stroke's group
-        # selects its real color again before touching the canvas.
-        self._select_color(
-            (255, 0, 255),
-            job.target,
-            settings,
-            epoch,
-            apply_correction=False,
-        )
-
-        low = 0.0
-        high = 1.0
-        best_fraction = 0.0
-        best_diameter = 0.0
-        best_error = math.inf
-        observed: list[float] = []
-        current_fraction: float | None = None
-        for _iteration in range(7):
-            fraction = (low + high) / 2.0
-            self._safe_click(self._slider_point(slider, fraction), epoch)
-            self._interruptible_sleep(
-                preview_settle_seconds, epoch=epoch, check_focus=True
-            )
+        self._safe_click(normalized_point(box, 0.5, 0.5), epoch)
+        self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
+        # The field holds at most three digits, and clearing from both sides of
+        # the caret empties it wherever the click happened to place it.
+        for key in ("BACKSPACE",) * 4 + ("DELETE",) * 4:
             self._checkpoint(epoch=epoch, check_focus=True)
-            diameter = self._measure_brush_preview(preview).diameter
-            current_fraction = fraction
-            observed.append(diameter)
-            raw_error = abs(diameter - target_diameter)
-            error = raw_error
-            if diameter_cells > 1 and diameter < target_diameter:
-                # A multi-cell pass plans its coverage from the nominal
-                # footprint, so an undershoot seam is worse than the same
-                # amount of overshoot landing inside the safety margin.
-                error *= 2.0
-            if error < best_error:
-                best_error = error
-                best_fraction = fraction
-                best_diameter = diameter
-            if diameter < target_diameter:
-                low = fraction
-            else:
-                high = fraction
-            if raw_error <= 0.75:
-                break
+            self.input.press_key(key)
+        for digit in str(size):
+            self._checkpoint(epoch=epoch, check_focus=True)
+            self.input.press_key(digit)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self.input.press_key("ENTER")
+        self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
 
-        if len(observed) >= 4 and max(observed) - min(observed) < 1.5:
-            raise RuntimeError(
-                "The brush preview did not change while testing the Size slider. "
-                "Recalibrate both regions and confirm the solid square or circle tool is selected."
-            )
-        # Adjacent multi-cell bands overlap one row, which tolerates a brush up
-        # to one cell under its nominal footprint; anything smaller would leave
-        # stripes the plan already counts as covered, so fail loudly instead.
-        if diameter_cells > 1 and best_diameter < (
-            target_diameter * (diameter_cells - 1) / diameter_cells - 0.75
-        ):
-            raise RuntimeError(
-                f"The Size slider reached only {best_diameter:.0f}px of the "
-                f"{target_diameter:.0f}px this plan's {diameter_cells}-cell brush "
-                "needs. Choose a lower optimization mode or a higher painting "
-                "resolution, or recalibrate the Size track."
-            )
-        # The preview tile draws at its own scale, so this only catches gross
-        # mismatch - but a closest-achievable dab half again wider than a cell
-        # means the slider bottomed out, and painting on would smear every
-        # detail stroke over its neighbours.
-        if (
-            diameter_cells <= 1
-            and best_diameter > cell * self._DETAIL_OVERSHOOT_LIMIT + 0.75
-        ):
-            raise RuntimeError(
-                f"The smallest brush the Size track reached renders {best_diameter:.0f}px "
-                f"in the preview, but one logical cell is only {cell:.0f}px, so detail "
-                "strokes would overwrite their neighbours. Lower the painting "
-                "resolution or calibrate a larger sign."
-            )
-        if current_fraction is None or abs(current_fraction - best_fraction) > 1e-6:
-            self._safe_click(self._slider_point(slider, best_fraction), epoch)
-            self._interruptible_sleep(
-                preview_settle_seconds, epoch=epoch, check_focus=True
-            )
-        self._brush_fractions[diameter_cells] = best_fraction
-        LOGGER.info(
-            "Brush auto-sized: %.1f px measured for %.1f px target (slider %.3f)",
-            best_diameter,
-            target_diameter,
-            best_fraction,
+    # Sizes probed when measuring what Rust's Size numbers paint.  Descending,
+    # so the widest band goes down first and the narrower ones are drawn inside
+    # it: every probe then sits clear of the sign's edges, where a clipped band
+    # would measure short and bend the fit.
+    _BRUSH_PROBE_SIZES = (60, 30, 12)
+
+    # One color per probe, so a stroke drawn inside a previous, wider band still
+    # reads as a change against the capture taken just before it.
+    _BRUSH_PROBE_COLORS = ((255, 0, 255), (0, 255, 0), (255, 200, 0))
+
+    def _measure_brush_size_model(self, job: _Job) -> BrushSizeModel:
+        """Paint probe strokes and fit Size number to painted canvas fraction.
+
+        Each probe types a number, drags one stroke through the middle of the
+        sign, and measures the band it left behind.  Reading the sign itself is
+        what makes the result independent of Rust's preview tile and of how
+        close the camera happens to be standing.
+        """
+
+        target = job.target
+        settings = job.settings
+        box = target.brush_size_box
+        if box is None:
+            raise RuntimeError("Rust's Size value box is not calibrated")
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
         )
-        return True
+        # Parked over the color box, the cursor cannot shadow the capture.
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        # Drawn through the vertical middle and well short of both sides, so the
+        # straight section of the stroke dominates the measurement even when the
+        # widest probe rounds off its ends.
+        stroke_y = int(round(canvas.top + canvas.height / 2.0))
+        start = (int(round(canvas.left + canvas.width * 0.15)), stroke_y)
+        end = (int(round(canvas.left + canvas.width * 0.85)), stroke_y)
+
+        samples: list[tuple[int, float]] = []
+        clipped: list[int] = []
+        for index, size in enumerate(self._BRUSH_PROBE_SIZES):
+            epoch = self._pause_generation_value()
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Measuring brush size {size} "
+                f"({index + 1} of {len(self._BRUSH_PROBE_SIZES)})",
+            )
+            color = self._BRUSH_PROBE_COLORS[index % len(self._BRUSH_PROBE_COLORS)]
+            self._select_color(color, target, settings, epoch, apply_correction=False)
+            self._write_brush_size(box, size, settings, epoch)
+            before = self._capture_parked(canvas, park, epoch)
+            self._screen_stroke(start, end, settings, epoch)
+            after = self._capture_parked(canvas, park, epoch)
+            band = measure_stroke_band(before, after)
+            LOGGER.info(
+                "Brush probe %d painted a %.1f px band of %d (%s)",
+                size,
+                band.height,
+                canvas.height,
+                "clipped" if band.clipped else "clear",
+            )
+            if band.clipped:
+                # The band ran off the sign, so its height is a floor rather
+                # than a measurement. A smaller probe still carries the fit.
+                clipped.append(size)
+                continue
+            samples.append((size, band.height / canvas.height))
+
+        if len(samples) < 2:
+            detail = (
+                "Sizes "
+                + ", ".join(str(size) for size in clipped)
+                + " covered the whole sign, so stand closer or calibrate a larger sign."
+                if clipped
+                else "Confirm the paint tool is selected and the sign fills the "
+                "calibrated canvas."
+            )
+            raise RuntimeError(
+                "Brush measurement needs two usable probe strokes but got "
+                f"{len(samples)}. {detail}"
+            )
+        model = fit_brush_size_model(samples)
+        LOGGER.info(
+            "Brush size model: %.6f of the sign per unit (~%.0f sign rows), offset %.6f",
+            model.slope,
+            model.sign_pixel_rows,
+            model.intercept,
+        )
+        return model
+
+    def _capture_parked(
+        self, canvas: ScreenRect, park: tuple[int, int], epoch: int
+    ) -> Any:
+        """Move the cursor off the sign, let Rust settle, then capture it."""
+
+        self._move(park, epoch)
+        self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        return self._screen_capture(canvas)
 
     def _measured_picker_target(self, target: PaintingTarget) -> PaintingTarget:
         """Shrink the picker rectangles to the widgets Rust is really drawing.
@@ -992,47 +1151,6 @@ class Painter:
             measured[name] = trimmed
         return replace(target, **measured) if measured else target
 
-    # The plan treats a cell as final once its color's last stroke lands, so a
-    # brush that spills half a cell each side starts destroying finished
-    # neighbours.  Below this ratio the spill stays inside the seams the plan
-    # already tolerates; above it the painted sign visibly diverges from the
-    # preview, and stopping beats quietly painting the wrong image.
-    _DETAIL_OVERSHOOT_LIMIT = 1.5
-
-    def _measure_brush_preview(self, preview: RectangleLike) -> BrushFootprint:
-        return self._measure_footprint(preview)
-
-    def _measure_footprint(self, region: RectangleLike) -> BrushFootprint:
-        """Measure a brush shape, retrying tiny ones with tighter center crops.
-
-        A crop reduces the amount of background used to derive the detector's
-        minimum component size, which is what lets the smallest positions of
-        the Size track be measured at all rather than dismissed as noise.  The
-        calibrated rectangle itself is never mutated, so subsequent jobs and
-        the calibration overlay retain the user's original box.
-        """
-
-        last_error: ValueError | None = None
-        for scale in (1.0, 0.5, 0.25):
-            width = max(8, int(round(region.width * scale)))
-            height = max(8, int(round(region.height * scale)))
-            width = min(width, region.width)
-            height = min(height, region.height)
-            capture_rect = ScreenRect(
-                region.left + (region.width - width) // 2,
-                region.top + (region.height - height) // 2,
-                width,
-                height,
-            )
-            try:
-                return measure_brush_footprint(self._screen_capture(capture_rect))
-            except ValueError as exc:
-                last_error = exc
-                if width == 8 and height == 8:
-                    break
-        assert last_error is not None
-        raise last_error
-
     def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
         plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
@@ -1061,8 +1179,8 @@ class Painter:
             return
         sizing_enabled = (
             settings.apply_brush_size
-            and target.brush_slider is not None
-            and target.brush_preview is not None
+            and target.brush_size_box is not None
+            and target.brush_size_model is not None
         )
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
@@ -1082,10 +1200,7 @@ class Painter:
                             applied_diameter = None
                             applied_epoch = current_epoch
                         if sizing_enabled and diameter != applied_diameter:
-                            if self._apply_brush_size(job, diameter, current_epoch):
-                                # Measuring the preview selected the temporary
-                                # color.
-                                selected = None
+                            self._apply_brush_size(job, diameter, current_epoch)
                             applied_diameter = diameter
                         if selected != (group.color, current_epoch):
                             self._select_color(group.color, target, settings, current_epoch)

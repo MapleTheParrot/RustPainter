@@ -13,6 +13,7 @@ from app.input_controller import DryRunInputController, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
 from app.painter import Painter, PainterSettings, PainterState
 from app.screen import VirtualScreen
+from app.brush_calibration import fit_brush_size_model
 from app.profiles import CalibrationProfile
 
 
@@ -106,106 +107,135 @@ def test_painter_completes_and_releases_mouse() -> None:
     assert states[-1] is PainterState.COMPLETED
 
 
-def test_automatic_brush_size_matches_preview_to_logical_cell() -> None:
-    controller = MockInputController()
-    slider = ScreenRect(800, 100, 101, 12)
+def _sized_profile(name: str, *, sign_rows: int = 320) -> CalibrationProfile:
+    """A calibrated profile whose brush model describes a known sign.
+
+    The canvas is 320px tall, so ``sign_rows=320`` makes one Size unit exactly
+    one screen pixel and keeps the arithmetic in these tests readable.
+    """
+
     profile = CalibrationProfile.new(
-        "Auto brush",
+        name,
         canvas=ScreenRect(100, 100, 640, 320),
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
-        brush_slider=slider,
-        brush_preview=ScreenRect(800, 150, 100, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
     )
-    # A profile correction that swaps red and green would normally turn the
-    # magenta calibration request into cyan. Calibration must bypass it.
-    profile.metadata["color_correction"] = ColorCorrectionModel(
-        forward_matrix=(
-            (0.0, 1.0, 0.0, 0.0),
-            (1.0, 0.0, 0.0, 0.0),
-            (0.0, 0.0, 1.0, 0.0),
-        ),
-        fit_rmse=0.0,
-        sample_count=32,
-        captured_at="2026-08-17T00:00:00+00:00",
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / sign_rows) for size in (60, 30, 12)]
     ).to_dict()
-    captured_diameters: list[int] = []
+    return profile
 
-    def capture_preview(_rect) -> Image.Image:
-        x, _y = controller.get_cursor_position()
-        fraction = min(1.0, max(0.0, (x - slider.left) / (slider.width - 1)))
-        diameter = round(2 + fraction * 30)
-        captured_diameters.append(diameter)
-        image = Image.new("RGB", (100, 100), (72, 72, 72))
-        left = (100 - diameter) // 2
-        top = (100 - diameter) // 2
-        ImageDraw.Draw(image).rectangle(
-            (left, top, left + diameter - 1, top + diameter - 1),
-            fill=(255, 0, 255),
-        )
-        return image
 
+def _typed_values(controller: MockInputController) -> list[str]:
+    """Every value the painter committed into the Size field, in order."""
+
+    values: list[str] = []
+    digits = ""
+    for event in controller.events:
+        if event.kind != "key_down":
+            continue
+        if str(event.value).isdigit():
+            digits += str(event.value)
+        elif event.value == "ENTER":
+            if digits:
+                values.append(digits)
+            digits = ""
+        else:
+            digits = ""
+    return values
+
+
+def test_automatic_brush_size_types_the_number_for_one_logical_cell() -> None:
+    controller = MockInputController()
+    profile = _sized_profile("Auto brush")
     plan = PaintPlan(
         64,
         32,
         (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
     )
-    painter = Painter(controller, screen_capture=capture_preview)
+    painter = Painter(controller, screen_capture=_panel_capture)
 
     assert painter.start(plan, profile, _settings(apply_brush_size=True))
     assert painter.wait(_t(2.0))
 
-    # A 640x320 canvas with a 64x32 grid has 10px cells. The automatic
-    # target deliberately uses 90% coverage, so the selected preview is ~9px.
+    # A 640x320 canvas under a 64x32 grid has 10px cells, and a one-cell brush
+    # deliberately targets 90% of that. One Size unit is one screen pixel here,
+    # so the painter should ask Rust for exactly 9.
     assert painter.state is PainterState.COMPLETED
-    assert captured_diameters
-    assert min(abs(diameter - 9) for diameter in captured_diameters) <= 1
+    assert _typed_values(controller) == ["9"]
     assert not controller.held_buttons
-    expected_hue = map_rgb_to_picker(
-        (255, 0, 255),
+
+
+def test_brush_size_is_committed_by_clearing_the_field_and_pressing_enter() -> None:
+    controller = MockInputController()
+    profile = _sized_profile("Commit brush")
+    plan = PaintPlan(
+        64,
+        32,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(2.0))
+
+    keys = [
+        str(event.value)
+        for event in controller.events
+        if event.kind == "key_down"
+    ]
+    # Old contents go from both sides of the caret, wherever the click put it.
+    assert keys == ["BACKSPACE"] * 4 + ["DELETE"] * 4 + ["9", "ENTER"]
+    box = profile.brush_size_box
+    assert any(
+        event.kind == "move"
+        and event.x is not None
+        and event.y is not None
+        and box.contains(event.x, event.y)
+        for event in controller.events
+    )
+
+
+def test_brush_sizing_never_disturbs_the_selected_color() -> None:
+    """Typing a number cannot repaint the picker, so the group color stands."""
+
+    controller = MockInputController()
+    profile = _sized_profile("Color safe")
+    plan = PaintPlan(
+        64,
+        32,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(2.0))
+
+    expected = map_rgb_to_picker(
+        (40, 80, 160),
         profile.hue_bar,
         profile.color_box,
         hue_direction="bottom_to_top",
         saturation_direction="left_low",
         value_direction="top_bright",
     ).hue
-    first_hue_move = next(
-        event
+    hue_moves = [
+        (event.x, event.y)
         for event in controller.events
         if event.kind == "move"
         and event.x is not None
         and event.y is not None
         and profile.hue_bar.contains(event.x, event.y)
-    )
-    assert (first_hue_move.x, first_hue_move.y) == tuple(round(v) for v in expected_hue)
+    ]
+    # Exactly one hue selection: the old search picked a temporary magenta
+    # first and had to re-select the real color afterwards.
+    assert hue_moves == [tuple(round(value) for value in expected)]
 
 
 def test_optimized_plan_switches_brush_size() -> None:
     controller = MockInputController()
-    slider = ScreenRect(800, 100, 101, 12)
-    profile = CalibrationProfile.new(
-        "Size aware",
-        canvas=ScreenRect(100, 100, 640, 320),
-        color_box=ScreenRect(600, 500, 100, 100),
-        hue_bar=ScreenRect(720, 500, 12, 100),
-        brush_slider=slider,
-        brush_preview=ScreenRect(800, 150, 100, 100),
-    )
-    measurements: list[int] = []
-
-    def capture_preview(_rect) -> Image.Image:
-        x, _y = controller.get_cursor_position()
-        fraction = min(1.0, max(0.0, (x - slider.left) / (slider.width - 1)))
-        diameter = round(2 + fraction * 60)
-        measurements.append(diameter)
-        image = Image.new("RGB", (100, 100), (72, 72, 72))
-        left = (100 - diameter) // 2
-        ImageDraw.Draw(image).rectangle(
-            (left, left, left + diameter - 1, left + diameter - 1),
-            fill=(255, 0, 255),
-        )
-        return image
-
+    profile = _sized_profile("Size aware")
     plan = PaintPlan(
         64,
         32,
@@ -225,43 +255,24 @@ def test_optimized_plan_switches_brush_size() -> None:
             ),
         ),
     )
-    painter = Painter(controller, screen_capture=capture_preview)
+    painter = Painter(controller, screen_capture=_panel_capture)
 
     assert painter.start(plan, profile, _settings(apply_brush_size=True))
     assert painter.wait(_t(3.0))
     assert painter.state is PainterState.COMPLETED
     assert not controller.held_buttons
 
-    # Two searches at most: 5 cells and 1 cell.  Returning to 5 cells replays
-    # the cached slider fraction without a single preview measurement.
-    assert len(measurements) <= 14
+    # 5 cells of a 10px pitch is 50 units; one cell is 90% of 10.  Every switch
+    # is one computed number, so returning to 5 costs no search at all.
+    assert _typed_values(controller) == ["50", "9", "50"]
 
 
-def test_multi_cell_brush_that_cannot_reach_its_target_fails_loudly() -> None:
+def test_multi_cell_brush_beyond_the_size_field_is_refused_before_painting() -> None:
     controller = MockInputController()
-    slider = ScreenRect(800, 100, 101, 12)
-    profile = CalibrationProfile.new(
-        "Weak slider",
-        canvas=ScreenRect(100, 100, 640, 320),
-        color_box=ScreenRect(600, 500, 100, 100),
-        hue_bar=ScreenRect(720, 500, 12, 100),
-        brush_slider=slider,
-        brush_preview=ScreenRect(800, 150, 100, 100),
-    )
-
-    def capture_preview(_rect) -> Image.Image:
-        x, _y = controller.get_cursor_position()
-        fraction = min(1.0, max(0.0, (x - slider.left) / (slider.width - 1)))
-        # The slider tops out far below the 50px a 5-cell pass needs.
-        diameter = round(2 + fraction * 12)
-        image = Image.new("RGB", (100, 100), (72, 72, 72))
-        left = (100 - diameter) // 2
-        ImageDraw.Draw(image).rectangle(
-            (left, left, left + diameter - 1, left + diameter - 1),
-            fill=(255, 0, 255),
-        )
-        return image
-
+    # A sign only 40 rows tall over a 320px canvas: 8 screen px per Size unit,
+    # so the field's maximum of 100 still cannot reach a 5-cell, 50px band...
+    # but a coarse sign reaches it easily, so squeeze the range instead.
+    profile = _sized_profile("Weak field", sign_rows=6400)
     plan = PaintPlan(
         64,
         32,
@@ -274,19 +285,28 @@ def test_multi_cell_brush_that_cannot_reach_its_target_fails_loudly() -> None:
             ),
         ),
     )
-    errors: list[str] = []
-    painter = Painter(
-        controller,
-        screen_capture=capture_preview,
-        on_error=lambda exc: errors.append(str(exc)),
-    )
+    painter = Painter(controller, screen_capture=_panel_capture)
 
-    assert painter.start(plan, profile, _settings(apply_brush_size=True))
-    assert painter.wait(_t(3.0))
-    # Failing loudly beats silently leaving stripes the plan counts as covered.
-    assert painter.state is PainterState.ERROR
-    assert errors and "Size slider" in errors[0]
-    assert not controller.held_buttons
+    # Refusing at configure time means the sign is still blank when the user
+    # finds out, instead of half painted with stripes.
+    with pytest.raises(ValueError, match="reaches only"):
+        painter.configure(plan, profile, _settings(apply_brush_size=True))
+
+
+def test_resolution_finer_than_the_sign_is_refused_before_painting() -> None:
+    controller = MockInputController()
+    # 40 sign rows under a 320px canvas: Rust's smallest brush is 8px while a
+    # cell of this plan is only 2px, so every detail stroke would smear.
+    profile = _sized_profile("Coarse sign", sign_rows=40)
+    plan = PaintPlan(
+        320,
+        160,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    with pytest.raises(ValueError, match="smallest brush"):
+        painter.configure(plan, profile, _settings(apply_brush_size=True))
 
 
 def test_multi_size_plan_requires_brush_sizing_calibration() -> None:
@@ -301,48 +321,6 @@ def test_multi_size_plan_requires_brush_sizing_calibration() -> None:
     painter = Painter(controller)
     with pytest.raises(ValueError, match="brush sizes"):
         painter.configure(plan, _profile(), _settings())
-
-
-def test_automatic_brush_size_retries_tiny_preview_with_center_crop() -> None:
-    controller = MockInputController()
-    slider = ScreenRect(800, 100, 101, 12)
-    original_preview = ScreenRect(800, 150, 120, 120)
-    profile = CalibrationProfile.new(
-        "Tiny auto brush",
-        canvas=ScreenRect(100, 100, 640, 320),
-        color_box=ScreenRect(600, 500, 100, 100),
-        hue_bar=ScreenRect(720, 500, 12, 100),
-        brush_slider=slider,
-        brush_preview=original_preview,
-    )
-    capture_sizes: list[tuple[int, int]] = []
-
-    def capture_preview(rect) -> Image.Image:
-        capture_sizes.append((rect.width, rect.height))
-        image = Image.new("RGB", (rect.width, rect.height), (72, 72, 72))
-        # A two-pixel brush is below the full 120x120 capture's area threshold,
-        # but becomes viable in the smaller temporary center capture.
-        left = (rect.width - 2) // 2
-        top = (rect.height - 2) // 2
-        ImageDraw.Draw(image).rectangle(
-            (left, top, left + 1, top + 1), fill=(255, 0, 255)
-        )
-        return image
-
-    plan = PaintPlan(
-        320,
-        160,
-        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
-    )
-    painter = Painter(controller, screen_capture=capture_preview)
-
-    assert painter.start(plan, profile, _settings(apply_brush_size=True))
-    assert painter.wait(_t(2.0))
-
-    assert painter.state is PainterState.COMPLETED
-    assert (120, 120) in capture_sizes
-    assert (60, 60) in capture_sizes
-    assert profile.brush_preview == original_preview
 
 
 def test_profile_color_correction_changes_picker_command() -> None:
@@ -624,12 +602,26 @@ def test_abort_of_ready_job_prevents_late_start() -> None:
     assert input_controller.events == []
 
 
-def test_brush_application_requires_slider_calibration() -> None:
+def test_brush_application_requires_the_size_value_box() -> None:
     painter = Painter(MockInputController())
-    with pytest.raises(ValueError, match="no brush slider"):
+    with pytest.raises(ValueError, match="Size value box"):
         painter.configure(
             _dot_plan(1),
             _profile(),
+            _settings(apply_brush_size=True),
+        )
+
+
+def test_brush_application_requires_a_measured_model() -> None:
+    """A calibrated box is only half of it; the numbers still mean nothing."""
+
+    profile = _profile()
+    profile.brush_size_box = ScreenRect(800, 100, 60, 24)
+    painter = Painter(MockInputController())
+    with pytest.raises(ValueError, match="Measure Brush Size"):
+        painter.configure(
+            _dot_plan(1),
+            profile,
             _settings(apply_brush_size=True),
         )
 
@@ -761,3 +753,125 @@ def test_corner_emergency_stop_still_aborts_while_paused() -> None:
     assert _wait_until(lambda: painter.state is PainterState.ABORTED)
     assert painter.wait(_t(2.0))
     assert not input_controller.held_buttons
+
+
+def _sign_simulator(controller: MockInputController, canvas: ScreenRect, sign_rows: int):
+    """A fake sign that paints bands as wide as the Size number typed into it.
+
+    Replaying the recorded events on every capture keeps the simulator honest:
+    it only ever knows what the painter actually did, so a probe that forgot to
+    commit its number shows up as a band of the previous width.
+    """
+
+    palette = ((255, 0, 255), (0, 255, 0), (255, 200, 0), (0, 200, 255))
+    scale = canvas.height / sign_rows
+
+    def capture(rect) -> Image.Image:
+        image = Image.new("RGB", (rect.width, rect.height), (96, 96, 96))
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            # The picker measurement captures other regions; a flat panel there
+            # leaves the calibration exactly as written.
+            return Image.new("RGB", (rect.width, rect.height), (21, 21, 12))
+        draw = ImageDraw.Draw(image)
+        size = 0
+        digits = ""
+        position = (0, 0)
+        painted = 0
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+            elif event.kind == "key_down":
+                value = str(event.value)
+                if value.isdigit():
+                    digits += value
+                elif value == "ENTER":
+                    size = int(digits) if digits else size
+                    digits = ""
+                else:
+                    digits = ""
+            elif event.kind == "mouse_down" and canvas.contains(*position):
+                height = max(1, round(size * scale))
+                top = round(rect.height / 2 - height / 2)
+                draw.rectangle(
+                    (10, top, rect.width - 11, top + height - 1),
+                    fill=palette[painted % len(palette)],
+                )
+                painted += 1
+        return image
+
+    return capture
+
+
+def test_brush_measurement_fits_the_sign_it_probes() -> None:
+    controller = MockInputController()
+    profile = CalibrationProfile.new(
+        "Measure me",
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
+    )
+    painter = Painter(
+        controller,
+        screen_capture=_sign_simulator(controller, profile.canvas, sign_rows=128),
+    )
+
+    painter.configure_brush_measurement(profile, _settings())
+    assert painter.start()
+    assert painter.wait(_t(5.0))
+
+    assert painter.state is PainterState.COMPLETED
+    model = painter.measured_brush_size_model
+    assert model is not None
+    # 128 rows over a 320px canvas: the fit has to recover the sign, not the
+    # screen pixels it happened to be measured in.
+    assert model.sign_pixel_rows == pytest.approx(128.0, rel=0.02)
+    assert _typed_values(controller) == ["60", "30", "12"]
+    assert not controller.held_buttons
+
+
+def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:
+    """Rust eating the digits as hotbar keys must not become a silent model."""
+
+    controller = MockInputController()
+    profile = CalibrationProfile.new(
+        "Deaf field",
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
+    )
+    canvas = profile.canvas
+
+    def stuck_capture(rect) -> Image.Image:
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            return Image.new("RGB", (rect.width, rect.height), (21, 21, 12))
+        image = Image.new("RGB", (rect.width, rect.height), (96, 96, 96))
+        # Every probe paints the same 20px band whatever was typed, and each in
+        # its own color so the diff still sees a change.
+        painted = sum(
+            1
+            for event in controller.events
+            if event.kind == "mouse_down"
+        )
+        top = rect.height // 2 - 10
+        ImageDraw.Draw(image).rectangle(
+            (10, top, rect.width - 11, top + 19),
+            fill=(255, (painted * 40) % 256, 255),
+        )
+        return image
+
+    errors: list[str] = []
+    painter = Painter(
+        controller,
+        screen_capture=stuck_capture,
+        on_error=lambda exc: errors.append(str(exc)),
+    )
+
+    painter.configure_brush_measurement(profile, _settings())
+    assert painter.start()
+    assert painter.wait(_t(5.0))
+
+    assert painter.state is PainterState.ERROR
+    assert errors and "did not grow" in errors[0]
+    assert painter.measured_brush_size_model is None

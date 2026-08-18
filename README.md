@@ -118,7 +118,8 @@ painting unattended. Everything below is detail you only need when tuning.
 - Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
-- Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
+- Drag calibration for the canvas, color box, hue bar, and the optional numeric Size field, with an on-screen overlay to verify them
+- Brush sizing measured from the sign itself: a few probe strokes fit what Rust's Size numbers really cover, and the result is stored as a fraction of the sign so it survives zooming, a new painting resolution, and a different monitor
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
@@ -133,7 +134,7 @@ painting unattended. Everything below is detail you only need when tuning.
 2. Open the target sign's painting interface and leave it stationary.
 3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
 4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through and hide automatically while painting).
-5. If automatic brush sizing is wanted, also calibrate the clickable **Size track** and the separate gray **brush-preview tile** that displays the current brush footprint.
+5. If automatic brush sizing is wanted, calibrate the numeric **Size value box** beside Rust's size slider, then click **Measure Brush Size** once. Measuring paints three short probe strokes across the middle of the sign and reads back how wide each one came out; paint over them afterwards or clear the sign. Because the result is a fraction of the sign rather than a pixel count, one measurement covers that sign type at any camera distance - only a different sign needs a new one.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
 8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
@@ -182,9 +183,12 @@ image the plan will reproduce, so the trade-off is visible before painting.
 
 Optimized modes paint most-common colors first and may sweep straight across
 pixels a later color repaints anyway - the same idea as stroke merging, taken
-further. With **Automatic brush sizing** calibrated they also fill wide areas
-with a bigger brush before switching down for edges and detail; a resize costs
-real seconds, so the planner only fetches a big brush when it pays for the trip.
+further. With **Automatic brush sizing** measured they also fill wide areas
+with a bigger brush before switching down for edges and detail; a resize still
+costs a click and a typed number, so the planner only fetches a big brush when
+it pays for the trip. The measurement also tells the planner the widest brush
+Rust can actually reach on that sign, so it never plans a pass the Size field
+would have to clamp.
 Dithered images keep their deliberate speckle: region cleanup turns itself off
 when dithering is enabled.
 
@@ -240,7 +244,7 @@ Rust brush behavior can vary with sign type, selected in-game brush, frame rate,
 
 - Painting speed preset (Relaxed / Standard / Fast / Turbo); editing any timing value switches it to Custom
 - Stroke merging (Off / Balanced / Maximum) under Paint Quality
-- Automatic Size-track search using the calibrated brush-preview footprint (optional)
+- Automatic brush sizing, which types the Size number a logical cell needs (optional; needs the Size value box calibrated and measured)
 - Logical pixel spacing
 - Stroke duration/speed and interpolation step
 - Mouse-down time for dots
@@ -251,7 +255,14 @@ Start with a low-resolution 8-color test. If adjacent rows bleed together, reduc
 
 **Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is almost always the fastest choice; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. The paint-plan panel reports how many strokes merging removed.
 
-Automatic brush sizing works with a solid square or circle. Spray/noise brushes do not have a stable footprint and must be sized manually.
+Automatic brush sizing works with a solid square or circle. Spray/noise
+brushes do not have a stable footprint and must be sized manually.
+
+Because the brush is measured on the sign rather than inferred from Rust's
+preview tile, an impossible plan is refused before the first stroke instead of
+discovered as smearing. If the smallest brush Rust offers is wider than one
+logical cell, RustPainter says so and names the resolution that would fit -
+that limit is the sign's own texture resolution, which no setting can raise.
 
 A one-cell brush deliberately targets 90% of a logical cell, so rows meet with
 a hairline seam the sign texture hides rather than smearing into each other.
@@ -352,7 +363,7 @@ Profiles, settings, calibration reference captures, and logs are stored under `%
 
 ## Known limitations
 
-- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient. Calibration and small test strokes are required.
+- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient up front. Brush measurement infers the first two from probe strokes; the picker gradient still needs calibration and small test strokes.
 - `SendInput` may be ignored by exclusive fullscreen, elevated, protected, or anti-cheat-managed windows. The utility does not work around those restrictions.
 - Horizontal runs are deliberately prioritized for reliability; complex images can still require many strokes.
 - Color accuracy is approximate because the displayed picker, monitor color, sign material, lighting, and in-game rendering can alter the result. Without a measured correction the preview shows the commanded RGB, which is what the picker is asked for and not what the lit sign returns.
@@ -370,7 +381,7 @@ app/
   settings.py          defaults and local settings
   image_processing.py  composition, background removal, palette reduction
   color_mapping.py     RGB/HSV picker mapping
-  brush_calibration.py live brush-preview measurement
+  brush_calibration.py probe-stroke measurement of Rust's Size numbers
   color_calibration.py painted-chart response fitting
   coordinates.py       logical/screen coordinate conversion
   paint_plan.py        horizontal-run planning and estimates

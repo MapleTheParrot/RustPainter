@@ -29,6 +29,7 @@ from app.models import (
     TransparencyMode,
 )
 from app.painter import Painter, PainterState
+from app.brush_calibration import fit_brush_size_model
 from app.profiles import DisplayMetadata, Profile
 from app.screen import VirtualScreen
 
@@ -450,19 +451,37 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert window.logical_height_spin.isEnabled()
 
 
-def test_automatic_brush_sizing_marks_its_calibrations_as_required(
+def test_automatic_brush_sizing_marks_its_calibration_as_required(
     window: MainWindow,
 ) -> None:
-    window._current_profile.brush_slider = None
-    window._current_profile.brush_preview = None
+    window._current_profile.brush_size_box = None
     window.apply_brush_check.setChecked(False)
     window._refresh_profile_ui()
-    assert window.brush_slider_status._value.text() == "Optional"
-    assert window.brush_preview_status._value.text() == "Optional"
+    assert window.brush_size_box_status._value.text() == "Optional"
 
     window.apply_brush_check.setChecked(True)
-    assert window.brush_slider_status._value.text() == "Needed"
-    assert window.brush_preview_status._value.text() == "Needed"
+    assert window.brush_size_box_status._value.text() == "Needed"
+
+
+def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> None:
+    window._current_profile.brush_size_box = None
+    window._current_profile.metadata.pop("brush_size_model", None)
+    window._refresh_profile_ui()
+    assert "calibrate the Size value box" in window.brush_model_status.text()
+    assert not window.clear_brush_model_button.isEnabled()
+
+    window._current_profile.brush_size_box = ScreenRect(220, 120, 60, 24)
+    window._refresh_profile_ui()
+    assert "run Measure Brush Size" in window.brush_model_status.text()
+
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 128.0) for size in (60, 30, 12)]
+    ).to_dict()
+    window._refresh_profile_ui()
+    # The derived row count is the number a user can sanity-check against the
+    # sign they are actually looking at.
+    assert "128 rows" in window.brush_model_status.text()
+    assert window.clear_brush_model_button.isEnabled()
 
 
 def test_dry_run_completes_without_sendinput(
@@ -1135,12 +1154,12 @@ def test_gui_persists_complete_brush_settings_and_future_keys(
     assert saved["painting"]["future_tuning_value"] == 321
 
 
-def test_brush_slider_is_required_only_when_brush_application_is_enabled(
+def test_size_value_box_is_required_only_when_brush_application_is_enabled(
     window: MainWindow,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = Profile.new(
-        "No brush slider",
+        "No size box",
         canvas=ScreenRect(10, 10, 200, 100),
         color_box=ScreenRect(220, 10, 100, 100),
         hue_bar=ScreenRect(325, 10, 10, 100),
@@ -1151,25 +1170,27 @@ def test_brush_slider_is_required_only_when_brush_application_is_enabled(
     )
 
     window._validate_profile_on_virtual_screen(profile, apply_brush_size=False)
-    with pytest.raises(ValueError, match="Size slider"):
+    with pytest.raises(ValueError, match="numeric Size field"):
         window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
 
-    profile.brush_slider = ScreenRect(220, 120, 115, 12)
-    with pytest.raises(ValueError, match="brush-preview"):
-        window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
+    profile.brush_size_box = ScreenRect(220, 120, 60, 24)
+    window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
 
 
 def _profile_with_full_calibration(display: DisplayMetadata) -> Profile:
-    return Profile.new(
+    profile = Profile.new(
         "GUI calibration test",
         canvas=ScreenRect(10, 10, 200, 100),
         color_box=ScreenRect(220, 10, 100, 100),
         hue_bar=ScreenRect(325, 10, 10, 100),
-        brush_slider=ScreenRect(220, 120, 115, 12),
-        brush_preview=ScreenRect(350, 120, 80, 80),
+        brush_size_box=ScreenRect(220, 120, 60, 24),
         display=display,
         metadata={"ui_reference": {"path": "old.png"}},
     )
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 128.0) for size in (60, 30, 12)]
+    ).to_dict()
+    return profile
 
 
 def test_partial_recalibration_preserves_other_regions_on_same_display(
@@ -1192,6 +1213,33 @@ def test_partial_recalibration_preserves_other_regions_on_same_display(
     assert window._current_profile.color_box == profile.color_box
     assert window._current_profile.hue_bar == profile.hue_bar
     assert "ui_reference" in window._current_profile.metadata
+    # Re-framing the same sign leaves its shape alone, and the brush model is a
+    # fraction of the sign, so it has to survive standing somewhere else.
+    assert "brush_size_model" in window._current_profile.metadata
+
+
+def test_recalibrating_onto_a_differently_shaped_sign_drops_the_brush_model(
+    window: MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    display = DisplayMetadata(
+        virtual_screen=ScreenRect(0, 0, 800, 600),
+        coordinate_space="logical",
+    )
+    profile = window._profile_store.save(_profile_with_full_calibration(display))
+    window._current_profile = profile
+    # 200x100 was 2:1; a square sign is a different sign, whose texture
+    # resolution the old measurement says nothing about.
+    square_canvas = ScreenRect(20, 30, 160, 160)
+    monkeypatch.setattr(
+        main_window_module, "select_screen_rect", lambda *_a, **_k: square_canvas
+    )
+    monkeypatch.setattr(main_window_module, "capture_display_metadata", lambda: display)
+
+    window._begin_calibration("canvas", "canvas")
+
+    assert window._current_profile.canvas == square_canvas
+    assert "brush_size_model" not in window._current_profile.metadata
 
 
 def test_recalibration_after_display_change_invalidates_stale_regions(
@@ -1218,8 +1266,7 @@ def test_recalibration_after_display_change_invalidates_stale_regions(
     assert window._current_profile.canvas == new_canvas
     assert window._current_profile.color_box is None
     assert window._current_profile.hue_bar is None
-    assert window._current_profile.brush_slider is None
-    assert window._current_profile.brush_preview is None
+    assert window._current_profile.brush_size_box is None
     assert "ui_reference" not in window._current_profile.metadata
 
 
