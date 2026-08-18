@@ -270,19 +270,26 @@ measuring what Rust actually paints:
 1. Use a blank or disposable sign with the profile's canvas, picker, and Size
    track calibrated.
 2. Click **Measure Brush on Canvas** and focus Rust for the countdown.
-3. The painter stamps one dab at the widest Size-track position and measures
-   it, which tells it how far apart the priming sweeps may run. That one dab
-   is the difference between priming a patch in five strokes and thirty-five.
-4. It then primes six small squares of canvas, stamps one dab in each at a
-   different Size-track position, and reads back how wide each came out. The
+3. The painter reads six small patches of bare sign, picks whichever of black
+   or white stands further off that surface, then stamps one dab per patch at
+   a different Size-track position and reads back how wide each came out. The
    probes crowd the low end of the track, where a mis-sized brush does the
    most damage.
-5. With both shape buttons calibrated the grid runs twice, once per shape,
+4. Nothing is painted as a background first. The detector separates a dab from
+   its surroundings by distance and scales its threshold to those
+   surroundings' own noise, so a contrasting dab reads perfectly well on bare
+   sign. A whole run is a dozen clicks and takes a couple of seconds.
+5. If a sign defeats that - existing paint, a plank seam through a patch, too
+   little contrast - the run paints the patches clean and tries once more.
+   Only that fallback needs a size estimate for its sweeps, and the preview
+   tile is good enough for it: spacing needs an order of magnitude, not the
+   accuracy the tile cannot give.
+6. With both shape buttons calibrated the grid runs twice, once per shape,
    because the same slider position can render a different footprint as a
    square than as a circle. A measurement taken under one shape is never
    reused for the other; a pass whose shape has no curve falls back to the
    preview search.
-6. The measured curves are stored on the profile.
+7. The measured curves are stored on the profile.
 
 A one-cell brush deliberately targets 90% of a logical cell, so rows meet with
 a hairline seam the sign texture hides rather than smearing into each other.

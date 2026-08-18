@@ -1097,26 +1097,42 @@ class Painter:
         if button is not None:
             self._select_brush_shape(button, settings, epoch)
 
-    def _measure_widest_brush(
-        self,
-        target: PaintingTarget,
-        site: ProbeSite,
-        settings: PainterSettings,
-        epoch: int,
-    ) -> float | None:
-        """Stamp one dab at full size on bare canvas and read its width.
+    @staticmethod
+    def _contrast_ink(patches: "list[Any]") -> RGBColor:
+        """Black or white, whichever stands further off this sign's own surface.
 
-        Priming needs sweeps no further apart than the brush is wide, and the
-        only way to know that without guessing is to paint it.  A worst-case
-        guess costs dozens of strokes per patch; the answer costs one dab, and
-        priming paints over it moments later.  Returning None simply falls the
-        run back to the conservative spacing.
+        The detector separates a dab from its background by distance, so the
+        dab only has to out-contrast the surface it lands on - it does not have
+        to land on a surface we painted first.
         """
 
+        import numpy as np
+
+        levels = [
+            float(np.median(np.asarray(patch.convert("RGB"), dtype=np.float32)))
+            for patch in patches
+        ]
+        return (0, 0, 0) if sum(levels) / max(1, len(levels)) > 128.0 else (255, 255, 255)
+
+    def _preview_brush_estimate(
+        self, target: PaintingTarget, settings: PainterSettings, epoch: int
+    ) -> float | None:
+        """Roughly how wide the widest brush is, read off Rust's preview tile.
+
+        The tile draws at its own scale, so this is no use as a canvas
+        measurement - that is the whole reason this module exists.  It is
+        perfectly good for deciding how far apart priming sweeps may run,
+        which only needs an order of magnitude.
+        """
+
+        preview = target.brush_preview
         slider = target.brush_slider
-        assert slider is not None
-        self._select_color((0, 0, 0), target, settings, epoch, apply_correction=False)
+        if preview is None or slider is None:
+            return None
         self._safe_click(self._slider_point(slider, 1.0), epoch)
+        self._select_color(
+            (255, 0, 255), target, settings, epoch, apply_correction=False
+        )
         self._interruptible_sleep(
             max(settings.delay_after_brush_seconds, 0.16)
             if self.input.emits_real_input
@@ -1124,109 +1140,54 @@ class Painter:
             epoch=epoch,
             check_focus=True,
         )
-        self._screen_stroke(site.point, site.point, settings, epoch)
-        self._checkpoint(epoch=epoch, check_focus=True)
         try:
-            footprint = self._measure_footprint(site.prime)
+            return self._measure_brush_preview(preview).diameter
         except ValueError as exc:
-            LOGGER.warning(
-                "Could not size the widest brush on bare canvas (%s); priming "
-                "falls back to close sweeps",
-                exc,
-            )
+            LOGGER.warning("Could not read the brush preview for priming (%s)", exc)
             return None
-        if max(footprint.width, footprint.height) >= site.prime.width * 0.8:
-            LOGGER.warning(
-                "The widest brush filled its measuring patch; priming falls back "
-                "to close sweeps"
-            )
-            return None
-        return footprint.diameter
 
-    def _execute_brush_measurement(self, job: _Job) -> None:
-        """Prime patches of canvas, stamp one dab per Size-track position, measure.
-
-        Rust's preview tile draws the brush at the tile's own scale, so a
-        footprint measured there answers a different question than the one the
-        planner asks: how many canvas pixels will this brush actually cover.
-        Painting the dabs and reading them back answers it directly, and folds
-        in the brush's soft edge - which is what makes neighbouring cells bleed
-        together - rather than modelling it.
-        """
-
-        target, settings = job.target, job.settings
+    def _stamp_probes(
+        self,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        sites: "tuple[ProbeSite, ...]",
+        shapes: "tuple[str | None, ...]",
+        fractions: "tuple[float, ...]",
+        ink: RGBColor,
+        epoch: int,
+        progress: "Any",
+        offset: int,
+    ) -> None:
         slider = target.brush_slider
-        assert slider is not None  # configure_brush_measurement guarantees it
-        canvas = ScreenRect(
-            target.canvas.left,
-            target.canvas.top,
-            target.canvas.width,
-            target.canvas.height,
-        )
-        shapes = self._measured_shapes(target)
-        per_shape = job.probe_count
-        sites = probe_sites(canvas, per_shape * len(shapes))
-        # The smallest positions of the track are where a mis-set brush hurts
-        # most, so the probes crowd the low end rather than spreading evenly.
-        fractions = tuple(
-            round((index / (per_shape - 1)) ** 1.7, 4) for index in range(per_shape)
-        )
+        assert slider is not None
+        per_shape = len(fractions)
+        self._select_color(ink, target, settings, epoch, apply_correction=False)
         settle = (
             max(settings.delay_after_brush_seconds, 0.16)
             if self.input.emits_real_input
             else 0.0
         )
-        epoch = self._pause_generation_value()
-        total = len(sites) * 2
-
-        def progress(done: int, message: str) -> None:
-            self._set_progress(
-                color_index=done,
-                total_colors=total,
-                stroke_index_in_color=0,
-                strokes_in_color=0,
-                completed_strokes=done,
-                total_strokes=total,
-                message=message,
-            )
-
-        # How wide the widest brush paints decides how far apart the priming
-        # sweeps may run, so it is worth one dab to find out rather than
-        # assuming the worst and dragging for a minute.
-        progress(0, "Sizing the widest brush")
-        widest = self._measure_widest_brush(target, sites[0], settings, epoch)
-        spacing = prime_spacing(widest)
-        LOGGER.info(
-            "Priming sweeps %dpx apart for a widest brush of %s",
-            spacing,
-            f"{widest:.0f}px" if widest else "unknown width",
-        )
-
-        # Prime with the widest brush the track offers: every probe patch has
-        # to be solid paint before a dab lands on it, or the detector reads the
-        # sign texture as part of the dab.
-        self._select_color(
-            (255, 255, 255), target, settings, epoch, apply_correction=False
-        )
-        self._safe_click(self._slider_point(slider, 1.0), epoch)
-        self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
-        for index, site in enumerate(sites):
-            progress(index, f"Priming probe {index + 1} of {len(sites)}")
-            for stroke_start, stroke_end in prime_sweeps(site.prime, spacing):
-                self._screen_stroke(stroke_start, stroke_end, settings, epoch)
-
-        self._select_color((0, 0, 0), target, settings, epoch, apply_correction=False)
         for shape_index, shape in enumerate(shapes):
             self._select_measured_shape(target, shape, settings, epoch)
             for index, fraction in enumerate(fractions):
                 site = sites[shape_index * per_shape + index]
-                done = len(sites) + shape_index * per_shape + index
                 label = f" ({shape})" if shape else ""
-                progress(done, f"Stamping probe {index + 1} of {per_shape}{label}")
+                progress(
+                    offset + shape_index * per_shape + index,
+                    f"Stamping probe {index + 1} of {per_shape}{label}",
+                )
                 self._safe_click(self._slider_point(slider, fraction), epoch)
                 self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
                 self._screen_stroke(site.point, site.point, settings, epoch)
 
+    def _read_probes(
+        self,
+        sites: "tuple[ProbeSite, ...]",
+        shapes: "tuple[str | None, ...]",
+        fractions: "tuple[float, ...]",
+        epoch: int,
+    ) -> "tuple[list[BrushResponse], list[str]]":
+        per_shape = len(fractions)
         curves: list[BrushResponse] = []
         failures: list[str] = []
         for shape_index, shape in enumerate(shapes):
@@ -1247,9 +1208,108 @@ class Painter:
                     continue
                 samples.append((fraction, footprint.diameter))
             if len(samples) >= 2:
-                curves.append(build_brush_response(samples, shape=shape))
+                try:
+                    curves.append(build_brush_response(samples, shape=shape))
+                except ValueError as exc:
+                    failures.append(f"{named}: {exc}")
             else:
                 failures.append(f"{named}: too few probes to build a curve")
+        return curves, failures
+
+    def _execute_brush_measurement(self, job: _Job) -> None:
+        """Stamp one dab per Size-track position on the canvas and measure them.
+
+        Rust's preview tile draws the brush at the tile's own scale, so a
+        footprint measured there answers a different question than the one the
+        planner asks: how many canvas pixels will this brush actually cover.
+        Painting the dabs and reading them back answers it directly, and folds
+        in the brush's soft edge - which is what makes neighbouring cells bleed
+        together - rather than modelling it.
+
+        The dabs land on bare sign.  The detector separates a dab from its
+        surroundings by distance and scales its threshold to the surroundings'
+        own noise, so a dab in a colour that contrasts with the sign reads
+        perfectly well without painting a background first.  Priming is kept
+        for the sign that defeats that, and only then.
+        """
+
+        target, settings = job.target, job.settings
+        slider = target.brush_slider
+        assert slider is not None  # configure_brush_measurement guarantees it
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        shapes = self._measured_shapes(target)
+        per_shape = job.probe_count
+        sites = probe_sites(canvas, per_shape * len(shapes))
+        # The smallest positions of the track are where a mis-sized brush hurts
+        # most, so the probes crowd the low end rather than spreading evenly.
+        fractions = tuple(
+            round((index / (per_shape - 1)) ** 1.7, 4) for index in range(per_shape)
+        )
+        epoch = self._pause_generation_value()
+        total = len(sites) * 2
+
+        def progress(done: int, message: str) -> None:
+            self._set_progress(
+                color_index=done,
+                total_colors=total,
+                stroke_index_in_color=0,
+                strokes_in_color=0,
+                completed_strokes=done,
+                total_strokes=total,
+                message=message,
+            )
+
+        progress(0, "Reading the bare canvas")
+        bare = []
+        for site in sites:
+            self._checkpoint(epoch=epoch, check_focus=True)
+            bare.append(self._screen_capture(site.patch))
+        ink = self._contrast_ink(bare)
+
+        self._stamp_probes(
+            target, settings, sites, shapes, fractions, ink, epoch, progress, 0
+        )
+        curves, failures = self._read_probes(sites, shapes, fractions, epoch)
+
+        if len(curves) < len(shapes):
+            # Something about this sign defeats reading a dab off it directly -
+            # existing paint, a plank seam through a patch, too little contrast.
+            # Paint a clean background and try once more.  The preview tile is
+            # useless as a canvas measurement but perfectly good for deciding
+            # how far apart the sweeps may run.
+            LOGGER.info(
+                "Falling back to primed probes: %s", "; ".join(failures) or "unknown"
+            )
+            spacing = prime_spacing(
+                self._preview_brush_estimate(target, settings, epoch)
+            )
+            primer = (255, 255, 255) if ink == (0, 0, 0) else (0, 0, 0)
+            self._select_color(
+                primer, target, settings, epoch, apply_correction=False
+            )
+            self._safe_click(self._slider_point(slider, 1.0), epoch)
+            for index, site in enumerate(sites):
+                progress(index, f"Priming probe {index + 1} of {len(sites)}")
+                for stroke_start, stroke_end in prime_sweeps(site.prime, spacing):
+                    self._screen_stroke(stroke_start, stroke_end, settings, epoch)
+            self._stamp_probes(
+                target,
+                settings,
+                sites,
+                shapes,
+                fractions,
+                ink,
+                epoch,
+                progress,
+                len(sites),
+            )
+            curves, failures = self._read_probes(sites, shapes, fractions, epoch)
+
         if failures:
             LOGGER.warning(
                 "Some brush probes could not be measured: %s", "; ".join(failures)

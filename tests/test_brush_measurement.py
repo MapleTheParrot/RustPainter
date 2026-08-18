@@ -66,7 +66,7 @@ def _settings(**overrides: object) -> PainterSettings:
     return PainterSettings(**values)  # type: ignore[arg-type]
 
 
-def _canvas_capture(controller: MockInputController, shape_widths=None):
+def _canvas_capture(controller: MockInputController, shape_widths=None, needs_priming=False):
     """A tiny canvas model: replay the input log, then serve what it painted.
 
     Dabs are stamped long before their patches are captured, so answering from
@@ -75,11 +75,15 @@ def _canvas_capture(controller: MockInputController, shape_widths=None):
     which is what Rust's canvas does too.
     """
 
-    def replay() -> dict[tuple[int, int], int]:
+    def replay():
         position = (0, 0)
         fraction = 0.0
         shape: str | None = None
         dabs: dict[tuple[int, int], int] = {}
+        # Spans of held movement. A dab is a press that never moved, so only a
+        # span with two distinct ends counts as having painted a background.
+        swept: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        held_from: tuple[int, int] | None = None
         for event in controller.events:
             if event.kind == "move":
                 position = (event.x, event.y)
@@ -95,6 +99,7 @@ def _canvas_capture(controller: MockInputController, shape_widths=None):
                     ):
                         shape = name
             elif event.kind == "mouse_down":
+                held_from = position
                 if (
                     CANVAS.left <= position[0] < CANVAS.left + CANVAS.width
                     and CANVAS.top <= position[1] < CANVAS.top + CANVAS.height
@@ -104,12 +109,24 @@ def _canvas_capture(controller: MockInputController, shape_widths=None):
                         diameter += shape_widths.get(shape, 0)
                     # Last dab at a point wins, exactly as paint does.
                     dabs[position] = diameter
-        return dabs
+            elif event.kind == "mouse_up":
+                if held_from is not None and held_from != position:
+                    swept.append((held_from, position))
+                held_from = None
+        return dabs, swept
 
     def capture(rect):
         center = (rect.left + rect.width // 2, rect.top + rect.height // 2)
         image = Image.new("RGB", (rect.width, rect.height), (250, 250, 250))
-        for point, diameter in replay().items():
+        dabs, swept = replay()
+        if needs_priming and not any(
+            min(start[0], end[0]) <= center[0] <= max(start[0], end[0])
+            and abs(start[1] - center[1]) <= rect.height
+            for start, end in swept
+        ):
+            # This sign hides a dab until the patch has been painted over.
+            return image
+        for point, diameter in dabs.items():
             if abs(point[0] - center[0]) <= 2 and abs(point[1] - center[1]) <= 2:
                 left = (rect.width - diameter) // 2
                 top = (rect.height - diameter) // 2
@@ -125,6 +142,23 @@ def _canvas_capture(controller: MockInputController, shape_widths=None):
 
 def _strokes(controller: MockInputController) -> int:
     return sum(1 for event in controller.events if event.kind == "mouse_down")
+
+
+def _held_travel(controller: MockInputController) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Start and end of every press, so a dab can be told from a drag."""
+
+    spans: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    position = (0, 0)
+    start: tuple[int, int] | None = None
+    for event in controller.events:
+        if event.kind == "move":
+            position = (event.x, event.y)
+        elif event.kind == "mouse_down":
+            start = position
+        elif event.kind == "mouse_up" and start is not None:
+            spans.append((start, position))
+            start = None
+    return spans
 
 
 def test_probe_sites_stay_inside_the_canvas_and_apart() -> None:
@@ -304,3 +338,47 @@ def test_a_measured_curve_replaces_the_preview_search_while_painting() -> None:
     assert slider_x, "the Size track was never clicked"
     fraction = (slider_x[-1] - SLIDER.left) / float(SLIDER.width - 1)
     assert fraction == pytest.approx(0.24, abs=0.05)
+
+
+def test_measuring_never_paints_a_background_it_does_not_need() -> None:
+    # A dab out-contrasts the bare sign well enough to be measured, so the run
+    # stamps six dabs and reads them. Priming the patches first cost two
+    # hundred strokes and bought nothing.
+    controller = MockInputController()
+    painter = Painter(controller, screen_capture=_canvas_capture(controller))
+
+    painter.configure_brush_measurement(_profile(), _settings(), probe_count=PROBES)
+    assert painter.start()
+    assert painter.wait(30.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    assert _strokes(controller) <= 20, "the fast path should stamp, not paint"
+    # Nothing is dragged across the canvas at all: every canvas press is a dab.
+    drags = [
+        (start, end)
+        for start, end in _held_travel(controller)
+        if start != end
+    ]
+    assert drags == [], f"the fast path dragged {len(drags)} strokes"
+
+
+def test_a_sign_that_hides_a_bare_dab_falls_back_to_priming() -> None:
+    # Existing paint, a plank seam, too little contrast - whatever the reason,
+    # a dab that cannot be read on bare sign has to be readable after the
+    # patch is painted clean.
+    controller = MockInputController()
+    painter = Painter(
+        controller, screen_capture=_canvas_capture(controller, needs_priming=True)
+    )
+
+    painter.configure_brush_measurement(_profile(), _settings(), probe_count=PROBES)
+    assert painter.start()
+    assert painter.wait(40.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    measured = painter.brush_responses
+    assert measured is not None
+    curve = measured.for_shape(None)
+    assert curve is not None and len(curve.samples) == PROBES
+    # Recovering cost real priming strokes, which is the trade being made.
+    assert _strokes(controller) > 20
