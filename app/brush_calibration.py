@@ -23,9 +23,16 @@ BRUSH_RESPONSE_SCHEMA = 1
 PROBE_PATCH_PIXELS = 176
 PROBE_PRIME_PIXELS = 200
 
-# How far apart the priming sweeps run.  Any brush at least this wide covers
-# the square without gaps, and Rust's largest brush is far wider than this.
+# How far apart priming sweeps run when the widest brush could not be measured.
+# Any brush at least this wide still covers the square without gaps, at the cost
+# of a lot of dragging - which is why the run measures the widest brush first
+# and spaces its sweeps from that instead.
 PROBE_PRIME_SPACING_PIXELS = 6
+
+# Fraction of the measured widest brush to step between priming sweeps. Under
+# one so consecutive sweeps overlap rather than meeting exactly, which absorbs
+# both the measurement's own error and a soft brush edge.
+PRIME_SWEEP_OVERLAP = 0.8
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,16 +209,32 @@ def probe_sites(canvas: ScreenRect, count: int) -> tuple[ProbeSite, ...]:
     return tuple(sites)
 
 
-def prime_sweeps(square: ScreenRect) -> tuple[tuple[tuple[int, int], tuple[int, int]], ...]:
-    """Horizontal strokes that cover ``square`` with the brush at full size."""
+def prime_spacing(widest_diameter: float | None) -> int:
+    """How far apart priming sweeps may run for a brush of this width."""
 
+    if widest_diameter is None or not widest_diameter > 0:
+        return PROBE_PRIME_SPACING_PIXELS
+    return max(PROBE_PRIME_SPACING_PIXELS, int(widest_diameter * PRIME_SWEEP_OVERLAP))
+
+
+def prime_sweeps(
+    square: ScreenRect, spacing: int = PROBE_PRIME_SPACING_PIXELS
+) -> tuple[tuple[tuple[int, int], tuple[int, int]], ...]:
+    """Horizontal strokes that cover ``square`` with the brush at full size.
+
+    ``spacing`` comes from the measured widest brush, so a wide brush primes a
+    patch in a handful of strokes instead of the dozens a worst-case guess
+    would need.
+    """
+
+    step = max(1, int(spacing))
     sweeps: list[tuple[tuple[int, int], tuple[int, int]]] = []
     last = square.top + square.height - 1
     right = square.left + square.width - 1
     y = square.top
     while y < last:
         sweeps.append(((square.left, y), (right, y)))
-        y += PROBE_PRIME_SPACING_PIXELS
+        y += step
     sweeps.append(((square.left, last), (right, last)))
     return tuple(sweeps)
 
@@ -390,6 +413,7 @@ __all__ = [
     "ProbeSite",
     "build_brush_response",
     "measure_brush_footprint",
+    "prime_spacing",
     "prime_sweeps",
     "probe_sites",
 ]

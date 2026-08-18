@@ -270,16 +270,26 @@ measuring what Rust actually paints:
 1. Use a blank or disposable sign with the profile's canvas, picker, and Size
    track calibrated.
 2. Click **Measure Brush on Canvas** and focus Rust for the countdown.
-3. The painter primes six small squares of canvas with the widest brush, stamps
-   one dab in each at a different Size-track position, and reads back how wide
-   each dab came out. The probes crowd the low end of the track, where a
-   mis-sized brush does the most damage.
-4. With both shape buttons calibrated the grid runs twice, once per shape,
+3. The painter stamps one dab at the widest Size-track position and measures
+   it, which tells it how far apart the priming sweeps may run. That one dab
+   is the difference between priming a patch in five strokes and thirty-five.
+4. It then primes six small squares of canvas, stamps one dab in each at a
+   different Size-track position, and reads back how wide each came out. The
+   probes crowd the low end of the track, where a mis-sized brush does the
+   most damage.
+5. With both shape buttons calibrated the grid runs twice, once per shape,
    because the same slider position can render a different footprint as a
    square than as a circle. A measurement taken under one shape is never
    reused for the other; a pass whose shape has no curve falls back to the
    preview search.
-5. The measured curves are stored on the profile.
+6. The measured curves are stored on the profile.
+
+A one-cell brush deliberately targets 90% of a logical cell, so rows meet with
+a hairline seam the sign texture hides rather than smearing into each other.
+Perfectly edge-to-edge pixels need the **square** brush: a circle of one cell
+across leaves gaps at the cell corners, and widening it to close them overlaps
+its neighbours by 40%. Along a horizontal run the two shapes behave alike; the
+difference shows at run ends and on isolated pixels.
 
 Painting then sets the brush straight from that curve. Nothing has to be
 measured mid-job, so a run never pauses to hunt the slider, and the measurement

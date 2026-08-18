@@ -22,8 +22,10 @@ from .brush_calibration import (
     BrushResponseSet,
     build_brush_response,
     measure_brush_footprint,
+    prime_spacing,
     prime_sweeps,
     probe_sites,
+    ProbeSite,
 )
 from .color_calibration import ColorCorrectionModel
 from .color_mapping import map_rgb_to_picker
@@ -1095,6 +1097,52 @@ class Painter:
         if button is not None:
             self._select_brush_shape(button, settings, epoch)
 
+    def _measure_widest_brush(
+        self,
+        target: PaintingTarget,
+        site: ProbeSite,
+        settings: PainterSettings,
+        epoch: int,
+    ) -> float | None:
+        """Stamp one dab at full size on bare canvas and read its width.
+
+        Priming needs sweeps no further apart than the brush is wide, and the
+        only way to know that without guessing is to paint it.  A worst-case
+        guess costs dozens of strokes per patch; the answer costs one dab, and
+        priming paints over it moments later.  Returning None simply falls the
+        run back to the conservative spacing.
+        """
+
+        slider = target.brush_slider
+        assert slider is not None
+        self._select_color((0, 0, 0), target, settings, epoch, apply_correction=False)
+        self._safe_click(self._slider_point(slider, 1.0), epoch)
+        self._interruptible_sleep(
+            max(settings.delay_after_brush_seconds, 0.16)
+            if self.input.emits_real_input
+            else 0.0,
+            epoch=epoch,
+            check_focus=True,
+        )
+        self._screen_stroke(site.point, site.point, settings, epoch)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        try:
+            footprint = self._measure_footprint(site.prime)
+        except ValueError as exc:
+            LOGGER.warning(
+                "Could not size the widest brush on bare canvas (%s); priming "
+                "falls back to close sweeps",
+                exc,
+            )
+            return None
+        if max(footprint.width, footprint.height) >= site.prime.width * 0.8:
+            LOGGER.warning(
+                "The widest brush filled its measuring patch; priming falls back "
+                "to close sweeps"
+            )
+            return None
+        return footprint.diameter
+
     def _execute_brush_measurement(self, job: _Job) -> None:
         """Prime patches of canvas, stamp one dab per Size-track position, measure.
 
@@ -1142,6 +1190,18 @@ class Painter:
                 message=message,
             )
 
+        # How wide the widest brush paints decides how far apart the priming
+        # sweeps may run, so it is worth one dab to find out rather than
+        # assuming the worst and dragging for a minute.
+        progress(0, "Sizing the widest brush")
+        widest = self._measure_widest_brush(target, sites[0], settings, epoch)
+        spacing = prime_spacing(widest)
+        LOGGER.info(
+            "Priming sweeps %dpx apart for a widest brush of %s",
+            spacing,
+            f"{widest:.0f}px" if widest else "unknown width",
+        )
+
         # Prime with the widest brush the track offers: every probe patch has
         # to be solid paint before a dab lands on it, or the detector reads the
         # sign texture as part of the dab.
@@ -1152,7 +1212,7 @@ class Painter:
         self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
         for index, site in enumerate(sites):
             progress(index, f"Priming probe {index + 1} of {len(sites)}")
-            for stroke_start, stroke_end in prime_sweeps(site.prime):
+            for stroke_start, stroke_end in prime_sweeps(site.prime, spacing):
                 self._screen_stroke(stroke_start, stroke_end, settings, epoch)
 
         self._select_color((0, 0, 0), target, settings, epoch, apply_correction=False)
