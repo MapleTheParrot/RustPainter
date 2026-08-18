@@ -516,3 +516,112 @@ def test_foreground_failure_reason_calls_out_an_impossible_windows_name() -> Non
 
     posix_name = _settings(require_foreground=True, expected_process_name="RustClient")
     assert _foreground_failure_reason(posix_name) == "foreground window lost"
+
+
+class _HandInput(MockInputController):
+    """A real-input mock whose cursor can lag behind, or be moved by a hand."""
+
+    emits_real_input = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hand_offset = (0, 0)
+        self.report_lag = 0
+        self.absolute_cursor: tuple[int, int] | None = None
+        self._history: list[tuple[int, int]] = []
+
+    def move_mouse(self, x: float, y: float) -> None:
+        super().move_mouse(x, y)
+        self._history.append((int(round(x)), int(round(y))))
+
+    def get_cursor_position(self) -> tuple[int, int]:
+        if self.absolute_cursor is not None:
+            return self.absolute_cursor
+        if not self._history:
+            return super().get_cursor_position()
+        index = max(0, len(self._history) - 1 - self.report_lag)
+        point = self._history[index]
+        return (point[0] + self.hand_offset[0], point[1] + self.hand_offset[1])
+
+
+def test_mouse_movement_pauses_and_resume_repeats_the_interrupted_stroke() -> None:
+    input_controller = _HandInput()
+    input_controller.hand_offset = (60, 40)
+    painter = Painter(input_controller)
+    painter.start(
+        _dot_plan(4),
+        _profile(),
+        _settings(
+            mouse_down_duration_seconds=0.01,
+            delay_between_strokes_seconds=0.01,
+            pause_on_mouse_move=True,
+        ),
+    )
+
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert painter.state_reason.startswith("mouse moved")
+    # A pause mid-click must not leave the button down on the canvas.
+    assert not input_controller.held_buttons
+    before = len(input_controller.events)
+    time.sleep(_t(0.05))
+    assert len(input_controller.events) == before
+
+    # Letting go of the mouse and resuming continues the same job.
+    input_controller.hand_offset = (0, 0)
+    assert painter.resume()
+    assert painter.wait(_t(3.0))
+    assert painter.state is PainterState.COMPLETED
+    assert painter.progress.completed_strokes == 4
+    assert not input_controller.held_buttons
+
+
+def test_queued_input_lag_is_not_mistaken_for_mouse_movement() -> None:
+    # SendInput is asynchronous, so a sample can still report a point commanded
+    # several events ago.  That must never read as a hand on the mouse.
+    input_controller = _HandInput()
+    input_controller.report_lag = 4
+    painter = Painter(input_controller)
+    painter.start(
+        _dot_plan(12),
+        _profile(),
+        # Deliberate per-stroke time so the cursor is sampled many times over a
+        # history that is already full, not just once at the very start.
+        _settings(
+            mouse_down_duration_seconds=0.005,
+            delay_between_strokes_seconds=0.005,
+            pause_on_mouse_move=True,
+        ),
+    )
+
+    assert painter.wait(_t(3.0))
+    assert painter.state is PainterState.COMPLETED
+    assert painter.progress.completed_strokes == 12
+
+
+def test_corner_emergency_stop_still_aborts_while_paused() -> None:
+    input_controller = _HandInput()
+    painter = Painter(
+        input_controller,
+        virtual_screen_provider=lambda: VirtualScreen(0, 0, 1200, 900),
+    )
+    painter.start(
+        _dot_plan(400),
+        _profile(),
+        _settings(
+            delay_between_strokes_seconds=0.02,
+            corner_abort_enabled=True,
+            corner_abort_margin_pixels=2,
+            corner_abort_minimum_distance_pixels=50,
+            pause_on_mouse_move=False,
+        ),
+    )
+    assert _wait_until(lambda: painter.state is PainterState.RUNNING)
+    assert painter.pause("user")
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+
+    # The corner gesture is what a user reaches for once painting is already
+    # interrupted, so a paused job must still honour it.
+    input_controller.absolute_cursor = (0, 0)
+    assert _wait_until(lambda: painter.state is PainterState.ABORTED)
+    assert painter.wait(_t(2.0))
+    assert not input_controller.held_buttons

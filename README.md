@@ -121,7 +121,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
-- Safety throughout: countdown, foreground-window guard, corner abort, pause/resume, and an abort that always releases the mouse
+- Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
 ## Detailed setup and first paint
@@ -189,7 +189,8 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 - With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. On Windows the expected process defaults to `RustClient.exe`; on macOS it defaults to empty so the window title governs, because a Windows executable name can never match there and would pause the job the moment you focused the game. If you upgraded from an earlier build and the job pauses immediately after the countdown, clear **Expected process name** under Settings. Reading the frontmost window title needs Screen Recording on macOS (otherwise the application name is matched instead). Loss of focus pauses and releases the mouse.
 - F9 pauses at the next short cancellation checkpoint.
 - F10 aborts, clears pending work, and releases the mouse.
-- Optional rapid movement into a virtual-screen corner aborts the job.
+- **Mouse guard** (on by default, Settings > Safety): taking the mouse back mid-job pauses it instead of letting your hand fight the painter. The button is released within milliseconds, and resuming with F8 re-selects the color and repeats the interrupted stroke, so a bump costs one stroke rather than the whole sign. Movement is detected from the gap between where the painter put the cursor and where the cursor actually is; no input hook is installed. If a job pauses repeatedly on its own, the calibrated canvas is likely outside where the game lets the cursor go - recalibrate, or turn the guard off.
+- Optional rapid movement into a virtual-screen corner aborts the job. The corner stop keeps working while a job is paused, so the same gesture still ends a run the mouse guard has already halted.
 - UI-reference comparison is only a coarse warning for moved/wrong UI; it is not computer vision and should not replace calibration checks.
 
 Keep your hand near F10 during initial tests. Do not use the tool unattended.

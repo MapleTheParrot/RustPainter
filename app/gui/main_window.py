@@ -1205,6 +1205,13 @@ class MainWindow(QMainWindow):
         self.expected_process_edit.setPlaceholderText("Executable name (optional)")
         self.corner_abort_check = QCheckBox("Rapid move to a screen corner aborts")
         self.corner_abort_check.setChecked(True)
+        self.mouse_pause_check = QCheckBox("Moving the mouse pauses instead of painting over it")
+        self.mouse_pause_check.setChecked(True)
+        self.mouse_pause_check.setToolTip(
+            "Painting stops the moment you take the mouse back and releases the "
+            "button, then continues from the same stroke when you resume, so an "
+            "accidental nudge never costs the whole run."
+        )
         self.verify_ui_check = QCheckBox("Compare calibration reference before start")
         self.start_hotkey_combo = self._hotkey_combo("F8")
         self.pause_hotkey_combo = self._hotkey_combo("F9")
@@ -1214,6 +1221,7 @@ class MainWindow(QMainWindow):
         safety_form.addRow("Expected window", self.expected_window_edit)
         safety_form.addRow("Expected process", self.expected_process_edit)
         safety_form.addRow("Corner stop", self.corner_abort_check)
+        safety_form.addRow("Mouse guard", self.mouse_pause_check)
         safety_form.addRow("UI check", self.verify_ui_check)
         safety_form.addRow("Start / resume", self.start_hotkey_combo)
         safety_form.addRow("Pause", self.pause_hotkey_combo)
@@ -2204,6 +2212,7 @@ class MainWindow(QMainWindow):
             self.expected_window_edit,
             self.expected_process_edit,
             self.corner_abort_check,
+            self.mouse_pause_check,
             self.verify_ui_check,
             self.start_hotkey_combo,
             self.pause_hotkey_combo,
@@ -2365,6 +2374,7 @@ class MainWindow(QMainWindow):
 
             self.countdown_spin.setValue(int(safety.get("countdown_seconds", 3)))
             self.corner_abort_check.setChecked(bool(safety.get("corner_abort_enabled", True)))
+            self.mouse_pause_check.setChecked(bool(safety.get("pause_on_mouse_move", True)))
             self.focus_guard_check.setChecked(
                 bool(safety.get("require_rust_foreground", True))
             )
@@ -2450,6 +2460,7 @@ class MainWindow(QMainWindow):
             **current.get("safety", {}),
             "countdown_seconds": self.countdown_spin.value(),
             "corner_abort_enabled": self.corner_abort_check.isChecked(),
+            "pause_on_mouse_move": self.mouse_pause_check.isChecked(),
             "require_rust_foreground": self.focus_guard_check.isChecked(),
             "expected_window_title_contains": self.expected_window_edit.text().strip(),
             "expected_process_name": self.expected_process_edit.text().strip(),
@@ -3356,6 +3367,7 @@ class MainWindow(QMainWindow):
             self.expected_window_edit,
             self.expected_process_edit,
             self.corner_abort_check,
+            self.mouse_pause_check,
             self.verify_ui_check,
             self.start_hotkey_combo,
             self.pause_hotkey_combo,

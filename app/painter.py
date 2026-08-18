@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -31,6 +32,17 @@ from .screen import (
 
 
 LOGGER = logging.getLogger("rust_painter.painter")
+
+# ``SendInput`` only queues a move, so ``GetCursorPos`` can still report a point
+# the painter commanded a few events ago. Comparing a sample against a short
+# history of commanded points, rather than only the newest one, keeps that
+# ordinary lag from reading as a person grabbing the mouse.
+_COMMANDED_POINT_HISTORY = 8
+
+# A hand on the mouse crosses the pause threshold in a few dozen milliseconds.
+# Anything still accumulating after this long is rounding noise, and its total
+# is discarded rather than allowed to creep into a pause.
+_MOUSE_DRIFT_WINDOW_SECONDS = 0.6
 
 
 @contextlib.contextmanager
@@ -180,6 +192,9 @@ class PainterSettings:
     corner_abort_enabled: bool = True
     corner_abort_margin_pixels: int = 3
     corner_abort_minimum_distance_pixels: float = 80.0
+    pause_on_mouse_move: bool = True
+    mouse_move_pause_threshold_pixels: float = 24.0
+    mouse_move_tolerance_pixels: float = 3.0
     safety_poll_interval_seconds: float = 0.01
     progress_callback_interval_seconds: float = 0.04
 
@@ -190,6 +205,7 @@ class PainterSettings:
             "logical_pixel_spacing": self.logical_pixel_spacing,
             "focus_check_interval_seconds": self.focus_check_interval_seconds,
             "safety_poll_interval_seconds": self.safety_poll_interval_seconds,
+            "mouse_move_pause_threshold_pixels": self.mouse_move_pause_threshold_pixels,
         }
         for name, value in positive.items():
             if value <= 0 or not math.isfinite(value):
@@ -203,6 +219,7 @@ class PainterSettings:
             "delay_after_brush_seconds": self.delay_after_brush_seconds,
             "countdown_seconds": self.countdown_seconds,
             "corner_abort_minimum_distance_pixels": self.corner_abort_minimum_distance_pixels,
+            "mouse_move_tolerance_pixels": self.mouse_move_tolerance_pixels,
             "progress_callback_interval_seconds": self.progress_callback_interval_seconds,
         }
         for name, value in nonnegative.items():
@@ -281,6 +298,13 @@ class PainterSettings:
             ),
             corner_abort_minimum_distance_pixels=float(
                 pick(safety, "corner_abort_minimum_distance_pixels", 80.0)
+            ),
+            pause_on_mouse_move=bool(pick(safety, "pause_on_mouse_move", True)),
+            mouse_move_pause_threshold_pixels=float(
+                pick(safety, "mouse_move_pause_threshold_pixels", 24.0)
+            ),
+            mouse_move_tolerance_pixels=float(
+                pick(safety, "mouse_move_tolerance_pixels", 3.0)
             ),
             safety_poll_interval_seconds=float(
                 pick(safety, "safety_poll_interval_seconds", 0.01)
@@ -381,6 +405,11 @@ class Painter:
         self._last_focus_check = 0.0
         self._last_corner_check = 0.0
         self._last_commanded_point: tuple[int, int] | None = None
+        self._commanded_history: deque[tuple[int, int]] = deque(
+            maxlen=_COMMANDED_POINT_HISTORY
+        )
+        self._mouse_drift_pixels = 0.0
+        self._mouse_drift_started = 0.0
         self._last_progress_emit = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
@@ -525,7 +554,7 @@ class Painter:
             self._paused_seconds = 0.0
             self._last_focus_check = 0.0
             self._last_corner_check = 0.0
-            self._last_commanded_point = None
+            self._reset_mouse_movement_baseline()
             self._last_progress_emit = 0.0
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
@@ -593,6 +622,10 @@ class Painter:
             self._state_reason = "resumed"
             # Force the worker to verify focus again before its very next input.
             self._last_focus_check = 0.0
+            # The cursor is wherever the user left it, so there is no commanded
+            # point it should currently match. Without re-baselining, the first
+            # sample after resuming would read as movement and pause again.
+            self._reset_mouse_movement_baseline()
             self._pause_event.clear()
             self._condition.notify_all()
         LOGGER.info("Painting resumed")
@@ -1051,6 +1084,7 @@ class Painter:
         def emit() -> None:
             self.input.move_mouse(*point)
             self._last_commanded_point = point
+            self._commanded_history.append(point)
 
         self._guarded_input(epoch, emit)
 
@@ -1062,9 +1096,20 @@ class Painter:
             with self._condition:
                 if self._abort_event.is_set() or self._abort_requested:
                     raise _AbortRequested
-                if self._pause_event.is_set() or self._state == PainterState.PAUSED:
+                paused = (
+                    self._pause_event.is_set() or self._state == PainterState.PAUSED
+                )
+                if paused:
                     self._condition.wait(timeout=0.05)
-                    continue
+            if paused:
+                # Keep watching the corner while paused. The corner gesture is
+                # exactly what a user reaches for once the mouse has already
+                # interrupted the job and they want it gone rather than held,
+                # and a paused worker is the only thread still polling.
+                job = self._job
+                if job is not None:
+                    self._check_cursor(job.settings, time.monotonic(), allow_pause=False)
+                continue
             if self._check_safety(check_focus=check_focus):
                 continue
             with self._condition:
@@ -1095,23 +1140,104 @@ class Painter:
                 self.pause(_foreground_failure_reason(settings))
                 return True
 
-        if (
-            settings.corner_abort_enabled
-            and getattr(self.input, "emits_real_input", True)
-            and self._last_commanded_point is not None
-            and now - self._last_corner_check >= settings.safety_poll_interval_seconds
-        ):
-            self._last_corner_check = now
-            try:
-                cursor = self.input.get_cursor_position()
-                if self._is_manual_corner_stop(cursor, self._last_commanded_point, settings):
-                    self.abort("mouse moved to emergency corner")
-                    raise _AbortRequested
-            except _AbortRequested:
-                raise
-            except Exception:
-                LOGGER.warning("Could not evaluate corner emergency stop", exc_info=True)
-        return False
+        return self._check_cursor(settings, now, allow_pause=True)
+
+    def _check_cursor(
+        self, settings: PainterSettings, now: float, *, allow_pause: bool
+    ) -> bool:
+        """Sample the real cursor for the corner stop and for user movement.
+
+        ``allow_pause`` is False when the job is already paused: the corner
+        emergency stop still has to work there, but there is nothing left to
+        pause. Returns True when the job just paused and the caller must
+        re-evaluate its state.
+        """
+
+        watch_movement = allow_pause and settings.pause_on_mouse_move
+        if not settings.corner_abort_enabled and not watch_movement:
+            return False
+        if not getattr(self.input, "emits_real_input", True):
+            return False
+        # resume() clears the baseline from another thread, so snapshot both
+        # halves together rather than testing one and then reading the other.
+        with self._condition:
+            expected = self._last_commanded_point
+            history = tuple(self._commanded_history)
+        if expected is None or not history:
+            return False
+        if now - self._last_corner_check < settings.safety_poll_interval_seconds:
+            return False
+        self._last_corner_check = now
+        try:
+            cursor = self.input.get_cursor_position()
+            if settings.corner_abort_enabled and self._is_manual_corner_stop(
+                cursor, expected, settings
+            ):
+                self.abort("mouse moved to emergency corner")
+                raise _AbortRequested
+        except _AbortRequested:
+            raise
+        except Exception:
+            LOGGER.warning("Could not read the cursor for safety checks", exc_info=True)
+            return False
+        if not watch_movement:
+            return False
+        return self._check_mouse_movement(cursor, history, settings, now)
+
+    def _check_mouse_movement(
+        self,
+        cursor: tuple[int, int],
+        history: tuple[tuple[int, int], ...],
+        settings: PainterSettings,
+        now: float,
+    ) -> bool:
+        """Pause once the cursor keeps leaving the path the painter commands.
+
+        Detection is positional on purpose. A low-level mouse hook could tell
+        injected input from physical input outright, but installing one next to
+        an anti-cheat protected game is precisely the behaviour anti-cheat
+        looks for, so movement is inferred from the gap between where the
+        painter put the cursor and where the cursor actually is.
+
+        The painter re-warps the cursor every few milliseconds, which erases
+        most of a gap as fast as it appears, so single samples are small even
+        during a deliberate grab. Accumulating the part of each gap that
+        exceeds the tolerance is what makes a sustained hand movement separable
+        from the queued-input lag of one sample.
+        """
+
+        distance = min(
+            math.hypot(cursor[0] - point[0], cursor[1] - point[1])
+            for point in history
+        )
+        tolerance = settings.mouse_move_tolerance_pixels
+        if distance <= tolerance:
+            self._reset_mouse_drift()
+            return False
+        if self._mouse_drift_started == 0.0:
+            self._mouse_drift_started = now
+        elif now - self._mouse_drift_started > _MOUSE_DRIFT_WINDOW_SECONDS:
+            # A hand crosses the threshold in a few dozen milliseconds. A gap
+            # that needs this long only ever creeps a hair past the tolerance,
+            # which is rounding rather than movement, so drop what it added
+            # instead of letting it reach a pause over many seconds.
+            self._mouse_drift_pixels = 0.0
+            self._mouse_drift_started = now
+        self._mouse_drift_pixels += distance - tolerance
+        if self._mouse_drift_pixels < settings.mouse_move_pause_threshold_pixels:
+            return False
+        self._reset_mouse_drift()
+        self.pause("mouse moved - resume to continue from the same stroke")
+        return True
+
+    def _reset_mouse_drift(self) -> None:
+        self._mouse_drift_pixels = 0.0
+        self._mouse_drift_started = 0.0
+
+    def _reset_mouse_movement_baseline(self) -> None:
+        self._last_commanded_point = None
+        self._commanded_history.clear()
+        self._reset_mouse_drift()
 
     def _is_manual_corner_stop(
         self,

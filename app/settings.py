@@ -95,6 +95,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "countdown_seconds": 3,
         "corner_abort_enabled": True,
         "corner_abort_margin_pixels": 3,
+        "pause_on_mouse_move": True,
+        "mouse_move_pause_threshold_pixels": 24,
         "require_rust_foreground": True,
         "expected_process_name": DEFAULT_EXPECTED_PROCESS_NAME,
         "expected_window_title_contains": "Rust",
@@ -311,6 +313,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError("safety.countdown_seconds must be a non-negative integer")
     for key in (
         "corner_abort_enabled",
+        "pause_on_mouse_move",
         "require_rust_foreground",
         "verify_calibrated_ui",
     ):
@@ -328,10 +331,13 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError(
             "safety.corner_abort_margin_pixels must be a non-negative integer"
         )
+    may_be_zero = {"corner_abort_minimum_distance_pixels", "mouse_move_tolerance_pixels"}
     for key in (
         "corner_abort_minimum_distance_pixels",
         "focus_check_interval_seconds",
         "safety_poll_interval_seconds",
+        "mouse_move_pause_threshold_pixels",
+        "mouse_move_tolerance_pixels",
     ):
         if key not in safety:
             continue
@@ -343,7 +349,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
             or value < 0
         ):
             raise SettingsError(f"safety.{key} must be a finite non-negative number")
-        if key != "corner_abort_minimum_distance_pixels" and value == 0:
+        if key not in may_be_zero and value == 0:
             raise SettingsError(f"safety.{key} must be positive")
 
     assert isinstance(execution, Mapping)
