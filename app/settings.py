@@ -45,6 +45,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "scale_mode": "fit",
         "crop_alignment": "center",
         "quality_preset": "balanced",
+        # How boldly planning may simplify the image to paint faster; "exact"
+        # reproduces the raw quantized image with the classic pipeline.
+        "paint_mode": "balanced",
         "logical_width": 256,
         "logical_height": 128,
         "color_count": 32,
@@ -181,6 +184,15 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "quality_preset"
     ) not in {*QUALITY_PRESETS, "custom"}:
         raise SettingsError("image.quality_preset is invalid")
+    if not isinstance(image.get("paint_mode"), str) or image.get("paint_mode") not in {
+        "exact",
+        "quality",
+        "balanced",
+        "fast",
+    }:
+        raise SettingsError(
+            "image.paint_mode must be exact, quality, balanced, or fast"
+        )
     for key in ("logical_width", "logical_height"):
         value = image.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or not 8 <= value <= 2048:

@@ -682,8 +682,8 @@ class Painter:
 
     close = shutdown
 
-    @staticmethod
     def _validate_job(
+        self,
         plan: PaintPlan,
         target: PaintingTarget,
         settings: PainterSettings,
@@ -710,24 +710,35 @@ class Painter:
                 raise ValueError("brush slider calibration must have positive dimensions")
             if target.brush_preview.width <= 0 or target.brush_preview.height <= 0:
                 raise ValueError("brush preview calibration must have positive dimensions")
-        if any(group.brush_diameter > 1 for group in plan.color_groups) and not (
-            settings.apply_brush_size and target.brush_slider and target.brush_preview
-        ):
-            raise ValueError(
-                "This plan uses multiple brush sizes, which needs automatic brush "
-                "sizing enabled with the Size track and brush preview calibrated"
-            )
-        requested_shapes = {
-            group.brush_shape for group in plan.color_groups if group.brush_shape
-        }
-        if BrushShape.SQUARE.value in requested_shapes and target.square_shape_button is None:
-            raise ValueError(
-                "This plan selects the square brush, but no square shape button is calibrated"
-            )
-        if BrushShape.CIRCLE.value in requested_shapes and target.circle_shape_button is None:
-            raise ValueError(
-                "This plan selects the circle brush, but no circle shape button is calibrated"
-            )
+        # A dry run only visualizes the plan, so it may carry brush metadata
+        # that real input could not honor with the current calibration.
+        if getattr(self.input, "emits_real_input", True):
+            if any(group.brush_diameter > 1 for group in plan.color_groups) and not (
+                settings.apply_brush_size
+                and target.brush_slider
+                and target.brush_preview
+            ):
+                raise ValueError(
+                    "This plan uses multiple brush sizes, which needs automatic brush "
+                    "sizing enabled with the Size track and brush preview calibrated"
+                )
+            requested_shapes = {
+                group.brush_shape for group in plan.color_groups if group.brush_shape
+            }
+            if (
+                BrushShape.SQUARE.value in requested_shapes
+                and target.square_shape_button is None
+            ):
+                raise ValueError(
+                    "This plan selects the square brush, but no square shape button is calibrated"
+                )
+            if (
+                BrushShape.CIRCLE.value in requested_shapes
+                and target.circle_shape_button is None
+            ):
+                raise ValueError(
+                    "This plan selects the circle brush, but no circle shape button is calibrated"
+                )
 
     def _run(self) -> None:
         if getattr(self.input, "emits_real_input", True):

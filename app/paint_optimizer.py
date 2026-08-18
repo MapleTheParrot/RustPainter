@@ -45,9 +45,9 @@ from .paint_plan import (
 # maxing out below the planned footprint and leaving seams.
 _MAX_BRUSH_PIXELS = 64.0
 
-# Rough per-stroke overhead in covered-cell currency, used when comparing a
-# pass that covers slightly more area against one that needs fewer strokes.
-_STROKE_OVERHEAD_CELLS = 3
+# Rough cost of one extra stroke in cells of mouse travel: the inter-stroke
+# delay, the button press, and the hop to the stroke's start point.
+_STROKE_OVERHEAD_CELLS = 10
 
 _UNSET = object()
 
@@ -87,10 +87,14 @@ class OptimizerOptions:
     overpaint_gap: int
     # Descending odd brush diameters (in logical cells) tried above one cell.
     brush_diameters: tuple[int, ...]
-    # A brush resize costs real seconds, so a pass must cover at least this
-    # many cells to justify one; shape switches demand a further advantage.
-    min_cells_per_resize: int
-    min_cells_per_shape_switch: int
+    # Execution costs expressed in cells of mouse travel, so a candidate pass
+    # can be weighed directly against the detail strokes it would replace.
+    # Searching a fresh diameter measures the preview repeatedly; revisiting a
+    # diameter replays one remembered slider click; a shape switch is a trip
+    # to the toolbar and back.
+    resize_cost_cells: int
+    revisit_cost_cells: int
+    shape_switch_cost_cells: int
 
 
 MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
@@ -100,8 +104,9 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         region_contrast_limit=6.0,
         overpaint_gap=4,
         brush_diameters=(3,),
-        min_cells_per_resize=90,
-        min_cells_per_shape_switch=180,
+        resize_cost_cells=450,
+        revisit_cost_cells=110,
+        shape_switch_cost_cells=300,
     ),
     PaintMode.BALANCED: OptimizerOptions(
         merge_tolerance=5.0,
@@ -109,8 +114,9 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         region_contrast_limit=11.0,
         overpaint_gap=8,
         brush_diameters=(5, 3),
-        min_cells_per_resize=60,
-        min_cells_per_shape_switch=140,
+        resize_cost_cells=400,
+        revisit_cost_cells=90,
+        shape_switch_cost_cells=220,
     ),
     PaintMode.FAST: OptimizerOptions(
         merge_tolerance=9.0,
@@ -118,8 +124,9 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         region_contrast_limit=18.0,
         overpaint_gap=24,
         brush_diameters=(7, 5, 3),
-        min_cells_per_resize=40,
-        min_cells_per_shape_switch=100,
+        resize_cost_cells=350,
+        revisit_cost_cells=80,
+        shape_switch_cost_cells=150,
     ),
 }
 
@@ -543,16 +550,40 @@ def _serpentine(strokes: list[Stroke]) -> list[Stroke]:
     return ordered
 
 
+def _row_run_count(cells: np.ndarray) -> int:
+    """How many horizontal runs the cells split into (one stroke each)."""
+
+    previous = np.zeros_like(cells)
+    previous[:, 1:] = cells[:, :-1]
+    return int((cells & ~previous).sum())
+
+
 def _evaluate_pass(
     allowed: np.ndarray,
     uncovered: np.ndarray,
     diameter: int,
     shape: str | None,
-) -> tuple[np.ndarray, list[Stroke], int]:
+) -> tuple[np.ndarray, list[Stroke], int, float]:
+    """Plan one candidate pass and score its benefit over painting as detail.
+
+    The benefit is measured in cells of mouse travel: what the covered cells
+    would have cost as single-cell runs, minus what the pass itself travels.
+    Fixed per-pass costs (a brush resize, a shape switch) are the caller's to
+    subtract, since they depend on what is already selected.
+    """
+
     safe = _erode(allowed, _safety_offsets(diameter, shape))
     trial = uncovered.copy()
     strokes, covered = _plan_brush_pass(safe, trial, diameter)
-    return trial, strokes, covered
+    replaced_runs = _row_run_count(uncovered & ~trial)
+    pass_travel = sum(stroke.pixel_count for stroke in strokes)
+    benefit = float(
+        covered
+        + _STROKE_OVERHEAD_CELLS * replaced_runs
+        - pass_travel
+        - _STROKE_OVERHEAD_CELLS * len(strokes)
+    )
+    return trial, strokes, covered, benefit
 
 
 # ----------------------------------------------------------------- main entry
@@ -603,42 +634,46 @@ def optimize_paint_plan(
     groups: list[ColorGroup] = []
     current_shape: str | None = None
     last_diameter = 1
+    # Mirrors the painter's per-diameter slider cache: the first use of a
+    # diameter is a full search, returning to it later is a single click.
+    searched_diameters: set[int] = set()
     for color_index, color in enumerate(colors):
         allowed = index_map >= color_index
         uncovered = index_map == color_index
         shape_choice: object = _UNSET
         for diameter in diameters:
             remaining_cells = int(uncovered.sum())
-            resize_needed = diameter != last_diameter
-            gate = (
-                options.min_cells_per_resize
-                if resize_needed
-                else max(6, options.min_cells_per_resize // 4)
-            )
-            if remaining_cells < gate:
+            if remaining_cells < 32:
                 break
+            if diameter == last_diameter:
+                switch_cost = 0.0
+            elif diameter in searched_diameters:
+                switch_cost = float(options.revisit_cost_cells)
+            else:
+                switch_cost = float(options.resize_cost_cells)
             if shape_choice is _UNSET:
-                best: tuple[float, str | None, np.ndarray, list[Stroke], int] | None = None
+                best: (
+                    tuple[float, str | None, np.ndarray, list[Stroke], int] | None
+                ) = None
                 for shape in _shape_candidates(capabilities):
-                    trial, strokes, covered = _evaluate_pass(
+                    trial, strokes, covered, benefit = _evaluate_pass(
                         allowed, uncovered, diameter, shape
                     )
-                    score = float(covered - _STROKE_OVERHEAD_CELLS * len(strokes))
                     if (
                         shape is not None
                         and current_shape is not None
                         and shape != current_shape
                     ):
-                        score -= options.min_cells_per_shape_switch
-                    if best is None or score > best[0]:
-                        best = (score, shape, trial, strokes, covered)
+                        benefit -= options.shape_switch_cost_cells
+                    if best is None or benefit > best[0]:
+                        best = (benefit, shape, trial, strokes, covered)
                 assert best is not None
-                _score, shape_choice, trial, strokes, covered = best
+                benefit, shape_choice, trial, strokes, covered = best
             else:
-                trial, strokes, covered = _evaluate_pass(
+                trial, strokes, covered, benefit = _evaluate_pass(
                     allowed, uncovered, diameter, shape_choice  # type: ignore[arg-type]
                 )
-            if covered < gate or not strokes:
+            if not strokes or benefit <= switch_cost:
                 continue
             uncovered = trial
             resolved_shape = shape_choice if isinstance(shape_choice, str) else None
@@ -652,6 +687,7 @@ def optimize_paint_plan(
                 )
             )
             last_diameter = diameter
+            searched_diameters.add(diameter)
             if resolved_shape is not None:
                 current_shape = resolved_shape
         if uncovered.any():

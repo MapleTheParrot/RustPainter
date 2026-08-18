@@ -250,7 +250,10 @@ def test_multi_size_plan_requires_brush_sizing_calibration() -> None:
         8,
         (ColorGroup((10, 20, 30), (Stroke(0, 0, 0, 0),), 1, brush_diameter=3),),
     )
-    painter = Painter(MockInputController())
+    controller = MockInputController()
+    # The guard protects real input; mocks stand in for the system backend.
+    controller.emits_real_input = True  # type: ignore[misc]
+    painter = Painter(controller)
     with pytest.raises(ValueError, match="brush sizes"):
         painter.configure(plan, _profile(), _settings())
 
@@ -277,7 +280,9 @@ def test_shape_selecting_plan_requires_its_button() -> None:
             ),
         ),
     )
-    painter = Painter(MockInputController())
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    painter = Painter(controller)
     with pytest.raises(ValueError, match="circle"):
         painter.configure(plan, profile, _settings(apply_brush_size=True))
 

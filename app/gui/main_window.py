@@ -82,6 +82,7 @@ from app.models import (
     BackgroundRemovalScope,
     CropAlignment,
     ImageProcessOptions,
+    PaintMode,
     PaintPlan,
     ProcessedImage,
     ScaleMode,
@@ -89,6 +90,7 @@ from app.models import (
     TransparencyMode,
 )
 from app.paint_plan import generate_merged_color_groups, generate_paint_plan
+from app.paint_optimizer import BrushCapabilities, mode_options, optimize_paint_plan
 from app.profiles import Profile, ProfileStore
 from app.settings import SettingsStore, default_settings
 
@@ -196,6 +198,7 @@ class _ProcessResult:
     stroke_pixel_steps: int
     dot_count: int
     unmerged_stroke_count: int
+    optimization: Any = None
 
 
 @dataclass(slots=True)
@@ -356,6 +359,8 @@ class _ImageWorker(QRunnable):
         overpaint_gap: int | None = 0,
         text_overlays: tuple[_TextOverlayOptions, ...] = (),
         color_correction: ColorCorrectionModel | None = None,
+        paint_mode: str = PaintMode.EXACT.value,
+        capabilities: BrushCapabilities | None = None,
     ) -> None:
         super().__init__()
         self.serial = serial
@@ -364,6 +369,8 @@ class _ImageWorker(QRunnable):
         self.overpaint_gap = overpaint_gap
         self.text_overlays = text_overlays
         self.color_correction = color_correction
+        self.paint_mode = paint_mode
+        self.capabilities = capabilities
         self.signals = _WorkerSignals()
 
     @Slot()
@@ -371,19 +378,66 @@ class _ImageWorker(QRunnable):
         try:
             base_processed = process_image(self.image, self.options)
             processed = _apply_text_overlays(base_processed, self.text_overlays)
-            plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
-            if self.overpaint_gap == 0:
-                unmerged_stroke_count = plan.stroke_count
+            mode = PaintMode(self.paint_mode)
+            optimization = None
+            if mode is PaintMode.EXACT:
+                plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
+                if self.overpaint_gap == 0:
+                    unmerged_stroke_count = plan.stroke_count
+                else:
+                    unmerged_stroke_count = sum(
+                        len(group.strokes)
+                        for group in generate_merged_color_groups(
+                            processed, overpaint_gap=0
+                        )
+                    )
+                simulation_processed = base_processed
             else:
+                optimizer_options = mode_options(
+                    mode, preserve_dither=self.options.dither
+                )
+                optimized = optimize_paint_plan(
+                    processed,
+                    mode,
+                    capabilities=self.capabilities,
+                    options=optimizer_options,
+                )
+                plan = optimized.plan
+                optimization = optimized.statistics
+                # The savings headline compares against the exact plan the
+                # same processed image would have produced.
                 unmerged_stroke_count = sum(
                     len(group.strokes)
                     for group in generate_merged_color_groups(
                         processed, overpaint_gap=0
                     )
                 )
+                if processed is base_processed:
+                    simulation_processed = ProcessedImage(
+                        optimized.image, optimized.paint_mask, processed.requested_colors
+                    )
+                else:
+                    # Text stays a live vector overlay in the preview, so the
+                    # simulated backdrop is optimized without the text baked in.
+                    base_optimized = optimize_paint_plan(
+                        base_processed,
+                        mode,
+                        capabilities=self.capabilities,
+                        options=optimizer_options,
+                    )
+                    simulation_processed = ProcessedImage(
+                        base_optimized.image,
+                        base_optimized.paint_mask,
+                        base_processed.requested_colors,
+                    )
+                processed = ProcessedImage(
+                    optimized.image, optimized.paint_mask, processed.requested_colors
+                )
             # Text stays as live vector items in the editor preview. The paint
             # plan above still uses the composited, palette-limited result.
-            simulation = _build_simulation_image(base_processed, self.color_correction)
+            simulation = _build_simulation_image(
+                simulation_processed, self.color_correction
+            )
             stroke_pixel_steps = sum(
                 max(0, stroke.pixel_count - 1)
                 for group in plan.color_groups
@@ -403,6 +457,7 @@ class _ImageWorker(QRunnable):
                     stroke_pixel_steps,
                     dot_count,
                     unmerged_stroke_count,
+                    optimization,
                 )
             )
         except Exception as exc:  # surfaced to the GUI and log
@@ -971,10 +1026,25 @@ class MainWindow(QMainWindow):
         self.quality_combo = NoWheelComboBox()
         self.quality_combo.addItems([*QUALITY_LONG_EDGE.keys(), "Custom"])
         self.quality_combo.setCurrentText("Balanced")
+        self.paint_mode_combo = NoWheelComboBox()
+        self.paint_mode_combo.addItem("Exact — raw pixels", PaintMode.EXACT.value)
+        self.paint_mode_combo.addItem("Quality — subtle cleanup", PaintMode.QUALITY.value)
+        self.paint_mode_combo.addItem("Balanced — recommended", PaintMode.BALANCED.value)
+        self.paint_mode_combo.addItem("Fast — biggest savings", PaintMode.FAST.value)
+        self._set_combo_data(self.paint_mode_combo, PaintMode.BALANCED.value)
+        self.paint_mode_combo.setToolTip(
+            "How boldly planning may simplify the image to paint faster.\n"
+            "Exact reproduces every quantized pixel with the classic plan.\n"
+            "The optimized modes merge indistinguishable colors, absorb\n"
+            "insignificant specks, and — with automatic brush sizing\n"
+            "calibrated — fill large areas with a big brush first and\n"
+            "paint the details over them."
+        )
         for combo in (
             self.scale_mode_combo,
             self.quality_combo,
             self.crop_alignment_combo,
+            self.paint_mode_combo,
         ):
             combo.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -998,13 +1068,21 @@ class MainWindow(QMainWindow):
         ):
             quick_grid.addWidget(QLabel(label), 0, column)
             quick_grid.addWidget(control, 1, column)
-        quick_grid.addWidget(QLabel("Crop alignment"), 2, 0)
-        quick_grid.addWidget(self.crop_alignment_combo, 3, 0)
-        for row, checkbox in ((2, self.remove_background_check), (3, self.dither_check)):
+        for column, (label, control) in enumerate(
+            (
+                ("Crop alignment", self.crop_alignment_combo),
+                ("Optimization", self.paint_mode_combo),
+            )
+        ):
+            quick_grid.addWidget(QLabel(label), 2, column)
+            quick_grid.addWidget(control, 3, column)
+        for column, checkbox in enumerate(
+            (self.remove_background_check, self.dither_check)
+        ):
             quick_grid.addWidget(
                 checkbox,
-                row,
-                1,
+                4,
+                column,
                 alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             )
 
@@ -1030,7 +1108,7 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(self.logical_width_spin)
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
-        quick_grid.addWidget(self.custom_resolution_panel, 4, 0, 1, 2)
+        quick_grid.addWidget(self.custom_resolution_panel, 5, 0, 1, 2)
 
         self.background_removal_panel = QFrame()
         self.background_removal_panel.setObjectName("inlinePanel")
@@ -1084,7 +1162,7 @@ class MainWindow(QMainWindow):
         removal_grid.setColumnStretch(1, 1)
         removal_grid.setColumnStretch(2, 1)
         self.background_removal_panel.setVisible(False)
-        quick_grid.addWidget(self.background_removal_panel, 5, 0, 1, 2)
+        quick_grid.addWidget(self.background_removal_panel, 6, 0, 1, 2)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)
@@ -1200,11 +1278,20 @@ class MainWindow(QMainWindow):
         self.hue_bar_status = CalibrationStatus("Hue bar")
         self.brush_slider_status = CalibrationStatus("Size track", optional=True)
         self.brush_preview_status = CalibrationStatus("Brush preview", optional=True)
+        self.square_shape_status = CalibrationStatus("Square shape", optional=True)
+        self.circle_shape_status = CalibrationStatus("Circle shape", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
         self.calibrate_brush_preview_button = QPushButton("Set")
+        self.calibrate_square_shape_button = QPushButton("Set")
+        self.calibrate_circle_shape_button = QPushButton("Set")
+        shape_hint = (
+            "Optional. With neither shape button calibrated, painting keeps\n"
+            "whatever brush shape Rust has selected; with both calibrated,\n"
+            "optimized modes switch between square and circle automatically."
+        )
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -1214,6 +1301,16 @@ class MainWindow(QMainWindow):
                 self.brush_preview_status,
                 self.calibrate_brush_preview_button,
                 "Calibrate brush preview",
+            ),
+            (
+                self.square_shape_status,
+                self.calibrate_square_shape_button,
+                "Calibrate the square brush-shape button.\n" + shape_hint,
+            ),
+            (
+                self.circle_shape_status,
+                self.calibrate_circle_shape_button,
+                "Calibrate the circle brush-shape button.\n" + shape_hint,
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -1528,6 +1625,7 @@ class MainWindow(QMainWindow):
         self.color_count_combo.currentIndexChanged.connect(self._schedule_processing)
         self.dither_check.toggled.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
+        self.paint_mode_combo.currentIndexChanged.connect(self._on_paint_mode_changed)
         self.add_text_button.clicked.connect(self._add_text_layer)
         self.duplicate_text_button.clicked.connect(self._duplicate_selected_text_layer)
         self.remove_text_button.clicked.connect(self._remove_text_layer)
@@ -1572,9 +1670,52 @@ class MainWindow(QMainWindow):
         self.apply_brush_check.toggled.connect(
             lambda _checked: self._refresh_profile_ui()
         )
+        # Brush sizing decides whether optimized plans may use larger brushes.
+        self.apply_brush_check.toggled.connect(self._schedule_processing)
 
     def _current_overpaint_gap(self) -> int | None:
         return MERGE_MODE_GAPS.get(str(self.merge_combo.currentData()), 6)
+
+    def _current_paint_mode(self) -> str:
+        # A calibration chart measures the raw material response, so it is
+        # always planned exactly, whatever the user's normal mode is.
+        if self._painting_calibration_chart():
+            return PaintMode.EXACT.value
+        return str(self.paint_mode_combo.currentData() or PaintMode.BALANCED.value)
+
+    def _brush_capabilities(self) -> BrushCapabilities:
+        """What the optimizer may plan with, given the current calibration."""
+
+        slider = self._profile_rect("brush_slider")
+        preview = self._profile_rect("brush_preview")
+        canvas = self._profile_rect("canvas")
+        cell_pixels = 0.0
+        if canvas is not None:
+            cell_pixels = min(
+                canvas.width / max(1, self.logical_width_spin.value()),
+                canvas.height / max(1, self.logical_height_spin.value()),
+            )
+        return BrushCapabilities(
+            sizing=bool(
+                self.apply_brush_check.isChecked()
+                and slider is not None
+                and preview is not None
+            ),
+            square=self._profile_rect("square_shape_button") is not None,
+            circle=self._profile_rect("circle_shape_button") is not None,
+            cell_pixels=cell_pixels,
+        )
+
+    @Slot()
+    def _on_paint_mode_changed(self, *_args: Any) -> None:
+        self._sync_paint_mode_dependent_controls()
+        self._schedule_processing()
+
+    def _sync_paint_mode_dependent_controls(self) -> None:
+        """Stroke merging is superseded by the optimizer outside Exact mode."""
+
+        exact = self.paint_mode_combo.currentData() == PaintMode.EXACT.value
+        self.merge_combo.setEnabled(exact)
 
     @staticmethod
     def _text_layer_label(index: int, layer: _TextOverlayOptions) -> str:
@@ -2172,6 +2313,8 @@ class MainWindow(QMainWindow):
             self._current_overpaint_gap(),
             self._text_overlay_options(),
             self._color_correction_model(),
+            self._current_paint_mode(),
+            self._brush_capabilities(),
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
@@ -2190,8 +2333,22 @@ class MainWindow(QMainWindow):
         if not self.paint_preview.is_interacting:
             self._refresh_text_editor_layers()
         self.preview_tabs.setCurrentIndex(1)
+        optimization = result.optimization
         merged_away = result.unmerged_stroke_count - result.plan.stroke_count
-        if merged_away > 0 and result.unmerged_stroke_count > 0:
+        if optimization is not None:
+            saved_note = ""
+            if merged_away > 0 and result.unmerged_stroke_count > 0:
+                saved_percent = merged_away * 100.0 / result.unmerged_stroke_count
+                saved_note = (
+                    f", {result.unmerged_stroke_count:,}→"
+                    f"{result.plan.stroke_count:,} strokes (−{saved_percent:.0f}%)"
+                )
+            merge_note = (
+                f"  •  {optimization.mode} optimization: "
+                f"{optimization.input_colors}→{optimization.output_colors} colors"
+                f"{saved_note}  •  ~{optimization.similarity_percent:.0f}% similar"
+            )
+        elif merged_away > 0 and result.unmerged_stroke_count > 0:
             saved_percent = merged_away * 100.0 / result.unmerged_stroke_count
             merge_note = (
                 f"  •  stroke merging removed {merged_away:,} strokes "
@@ -2284,14 +2441,46 @@ class MainWindow(QMainWindow):
         )
         stroke_ms = plan.stroke_count * self.stroke_delay_spin.value()
         dot_ms = dot_count * self.dot_duration_spin.value()
-        brush_ms = (
-            self.dot_duration_spin.value() + self.brush_delay_spin.value()
-            if self.apply_brush_check.isChecked()
+        brush_seconds = 0.0
+        if (
+            self.apply_brush_check.isChecked()
             and self._profile_rect("brush_slider") is not None
-            else 0
-        )
+        ):
+            settle = max(self.brush_delay_spin.value() / 1000.0, 0.16)
+            click = self.dot_duration_spin.value() / 1000.0
+            searched: set[int] = set()
+            previous_diameter: int | None = None
+            searches = 0
+            revisits = 0
+            for group in plan.color_groups:
+                diameter = max(1, group.brush_diameter)
+                if diameter == previous_diameter:
+                    continue
+                if diameter in searched:
+                    revisits += 1
+                else:
+                    searches += 1
+                    searched.add(diameter)
+                previous_diameter = diameter
+            # A fresh diameter binary-searches the slider with ~7 preview
+            # measurements; a revisit replays one remembered click.
+            brush_seconds = searches * 7 * (settle + click) + revisits * (settle + click)
+        shape_changes = 0
+        tracked_shape: str | None = None
+        for group in plan.color_groups:
+            if group.brush_shape is not None and group.brush_shape != tracked_shape:
+                shape_changes += 1
+                tracked_shape = group.brush_shape
+        shape_seconds = shape_changes * (
+            self.brush_delay_spin.value() + self.dot_duration_spin.value()
+        ) / 1000.0
         movement_seconds = travel / max(1.0, self.stroke_speed_spin.value())
-        return movement_seconds + (color_ms + stroke_ms + dot_ms + brush_ms) / 1000.0
+        return (
+            movement_seconds
+            + (color_ms + stroke_ms + dot_ms) / 1000.0
+            + brush_seconds
+            + shape_seconds
+        )
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -2389,6 +2578,16 @@ class MainWindow(QMainWindow):
                 "brush_preview", "gray brush-preview tile"
             )
         )
+        self.calibrate_square_shape_button.clicked.connect(
+            lambda: self._begin_calibration(
+                "square_shape_button", "square brush-shape button"
+            )
+        )
+        self.calibrate_circle_shape_button.clicked.connect(
+            lambda: self._begin_calibration(
+                "circle_shape_button", "circle brush-shape button"
+            )
+        )
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
@@ -2407,6 +2606,7 @@ class MainWindow(QMainWindow):
             self.background_combo,
             self.transparency_combo,
             self.quality_combo,
+            self.paint_mode_combo,
             self.logical_width_spin,
             self.logical_height_spin,
             self.color_count_combo,
@@ -2481,6 +2681,9 @@ class MainWindow(QMainWindow):
             preset = str(image.get("quality_preset", "balanced")).replace("_", " ").title()
             if self.quality_combo.findText(preset) >= 0:
                 self.quality_combo.setCurrentText(preset)
+            self._set_combo_data(
+                self.paint_mode_combo, str(image.get("paint_mode", "balanced"))
+            )
             self.logical_width_spin.setValue(int(image.get("logical_width", 256)))
             self.logical_height_spin.setValue(int(image.get("logical_height", 128)))
             self._set_combo_data(self.color_count_combo, int(image.get("color_count", 32)))
@@ -2639,6 +2842,7 @@ class MainWindow(QMainWindow):
         )
         self._on_transparency_changed()
         self._on_background_removal_changed()
+        self._sync_paint_mode_dependent_controls()
         self._refresh_text_editor_layers()
 
     def _settings_document(self) -> dict[str, Any]:
@@ -2648,6 +2852,7 @@ class MainWindow(QMainWindow):
             "scale_mode": self.scale_mode_combo.currentData(),
             "crop_alignment": self.crop_alignment_combo.currentData(),
             "quality_preset": self.quality_combo.currentText().lower().replace(" ", "_"),
+            "paint_mode": str(self.paint_mode_combo.currentData() or "balanced"),
             "logical_width": self.logical_width_spin.value(),
             "logical_height": self.logical_height_spin.value(),
             "color_count": int(self.color_count_combo.currentData()),
@@ -2797,6 +3002,12 @@ class MainWindow(QMainWindow):
         self.brush_preview_status.set_calibrated(
             bool(status.get("brush_preview")), brush_optional
         )
+        self.square_shape_status.set_calibrated(
+            bool(status.get("square_shape_button")), True
+        )
+        self.circle_shape_status.set_calibrated(
+            bool(status.get("circle_shape_button")), True
+        )
         correction = (
             profile.metadata.get("color_correction")
             if profile and isinstance(profile.metadata, dict)
@@ -2856,6 +3067,8 @@ class MainWindow(QMainWindow):
                     "hue_bar",
                     "brush_slider",
                     "brush_preview",
+                    "square_shape_button",
+                    "circle_shape_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
@@ -2972,6 +3185,8 @@ class MainWindow(QMainWindow):
                 "hue_bar",
                 "brush_slider",
                 "brush_preview",
+                "square_shape_button",
+                "circle_shape_button",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -3014,6 +3229,14 @@ class MainWindow(QMainWindow):
         self._refresh_profile_ui()
         if field == "canvas":
             self._update_quality_dimensions()
+        elif field in {
+            "brush_slider",
+            "brush_preview",
+            "square_shape_button",
+            "circle_shape_button",
+        }:
+            # These calibrations change what the optimizer may plan with.
+            self._schedule_processing()
 
     def _refresh_display_warning(self) -> None:
         profile = self._current_profile
@@ -3052,6 +3275,8 @@ class MainWindow(QMainWindow):
                     ("Hue bar", getattr(profile, "hue_bar", None)),
                     ("Size track", getattr(profile, "brush_slider", None)),
                     ("Brush preview", getattr(profile, "brush_preview", None)),
+                    ("Square shape", getattr(profile, "square_shape_button", None)),
+                    ("Circle shape", getattr(profile, "circle_shape_button", None)),
                 )
                 if rect is not None
             ]
@@ -3227,6 +3452,8 @@ class MainWindow(QMainWindow):
             self.quality_combo.setCurrentText("Very Fast")
             self.color_count_combo.setCurrentText("32")
             self.dither_check.setChecked(False)
+            # The chart measures raw swatches, so it must be planned exactly.
+            self._set_combo_data(self.paint_mode_combo, PaintMode.EXACT.value)
             self.load_image(path)
             self.color_correction_status.setText(
                 "Chart loading • paint it, then click Measure Painted Chart"
@@ -3589,6 +3816,7 @@ class MainWindow(QMainWindow):
             self.removal_tolerance_spin,
             self.removal_scope_combo,
             self.quality_combo,
+            self.paint_mode_combo,
             self.logical_width_spin,
             self.logical_height_spin,
             self.color_count_combo,
@@ -3614,6 +3842,8 @@ class MainWindow(QMainWindow):
             self.calibrate_hue_bar_button,
             self.calibrate_brush_button,
             self.calibrate_brush_preview_button,
+            self.calibrate_square_shape_button,
+            self.calibrate_circle_shape_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -3653,6 +3883,7 @@ class MainWindow(QMainWindow):
             custom = self.quality_combo.currentText() == "Custom"
             self.logical_width_spin.setEnabled(custom)
             self.logical_height_spin.setEnabled(custom)
+            self._sync_paint_mode_dependent_controls()
             has_profile = self._current_profile is not None
             self.rename_profile_button.setEnabled(has_profile)
             self.delete_profile_button.setEnabled(has_profile)
@@ -3819,6 +4050,8 @@ class MainWindow(QMainWindow):
         names = ["canvas", "color_box", "hue_bar"]
         if apply_brush_size:
             names.extend(("brush_slider", "brush_preview"))
+        # The optional shape buttons are only checked when they exist.
+        names.extend(("square_shape_button", "circle_shape_button"))
         for name in names:
             rectangle = getattr(profile, name, None)
             if rectangle is None:

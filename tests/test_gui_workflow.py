@@ -63,6 +63,35 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
     assert not window.start_button.isEnabled()
 
 
+def test_optimization_mode_merges_colors_and_gates_controls(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    # Balanced is the recommended default, and it supersedes stroke merging.
+    assert window.paint_mode_combo.currentData() == "balanced"
+    assert not window.merge_combo.isEnabled()
+    window._set_combo_data(window.paint_mode_combo, "exact")
+    assert window.merge_combo.isEnabled()
+
+    # The two brush-shape calibrations advertise themselves as optional.
+    assert window.square_shape_status._value.text() == "Optional"
+    assert window.circle_shape_status._value.text() == "Optional"
+
+    source_path = tmp_path / "flat.png"
+    image = Image.new("RGB", (64, 32), (250, 250, 250))
+    for x in range(10):
+        image.putpixel((x, 0), (252, 250, 250))
+    image.save(source_path)
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    # The near-identical whites collapse into a single paint pass, and with
+    # no brush calibration the plan never promises a larger brush.
+    assert len(window._plan.color_groups) == 1
+    assert all(group.brush_diameter == 1 for group in window._plan.color_groups)
+    assert "optimization" in window.processing_label.text()
+
+
 def test_text_overlay_is_editable_and_included_in_paint_plan(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
