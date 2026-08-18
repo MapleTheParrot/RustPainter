@@ -532,6 +532,38 @@ def remove_background(
     return Image.fromarray(array, mode="RGBA"), remaining
 
 
+# Hue is meaningless for a near-neutral color: five levels of channel spread on
+# a near-white pixel swing it by nearly 180 degrees.  Median cut happily spends
+# several palette slots on such pixels, and each one then gets a fully saturated
+# hue click that only a click one or two pixels from the edge of the saturation
+# box pulls back, so any calibration slack there paints visible pastel speckle.
+# Four percent is about ten levels of spread on white - invisible on screen, and
+# well under any deliberate pastel.
+_NEUTRAL_SATURATION_LIMIT = 0.04
+
+
+def _snap_near_neutrals(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Flatten painted colors too faint to carry a hue onto the gray axis."""
+
+    painted = rgb[mask]
+    if painted.size == 0:
+        return rgb
+    high = painted.max(axis=1).astype(np.int16)
+    low = painted.min(axis=1).astype(np.int16)
+    # Saturation the way the picker defines it, rearranged so a black pixel does
+    # not divide by zero.
+    faint = (high - low) <= np.rint(high * _NEUTRAL_SATURATION_LIMIT)
+    if not faint.any():
+        return rgb
+    # The picker's value axis is the largest channel, so the gray it would hand
+    # back at zero saturation is that channel repeated.
+    painted = painted.copy()
+    painted[faint] = high[faint, None].astype(np.uint8)
+    snapped = rgb.copy()
+    snapped[mask] = painted
+    return snapped
+
+
 def quantize_image(
     image: Image.Image,
     color_count: int,
@@ -551,7 +583,9 @@ def quantize_image(
         mask = np.asarray(paint_mask, dtype=np.bool_)
         if mask.shape != (rgba.height, rgba.width):
             raise ValueError("Paint mask dimensions must match the image")
-    rgb = array[:, :, :3]
+    # Snapping before the palette is built stops a handful of indistinguishable
+    # near-whites from each consuming a palette slot the artwork could use.
+    rgb = _snap_near_neutrals(array[:, :, :3], mask)
 
     painted_colors = rgb[mask]
     if painted_colors.size == 0:
@@ -578,7 +612,14 @@ def quantize_image(
             dtype=np.uint8,
         ).copy()
 
-    output = np.dstack((mapped_rgb, np.where(mask, 255, 0).astype(np.uint8)))
+    # Median cut can reintroduce a faint tint by averaging a mixed bucket, so the
+    # palette it produced gets the same treatment.
+    output = np.dstack(
+        (
+            _snap_near_neutrals(mapped_rgb, mask),
+            np.where(mask, 255, 0).astype(np.uint8),
+        )
+    )
     return Image.fromarray(output, mode="RGBA")
 
 

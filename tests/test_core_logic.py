@@ -131,6 +131,42 @@ class TransparencyAndQuantizationTests(unittest.TestCase):
         self.assertEqual(result.getpixel((4, 0))[3], 0)
 
 
+    def test_faint_tints_snap_to_gray_and_deliberate_pastels_survive(self) -> None:
+        # A near-white pixel's hue is noise, and the picker would commit to it.
+        image = Image.new("RGBA", (3, 1))
+        image.putdata(
+            [(250, 252, 255, 255), (252, 253, 252, 255), (210, 225, 250, 255)]
+        )
+
+        result = quantize_image(image, 16)
+
+        self.assertEqual(result.getpixel((0, 0))[:3], (255, 255, 255))
+        self.assertEqual(result.getpixel((1, 0))[:3], (253, 253, 253))
+        self.assertEqual(result.getpixel((2, 0))[:3], (210, 225, 250))
+
+    def test_snapping_keeps_palette_slots_for_the_artwork(self) -> None:
+        # Four indistinguishable near-whites must not each buy a hued entry.
+        image = Image.new("RGBA", (6, 1))
+        image.putdata(
+            [
+                (252, 253, 252, 255),
+                (254, 252, 251, 255),
+                (252, 252, 253, 255),
+                (251, 254, 253, 255),
+                (250, 190, 44, 255),
+                (120, 60, 220, 255),
+            ]
+        )
+
+        result = quantize_image(image, 4)
+
+        painted = [result.getpixel((x, 0))[:3] for x in range(6)]
+        for gray in painted[:4]:
+            self.assertEqual(len(set(gray)), 1, gray)
+        # Every palette entry the near-whites did not need stays with the art.
+        self.assertEqual(painted[4], (250, 190, 44))
+        self.assertEqual(painted[5], (120, 60, 220))
+
 
 class CoordinateTests(unittest.TestCase):
     def test_logical_pixels_map_to_cell_centers_on_negative_monitor(self) -> None:
