@@ -148,6 +148,91 @@ def calculate_scaled_size(
     return target_size
 
 
+# sRGB transfer function.  Resampling has to happen in linear light: averaging
+# gamma-encoded values weighs perceptual codes instead of photons, which lands a
+# heavy downscale of a detailed photo about twenty RGB levels dark.
+def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
+    return np.where(
+        values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4
+    ).astype(np.float32)
+
+
+def _linear_to_srgb(values: np.ndarray) -> np.ndarray:
+    clamped = np.clip(values, 0.0, 1.0)
+    return np.where(
+        clamped <= 0.0031308,
+        clamped * 12.92,
+        1.055 * clamped ** (1.0 / 2.4) - 0.055,
+    ).astype(np.float32)
+
+
+# Decoding always starts from an 8-bit channel, so the transfer function is a
+# 256-entry lookup instead of a fractional power over every pixel of a photo.
+_SRGB_TO_LINEAR = _srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
+
+
+def _fill_crop_box(
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+    centering: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    """The source rectangle Fill keeps, matching ``ImageOps.fit`` without bleed.
+
+    Handing this box straight to the resampler is what stops an extreme source
+    aspect ratio from allocating a huge intermediate image, which is why Fill
+    does not simply crop and then resize.
+    """
+
+    source_width, source_height = source_size
+    target_ratio = target_size[0] / target_size[1]
+    if source_width / source_height >= target_ratio:
+        crop_width, crop_height = target_ratio * source_height, float(source_height)
+    else:
+        crop_width, crop_height = float(source_width), source_width / target_ratio
+    left = (source_width - crop_width) * centering[0]
+    top = (source_height - crop_height) * centering[1]
+    return (left, top, left + crop_width, top + crop_height)
+
+
+def _resample(
+    source: Image.Image,
+    size: tuple[int, int],
+    box: tuple[float, float, float, float] | None = None,
+) -> Image.Image:
+    """Resize RGBA in linear light so brightness survives a heavy downscale.
+
+    Resizing the gamma-encoded image directly is what makes a shrunken photo
+    come out muddy: every output pixel of a 12x reduction averages roughly two
+    hundred source pixels, and averaging sRGB codes systematically underweights
+    the bright ones.  Decoding first and re-encoding after keeps the logical
+    image as bright as the original, so the sign inherits the right exposure.
+    Alpha is already linear and is resampled untouched.
+    """
+
+    array = np.asarray(source.convert("RGBA"), dtype=np.uint8)
+    resized = []
+    # One channel at a time: a phone photo is already fifty megabytes as bytes,
+    # and holding all four as float at once would quadruple that for nothing.
+    for channel in range(4):
+        if channel < 3:
+            plane = _SRGB_TO_LINEAR[array[:, :, channel]]
+        else:
+            plane = np.ascontiguousarray(array[:, :, channel], dtype=np.float32) / 255.0
+        resized.append(
+            np.asarray(
+                Image.fromarray(plane, mode="F").resize(size, _LANCZOS, box=box),
+                dtype=np.float32,
+            )
+        )
+    # Lanczos undershoots at hard edges; clipping before re-encoding keeps the
+    # negative lobe out of the fractional power.
+    rgb = _linear_to_srgb(np.dstack(resized[:3])) * 255.0
+    alpha = np.clip(resized[3], 0.0, 1.0) * 255.0
+    return Image.fromarray(
+        np.rint(np.dstack((rgb, alpha))).astype(np.uint8), mode="RGBA"
+    )
+
+
 def _scale_layer(
     source: Image.Image,
     target_size: tuple[int, int],
@@ -159,7 +244,7 @@ def _scale_layer(
     target_width, target_height = target_size
     if mode is ScaleMode.STRETCH:
         return (
-            source.resize(target_size, _LANCZOS),
+            _resample(source, target_size),
             np.ones((target_height, target_width), dtype=np.bool_),
         )
 
@@ -171,16 +256,17 @@ def _scale_layer(
             CropAlignment.LEFT: (0.0, 0.5),
             CropAlignment.RIGHT: (1.0, 0.5),
         }[alignment]
-        # ImageOps.fit supplies a source crop box directly to resize.  Unlike
-        # resizing a very wide/tall image before cropping, this cannot create a
-        # huge intermediate allocation for an extreme source aspect ratio.
         return (
-            ImageOps.fit(source, target_size, method=_LANCZOS, centering=centering),
+            _resample(
+                source,
+                target_size,
+                box=_fill_crop_box(source.size, target_size, centering),
+            ),
             np.ones((target_height, target_width), dtype=np.bool_),
         )
 
     resized_size = calculate_fit_size(source.size, target_size)
-    resized = source.resize(resized_size, _LANCZOS)
+    resized = _resample(source, resized_size)
     layer = Image.new("RGBA", target_size, (0, 0, 0, 0))
     paste_x = (target_width - resized_size[0]) // 2
     paste_y = (target_height - resized_size[1]) // 2
@@ -459,13 +545,13 @@ def quantize_image(
         raise ValueError("Color count must be between 1 and 256")
     rgba = image.convert("RGBA")
     array = np.asarray(rgba, dtype=np.uint8)
-    rgb = array[:, :, :3]
     if paint_mask is None:
         mask = array[:, :, 3] > 0
     else:
         mask = np.asarray(paint_mask, dtype=np.bool_)
         if mask.shape != (rgba.height, rgba.width):
             raise ValueError("Paint mask dimensions must match the image")
+    rgb = array[:, :, :3]
 
     painted_colors = rgb[mask]
     if painted_colors.size == 0:

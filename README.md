@@ -161,6 +161,16 @@ Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
 
+### How the image is prepared for the picker
+
+One step of the pipeline exists purely to keep the sign faithful to the source:
+
+- **Resampling runs in linear light.** Averaging gamma-encoded sRGB weighs
+  perceptual codes instead of photons, so a phone photo reduced to a few
+  hundred pixels lands roughly twenty RGB levels dark. Decoding before the
+  resize and re-encoding after keeps the shrunken image as bright as what you
+  imported.
+
 The current Rust picker layout is fixed in the application: hue runs bottom to top, saturation increases left to right, brightness decreases top to bottom, and brush size increases left to right.
 
 Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** abort. Abort is designed to release any held mouse button immediately.

@@ -69,6 +69,18 @@ class AspectTransformTests(unittest.TestCase):
         self.assertEqual(pixels(left), [(255, 0, 0, 255), (0, 255, 0, 255)])
         self.assertEqual(pixels(right), [(0, 0, 255, 255), (255, 255, 0, 255)])
 
+    def test_downscale_preserves_brightness_in_linear_light(self) -> None:
+        # Half black, half white is half the light, which sRGB encodes as 188.
+        # Averaging the gamma-encoded codes instead would land near 128 and take
+        # the whole sign with it.
+        checker = (np.indices((64, 64)).sum(axis=0) % 2 * 255).astype(np.uint8)
+        source = Image.fromarray(checker).convert("RGBA")
+
+        result, _ = scale_image(source, (8, 8), "stretch")
+
+        levels = np.asarray(result.convert("RGB"), dtype=np.int16)
+        self.assertTrue(np.all(np.abs(levels - 188) <= 2), levels.min())
+
     def test_stretch_uses_exact_logical_size(self) -> None:
         source = Image.new("RGBA", (5, 2), (20, 40, 60, 255))
         result, mask = scale_image(source, (3, 7), "stretch")
@@ -117,6 +129,7 @@ class TransparencyAndQuantizationTests(unittest.TestCase):
         painted = array[:, :, :3][mask]
         self.assertLessEqual(len(np.unique(painted, axis=0)), 2)
         self.assertEqual(result.getpixel((4, 0))[3], 0)
+
 
 
 class CoordinateTests(unittest.TestCase):
