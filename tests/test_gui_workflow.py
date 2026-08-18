@@ -10,10 +10,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import numpy as np
 from PIL import Image
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QColorDialog
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import MainWindow, _PendingPaint
-from app.gui.widgets import CountdownDialog
+from app.gui.widgets import ColorButton, CountdownDialog
 from app.input_controller import MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, ScaleMode, Stroke, TransparencyMode
 from app.painter import Painter, PainterState
@@ -58,18 +61,29 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     Image.new("RGB", (128, 64), (0, 0, 0)).save(source_path)
     window.quality_combo.setCurrentText("Custom")
     window.logical_width_spin.setValue(128)
-    window.text_enabled_check.setChecked(True)
+    assert window.text_edit.isEnabled()
     window.text_edit.setText("RUST")
     window.text_size_spin.setValue(30)
     window.text_color_button.set_color("#FFFFFF", emit=True)
     window.text_bold_check.setChecked(True)
+    window.add_text_button.click()
+    window.text_edit.setText("BIRD")
+    window.text_color_button.set_color("#55FF55", emit=True)
 
     window.load_image(source_path)
     qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
 
     assert window.text_options_panel.isEnabled()
     assert window.text_font_combo.currentFont().family()
+    assert len(window._text_layers) == 2
+    assert len(window.paint_preview._items) == 2
+    assert window.paint_preview._items[1].defaultTextColor().name() == "#55ff55"
     assert window._processed is not None
+    old_y = window._text_layers[1].y
+    item = window.paint_preview._items[1]
+    item.setPos(item.pos().x(), item.pos().y() + 3)
+    assert window._text_layers[1].y > old_y
+    qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
     pixels = np.asarray(window._processed.image.convert("RGB"))
     assert np.any(pixels > 128)
     assert len(window._plan.color_groups) >= 2
@@ -81,6 +95,25 @@ def test_dithering_uses_a_single_labeled_checkbox(window: MainWindow) -> None:
         label.text() == "Enabled"
         for label in window.findChildren(main_window_module.QLabel)
     )
+
+
+def test_color_button_previews_changes_before_dialog_confirmation(qtbot) -> None:
+    button = ColorButton("#112233", dialog_title="Choose text color")
+    qtbot.addWidget(button)
+    observed: list[str] = []
+    button.colorChanged.connect(lambda color: observed.append(color.name()))
+
+    def change_then_cancel() -> None:
+        dialog = button.findChild(QColorDialog)
+        assert dialog is not None
+        dialog.setCurrentColor(QColor("#55ff55"))
+        dialog.reject()
+
+    QTimer.singleShot(0, change_then_cancel)
+    button.click()
+
+    assert "#55ff55" in observed
+    assert button.color().name() == "#112233"
 
 
 def test_primary_workspace_separates_daily_flow_from_advanced_settings(

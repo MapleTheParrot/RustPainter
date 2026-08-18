@@ -7,6 +7,20 @@ import pytest
 from app.settings import SettingsError, SettingsStore, default_settings
 
 
+def _text_layer(**overrides):
+    return {
+        "text": "",
+        "font_family": "",
+        "font_size": 24,
+        "color": "#FFFFFF",
+        "x": 0.5,
+        "y": 0.5,
+        "bold": False,
+        "italic": False,
+        **overrides,
+    }
+
+
 def test_settings_store_deep_merges_new_defaults_and_persists_updates(tmp_path) -> None:
     path = tmp_path / "settings.json"
     path.write_text(
@@ -39,14 +53,18 @@ def test_default_settings_returns_independent_documents() -> None:
     first["image"]["color_count"] = 8
     assert second["image"]["color_count"] == 32
     assert second["image"]["text_overlay"] == {
-        "enabled": False,
-        "text": "",
-        "font_family": "",
-        "font_size": 24,
-        "color": "#FFFFFF",
-        "position": "center",
-        "bold": False,
-        "italic": False,
+        "layers": [
+            {
+                "text": "",
+                "font_family": "",
+                "font_size": 24,
+                "color": "#FFFFFF",
+                "x": 0.5,
+                "y": 0.5,
+                "bold": False,
+                "italic": False,
+            }
+        ]
     }
 
 
@@ -93,9 +111,18 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
         ({"image": {"background_mode": "purple"}}, "background_mode"),
         ({"image": {"background_color": "white"}}, "background_color"),
         ({"image": {"transparent_pixels": "discard"}}, "transparent_pixels"),
-        ({"image": {"text_overlay": {"font_size": 2}}}, "font_size"),
-        ({"image": {"text_overlay": {"color": "white"}}}, "text_overlay.color"),
-        ({"image": {"text_overlay": {"position": "left"}}}, "position"),
+        (
+            {"image": {"text_overlay": {"layers": [_text_layer(font_size=2)]}}},
+            "font_size",
+        ),
+        (
+            {"image": {"text_overlay": {"layers": [_text_layer(color="white")]}}},
+            "color",
+        ),
+        (
+            {"image": {"text_overlay": {"layers": [_text_layer(x=2.0)]}}},
+            "layers\\[0\\].x",
+        ),
         ({"painting": {"brush_size": 1.01}}, "brush_size"),
         (
             {"painting": {"stroke_speed_pixels_per_second": float("nan")}},

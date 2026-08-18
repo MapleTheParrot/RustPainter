@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,9 @@ from PIL import Image, ImageOps, ImageQt
 from PySide6.QtCore import (
     QByteArray,
     QObject,
+    QPointF,
     QRunnable,
+    QRectF,
     QSize,
     Qt,
     QThreadPool,
@@ -98,6 +100,7 @@ from .widgets import (
     NoWheelSpinBox,
     PreviewLabel,
     QtLogHandler,
+    TextEditorPreview,
 )
 
 
@@ -208,7 +211,8 @@ class _TextOverlayOptions:
     font_family: str
     font_size: int
     color: tuple[int, int, int]
-    position: str = "center"
+    x: float = 0.5
+    y: float = 0.5
     bold: bool = False
     italic: bool = False
 
@@ -236,13 +240,14 @@ def _build_simulation_image(processed: ProcessedImage) -> Image.Image:
     return Image.fromarray(checker, mode="RGB")
 
 
-def _apply_text_overlay(
+def _apply_text_overlays(
     processed: ProcessedImage,
-    overlay_options: _TextOverlayOptions | None,
+    overlay_options: tuple[_TextOverlayOptions, ...],
 ) -> ProcessedImage:
-    """Render text in logical-pixel space before the final palette pass."""
+    """Render text layers in logical-pixel space before the final palette pass."""
 
-    if overlay_options is None or not overlay_options.text.strip():
+    visible_layers = tuple(layer for layer in overlay_options if layer.text.strip())
+    if not visible_layers:
         return processed
 
     width, height = processed.size
@@ -250,27 +255,23 @@ def _apply_text_overlay(
     overlay_qt.fill(Qt.GlobalColor.transparent)
     painter = QPainter(overlay_qt)
     try:
-        font = QFont(overlay_options.font_family)
-        font.setPixelSize(max(1, overlay_options.font_size))
-        font.setBold(overlay_options.bold)
-        font.setItalic(overlay_options.italic)
-        painter.setFont(font)
-        painter.setPen(QColor(*overlay_options.color))
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-
-        margin = max(2, round(min(width, height) * 0.04))
-        bounds = overlay_qt.rect().adjusted(margin, margin, -margin, -margin)
-        vertical_alignment = {
-            "top": Qt.AlignmentFlag.AlignTop,
-            "center": Qt.AlignmentFlag.AlignVCenter,
-            "bottom": Qt.AlignmentFlag.AlignBottom,
-        }.get(overlay_options.position, Qt.AlignmentFlag.AlignVCenter)
-        flags = (
-            int(Qt.AlignmentFlag.AlignHCenter)
-            | int(vertical_alignment)
-            | int(Qt.TextFlag.TextWordWrap)
-        )
-        painter.drawText(bounds, flags, overlay_options.text)
+        for layer in visible_layers:
+            font = QFont(layer.font_family)
+            font.setPixelSize(max(1, layer.font_size))
+            font.setBold(layer.bold)
+            font.setItalic(layer.italic)
+            painter.setFont(font)
+            painter.setPen(QColor(*layer.color))
+            text_bounds = painter.fontMetrics().boundingRect(layer.text)
+            bounds = QRectF(
+                0.0,
+                0.0,
+                max(1.0, float(text_bounds.width() + 4)),
+                max(1.0, float(text_bounds.height() + 4)),
+            )
+            bounds.moveCenter(QPointF(layer.x * width, layer.y * height))
+            painter.drawText(bounds, int(Qt.AlignmentFlag.AlignCenter), layer.text)
     finally:
         painter.end()
 
@@ -299,21 +300,21 @@ class _ImageWorker(QRunnable):
         image: Image.Image,
         options: ImageProcessOptions,
         overpaint_gap: int | None = 0,
-        text_overlay: _TextOverlayOptions | None = None,
+        text_overlays: tuple[_TextOverlayOptions, ...] = (),
     ) -> None:
         super().__init__()
         self.serial = serial
         self.image = image
         self.options = options
         self.overpaint_gap = overpaint_gap
-        self.text_overlay = text_overlay
+        self.text_overlays = text_overlays
         self.signals = _WorkerSignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            processed = process_image(self.image, self.options)
-            processed = _apply_text_overlay(processed, self.text_overlay)
+            base_processed = process_image(self.image, self.options)
+            processed = _apply_text_overlays(base_processed, self.text_overlays)
             plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
             if self.overpaint_gap == 0:
                 unmerged_stroke_count = plan.stroke_count
@@ -324,7 +325,9 @@ class _ImageWorker(QRunnable):
                         processed, overpaint_gap=0
                     )
                 )
-            simulation = _build_simulation_image(processed)
+            # Text stays as live vector items in the editor preview. The paint
+            # plan above still uses the composited, palette-limited result.
+            simulation = _build_simulation_image(base_processed)
             stroke_pixel_steps = sum(
                 max(0, stroke.pixel_count - 1)
                 for group in plan.color_groups
@@ -478,6 +481,11 @@ class MainWindow(QMainWindow):
         self._calibration_overlay: Any = None
         self._calibration_preview: CalibrationPreviewOverlay | None = None
         self._applying_speed_preset = False
+        self._text_layers = [
+            _TextOverlayOptions("", "", 24, (255, 255, 255))
+        ]
+        self._selected_text_layer = 0
+        self._syncing_text_controls = False
         self._closing = False
         self._painter_bridge = _PainterBridge()
         self._painter_bridge.progress.connect(self._on_paint_progress)
@@ -785,8 +793,9 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         self.original_preview = PreviewLabel("Browse an image to begin")
-        self.paint_preview = PreviewLabel(
-            "Paint simulation will appear here", smooth=False
+        self.paint_preview = TextEditorPreview("Paint simulation will appear here")
+        self.paint_preview.setToolTip(
+            "Select a text layer and drag it directly to position it."
         )
         tabs.addTab(self.original_preview, "Source")
         tabs.addTab(self.paint_preview, "Rust preview")
@@ -951,13 +960,14 @@ class MainWindow(QMainWindow):
         text_heading = QHBoxLayout()
         text_title = QLabel("Text overlay")
         text_title.setObjectName("sectionTitle")
-        self.text_enabled_check = QCheckBox("Add text")
-        self.text_enabled_check.setToolTip(
-            "Place editable text over the artwork before it is converted into a paint plan."
-        )
+        self.add_text_button = QPushButton("Add text")
+        self.add_text_button.setObjectName("compactButton")
+        self.remove_text_button = QPushButton("Remove")
+        self.remove_text_button.setObjectName("compactButton")
         text_heading.addWidget(text_title)
         text_heading.addStretch(1)
-        text_heading.addWidget(self.text_enabled_check)
+        text_heading.addWidget(self.add_text_button)
+        text_heading.addWidget(self.remove_text_button)
         image_layout.addLayout(text_heading)
 
         self.text_options_panel = QFrame()
@@ -966,6 +976,8 @@ class MainWindow(QMainWindow):
         text_grid.setContentsMargins(10, 9, 10, 9)
         text_grid.setHorizontalSpacing(8)
         text_grid.setVerticalSpacing(7)
+        self.text_layer_combo = NoWheelComboBox()
+        self.text_layer_combo.addItem("Text 1")
         self.text_edit = QLineEdit()
         self.text_edit.setPlaceholderText("Type text for the image")
         self.text_edit.setMaxLength(500)
@@ -980,11 +992,6 @@ class MainWindow(QMainWindow):
         self.text_color_button = ColorButton(
             "#ffffff", dialog_title="Choose text color"
         )
-        self.text_position_combo = NoWheelComboBox()
-        self.text_position_combo.addItem("Top", "top")
-        self.text_position_combo.addItem("Center", "center")
-        self.text_position_combo.addItem("Bottom", "bottom")
-        self._set_combo_data(self.text_position_combo, "center")
         self.text_bold_check = QCheckBox("Bold")
         self.text_italic_check = QCheckBox("Italic")
         text_style_layout = QHBoxLayout()
@@ -994,20 +1001,20 @@ class MainWindow(QMainWindow):
         text_style_layout.addWidget(self.text_italic_check)
         text_style_layout.addStretch(1)
 
-        text_grid.addWidget(QLabel("Text"), 0, 0)
-        text_grid.addWidget(self.text_edit, 0, 1, 1, 3)
-        text_grid.addWidget(QLabel("Font"), 1, 0)
-        text_grid.addWidget(self.text_font_combo, 1, 1, 1, 3)
-        text_grid.addWidget(QLabel("Size"), 2, 0)
-        text_grid.addWidget(self.text_size_spin, 2, 1)
-        text_grid.addWidget(QLabel("Color"), 2, 2)
-        text_grid.addWidget(self.text_color_button, 2, 3)
-        text_grid.addWidget(QLabel("Position"), 3, 0)
-        text_grid.addWidget(self.text_position_combo, 3, 1)
-        text_grid.addLayout(text_style_layout, 3, 2, 1, 2)
+        text_grid.addWidget(QLabel("Layer"), 0, 0)
+        text_grid.addWidget(self.text_layer_combo, 0, 1, 1, 3)
+        text_grid.addWidget(QLabel("Text"), 1, 0)
+        text_grid.addWidget(self.text_edit, 1, 1, 1, 3)
+        text_grid.addWidget(QLabel("Font"), 2, 0)
+        text_grid.addWidget(self.text_font_combo, 2, 1, 1, 3)
+        text_grid.addWidget(QLabel("Size"), 3, 0)
+        text_grid.addWidget(self.text_size_spin, 3, 1)
+        text_grid.addWidget(QLabel("Color"), 3, 2)
+        text_grid.addWidget(self.text_color_button, 3, 3)
+        text_grid.addWidget(QLabel("Style"), 4, 0)
+        text_grid.addLayout(text_style_layout, 4, 1, 1, 3)
         text_grid.setColumnStretch(1, 1)
         text_grid.setColumnStretch(3, 1)
-        self.text_options_panel.setEnabled(False)
         image_layout.addWidget(self.text_options_panel)
         layout.addWidget(image_group)
 
@@ -1356,14 +1363,17 @@ class MainWindow(QMainWindow):
         self.color_count_combo.currentIndexChanged.connect(self._schedule_processing)
         self.dither_check.toggled.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
-        self.text_enabled_check.toggled.connect(self._on_text_enabled_toggled)
-        self.text_edit.textChanged.connect(self._schedule_processing)
-        self.text_font_combo.currentFontChanged.connect(self._schedule_processing)
-        self.text_size_spin.valueChanged.connect(self._schedule_processing)
-        self.text_color_button.colorChanged.connect(self._schedule_processing)
-        self.text_position_combo.currentIndexChanged.connect(self._schedule_processing)
-        self.text_bold_check.toggled.connect(self._schedule_processing)
-        self.text_italic_check.toggled.connect(self._schedule_processing)
+        self.add_text_button.clicked.connect(self._add_text_layer)
+        self.remove_text_button.clicked.connect(self._remove_text_layer)
+        self.text_layer_combo.currentIndexChanged.connect(self._select_text_layer)
+        self.text_edit.textChanged.connect(self._on_text_control_changed)
+        self.text_font_combo.currentFontChanged.connect(self._on_text_control_changed)
+        self.text_size_spin.valueChanged.connect(self._on_text_control_changed)
+        self.text_color_button.colorChanged.connect(self._on_text_control_changed)
+        self.text_bold_check.toggled.connect(self._on_text_control_changed)
+        self.text_italic_check.toggled.connect(self._on_text_control_changed)
+        self.paint_preview.layerMoved.connect(self._on_text_layer_moved)
+        self.paint_preview.layerSelected.connect(self._select_text_layer)
         self.speed_preset_combo.currentIndexChanged.connect(self._apply_speed_preset)
         for timing in (
             self.stroke_speed_spin,
@@ -1393,10 +1403,125 @@ class MainWindow(QMainWindow):
     def _current_overpaint_gap(self) -> int | None:
         return MERGE_MODE_GAPS.get(str(self.merge_combo.currentData()), 6)
 
-    @Slot(bool)
-    def _on_text_enabled_toggled(self, enabled: bool) -> None:
-        self.text_options_panel.setEnabled(enabled)
+    @staticmethod
+    def _text_layer_label(index: int, layer: _TextOverlayOptions) -> str:
+        summary = " ".join(layer.text.strip().split())
+        if len(summary) > 22:
+            summary = summary[:21] + "…"
+        return f"Text {index + 1}" + (f" — {summary}" if summary else "")
+
+    def _rebuild_text_layer_combo(self) -> None:
+        self.text_layer_combo.blockSignals(True)
+        self.text_layer_combo.clear()
+        for index, layer in enumerate(self._text_layers):
+            self.text_layer_combo.addItem(self._text_layer_label(index, layer), index)
+        self.text_layer_combo.setCurrentIndex(self._selected_text_layer)
+        self.text_layer_combo.blockSignals(False)
+        self.remove_text_button.setEnabled(bool(self._text_layers))
+
+    def _sync_text_controls(self) -> None:
+        if not self._text_layers:
+            return
+        layer = self._text_layers[self._selected_text_layer]
+        self._syncing_text_controls = True
+        try:
+            self.text_edit.setText(layer.text)
+            if layer.font_family:
+                self.text_font_combo.setCurrentFont(QFont(layer.font_family))
+            self.text_size_spin.setValue(layer.font_size)
+            self.text_color_button.set_color(QColor(*layer.color))
+            self.text_bold_check.setChecked(layer.bold)
+            self.text_italic_check.setChecked(layer.italic)
+        finally:
+            self._syncing_text_controls = False
+
+    @Slot()
+    def _add_text_layer(self) -> None:
+        color = self.text_color_button.color()
+        offset = min(0.24, len(self._text_layers) * 0.06)
+        self._text_layers.append(
+            _TextOverlayOptions(
+                "",
+                self.text_font_combo.currentFont().family(),
+                self.text_size_spin.value(),
+                (color.red(), color.green(), color.blue()),
+                x=min(0.85, 0.5 + offset),
+                y=min(0.85, 0.5 + offset),
+                bold=self.text_bold_check.isChecked(),
+                italic=self.text_italic_check.isChecked(),
+            )
+        )
+        self._selected_text_layer = len(self._text_layers) - 1
+        self._rebuild_text_layer_combo()
+        self._sync_text_controls()
+        self._refresh_text_editor_layers()
+        self.text_edit.setFocus()
+        self._schedule_settings_save()
+
+    @Slot()
+    def _remove_text_layer(self) -> None:
+        if len(self._text_layers) > 1:
+            self._text_layers.pop(self._selected_text_layer)
+            self._selected_text_layer = min(
+                self._selected_text_layer, len(self._text_layers) - 1
+            )
+        else:
+            self._text_layers[0] = replace(self._text_layers[0], text="")
+        self._rebuild_text_layer_combo()
+        self._sync_text_controls()
+        self._refresh_text_editor_layers()
         self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot(int)
+    def _select_text_layer(self, index: int) -> None:
+        if not 0 <= index < len(self._text_layers):
+            return
+        self._selected_text_layer = index
+        if self.text_layer_combo.currentIndex() != index:
+            self.text_layer_combo.blockSignals(True)
+            self.text_layer_combo.setCurrentIndex(index)
+            self.text_layer_combo.blockSignals(False)
+        self._sync_text_controls()
+        self.paint_preview.select_layer(index)
+
+    def _on_text_control_changed(self, *_args: Any) -> None:
+        if self._syncing_text_controls or not self._text_layers:
+            return
+        current = self._text_layers[self._selected_text_layer]
+        color = self.text_color_button.color()
+        self._text_layers[self._selected_text_layer] = replace(
+            current,
+            text=self.text_edit.text(),
+            font_family=self.text_font_combo.currentFont().family(),
+            font_size=self.text_size_spin.value(),
+            color=(color.red(), color.green(), color.blue()),
+            bold=self.text_bold_check.isChecked(),
+            italic=self.text_italic_check.isChecked(),
+        )
+        self._rebuild_text_layer_combo()
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot(int, float, float)
+    def _on_text_layer_moved(self, index: int, x: float, y: float) -> None:
+        if not 0 <= index < len(self._text_layers):
+            return
+        self._text_layers[index] = replace(
+            self._text_layers[index],
+            x=min(max(x, 0.0), 1.0),
+            y=min(max(y, 0.0), 1.0),
+        )
+        self._selected_text_layer = index
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    def _refresh_text_editor_layers(self) -> None:
+        self.paint_preview.set_layers(
+            self._text_layers,
+            self._selected_text_layer,
+        )
 
     def _speed_preset_values(self) -> dict[str, float]:
         return {
@@ -1685,19 +1810,8 @@ class MainWindow(QMainWindow):
             alpha_threshold=0,
         )
 
-    def _text_overlay_options(self) -> _TextOverlayOptions | None:
-        if not self.text_enabled_check.isChecked() or not self.text_edit.text().strip():
-            return None
-        color = self.text_color_button.color()
-        return _TextOverlayOptions(
-            text=self.text_edit.text(),
-            font_family=self.text_font_combo.currentFont().family(),
-            font_size=self.text_size_spin.value(),
-            color=(color.red(), color.green(), color.blue()),
-            position=str(self.text_position_combo.currentData() or "center"),
-            bold=self.text_bold_check.isChecked(),
-            italic=self.text_italic_check.isChecked(),
-        )
+    def _text_overlay_options(self) -> tuple[_TextOverlayOptions, ...]:
+        return tuple(self._text_layers)
 
     @Slot()
     def _start_processing(self) -> None:
@@ -1730,6 +1844,7 @@ class MainWindow(QMainWindow):
         self._plan_stroke_pixel_steps = result.stroke_pixel_steps
         self._plan_dot_count = result.dot_count
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
+        self._refresh_text_editor_layers()
         self.preview_tabs.setCurrentIndex(1)
         merged_away = result.unmerged_stroke_count - result.plan.stroke_count
         if merged_away > 0 and result.unmerged_stroke_count > 0:
@@ -1942,14 +2057,6 @@ class MainWindow(QMainWindow):
             self.color_count_combo,
             self.dither_check,
             self.merge_combo,
-            self.text_enabled_check,
-            self.text_edit,
-            self.text_font_combo,
-            self.text_size_spin,
-            self.text_color_button,
-            self.text_position_combo,
-            self.text_bold_check,
-            self.text_italic_check,
             self.show_calibration_check,
             self.background_color_button,
             self.pixel_spacing_spin,
@@ -2026,20 +2133,52 @@ class MainWindow(QMainWindow):
                 image.get("transparent_pixels", "leave_unpainted"),
             )
             text_overlay = image.get("text_overlay", {})
-            self.text_enabled_check.setChecked(
+            layer_values = text_overlay.get("layers", [])
+            if (
                 bool(text_overlay.get("enabled", False))
-            )
-            self.text_edit.setText(str(text_overlay.get("text", "")))
-            font_family = str(text_overlay.get("font_family", ""))
-            if font_family:
-                self.text_font_combo.setCurrentFont(QFont(font_family))
-            self.text_size_spin.setValue(int(text_overlay.get("font_size", 24)))
-            self.text_color_button.set_color(text_overlay.get("color", "#ffffff"))
-            self._set_combo_data(
-                self.text_position_combo, text_overlay.get("position", "center")
-            )
-            self.text_bold_check.setChecked(bool(text_overlay.get("bold", False)))
-            self.text_italic_check.setChecked(bool(text_overlay.get("italic", False)))
+                and str(text_overlay.get("text", "")).strip()
+                and (
+                    not layer_values
+                    or not any(str(layer.get("text", "")).strip() for layer in layer_values)
+                )
+            ):
+                position_y = {"top": 0.12, "center": 0.5, "bottom": 0.88}.get(
+                    str(text_overlay.get("position", "center")), 0.5
+                )
+                layer_values = [
+                    {
+                        "text": text_overlay.get("text", ""),
+                        "font_family": text_overlay.get("font_family", ""),
+                        "font_size": text_overlay.get("font_size", 24),
+                        "color": text_overlay.get("color", "#FFFFFF"),
+                        "x": 0.5,
+                        "y": position_y,
+                        "bold": text_overlay.get("bold", False),
+                        "italic": text_overlay.get("italic", False),
+                    }
+                ]
+            self._text_layers = []
+            for layer_value in layer_values:
+                color = QColor(str(layer_value.get("color", "#FFFFFF")))
+                self._text_layers.append(
+                    _TextOverlayOptions(
+                        text=str(layer_value.get("text", "")),
+                        font_family=str(layer_value.get("font_family", "")),
+                        font_size=int(layer_value.get("font_size", 24)),
+                        color=(color.red(), color.green(), color.blue()),
+                        x=float(layer_value.get("x", 0.5)),
+                        y=float(layer_value.get("y", 0.5)),
+                        bold=bool(layer_value.get("bold", False)),
+                        italic=bool(layer_value.get("italic", False)),
+                    )
+                )
+            if not self._text_layers:
+                self._text_layers = [
+                    _TextOverlayOptions("", "", 24, (255, 255, 255))
+                ]
+            self._selected_text_layer = 0
+            self._rebuild_text_layer_combo()
+            self._sync_text_controls()
 
             self.pixel_spacing_spin.setValue(
                 float(painting.get("logical_pixel_spacing", 1.0))
@@ -2109,7 +2248,7 @@ class MainWindow(QMainWindow):
             else logging.INFO
         )
         self._on_transparency_changed()
-        self._on_text_enabled_toggled(self.text_enabled_check.isChecked())
+        self._refresh_text_editor_layers()
 
     def _settings_document(self) -> dict[str, Any]:
         current = self._settings.copy()
@@ -2126,14 +2265,19 @@ class MainWindow(QMainWindow):
             "background_color": self.background_color_button.color().name().upper(),
             "transparent_pixels": self.transparency_combo.currentData(),
             "text_overlay": {
-                "enabled": self.text_enabled_check.isChecked(),
-                "text": self.text_edit.text(),
-                "font_family": self.text_font_combo.currentFont().family(),
-                "font_size": self.text_size_spin.value(),
-                "color": self.text_color_button.color().name().upper(),
-                "position": self.text_position_combo.currentData(),
-                "bold": self.text_bold_check.isChecked(),
-                "italic": self.text_italic_check.isChecked(),
+                "layers": [
+                    {
+                        "text": layer.text,
+                        "font_family": layer.font_family,
+                        "font_size": layer.font_size,
+                        "color": "#{:02X}{:02X}{:02X}".format(*layer.color),
+                        "x": layer.x,
+                        "y": layer.y,
+                        "bold": layer.bold,
+                        "italic": layer.italic,
+                    }
+                    for layer in self._text_layers
+                ]
             },
         }
         current["painting"] = {

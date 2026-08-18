@@ -133,12 +133,13 @@ QFrame#metricCard {{
 }}
 QLabel#muted, QLabel.muted {{ color: {MUTED}; }}
 QLabel#metricValue {{ font-size: 13pt; font-weight: 700; color: {TEXT}; }}
-QLabel#preview {{
+QLabel#preview, QGraphicsView#preview {{
     background: #0d0c0b;
     border: 1px dashed {BORDER_LIGHT};
     border-radius: 10px;
     color: #7a6c60;
 }}
+QGraphicsView#preview {{ padding: 0; }}
 QPushButton {{
     background: #221c17;
     border: 1px solid {BORDER_LIGHT};
