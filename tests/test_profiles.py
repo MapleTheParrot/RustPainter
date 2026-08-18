@@ -46,6 +46,8 @@ def _complete_profile() -> Profile:
         hue_bar=Rect(1937, 610, 40, 252),
         brush_slider=Rect(1760, 392, 265, 34),
         brush_preview=Rect(1400, 970, 160, 160),
+        square_shape_button=Rect(1700, 340, 36, 36),
+        circle_shape_button=Rect(1744, 340, 36, 36),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -73,6 +75,8 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "hue_bar": True,
         "brush_slider": True,
         "brush_preview": True,
+        "square_shape_button": True,
+        "circle_shape_button": True,
     }
     assert restored.display is not None
     assert restored.display.virtual_screen == Rect(-1920, 0, 4480, 1440)
@@ -100,6 +104,9 @@ def test_profile_deserializer_accepts_legacy_names_and_rect_edges() -> None:
     assert profile.value_direction == "top_bright"
     assert profile.brush_slider is None
     assert profile.brush_preview is None
+    # Documents written before the optional shape buttons existed stay valid.
+    assert profile.square_shape_button is None
+    assert profile.circle_shape_button is None
 
 
 def test_profile_store_crud_and_default_survive_reload(tmp_path) -> None:
