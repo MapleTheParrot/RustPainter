@@ -26,6 +26,27 @@ class ScaleMode(str, Enum):
     STRETCH = "stretch"
 
 
+class PaintMode(str, Enum):
+    """How aggressively planning may trade fidelity for painting speed.
+
+    ``EXACT`` preserves the raw quantized image and the classic row-by-row
+    plan.  The other modes run the optimizer pipeline with progressively
+    looser perceptual tolerances and progressively bolder brush work.
+    """
+
+    EXACT = "exact"
+    QUALITY = "quality"
+    BALANCED = "balanced"
+    FAST = "fast"
+
+
+class BrushShape(str, Enum):
+    """The two Rust brush shapes planning understands."""
+
+    SQUARE = "square"
+    CIRCLE = "circle"
+
+
 class CropAlignment(str, Enum):
     CENTER = "center"
     TOP = "top"
@@ -255,9 +276,18 @@ class Stroke:
 
 @dataclass(frozen=True, slots=True)
 class ColorGroup:
+    """Strokes sharing one color, and optionally one brush size and shape.
+
+    ``brush_diameter`` is in logical cells.  The defaults describe every plan
+    the classic pipeline produces, so existing plans keep their meaning: one
+    cell per stroke, whatever brush shape Rust currently has selected.
+    """
+
     color: RGBColor
     strokes: tuple[Stroke, ...]
     pixel_count: int
+    brush_diameter: int = 1
+    brush_shape: str | None = None
 
     @property
     def rgb(self) -> RGBColor:
