@@ -43,6 +43,18 @@ def _settings(**overrides: object) -> PainterSettings:
     return PainterSettings(**values)  # type: ignore[arg-type]
 
 
+def _panel_capture(rect) -> Image.Image:
+    """A flat capture of Rust's panel colour.
+
+    The mouse-safety tests declare real input so the guards engage, which also
+    turns on the picker measurement.  Handing them a stub keeps them off the
+    real desktop: a flat region has no widget in it, so the measurement finds
+    nothing to trim and the calibration is used exactly as written.
+    """
+
+    return Image.new("RGB", (rect.width, rect.height), (21, 21, 12))
+
+
 def _dot_plan(count: int) -> PaintPlan:
     strokes = tuple(Stroke(x, 0, x, 0) for x in range(count))
     return PaintPlan(
@@ -719,7 +731,7 @@ class _HandInput(MockInputController):
 def test_mouse_movement_pauses_and_resume_repeats_the_interrupted_stroke() -> None:
     input_controller = _HandInput()
     input_controller.hand_offset = (60, 40)
-    painter = Painter(input_controller)
+    painter = Painter(input_controller, screen_capture=_panel_capture)
     painter.start(
         _dot_plan(4),
         _profile(),
@@ -752,7 +764,7 @@ def test_queued_input_lag_is_not_mistaken_for_mouse_movement() -> None:
     # several events ago.  That must never read as a hand on the mouse.
     input_controller = _HandInput()
     input_controller.report_lag = 4
-    painter = Painter(input_controller)
+    painter = Painter(input_controller, screen_capture=_panel_capture)
     painter.start(
         _dot_plan(12),
         _profile(),
@@ -775,6 +787,7 @@ def test_corner_emergency_stop_still_aborts_while_paused() -> None:
     painter = Painter(
         input_controller,
         virtual_screen_provider=lambda: VirtualScreen(0, 0, 1200, 900),
+        screen_capture=_panel_capture,
     )
     painter.start(
         _dot_plan(400),

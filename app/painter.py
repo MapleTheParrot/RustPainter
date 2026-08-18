@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Iterator
 
@@ -22,6 +22,7 @@ from .color_mapping import map_rgb_to_picker
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
 from .models import BrushShape, PaintPlan, RGBColor, ScreenRect
+from .picker_calibration import trim_to_widget
 from .screen import (
     ForegroundRequirement,
     VirtualScreen,
@@ -770,6 +771,7 @@ class Painter:
             # RUNNING is set before the first guard so a zero-second countdown
             # can still enter the ordinary PAUSED state when focus is wrong.
             self._checkpoint(check_focus=True)
+            job.target = self._measured_picker_target(job.target)
             self._update_progress_state(PainterState.RUNNING, "Painting")
             self._execute_plan(job)
             self._checkpoint(check_focus=False)
@@ -949,6 +951,47 @@ class Painter:
             best_fraction,
         )
         return True
+
+    def _measured_picker_target(self, target: PaintingTarget) -> PaintingTarget:
+        """Shrink the picker rectangles to the widgets Rust is really drawing.
+
+        A rectangle dragged one pixel wide sends saturation 0 and hue 0 degrees
+        onto the panel behind the widget, where the click does nothing at all
+        and the color stays whatever the previous group selected.  Measuring
+        here rather than at calibration time means profiles already on disk are
+        corrected too, and a picker that moved slightly is re-measured on every
+        run.  Any failure leaves the calibration exactly as the user drew it.
+        """
+
+        if not getattr(self.input, "emits_real_input", True):
+            return target
+        measured: dict[str, ScreenRect] = {}
+        for name in ("color_box", "hue_bar"):
+            rect = getattr(target, name)
+            region = ScreenRect(rect.left, rect.top, rect.width, rect.height)
+            try:
+                trimmed = trim_to_widget(self._screen_capture(region), region)
+            except Exception:
+                LOGGER.warning(
+                    "Could not measure the %s; using it as calibrated", name, exc_info=True
+                )
+                continue
+            if trimmed == region:
+                continue
+            LOGGER.info(
+                "Trimmed %s to the drawn widget: %d,%d %dx%d -> %d,%d %dx%d",
+                name,
+                region.left,
+                region.top,
+                region.width,
+                region.height,
+                trimmed.left,
+                trimmed.top,
+                trimmed.width,
+                trimmed.height,
+            )
+            measured[name] = trimmed
+        return replace(target, **measured) if measured else target
 
     def _measure_brush_preview(self, preview: RectangleLike) -> BrushFootprint:
         """Measure the preview, retrying tiny brushes with tighter center crops.

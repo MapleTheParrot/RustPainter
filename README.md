@@ -131,7 +131,7 @@ painting unattended. Everything below is detail you only need when tuning.
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
 2. Open the target sign's painting interface and leave it stationary.
 3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
-4. Calibrate the **canvas**, **color box**, and **hue bar**. Drag just inside each usable region; do not include borders. The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through and hide automatically while painting).
+4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through and hide automatically while painting).
 5. If automatic brush sizing is wanted, also calibrate the clickable **Size track** and the separate gray **brush-preview tile** that displays the current brush footprint.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
@@ -216,6 +216,19 @@ The current Rust picker layout is fixed in the application: hue runs bottom to t
 Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** abort. Abort is designed to release any held mouse button immediately.
 
 ## Calibration and DPI notes
+
+Before the first stroke of every job, the calibrated color box and hue bar are
+captured and shrunk to the widget Rust is actually drawing inside them. This
+matters more than it sounds: the mapping sends saturation 0, saturation 1,
+value 0, value 1, and hue 0 degrees to the exact edges of the stored rectangle,
+so overshooting a hue bar by one pixel puts every one of those clicks on the
+panel behind it. Rust ignores such a click, the color silently stays whatever
+was selected before, and grays, whites, blacks, and pure reds paint in a
+leftover color. Measuring at paint time rather than at calibration time means
+profiles already on disk are corrected without recalibrating, and a picker that
+shifted by a pixel is re-measured on the next run. A capture that does not
+clearly show the picker leaves the calibration exactly as you drew it.
+
 
 RustPainter opts into per-monitor DPI awareness before creating the GUI and stores virtual-desktop screen coordinates plus the current display layout with each profile. This supports Windows scaling and monitors left/above the primary display (negative coordinates). A display-layout warning means that the profile should be recalibrated before painting.
 
