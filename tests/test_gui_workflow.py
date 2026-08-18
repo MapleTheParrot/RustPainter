@@ -16,7 +16,6 @@ from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import MainWindow, _PendingPaint
-from app.brush_calibration import build_brush_response
 from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
 from app.input_controller import MockInputController
@@ -974,48 +973,6 @@ def test_preview_ignores_the_correction_while_the_chart_is_loaded(
     window._image_path = chart
 
     assert window._color_correction_model() is None
-
-
-def test_a_measured_brush_stands_in_for_the_preview_tile(window: MainWindow) -> None:
-    # A calibrated Size track is enough for sizing now: a real job measures
-    # the brush on the canvas at start when no curve is stored yet. A stored
-    # curve additionally hands the planner its measured extremes.
-    profile = window._current_profile
-    assert profile is not None
-    profile.canvas = ScreenRect(200, 150, 1400, 1100)
-    profile.brush_slider = ScreenRect(1700, 400, 240, 20)
-    profile.brush_preview = None
-    window.apply_brush_check.setChecked(True)
-
-    assert not window._has_brush_response()
-    capabilities = window._brush_capabilities()
-    assert capabilities.sizing
-    assert capabilities.min_brush_pixels == 0.0
-    assert capabilities.max_brush_pixels == 0.0
-
-    profile.metadata["brush_response"] = build_brush_response(
-        [(0.0, 4.0), (0.5, 34.0), (1.0, 64.0)]
-    ).to_dict()
-
-    assert window._has_brush_response()
-    capabilities = window._brush_capabilities()
-    assert capabilities.sizing
-    assert capabilities.min_brush_pixels == pytest.approx(4.0)
-    assert capabilities.max_brush_pixels == pytest.approx(64.0)
-
-
-def test_the_profile_panel_reports_the_measured_brush_range(window: MainWindow) -> None:
-    profile = window._current_profile
-    assert profile is not None
-    profile.metadata["brush_response"] = build_brush_response(
-        [(0.0, 4.0), (1.0, 64.0)]
-    ).to_dict()
-
-    window._refresh_profile_ui()
-
-    assert "4" in window.brush_response_status.text()
-    assert "64" in window.brush_response_status.text()
-    assert window.clear_brush_response_button.isEnabled()
 
 
 def test_custom_resolution_tracks_both_canvas_axes(window: MainWindow) -> None:

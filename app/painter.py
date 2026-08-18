@@ -16,18 +16,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Iterator
 
-from .brush_calibration import (
-    BrushFootprint,
-    BrushResponse,
-    BrushResponseSet,
-    build_brush_response,
-    measure_brush_footprint,
-    prime_spacing,
-    prime_sweeps,
-    probe_sites,
-    probe_sites_within,
-    ProbeSite,
-)
+from .brush_calibration import BrushFootprint, measure_brush_footprint
 from .color_calibration import ColorCorrectionModel
 from .color_mapping import map_rgb_to_picker
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
@@ -149,7 +138,6 @@ class PaintingTarget:
     color_correction: ColorCorrectionModel | None = None
     square_shape_button: RectangleLike | None = None
     circle_shape_button: RectangleLike | None = None
-    brush_responses: BrushResponseSet | None = None
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -168,18 +156,6 @@ class PaintingTarget:
             if isinstance(correction_value, Mapping)
             else None
         )
-        response_value = (
-            metadata.get("brush_response") if isinstance(metadata, Mapping) else None
-        )
-        try:
-            responses = (
-                BrushResponseSet.from_dict(response_value)
-                if isinstance(response_value, Mapping)
-                else None
-            )
-        except ValueError:
-            LOGGER.warning("Ignoring an unreadable stored brush response")
-            responses = None
         return cls(
             canvas=canvas,
             color_box=color_box,
@@ -194,7 +170,6 @@ class PaintingTarget:
             color_correction=correction,
             square_shape_button=getattr(profile, "square_shape_button", None),
             circle_shape_button=getattr(profile, "circle_shape_button", None),
-            brush_responses=responses,
         )
 
 
@@ -383,9 +358,6 @@ class _Job:
     plan: PaintPlan
     target: PaintingTarget
     settings: PainterSettings
-    # A measurement run reuses every guard the painter already has - countdown,
-    # focus, pause epochs, corner stop - and simply paints a different thing.
-    probe_count: int = 0
 
 
 class _AbortRequested(Exception):
@@ -455,7 +427,6 @@ class Painter:
         # (diameter in logical cells, brush shape), so returning to a diameter
         # under the same shape is one deterministic click, not a fresh search.
         self._brush_fractions: dict[tuple[int, str | None], float] = {}
-        self._brush_responses: BrushResponseSet | None = None
         self._last_progress_emit = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
@@ -544,9 +515,6 @@ class Painter:
             ):
                 raise RuntimeError("Cannot replace a paint job while one is active")
             self._job = _Job(plan, target, resolved_settings)
-            # Curves surfaced by the previous job must never be mistaken for
-            # this one's; an inline measurement will repopulate them.
-            self._brush_responses = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -743,22 +711,14 @@ class Painter:
                 raise ValueError(
                     "Brush-size application is enabled, but no brush slider is calibrated"
                 )
-            if (
-                target.brush_preview is None
-                and target.brush_responses is None
-                # Real input can measure the brush on the canvas at job start,
-                # so only input that cannot paint probes needs a source now.
-                and not getattr(self.input, "emits_real_input", True)
-            ):
+            if target.brush_preview is None:
                 raise ValueError(
-                    "Automatic brush sizing is enabled, but the brush has neither a "
-                    "measured response nor a calibrated preview tile"
+                    "Automatic brush sizing is enabled, but the brush preview tile "
+                    "is not calibrated"
                 )
             if target.brush_slider.width <= 0 or target.brush_slider.height <= 0:
                 raise ValueError("brush slider calibration must have positive dimensions")
-            if target.brush_preview is not None and (
-                target.brush_preview.width <= 0 or target.brush_preview.height <= 0
-            ):
+            if target.brush_preview.width <= 0 or target.brush_preview.height <= 0:
                 raise ValueError("brush preview calibration must have positive dimensions")
         # A dry run only visualizes the plan, so it may carry brush metadata
         # that real input could not honor with the current calibration.
@@ -819,14 +779,9 @@ class Painter:
             # can still enter the ordinary PAUSED state when focus is wrong.
             self._checkpoint(check_focus=True)
             job.target = self._measured_picker_target(job.target)
-            if job.probe_count:
-                self._update_progress_state(PainterState.RUNNING, "Measuring the brush")
-                self._execute_brush_measurement(job)
-            else:
-                self._prepare_brush_for_job(job)
-                self._update_progress_state(PainterState.RUNNING, "Painting")
-                self._execute_plan(job)
-                self._verify_and_touch_up(job)
+            self._update_progress_state(PainterState.RUNNING, "Painting")
+            self._execute_plan(job)
+            self._verify_and_touch_up(job)
             self._checkpoint(check_focus=False)
             self._finish_completed()
             self._update_progress_state(PainterState.COMPLETED, "Completed")
@@ -893,11 +848,7 @@ class Painter:
         settings = job.settings
         slider = job.target.brush_slider
         preview = job.target.brush_preview
-        responses = job.target.brush_responses
-        response = responses.for_shape(shape_key) if responses is not None else None
-        if not settings.apply_brush_size or slider is None:
-            return False
-        if preview is None and response is None:
+        if not settings.apply_brush_size or slider is None or preview is None:
             return False
         cell = min(
             job.target.canvas.width / job.plan.width,
@@ -916,26 +867,6 @@ class Painter:
             if self.input.emits_real_input
             else 0.0
         )
-        if response is not None:
-            # A curve measured on the canvas already answers the only question
-            # that matters - how wide this brush paints - so the whole search,
-            # and every preview capture it costs, is skipped.
-            self._require_reachable_brush(response, target_diameter, diameter_cells)
-            self._require_cell_sized_brush(
-                response, diameter_cells, cell, job.target.canvas
-            )
-            fraction = response.fraction_for(target_diameter)
-            self._safe_click(self._slider_point(slider, fraction), epoch)
-            self._interruptible_sleep(
-                preview_settle_seconds, epoch=epoch, check_focus=True
-            )
-            LOGGER.debug(
-                "Brush set from the measured curve: %.1f px wanted, %.1f px at %.3f",
-                target_diameter,
-                response.diameter_for(fraction),
-                fraction,
-            )
-            return False
         cached_fraction = self._brush_fractions.get((diameter_cells, shape_key))
         if cached_fraction is not None:
             # The Size track is click-to-set, so repeating the exact click the
@@ -1027,8 +958,7 @@ class Painter:
                 f"The smallest brush the Size track reached renders {best_diameter:.0f}px "
                 f"in the preview, but one logical cell is only {cell:.0f}px, so detail "
                 "strokes would overwrite their neighbours. Lower the painting "
-                "resolution, calibrate a larger sign, or measure the brush on the "
-                "canvas for an exact answer."
+                "resolution or calibrate a larger sign."
             )
         if current_fraction is None or abs(current_fraction - best_fraction) > 1e-6:
             self._safe_click(self._slider_point(slider, best_fraction), epoch)
@@ -1043,411 +973,6 @@ class Painter:
             best_fraction,
         )
         return True
-
-    def configure_brush_measurement(
-        self,
-        profile: object | None = None,
-        settings: PainterSettings | Mapping[str, Any] | None = None,
-        *,
-        target: PaintingTarget | None = None,
-        probe_count: int = 6,
-    ) -> None:
-        """Prepare a run that measures the brush on the canvas instead of painting.
-
-        The result lands in :attr:`brush_responses` when the run completes.
-        """
-
-        if target is None:
-            if profile is None:
-                raise ValueError("Brush measurement needs a calibrated profile")
-            target = PaintingTarget.from_profile(profile)
-        if target.brush_slider is None:
-            raise ValueError("Brush measurement needs the Size track calibrated")
-        resolved = (
-            settings
-            if isinstance(settings, PainterSettings)
-            else PainterSettings.from_mapping(settings)
-            if settings is not None
-            else PainterSettings()
-        )
-        # Fails here, before a single stroke, when the canvas cannot hold the
-        # probes every calibrated shape needs.
-        probe_sites(
-            ScreenRect(
-                target.canvas.left,
-                target.canvas.top,
-                target.canvas.width,
-                target.canvas.height,
-            ),
-            probe_count * len(self._measured_shapes(target)),
-        )
-        self.configure(
-            PaintPlan(1, 1, ()), target=target, settings=resolved
-        )
-        with self._condition:
-            if self._job is not None:
-                self._job.probe_count = probe_count
-        self._brush_responses = None
-
-    @property
-    def brush_responses(self) -> BrushResponseSet | None:
-        """The curves measured by the last completed measurement run."""
-
-        return self._brush_responses
-
-    @staticmethod
-    def _measured_shapes(target: PaintingTarget) -> tuple[str | None, ...]:
-        """Which brush shapes a measurement run has to cover for this profile.
-
-        A shape change can render a different footprint at the same slider
-        position, so each calibrated shape earns its own curve.  With no shape
-        buttons calibrated the run measures whatever brush Rust has selected,
-        which is the same brush every pass will then use.
-        """
-
-        shapes = [
-            shape
-            for shape, button in (
-                (BrushShape.SQUARE.value, target.square_shape_button),
-                (BrushShape.CIRCLE.value, target.circle_shape_button),
-            )
-            if button is not None
-        ]
-        return tuple(shapes) if shapes else (None,)
-
-    def _select_measured_shape(
-        self,
-        target: PaintingTarget,
-        shape: str | None,
-        settings: PainterSettings,
-        epoch: int,
-    ) -> None:
-        button = (
-            target.square_shape_button
-            if shape == BrushShape.SQUARE.value
-            else target.circle_shape_button
-            if shape == BrushShape.CIRCLE.value
-            else None
-        )
-        if button is not None:
-            self._select_brush_shape(button, settings, epoch)
-
-    @staticmethod
-    def _contrast_ink(patches: "list[Any]") -> RGBColor:
-        """Black or white, whichever stands further off this sign's own surface.
-
-        The detector separates a dab from its background by distance, so the
-        dab only has to out-contrast the surface it lands on - it does not have
-        to land on a surface we painted first.
-        """
-
-        import numpy as np
-
-        levels = [
-            float(np.median(np.asarray(patch.convert("RGB"), dtype=np.float32)))
-            for patch in patches
-        ]
-        return (0, 0, 0) if sum(levels) / max(1, len(levels)) > 128.0 else (255, 255, 255)
-
-    def _preview_brush_estimate(
-        self, target: PaintingTarget, settings: PainterSettings, epoch: int
-    ) -> float | None:
-        """Roughly how wide the widest brush is, read off Rust's preview tile.
-
-        The tile draws at its own scale, so this is no use as a canvas
-        measurement - that is the whole reason this module exists.  It is
-        perfectly good for deciding how far apart priming sweeps may run,
-        which only needs an order of magnitude.
-        """
-
-        preview = target.brush_preview
-        slider = target.brush_slider
-        if preview is None or slider is None:
-            return None
-        self._safe_click(self._slider_point(slider, 1.0), epoch)
-        self._select_color(
-            (255, 0, 255), target, settings, epoch, apply_correction=False
-        )
-        self._interruptible_sleep(
-            max(settings.delay_after_brush_seconds, 0.16)
-            if self.input.emits_real_input
-            else 0.0,
-            epoch=epoch,
-            check_focus=True,
-        )
-        try:
-            return self._measure_brush_preview(preview).diameter
-        except ValueError as exc:
-            LOGGER.warning("Could not read the brush preview for priming (%s)", exc)
-            return None
-
-    def _stamp_probes(
-        self,
-        target: PaintingTarget,
-        settings: PainterSettings,
-        sites: "tuple[ProbeSite, ...]",
-        shapes: "tuple[str | None, ...]",
-        fractions: "tuple[float, ...]",
-        ink: RGBColor,
-        epoch: int,
-        progress: "Any",
-        offset: int,
-    ) -> None:
-        slider = target.brush_slider
-        assert slider is not None
-        per_shape = len(fractions)
-        self._select_color(ink, target, settings, epoch, apply_correction=False)
-        settle = (
-            max(settings.delay_after_brush_seconds, 0.16)
-            if self.input.emits_real_input
-            else 0.0
-        )
-        for shape_index, shape in enumerate(shapes):
-            self._select_measured_shape(target, shape, settings, epoch)
-            for index, fraction in enumerate(fractions):
-                site = sites[shape_index * per_shape + index]
-                label = f" ({shape})" if shape else ""
-                progress(
-                    offset + shape_index * per_shape + index,
-                    f"Stamping probe {index + 1} of {per_shape}{label}",
-                )
-                self._safe_click(self._slider_point(slider, fraction), epoch)
-                self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
-                self._screen_stroke(site.point, site.point, settings, epoch)
-
-    def _read_probes(
-        self,
-        sites: "tuple[ProbeSite, ...]",
-        shapes: "tuple[str | None, ...]",
-        fractions: "tuple[float, ...]",
-        epoch: int,
-    ) -> "tuple[list[BrushResponse], list[str]]":
-        per_shape = len(fractions)
-        curves: list[BrushResponse] = []
-        failures: list[str] = []
-        for shape_index, shape in enumerate(shapes):
-            named = shape or "brush"
-            samples: list[tuple[float, float]] = []
-            for index, fraction in enumerate(fractions):
-                site = sites[shape_index * per_shape + index]
-                self._checkpoint(epoch=epoch, check_focus=True)
-                try:
-                    footprint = self._measure_footprint(site.patch)
-                except ValueError as exc:
-                    failures.append(f"{named} at {fraction:.2f}: {exc}")
-                    continue
-                if max(footprint.width, footprint.height) >= site.patch.width * 0.8:
-                    failures.append(
-                        f"{named} at {fraction:.2f}: the dab filled its patch"
-                    )
-                    continue
-                samples.append((fraction, footprint.diameter))
-            if len(samples) >= 2:
-                try:
-                    curves.append(build_brush_response(samples, shape=shape))
-                except ValueError as exc:
-                    failures.append(f"{named}: {exc}")
-            else:
-                failures.append(f"{named}: too few probes to build a curve")
-        return curves, failures
-
-    def _prepare_brush_for_job(self, job: _Job) -> None:
-        """Measure the brush on the canvas at job start when no curve exists.
-
-        The manual measurement run needed a blank sign because its dabs land
-        on a full grid.  A paint job already knows exactly which cells it will
-        repaint, so the dabs can be placed only there and the whole ritual
-        disappears into the first seconds of the job.  The measured curves are
-        left on :attr:`brush_responses` for the caller to persist.
-        """
-
-        target, settings = job.target, job.settings
-        if (
-            not getattr(self.input, "emits_real_input", True)
-            or not settings.apply_brush_size
-            or target.brush_slider is None
-            or target.brush_responses is not None
-            or not any(group.strokes for group in job.plan.color_groups)
-        ):
-            return
-        self._update_progress_state(
-            PainterState.RUNNING, "Measuring the brush before painting"
-        )
-        measured = self._measure_brush_inline(job)
-        if measured is not None:
-            job.target = replace(target, brush_responses=measured)
-            return
-        if target.brush_preview is not None:
-            # The preview tile answers at the wrong scale, but a wrong-scale
-            # answer with the gross-mismatch guard beats stopping the job.
-            LOGGER.warning(
-                "Could not measure the brush on this plan's painted area; "
-                "falling back to the preview tile"
-            )
-            return
-        raise RuntimeError(
-            "Automatic brush sizing needs a measured brush, and this plan's "
-            "painted area is too small to measure on. Run Measure Brush on "
-            "Canvas once on a blank sign, or calibrate the brush preview tile."
-        )
-
-    def _measure_brush_inline(self, job: _Job) -> BrushResponseSet | None:
-        """Measure using only probe sites the plan repaints, or ``None``."""
-
-        from .paint_plan import plan_painted_mask
-
-        target = job.target
-        canvas = ScreenRect(
-            target.canvas.left,
-            target.canvas.top,
-            target.canvas.width,
-            target.canvas.height,
-        )
-        shapes = self._measured_shapes(target)
-        per_shape = 5
-        sites = probe_sites_within(
-            canvas, per_shape * len(shapes), plan_painted_mask(job.plan)
-        )
-        available = len(sites) // len(shapes)
-        if available < 3:
-            LOGGER.warning(
-                "Only %d probe sites fit the plan's painted area; not enough "
-                "to measure the brush inline",
-                len(sites),
-            )
-            return None
-        per_shape = min(per_shape, available)
-        try:
-            self._execute_brush_measurement(
-                job, sites=sites[: per_shape * len(shapes)], per_shape=per_shape
-            )
-        except (_AbortRequested, _RetryAction):
-            raise
-        except RuntimeError as exc:
-            LOGGER.warning("Measuring the brush before painting failed: %s", exc)
-            return None
-        return self._brush_responses
-
-    def _execute_brush_measurement(
-        self,
-        job: _Job,
-        *,
-        sites: "tuple[ProbeSite, ...] | None" = None,
-        per_shape: int | None = None,
-    ) -> None:
-        """Stamp one dab per Size-track position on the canvas and measure them.
-
-        Rust's preview tile draws the brush at the tile's own scale, so a
-        footprint measured there answers a different question than the one the
-        planner asks: how many canvas pixels will this brush actually cover.
-        Painting the dabs and reading them back answers it directly, and folds
-        in the brush's soft edge - which is what makes neighbouring cells bleed
-        together - rather than modelling it.
-
-        The dabs land on bare sign.  The detector separates a dab from its
-        surroundings by distance and scales its threshold to the surroundings'
-        own noise, so a dab in a colour that contrasts with the sign reads
-        perfectly well without painting a background first.  Priming is kept
-        for the sign that defeats that, and only then.
-        """
-
-        target, settings = job.target, job.settings
-        slider = target.brush_slider
-        assert slider is not None  # configure_brush_measurement guarantees it
-        canvas = ScreenRect(
-            target.canvas.left,
-            target.canvas.top,
-            target.canvas.width,
-            target.canvas.height,
-        )
-        shapes = self._measured_shapes(target)
-        if per_shape is None:
-            per_shape = job.probe_count
-        if sites is None:
-            sites = probe_sites(canvas, per_shape * len(shapes))
-        # The smallest positions of the track are where a mis-sized brush hurts
-        # most, so the probes crowd the low end rather than spreading evenly.
-        fractions = tuple(
-            round((index / (per_shape - 1)) ** 1.7, 4) for index in range(per_shape)
-        )
-        epoch = self._pause_generation_value()
-        total = len(sites) * 2
-
-        def progress(done: int, message: str) -> None:
-            self._set_progress(
-                color_index=done,
-                total_colors=total,
-                stroke_index_in_color=0,
-                strokes_in_color=0,
-                completed_strokes=done,
-                total_strokes=total,
-                message=message,
-            )
-
-        progress(0, "Reading the bare canvas")
-        bare = []
-        for site in sites:
-            self._checkpoint(epoch=epoch, check_focus=True)
-            bare.append(self._screen_capture(site.patch))
-        ink = self._contrast_ink(bare)
-
-        self._stamp_probes(
-            target, settings, sites, shapes, fractions, ink, epoch, progress, 0
-        )
-        curves, failures = self._read_probes(sites, shapes, fractions, epoch)
-
-        if len(curves) < len(shapes):
-            # Something about this sign defeats reading a dab off it directly -
-            # existing paint, a plank seam through a patch, too little contrast.
-            # Paint a clean background and try once more.  The preview tile is
-            # useless as a canvas measurement but perfectly good for deciding
-            # how far apart the sweeps may run.
-            LOGGER.info(
-                "Falling back to primed probes: %s", "; ".join(failures) or "unknown"
-            )
-            spacing = prime_spacing(
-                self._preview_brush_estimate(target, settings, epoch)
-            )
-            primer = (255, 255, 255) if ink == (0, 0, 0) else (0, 0, 0)
-            self._select_color(
-                primer, target, settings, epoch, apply_correction=False
-            )
-            self._safe_click(self._slider_point(slider, 1.0), epoch)
-            for index, site in enumerate(sites):
-                progress(index, f"Priming probe {index + 1} of {len(sites)}")
-                for stroke_start, stroke_end in prime_sweeps(site.prime, spacing):
-                    self._screen_stroke(stroke_start, stroke_end, settings, epoch)
-            self._stamp_probes(
-                target,
-                settings,
-                sites,
-                shapes,
-                fractions,
-                ink,
-                epoch,
-                progress,
-                len(sites),
-            )
-            curves, failures = self._read_probes(sites, shapes, fractions, epoch)
-
-        if failures:
-            LOGGER.warning(
-                "Some brush probes could not be measured: %s", "; ".join(failures)
-            )
-        if not curves:
-            raise RuntimeError(
-                "The brush could not be measured on the canvas. Confirm the canvas "
-                "calibration covers only the sign and that a solid brush is selected."
-                + (chr(10) + chr(10).join(failures) if failures else "")
-            )
-        self._brush_responses = BrushResponseSet(tuple(curves))
-        for curve in curves:
-            LOGGER.info(
-                "Brush measured on canvas (%s): %s",
-                curve.shape or "current shape",
-                ", ".join(f"{f:.2f}->{d:.0f}px" for f, d in curve.samples),
-            )
-        progress(total, "Brush measured")
 
     def _measured_picker_target(self, target: PaintingTarget) -> PaintingTarget:
         """Shrink the picker rectangles to the widgets Rust is really drawing.
@@ -1490,72 +1015,12 @@ class Painter:
             measured[name] = trimmed
         return replace(target, **measured) if measured else target
 
-    @staticmethod
-    def _require_reachable_brush(
-        response: BrushResponse, target_diameter: float, diameter_cells: int
-    ) -> None:
-        """Refuse a multi-cell pass the Size track measurably cannot paint.
-
-        Adjacent bands overlap by one cell, so a brush up to one cell under its
-        nominal footprint still covers; anything smaller leaves stripes the
-        plan has already counted as painted.
-        """
-
-        if diameter_cells <= 1:
-            return
-        floor = target_diameter * (diameter_cells - 1) / diameter_cells - 0.75
-        if response.largest_diameter >= floor:
-            return
-        raise RuntimeError(
-            f"The Size slider paints at most {response.largest_diameter:.0f}px, and "
-            f"this plan's {diameter_cells}-cell brush needs {target_diameter:.0f}px. "
-            "Choose a lower optimization mode or a higher painting resolution."
-        )
-
     # The plan treats a cell as final once its color's last stroke lands, so a
     # brush that spills half a cell each side starts destroying finished
     # neighbours.  Below this ratio the spill stays inside the seams the plan
     # already tolerates; above it the painted sign visibly diverges from the
     # preview, and stopping beats quietly painting the wrong image.
     _DETAIL_OVERSHOOT_LIMIT = 1.5
-
-    @staticmethod
-    def _require_cell_sized_brush(
-        response: BrushResponse,
-        diameter_cells: int,
-        cell: float,
-        canvas: RectangleLike,
-    ) -> None:
-        """Refuse detail strokes when even the smallest brush dwarfs a cell.
-
-        ``fraction_for`` clamps to the measured range, so without this check a
-        Size track whose minimum dab is wider than a logical cell would simply
-        paint every single-cell stroke with that oversized dab - each stroke
-        overwriting its neighbours, which is exactly the smeared result the
-        guard exists to prevent.
-        """
-
-        if diameter_cells > 1:
-            return
-        smallest = response.smallest_diameter
-        if smallest > cell + 0.75:
-            LOGGER.warning(
-                "The smallest measured brush (%.1fpx) is wider than a %.1fpx "
-                "logical cell; detail strokes will bleed into their neighbours",
-                smallest,
-                cell,
-            )
-        if smallest <= cell * Painter._DETAIL_OVERSHOOT_LIMIT + 0.75:
-            return
-        fit_width = max(1, int(canvas.width / smallest))
-        fit_height = max(1, int(canvas.height / smallest))
-        raise RuntimeError(
-            f"The smallest brush this Size track paints is {smallest:.0f}px, but "
-            f"one logical cell is only {cell:.0f}px, so every detail stroke would "
-            "overwrite its neighbours and the sign would not match the preview. "
-            f"Lower the painting resolution to at most {fit_width}×{fit_height} "
-            "for this canvas, or calibrate a larger sign."
-        )
 
     def _measure_brush_preview(self, preview: RectangleLike) -> BrushFootprint:
         return self._measure_footprint(preview)
@@ -1627,8 +1092,10 @@ class Painter:
                 message="Nothing to paint",
             )
             return
-        sizing_enabled = settings.apply_brush_size and target.brush_slider is not None and (
-            target.brush_preview is not None or target.brush_responses is not None
+        sizing_enabled = (
+            settings.apply_brush_size
+            and target.brush_slider is not None
+            and target.brush_preview is not None
         )
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
@@ -1852,11 +1319,7 @@ class Painter:
         settings: PainterSettings,
         epoch: int,
     ) -> None:
-        """Drag between two physical points, or dab when they are the same.
-
-        Kept apart from logical-cell geometry so brush measurement can paint
-        directly in screen coordinates under the same guards.
-        """
+        """Drag between two physical points, or dab when they are the same."""
 
         self._checkpoint(epoch=epoch, check_focus=True)
         self._move(start_int, epoch)

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-import numpy as np
+import os
 
-from app.models import ColorGroup, PaintPlan, Stroke
+import numpy as np
+from PIL import Image
+
+from app.input_controller import MockInputController
+from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
+from app.painter import Painter, PainterSettings, PainterState
+from app.profiles import CalibrationProfile
 from app.verification import (
     mismatched_cells,
     plan_expectations,
     sample_cell_colors,
     touch_up_plan,
 )
+
+_TIMEOUT_SCALE = float(os.environ.get("RUST_PAINTER_TEST_TIMEOUT_SCALE", "1"))
 
 
 RED = (200, 30, 30)
@@ -108,3 +116,98 @@ def test_uncovered_cells_are_ignored() -> None:
     capture[0:20] = RED
     sampled = sample_cell_colors(capture, plan.width, plan.height)
     assert not mismatched_cells(sampled, indices, palette).any()
+
+
+class _RealishInputController(MockInputController):
+    """A mock that claims to emit real input, so the verify pass runs."""
+
+    emits_real_input = True
+
+
+def _held_travel(controller: MockInputController) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Start and end of every press, so a dab can be told from a drag."""
+
+    spans: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    position = (0, 0)
+    start: tuple[int, int] | None = None
+    for event in controller.events:
+        if event.kind == "move":
+            position = (event.x, event.y)
+        elif event.kind == "mouse_down":
+            start = position
+        elif event.kind == "mouse_up" and start is not None:
+            spans.append((start, position))
+            start = None
+    return spans
+
+
+def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
+    # The painted sign is captured after the job; three cells read decisively
+    # as the *other* plan color and must be repainted - two adjacent ones as a
+    # single stroke, the lone one as a dab. Nothing else may be touched up.
+    red, blue = (200, 30, 30), (30, 60, 200)
+    canvas = ScreenRect(200, 150, 1400, 1100)
+    profile = CalibrationProfile.new(
+        "Verified",
+        canvas=canvas,
+        color_box=ScreenRect(1700, 150, 200, 200),
+        hue_bar=ScreenRect(1950, 150, 20, 200),
+    )
+    corrupted = {(5, 5), (6, 5), (40, 40)}  # logical (x, y)
+
+    def capture(rect):
+        if (rect.width, rect.height) != (canvas.width, canvas.height):
+            return Image.new("RGB", (rect.width, rect.height), (120, 120, 120))
+        pixels = np.zeros((rect.height, rect.width, 3), dtype=np.uint8)
+        for y in range(55):
+            for x in range(70):
+                expected = red if y < 27 else blue
+                if (x, y) in corrupted:
+                    expected = blue if expected == red else red
+                pixels[y * 20 : (y + 1) * 20, x * 20 : (x + 1) * 20] = expected
+        return Image.fromarray(pixels, "RGB")
+
+    controller = _RealishInputController()
+    painter = Painter(controller, screen_capture=capture)
+    plan = PaintPlan(
+        70,
+        55,
+        (
+            ColorGroup(red, tuple(Stroke(0, y, 69, y) for y in range(27)), 27 * 70),
+            ColorGroup(blue, tuple(Stroke(0, y, 69, y) for y in range(27, 55)), 28 * 70),
+        ),
+    )
+    settings = PainterSettings(
+        countdown_seconds=0.0,
+        mouse_down_duration_seconds=0.0,
+        delay_after_hue_seconds=0.0,
+        delay_after_saturation_value_seconds=0.0,
+        delay_between_strokes_seconds=0.0,
+        delay_between_colors_seconds=0.0,
+        delay_after_brush_seconds=0.0,
+        stroke_speed_pixels_per_second=1_000_000.0,
+        stroke_interpolation_step_pixels=4096.0,
+        corner_abort_enabled=False,
+        progress_callback_interval_seconds=0.0,
+        safety_poll_interval_seconds=0.002,
+    )
+
+    assert painter.start(plan, profile, settings)
+    assert painter.wait(90.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    spans = [
+        (start, end)
+        for start, end in _held_travel(controller)
+        if canvas.left <= start[0] < canvas.left + canvas.width
+        and canvas.top <= start[1] < canvas.top + canvas.height
+    ]
+    center = lambda x, y: (canvas.left + x * 20 + 10, canvas.top + y * 20 + 10)
+    # The two adjacent wrong cells merge into one touch-up drag.
+    assert ((center(5, 5), center(6, 5)) in spans) or (
+        (center(6, 5), center(5, 5)) in spans
+    )
+    # The lone wrong cell is repainted as a dab.
+    assert (center(40, 40), center(40, 40)) in spans
+    # The main plan painted 55 row strokes; only two touch-up strokes follow.
+    assert len(spans) == 57

@@ -61,17 +61,12 @@ class BrushCapabilities:
     ``square``/``circle`` mirror the two optional shape-button calibrations.
     ``cell_pixels`` is the physical size of one logical cell, used to keep a
     planned brush inside the slider's realistic range; zero means unknown.
-    ``min_brush_pixels``/``max_brush_pixels`` are the measured extremes of what
-    the Size track actually paints on this canvas; zero means unmeasured, and
-    the planner falls back to a conservative guess for the top end only.
     """
 
     sizing: bool = False
     square: bool = False
     circle: bool = False
     cell_pixels: float = 0.0
-    min_brush_pixels: float = 0.0
-    max_brush_pixels: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,25 +387,13 @@ def _brush_is_achievable(diameter: int, capabilities: BrushCapabilities) -> bool
     """Whether the physical Size track can render a ``diameter``-cell pass.
 
     With no cell size known there is nothing to compare against, so every
-    candidate stays.  A measured top end replaces the conservative
-    ``_MAX_BRUSH_PIXELS`` guess (adjacent bands overlap one cell, so a brush a
-    shade under nominal still covers).  A measured bottom end rules out passes
-    whose brush would overshoot the one-cell safety guard the erosion budgets.
+    candidate stays.
     """
 
     cell = capabilities.cell_pixels
     if cell <= 0:
         return True
-    if capabilities.max_brush_pixels > 0:
-        if capabilities.max_brush_pixels < (diameter - 1) * cell - 0.75:
-            return False
-    elif diameter * cell > _MAX_BRUSH_PIXELS:
-        return False
-    if capabilities.min_brush_pixels > 0 and capabilities.min_brush_pixels > (
-        diameter + 1.5
-    ) * cell:
-        return False
-    return True
+    return diameter * cell <= _MAX_BRUSH_PIXELS
 
 
 def _shape_candidates(capabilities: BrushCapabilities) -> tuple[str | None, ...]:

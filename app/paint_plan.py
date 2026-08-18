@@ -305,29 +305,6 @@ def generate_merged_color_groups(
     return tuple(groups)
 
 
-def plan_painted_mask(plan: PaintPlan) -> np.ndarray:
-    """Cells the plan will paint over, including multi-cell band coverage.
-
-    Uses each pass's nominal footprint - rows within its coverage radius - so
-    the result never counts on accidental spill.  Anything placed under a True
-    cell (a probe dab, existing paint) is repainted before the job finishes.
-    """
-
-    mask = np.zeros((plan.height, plan.width), dtype=np.bool_)
-    for group in plan.color_groups:
-        radius = (max(1, group.brush_diameter) - 1) // 2
-        for stroke in group.strokes:
-            x0 = min(stroke.start_x, stroke.end_x)
-            x1 = max(stroke.start_x, stroke.end_x)
-            y0 = min(stroke.start_y, stroke.end_y)
-            y1 = max(stroke.start_y, stroke.end_y)
-            mask[
-                max(0, y0 - radius) : min(plan.height, y1 + radius + 1),
-                max(0, x0) : min(plan.width, x1 + 1),
-            ] = True
-    return mask
-
-
 def _estimate_mouse_travel(groups: tuple[ColorGroup, ...]) -> float:
     travel = 0.0
     for group in groups:
@@ -424,5 +401,4 @@ __all__ = [
     "group_horizontal_runs",
     "horizontal_runs_for_color",
     "merge_runs_across_gaps",
-    "plan_painted_mask",
 ]
