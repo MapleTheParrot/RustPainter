@@ -4,12 +4,14 @@ import numpy as np
 import pytest
 
 from app.models import PaintMode, PaintPlan
+from app.paint_plan import count_unmerged_strokes, generate_merged_color_groups
 from app.paint_optimizer import (
     BrushCapabilities,
     absorb_insignificant_regions,
     merge_similar_colors,
     mode_options,
     optimize_paint_plan,
+    simplify_colors,
 )
 
 
@@ -202,6 +204,31 @@ def test_partial_mask_is_never_touched() -> None:
     _assert_plan_paints_target(
         result.plan, np.asarray(result.image.convert("RGB")), result.paint_mask
     )
+
+
+def test_unmerged_stroke_count_matches_the_built_plan() -> None:
+    rng = np.random.default_rng(5)
+    image = rng.integers(0, 4, (24, 40))[:, :, None].repeat(3, axis=2) * 60
+    image = image.astype(np.uint8)
+    mask = _full_mask(image)
+    mask[:, 30:] = False
+    built = sum(
+        len(group.strokes)
+        for group in generate_merged_color_groups(image, mask, overpaint_gap=0)
+    )
+    assert count_unmerged_strokes(image, mask) == built
+
+
+def test_simplify_colors_matches_the_full_optimizer_target() -> None:
+    image = _rgb(48, 24, (250, 250, 250))
+    image[4, 4] = (252, 250, 250)
+    image[10:20, 10:30] = (30, 30, 30)
+    simplified, mask = simplify_colors(image, PaintMode.BALANCED)
+    full = optimize_paint_plan(image, PaintMode.BALANCED)
+    assert np.array_equal(
+        np.asarray(simplified.convert("RGB")), np.asarray(full.image.convert("RGB"))
+    )
+    assert np.array_equal(mask, full.paint_mask)
 
 
 def test_oversized_cells_cap_the_brush() -> None:

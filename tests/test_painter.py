@@ -239,9 +239,62 @@ def test_optimized_plan_switches_brush_size_and_shape() -> None:
 
     assert clicks_inside(square_button) == 1
     assert clicks_inside(circle_button) == 1
-    # The third group reuses the 5-cell diameter through the cached slider
-    # fraction, so only the first two diameters ever measured the preview.
-    assert len(measurements) <= 14
+    # Three searches at most: 5 cells under the square, 1 cell, and 5 cells
+    # again under the circle - a shape switch invalidates the cached fraction
+    # because the same slider position can render a different footprint.
+    assert len(measurements) <= 21
+
+
+def test_multi_cell_brush_that_cannot_reach_its_target_fails_loudly() -> None:
+    controller = MockInputController()
+    slider = ScreenRect(800, 100, 101, 12)
+    profile = CalibrationProfile.new(
+        "Weak slider",
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_slider=slider,
+        brush_preview=ScreenRect(800, 150, 100, 100),
+    )
+
+    def capture_preview(_rect) -> Image.Image:
+        x, _y = controller.get_cursor_position()
+        fraction = min(1.0, max(0.0, (x - slider.left) / (slider.width - 1)))
+        # The slider tops out far below the 50px a 5-cell pass needs.
+        diameter = round(2 + fraction * 12)
+        image = Image.new("RGB", (100, 100), (72, 72, 72))
+        left = (100 - diameter) // 2
+        ImageDraw.Draw(image).rectangle(
+            (left, left, left + diameter - 1, left + diameter - 1),
+            fill=(255, 0, 255),
+        )
+        return image
+
+    plan = PaintPlan(
+        64,
+        32,
+        (
+            ColorGroup(
+                (30, 60, 200),
+                (Stroke(10, 10, 30, 10),),
+                105,
+                brush_diameter=5,
+            ),
+        ),
+    )
+    errors: list[str] = []
+    painter = Painter(
+        controller,
+        screen_capture=capture_preview,
+        on_error=lambda exc: errors.append(str(exc)),
+    )
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(3.0))
+    # Failing loudly beats silently leaving stripes the plan counts as covered.
+    assert painter.state is PainterState.ERROR
+    assert errors and "Size slider" in errors[0]
+    assert not controller.held_buttons
 
 
 def test_multi_size_plan_requires_brush_sizing_calibration() -> None:

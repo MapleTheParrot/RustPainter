@@ -13,6 +13,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from .models import PaintMode
+
 
 # Rust's Windows client runs as RustClient.exe. On other platforms the
 # executable name differs, so a Windows name there can never match and would
@@ -184,14 +186,12 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "quality_preset"
     ) not in {*QUALITY_PRESETS, "custom"}:
         raise SettingsError("image.quality_preset is invalid")
-    if not isinstance(image.get("paint_mode"), str) or image.get("paint_mode") not in {
-        "exact",
-        "quality",
-        "balanced",
-        "fast",
-    }:
+    paint_modes = {mode.value for mode in PaintMode}
+    if not isinstance(image.get("paint_mode"), str) or image.get(
+        "paint_mode"
+    ) not in paint_modes:
         raise SettingsError(
-            "image.paint_mode must be exact, quality, balanced, or fast"
+            "image.paint_mode must be one of: " + ", ".join(sorted(paint_modes))
         )
     for key in ("logical_width", "logical_height"):
         value = image.get(key)

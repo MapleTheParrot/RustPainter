@@ -27,7 +27,6 @@ from .models import (
     ColorGroup,
     PaintMode,
     PaintPlan,
-    ProcessedImage,
     RGBColor,
     Stroke,
 )
@@ -37,6 +36,7 @@ from .paint_plan import (
     _as_rgb_and_mask,
     _ordered_color_index_map,
     analyze_paint_plan,
+    merge_runs_across_gaps,
 )
 
 
@@ -153,12 +153,6 @@ class OptimizedPlan:
     image: Image.Image
     paint_mask: np.ndarray
     statistics: OptimizationStatistics
-
-    @property
-    def processed(self) -> ProcessedImage:
-        """The optimized target in the shape downstream preview code expects."""
-
-        return ProcessedImage(self.image, self.paint_mask, 256)
 
 
 def mode_options(mode: PaintMode | str, *, preserve_dither: bool = False) -> OptimizerOptions:
@@ -494,32 +488,12 @@ def _plan_detail_runs(
 ) -> list[Stroke]:
     """Single-cell runs over the remaining target, crossing allowed gaps.
 
-    The same barrier rule as :func:`app.paint_plan._runs_for_color`: a gap may
-    only be painted through when every cell in it is repainted later (or is
-    this color anyway), and when the gap is short enough to be worth it.
+    A gap may only be painted through when every cell in it is repainted later
+    (or is this color anyway), and when the gap is short enough to be worth it.
     """
 
-    strokes: list[Stroke] = []
     blocked_cumulative = np.cumsum(~allowed, axis=1) if max_gap > 0 else None
-    for y in np.flatnonzero(uncovered.any(axis=1)):
-        columns = np.flatnonzero(uncovered[y])
-        if columns.size == 1:
-            x = int(columns[0])
-            strokes.append(Stroke(x, int(y), x, int(y)))
-            continue
-        gap_lengths = np.diff(columns) - 1
-        split = gap_lengths > max_gap
-        if blocked_cumulative is not None:
-            row = blocked_cumulative[y]
-            split = split | (row[columns[1:] - 1] - row[columns[:-1]] > 0)
-        boundaries = np.flatnonzero(split)
-        starts = columns[np.concatenate(([0], boundaries + 1))]
-        ends = columns[np.concatenate((boundaries, [columns.size - 1]))]
-        strokes.extend(
-            Stroke(int(start), int(y), int(end), int(y))
-            for start, end in zip(starts, ends)
-        )
-    return strokes
+    return merge_runs_across_gaps(uncovered, blocked_cumulative, max_gap)
 
 
 def _serpentine(strokes: list[Stroke]) -> list[Stroke]:
@@ -589,6 +563,31 @@ def _evaluate_pass(
 # ----------------------------------------------------------------- main entry
 
 
+def simplify_colors(
+    source: PlanImage,
+    mode: PaintMode | str,
+    *,
+    options: OptimizerOptions | None = None,
+    paint_mask: np.ndarray | None = None,
+) -> tuple[Image.Image, np.ndarray]:
+    """Run only the color simplification a mode would apply, no brush planning.
+
+    Returns the merged/cleaned RGBA image and its paint mask.  This is what a
+    preview backdrop needs, at a fraction of a full plan's cost.
+    """
+
+    resolved_mode = PaintMode(mode)
+    options = options or MODE_OPTIONS[resolved_mode]
+    rgb, mask = _as_rgb_and_mask(source, paint_mask)
+    rgb = merge_similar_colors(rgb, mask, options.merge_tolerance)
+    rgb = absorb_insignificant_regions(
+        rgb, mask, options.min_region_area, options.region_contrast_limit
+    )
+    alpha = np.where(mask, 255, 0).astype(np.uint8)
+    image = Image.fromarray(np.dstack((rgb, alpha)), mode="RGBA")
+    return image, np.asarray(mask, dtype=np.bool_).copy()
+
+
 def optimize_paint_plan(
     source: PlanImage,
     mode: PaintMode | str,
@@ -653,26 +652,36 @@ def optimize_paint_plan(
                 switch_cost = float(options.resize_cost_cells)
             if shape_choice is _UNSET:
                 best: (
-                    tuple[float, str | None, np.ndarray, list[Stroke], int] | None
+                    tuple[float, float, str | None, np.ndarray, list[Stroke], int]
+                    | None
                 ) = None
                 for shape in _shape_candidates(capabilities):
                     trial, strokes, covered, benefit = _evaluate_pass(
                         allowed, uncovered, diameter, shape
                     )
+                    ranking = benefit
                     if (
                         shape is not None
                         and current_shape is not None
                         and shape != current_shape
                     ):
-                        benefit -= options.shape_switch_cost_cells
-                    if best is None or benefit > best[0]:
-                        best = (benefit, shape, trial, strokes, covered)
+                        ranking -= options.shape_switch_cost_cells
+                    if best is None or ranking > best[0]:
+                        best = (ranking, benefit, shape, trial, strokes, covered)
                 assert best is not None
-                benefit, shape_choice, trial, strokes, covered = best
+                _ranking, benefit, shape_choice, trial, strokes, covered = best
             else:
                 trial, strokes, covered, benefit = _evaluate_pass(
                     allowed, uncovered, diameter, shape_choice  # type: ignore[arg-type]
                 )
+            # The toolbar trip stays on the bill for every diameter until a
+            # pass is actually accepted and the shape becomes current.
+            if (
+                isinstance(shape_choice, str)
+                and current_shape is not None
+                and shape_choice != current_shape
+            ):
+                switch_cost += options.shape_switch_cost_cells
             if not strokes or benefit <= switch_cost:
                 continue
             uncovered = trial
@@ -779,4 +788,5 @@ __all__ = [
     "merge_similar_colors",
     "mode_options",
     "optimize_paint_plan",
+    "simplify_colors",
 ]

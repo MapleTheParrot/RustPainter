@@ -89,8 +89,14 @@ from app.models import (
     ScreenRect,
     TransparencyMode,
 )
-from app.paint_plan import generate_merged_color_groups, generate_paint_plan
-from app.paint_optimizer import BrushCapabilities, mode_options, optimize_paint_plan
+from app.paint_plan import count_unmerged_strokes, generate_paint_plan
+from app.paint_optimizer import (
+    BrushCapabilities,
+    OptimizationStatistics,
+    mode_options,
+    optimize_paint_plan,
+    simplify_colors,
+)
 from app.profiles import Profile, ProfileStore
 from app.settings import SettingsStore, default_settings
 
@@ -198,7 +204,7 @@ class _ProcessResult:
     stroke_pixel_steps: int
     dot_count: int
     unmerged_stroke_count: int
-    optimization: Any = None
+    optimization: OptimizationStatistics | None = None
 
 
 @dataclass(slots=True)
@@ -382,15 +388,11 @@ class _ImageWorker(QRunnable):
             optimization = None
             if mode is PaintMode.EXACT:
                 plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
-                if self.overpaint_gap == 0:
-                    unmerged_stroke_count = plan.stroke_count
-                else:
-                    unmerged_stroke_count = sum(
-                        len(group.strokes)
-                        for group in generate_merged_color_groups(
-                            processed, overpaint_gap=0
-                        )
-                    )
+                unmerged_stroke_count = (
+                    plan.stroke_count
+                    if self.overpaint_gap == 0
+                    else count_unmerged_strokes(processed)
+                )
                 simulation_processed = base_processed
             else:
                 optimizer_options = mode_options(
@@ -406,33 +408,26 @@ class _ImageWorker(QRunnable):
                 optimization = optimized.statistics
                 # The savings headline compares against the exact plan the
                 # same processed image would have produced.
-                unmerged_stroke_count = sum(
-                    len(group.strokes)
-                    for group in generate_merged_color_groups(
-                        processed, overpaint_gap=0
-                    )
-                )
-                if processed is base_processed:
-                    simulation_processed = ProcessedImage(
-                        optimized.image, optimized.paint_mask, processed.requested_colors
-                    )
-                else:
-                    # Text stays a live vector overlay in the preview, so the
-                    # simulated backdrop is optimized without the text baked in.
-                    base_optimized = optimize_paint_plan(
-                        base_processed,
-                        mode,
-                        capabilities=self.capabilities,
-                        options=optimizer_options,
-                    )
-                    simulation_processed = ProcessedImage(
-                        base_optimized.image,
-                        base_optimized.paint_mask,
-                        base_processed.requested_colors,
-                    )
-                processed = ProcessedImage(
+                unmerged_stroke_count = count_unmerged_strokes(processed)
+                optimized_processed = ProcessedImage(
                     optimized.image, optimized.paint_mask, processed.requested_colors
                 )
+                if processed is base_processed:
+                    simulation_processed = optimized_processed
+                else:
+                    # Text stays a live vector overlay in the preview, so the
+                    # backdrop is simplified without the text baked in. Only
+                    # the color simplification runs here - brush planning has
+                    # no effect on how the target looks. Merge centers are
+                    # derived without the text pixels, so a backdrop shade can
+                    # differ very slightly from the painted plan's.
+                    backdrop_image, backdrop_mask = simplify_colors(
+                        base_processed, mode, options=optimizer_options
+                    )
+                    simulation_processed = ProcessedImage(
+                        backdrop_image, backdrop_mask, base_processed.requested_colors
+                    )
+                processed = optimized_processed
             # Text stays as live vector items in the editor preview. The paint
             # plan above still uses the composited, palette-limited result.
             simulation = _build_simulation_image(
@@ -1670,8 +1665,10 @@ class MainWindow(QMainWindow):
         self.apply_brush_check.toggled.connect(
             lambda _checked: self._refresh_profile_ui()
         )
-        # Brush sizing decides whether optimized plans may use larger brushes.
+        # Brush sizing decides whether optimized plans may use larger brushes,
+        # and logical spacing above 1.0 rules multi-cell passes out entirely.
         self.apply_brush_check.toggled.connect(self._schedule_processing)
+        self.pixel_spacing_spin.valueChanged.connect(self._schedule_processing)
 
     def _current_overpaint_gap(self) -> int | None:
         return MERGE_MODE_GAPS.get(str(self.merge_combo.currentData()), 6)
@@ -1700,6 +1697,10 @@ class MainWindow(QMainWindow):
                 self.apply_brush_check.isChecked()
                 and slider is not None
                 and preview is not None
+                # Spacing above 1.0 spreads stroke geometry while the brush
+                # stays capped at one unspaced cell, so multi-cell bands would
+                # leave unpainted rows; keep those plans single-cell.
+                and self.pixel_spacing_spin.value() <= 1.0
             ),
             square=self._profile_rect("square_shape_button") is not None,
             circle=self._profile_rect("circle_shape_button") is not None,
@@ -2406,8 +2407,9 @@ class MainWindow(QMainWindow):
         self.analysis_resolution.value_label.setText(  # type: ignore[attr-defined]
             f"{plan.width} × {plan.height}"
         )
+        # Optimized plans emit several passes per color, so count colors.
         self.analysis_colors.value_label.setText(  # type: ignore[attr-defined]
-            str(len(plan.color_groups))
+            str(len({group.color for group in plan.color_groups}))
         )
         self.analysis_strokes.value_label.setText(  # type: ignore[attr-defined]
             f"{plan.stroke_count:,}"
@@ -2433,44 +2435,54 @@ class MainWindow(QMainWindow):
                 for stroke in group.strokes
             )
         travel = stroke_pixel_steps * cell_width
-        color_ms = len(plan.color_groups) * (
-            self.hue_delay_spin.value()
-            + self.sv_delay_spin.value()
-            + self.color_delay_spin.value()
-            + 2 * self.dot_duration_spin.value()
-        )
-        stroke_ms = plan.stroke_count * self.stroke_delay_spin.value()
-        dot_ms = dot_count * self.dot_duration_spin.value()
-        brush_seconds = 0.0
-        if (
+        # One walk over the groups tracks everything the painter tracks: the
+        # picker is selected once per run of same-color groups, the slider
+        # cache is keyed by (diameter, shape), and a shape click both costs a
+        # trip and invalidates the sizing.
+        sizing = (
             self.apply_brush_check.isChecked()
             and self._profile_rect("brush_slider") is not None
-        ):
-            settle = max(self.brush_delay_spin.value() / 1000.0, 0.16)
-            click = self.dot_duration_spin.value() / 1000.0
-            searched: set[int] = set()
-            previous_diameter: int | None = None
-            searches = 0
-            revisits = 0
-            for group in plan.color_groups:
-                diameter = max(1, group.brush_diameter)
-                if diameter == previous_diameter:
-                    continue
-                if diameter in searched:
-                    revisits += 1
-                else:
-                    searches += 1
-                    searched.add(diameter)
-                previous_diameter = diameter
-            # A fresh diameter binary-searches the slider with ~7 preview
-            # measurements; a revisit replays one remembered click.
-            brush_seconds = searches * 7 * (settle + click) + revisits * (settle + click)
+            and self._profile_rect("brush_preview") is not None
+        )
+        selections = 0
+        previous_color: tuple[int, int, int] | None = None
         shape_changes = 0
         tracked_shape: str | None = None
+        searched: set[tuple[int, str | None]] = set()
+        previous_key: tuple[int, str | None] | None = None
+        revisits = 0
         for group in plan.color_groups:
+            if group.color != previous_color:
+                selections += 1
+                previous_color = group.color
             if group.brush_shape is not None and group.brush_shape != tracked_shape:
                 shape_changes += 1
                 tracked_shape = group.brush_shape
+                previous_key = None
+            if sizing:
+                key = (max(1, group.brush_diameter), tracked_shape)
+                if key != previous_key:
+                    if key in searched:
+                        revisits += 1
+                    else:
+                        searched.add(key)
+                    previous_key = key
+        # A fresh (diameter, shape) binary-searches the slider with ~7 preview
+        # measurements, each of which also selects a temporary color; a
+        # revisit replays one remembered click.
+        settle = max(self.brush_delay_spin.value() / 1000.0, 0.16)
+        click = self.dot_duration_spin.value() / 1000.0
+        brush_seconds = len(searched) * 7 * (settle + click) + revisits * (
+            settle + click
+        )
+        selections += len(searched)
+        color_ms = selections * (
+            self.hue_delay_spin.value()
+            + self.sv_delay_spin.value()
+            + 2 * self.dot_duration_spin.value()
+        ) + len(plan.color_groups) * self.color_delay_spin.value()
+        stroke_ms = plan.stroke_count * self.stroke_delay_spin.value()
+        dot_ms = dot_count * self.dot_duration_spin.value()
         shape_seconds = shape_changes * (
             self.brush_delay_spin.value() + self.dot_duration_spin.value()
         ) / 1000.0
@@ -3452,8 +3464,9 @@ class MainWindow(QMainWindow):
             self.quality_combo.setCurrentText("Very Fast")
             self.color_count_combo.setCurrentText("32")
             self.dither_check.setChecked(False)
-            # The chart measures raw swatches, so it must be planned exactly.
-            self._set_combo_data(self.paint_mode_combo, PaintMode.EXACT.value)
+            # The Optimization combo is deliberately left alone: while the
+            # chart is the loaded image, _current_paint_mode() forces Exact,
+            # and the user's saved mode survives for their next artwork.
             self.load_image(path)
             self.color_correction_status.setText(
                 "Chart loading • paint it, then click Measure Painted Chart"

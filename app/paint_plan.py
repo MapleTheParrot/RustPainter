@@ -203,24 +203,20 @@ def _ordered_color_index_map(
     return index_map.reshape(mask.shape), colors, counts[order]
 
 
-def _runs_for_color(
-    index_map: np.ndarray,
-    color_index: int,
+def merge_runs_across_gaps(
+    must: np.ndarray,
+    barrier_cumulative: np.ndarray | None,
     max_gap: int,
 ) -> list[Stroke]:
-    """Merge one color's horizontal runs, optionally crossing later colors.
+    """Turn required cells into horizontal strokes, crossing harmless gaps.
 
-    A run may extend across up to ``max_gap`` consecutive pixels belonging to
-    colors painted *later* (they repaint themselves afterwards). Pixels that are
-    unpainted or belong to already-painted colors always split runs.
+    A run may extend across up to ``max_gap`` consecutive non-required cells,
+    but never across a barrier.  ``barrier_cumulative`` is a per-row cumulative
+    count of barrier cells (or ``None`` when ``max_gap`` is zero), so a gap is
+    tested with two lookups instead of a scan.
     """
 
-    must = index_map == color_index
     strokes: list[Stroke] = []
-    barrier_cumulative: np.ndarray | None = None
-    if max_gap > 0:
-        barrier_cumulative = np.cumsum(index_map < color_index, axis=1)
-
     for y in np.flatnonzero(must.any(axis=1)):
         columns = np.flatnonzero(must[y])
         if columns.size == 1:
@@ -240,6 +236,43 @@ def _runs_for_color(
             for start, end in zip(starts, ends)
         )
     return strokes
+
+
+def _runs_for_color(
+    index_map: np.ndarray,
+    color_index: int,
+    max_gap: int,
+) -> list[Stroke]:
+    """Merge one color's horizontal runs, optionally crossing later colors.
+
+    A run may extend across up to ``max_gap`` consecutive pixels belonging to
+    colors painted *later* (they repaint themselves afterwards). Pixels that are
+    unpainted or belong to already-painted colors always split runs.
+    """
+
+    must = index_map == color_index
+    barrier_cumulative: np.ndarray | None = None
+    if max_gap > 0:
+        barrier_cumulative = np.cumsum(index_map < color_index, axis=1)
+    return merge_runs_across_gaps(must, barrier_cumulative, max_gap)
+
+
+def count_unmerged_strokes(
+    source: PlanImage,
+    paint_mask: np.ndarray | None = None,
+) -> int:
+    """The stroke count of an exact, unmerged plan - without building it.
+
+    Equal to the number of maximal same-color horizontal runs, which is just
+    the number of cells that start one.
+    """
+
+    rgb, mask = _as_rgb_and_mask(source, paint_mask)
+    continues_run = np.zeros(mask.shape, dtype=np.bool_)
+    continues_run[:, 1:] = (
+        mask[:, 1:] & mask[:, :-1] & np.all(rgb[:, 1:] == rgb[:, :-1], axis=2)
+    )
+    return int((mask & ~continues_run).sum())
 
 
 def generate_merged_color_groups(
@@ -360,10 +393,12 @@ __all__ = [
     "PaintPlanTiming",
     "analyze_paint_plan",
     "build_paint_plan",
+    "count_unmerged_strokes",
     "create_paint_plan",
     "generate_horizontal_runs",
     "generate_merged_color_groups",
     "generate_paint_plan",
     "group_horizontal_runs",
     "horizontal_runs_for_color",
+    "merge_runs_across_gaps",
 ]

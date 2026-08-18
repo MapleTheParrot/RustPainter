@@ -415,9 +415,9 @@ class Painter:
         self._mouse_drift_pixels = 0.0
         self._mouse_drift_started = 0.0
         # Slider fractions the binary search already found this job, keyed by
-        # brush diameter in logical cells, so returning to a diameter is one
-        # deterministic click instead of a fresh search.
-        self._brush_fractions: dict[int, float] = {}
+        # (diameter in logical cells, brush shape), so returning to a diameter
+        # under the same shape is one deterministic click, not a fresh search.
+        self._brush_fractions: dict[tuple[int, str | None], float] = {}
         self._last_progress_emit = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
@@ -722,6 +722,16 @@ class Painter:
                     "This plan uses multiple brush sizes, which needs automatic brush "
                     "sizing enabled with the Size track and brush preview calibrated"
                 )
+            if (
+                any(group.brush_diameter > 1 for group in plan.color_groups)
+                and settings.logical_pixel_spacing > 1.0
+            ):
+                # Spacing spreads stroke geometry while the brush target stays
+                # capped at one unspaced cell, so multi-cell bands would leave
+                # unpainted rows between their sweeps.
+                raise ValueError(
+                    "Multi-cell brush passes need Logical spacing at 1.0 or below"
+                )
             requested_shapes = {
                 group.brush_shape for group in plan.color_groups if group.brush_shape
             }
@@ -799,8 +809,27 @@ class Painter:
             # the user's focus countdown.
             remaining -= slice_seconds
 
-    def _apply_brush_size(self, job: _Job, diameter_cells: int = 1) -> bool:
+    @staticmethod
+    def _slider_point(slider: RectangleLike, fraction: float) -> tuple[float, float]:
+        """The click point for a Size-track fraction, whatever its orientation."""
+
+        if slider.width >= slider.height:
+            return normalized_point(slider, fraction, 0.5)
+        return normalized_point(slider, 0.5, fraction)
+
+    def _apply_brush_size(
+        self,
+        job: _Job,
+        diameter_cells: int,
+        epoch: int,
+        shape_key: str | None,
+    ) -> bool:
         """Size the brush to ``diameter_cells`` logical cells.
+
+        Every input is guarded by ``epoch``: a pause raises ``_RetryAction`` to
+        the caller's stroke loop, which re-applies shape, size, and color once
+        painting resumes.  The slider cache is keyed by shape as well, because
+        the same slider position can render different footprints per shape.
 
         Returns ``True`` when the preview had to be measured (which selects a
         temporary color), ``False`` when a cached slider fraction was reused.
@@ -828,26 +857,16 @@ class Painter:
             if self.input.emits_real_input
             else 0.0
         )
-        cached_fraction = self._brush_fractions.get(diameter_cells)
+        cached_fraction = self._brush_fractions.get((diameter_cells, shape_key))
         if cached_fraction is not None:
             # The Size track is click-to-set, so repeating the exact click the
             # earlier search settled on restores that diameter without a single
             # preview measurement.
-            while True:
-                epoch = self._pause_generation_value()
-                try:
-                    point = (
-                        normalized_point(slider, cached_fraction, 0.5)
-                        if slider.width >= slider.height
-                        else normalized_point(slider, 0.5, cached_fraction)
-                    )
-                    self._safe_click(point, epoch)
-                    self._interruptible_sleep(
-                        preview_settle_seconds, epoch=epoch, check_focus=True
-                    )
-                    return False
-                except _RetryAction:
-                    continue
+            self._safe_click(self._slider_point(slider, cached_fraction), epoch)
+            self._interruptible_sleep(
+                preview_settle_seconds, epoch=epoch, check_focus=True
+            )
+            return False
         self._update_progress_state(
             PainterState.RUNNING,
             f"Matching brush to {target_diameter:.1f}px "
@@ -855,21 +874,15 @@ class Painter:
         )
 
         # Use a high-contrast temporary color so the footprint can be separated
-        # reliably from the gray preview background. The first paint group
-        # immediately selects its real color before touching the canvas.
-        while True:
-            epoch = self._pause_generation_value()
-            try:
-                self._select_color(
-                    (255, 0, 255),
-                    job.target,
-                    settings,
-                    epoch,
-                    apply_correction=False,
-                )
-                break
-            except _RetryAction:
-                continue
+        # reliably from the gray preview background. The next stroke's group
+        # selects its real color again before touching the canvas.
+        self._select_color(
+            (255, 0, 255),
+            job.target,
+            settings,
+            epoch,
+            apply_correction=False,
+        )
 
         low = 0.0
         high = 1.0
@@ -880,27 +893,13 @@ class Painter:
         current_fraction: float | None = None
         for _iteration in range(7):
             fraction = (low + high) / 2.0
-            while True:
-                epoch = self._pause_generation_value()
-                try:
-                    point = (
-                        normalized_point(slider, fraction, 0.5)
-                        if slider.width >= slider.height
-                        else normalized_point(slider, 0.5, fraction)
-                    )
-                    self._safe_click(point, epoch)
-                    self._interruptible_sleep(
-                        preview_settle_seconds,
-                        epoch=epoch,
-                        check_focus=True,
-                    )
-                    self._checkpoint(epoch=epoch, check_focus=True)
-                    footprint = self._measure_brush_preview(preview)
-                    diameter = footprint.diameter
-                    current_fraction = fraction
-                    break
-                except _RetryAction:
-                    continue
+            self._safe_click(self._slider_point(slider, fraction), epoch)
+            self._interruptible_sleep(
+                preview_settle_seconds, epoch=epoch, check_focus=True
+            )
+            self._checkpoint(epoch=epoch, check_focus=True)
+            diameter = self._measure_brush_preview(preview).diameter
+            current_fraction = fraction
             observed.append(diameter)
             raw_error = abs(diameter - target_diameter)
             error = raw_error
@@ -925,27 +924,24 @@ class Painter:
                 "The brush preview did not change while testing the Size slider. "
                 "Recalibrate both regions and confirm the solid square or circle tool is selected."
             )
+        # Adjacent multi-cell bands overlap one row, which tolerates a brush up
+        # to one cell under its nominal footprint; anything smaller would leave
+        # stripes the plan already counts as covered, so fail loudly instead.
+        if diameter_cells > 1 and best_diameter < (
+            target_diameter * (diameter_cells - 1) / diameter_cells - 0.75
+        ):
+            raise RuntimeError(
+                f"The Size slider reached only {best_diameter:.0f}px of the "
+                f"{target_diameter:.0f}px this plan's {diameter_cells}-cell brush "
+                "needs. Choose a lower optimization mode or a higher painting "
+                "resolution, or recalibrate the Size track."
+            )
         if current_fraction is None or abs(current_fraction - best_fraction) > 1e-6:
-            epoch = self._pause_generation_value()
-            point = (
-                normalized_point(slider, best_fraction, 0.5)
-                if slider.width >= slider.height
-                else normalized_point(slider, 0.5, best_fraction)
-            )
-            self._safe_click(point, epoch)
+            self._safe_click(self._slider_point(slider, best_fraction), epoch)
             self._interruptible_sleep(
-                preview_settle_seconds,
-                epoch=epoch,
-                check_focus=True,
+                preview_settle_seconds, epoch=epoch, check_focus=True
             )
-        self._brush_fractions[diameter_cells] = best_fraction
-        if diameter_cells > 1 and best_diameter < target_diameter * 0.8:
-            LOGGER.warning(
-                "The Size slider only reached %.1f px of the %.1f px target; "
-                "large-brush coverage may leave seams for smaller passes to miss",
-                best_diameter,
-                target_diameter,
-            )
+        self._brush_fractions[(diameter_cells, shape_key)] = best_fraction
         LOGGER.info(
             "Brush auto-sized: %.1f px measured for %.1f px target (slider %.3f)",
             best_diameter,
@@ -984,23 +980,15 @@ class Painter:
         assert last_error is not None
         raise last_error
 
-    def _select_brush_shape(self, button: RectangleLike, settings: PainterSettings) -> None:
+    def _select_brush_shape(
+        self, button: RectangleLike, settings: PainterSettings, epoch: int
+    ) -> None:
         """Click a calibrated Square/Circle toolbar button and let the UI settle."""
 
-        center = (
-            button.left + button.width / 2.0,
-            button.top + button.height / 2.0,
+        self._safe_click(normalized_point(button, 0.5, 0.5), epoch)
+        self._interruptible_sleep(
+            settings.delay_after_brush_seconds, epoch=epoch, check_focus=True
         )
-        while True:
-            epoch = self._pause_generation_value()
-            try:
-                self._safe_click(center, epoch)
-                self._interruptible_sleep(
-                    settings.delay_after_brush_seconds, epoch=epoch, check_focus=True
-                )
-                return
-            except _RetryAction:
-                continue
 
     def _execute_plan(self, job: _Job) -> None:
         plan, target, settings = job.plan, job.target, job.settings
@@ -1032,32 +1020,49 @@ class Painter:
             and target.brush_slider is not None
             and target.brush_preview is not None
         )
-        applied_diameter: int | None = None
+        # Physical brush facts and the pause epoch they were established under.
+        # A pause hands the mouse back to the user, who may change the brush in
+        # Rust, so an epoch bump re-applies shape and size before the next
+        # stroke - mirroring the (color, epoch) guard on the picker selection.
         applied_shape: str | None = None
-        # (color, epoch) currently selected in the picker; kept across groups
-        # so an optimized plan's several passes of one color select it once.
+        applied_diameter: int | None = None
+        applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
         for color_index, group in enumerate(plan.color_groups, start=1):
             diameter = max(1, int(group.brush_diameter))
-            if group.brush_shape is not None and group.brush_shape != applied_shape:
-                button = (
+            shape = group.brush_shape
+            shape_button = None
+            if shape is not None:
+                shape_button = (
                     target.square_shape_button
-                    if group.brush_shape == BrushShape.SQUARE.value
+                    if shape == BrushShape.SQUARE.value
                     else target.circle_shape_button
                 )
-                if button is not None:
-                    self._select_brush_shape(button, settings)
-                    applied_shape = group.brush_shape
-            if sizing_enabled and diameter != applied_diameter:
-                if self._apply_brush_size(job, diameter):
-                    # Measuring the preview selected the temporary color.
-                    selected = None
-                applied_diameter = diameter
             for index_in_group, stroke in enumerate(group.strokes, start=1):
                 while True:
                     self._checkpoint(check_focus=True)
                     current_epoch = self._pause_generation_value()
                     try:
+                        if applied_epoch != current_epoch:
+                            applied_shape = None
+                            applied_diameter = None
+                            applied_epoch = current_epoch
+                        if shape_button is not None and shape != applied_shape:
+                            self._select_brush_shape(
+                                shape_button, settings, current_epoch
+                            )
+                            applied_shape = shape
+                            # A new shape can render a different footprint at
+                            # the same slider position, so size again under it.
+                            applied_diameter = None
+                        if sizing_enabled and diameter != applied_diameter:
+                            if self._apply_brush_size(
+                                job, diameter, current_epoch, applied_shape
+                            ):
+                                # Measuring the preview selected the temporary
+                                # color.
+                                selected = None
+                            applied_diameter = diameter
                         if selected != (group.color, current_epoch):
                             self._select_color(group.color, target, settings, current_epoch)
                             selected = (group.color, current_epoch)
