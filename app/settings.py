@@ -97,6 +97,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "delay_between_colors_seconds": 0.12,
         "stroke_interpolation_step_pixels": 4.0,
         "stroke_merge_mode": "balanced",
+        # After painting, capture the canvas and repaint cells whose color
+        # does not match the plan - up to this many correction passes.
+        "verify_passes": 1,
     },
     "hotkeys": {
         "start_resume": "F8",
@@ -338,6 +341,13 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError(
             "painting.stroke_merge_mode must be off, balanced, or maximum"
         )
+    verify_passes = painting.get("verify_passes", 1)
+    if (
+        isinstance(verify_passes, bool)
+        or not isinstance(verify_passes, int)
+        or not 0 <= verify_passes <= 5
+    ):
+        raise SettingsError("painting.verify_passes must be an integer from 0 to 5")
 
     assert isinstance(hotkeys, Mapping)
     allowed_hotkeys = {f"F{number}" for number in range(5, 13)}

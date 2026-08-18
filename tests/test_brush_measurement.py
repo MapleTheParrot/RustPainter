@@ -451,6 +451,62 @@ def test_a_stored_curve_skips_the_inline_measurement() -> None:
     assert dabs == [], "a stored curve must make inline probing unnecessary"
 
 
+def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
+    # The painted sign is captured after the job; three cells read decisively
+    # as the *other* plan color and must be repainted - two adjacent ones as a
+    # single stroke, the lone one as a dab. Nothing else may be touched up.
+    red, blue = (200, 30, 30), (30, 60, 200)
+    profile = _profile()
+    profile.brush_preview = None
+    profile.metadata["brush_response"] = build_brush_response(
+        [(0.0, 4.0), (1.0, 64.0)]
+    ).to_dict()
+    corrupted = {(5, 5), (6, 5), (40, 40)}  # logical (x, y)
+
+    def capture(rect):
+        if (rect.width, rect.height) != (CANVAS.width, CANVAS.height):
+            return Image.new("RGB", (rect.width, rect.height), (120, 120, 120))
+        pixels = np.zeros((rect.height, rect.width, 3), dtype=np.uint8)
+        for y in range(55):
+            for x in range(70):
+                expected = red if y < 27 else blue
+                if (x, y) in corrupted:
+                    expected = blue if expected == red else red
+                pixels[y * 20 : (y + 1) * 20, x * 20 : (x + 1) * 20] = expected
+        return Image.fromarray(pixels, "RGB")
+
+    controller = _RealishInputController()
+    painter = Painter(controller, screen_capture=capture)
+    plan = PaintPlan(
+        70,
+        55,
+        (
+            ColorGroup(red, tuple(Stroke(0, y, 69, y) for y in range(27)), 27 * 70),
+            ColorGroup(blue, tuple(Stroke(0, y, 69, y) for y in range(27, 55)), 28 * 70),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(90.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    spans = [
+        (start, end)
+        for start, end in _held_travel(controller)
+        if CANVAS.left <= start[0] < CANVAS.left + CANVAS.width
+        and CANVAS.top <= start[1] < CANVAS.top + CANVAS.height
+    ]
+    center = lambda x, y: (CANVAS.left + x * 20 + 10, CANVAS.top + y * 20 + 10)
+    # The two adjacent wrong cells merge into one touch-up drag.
+    assert ((center(5, 5), center(6, 5)) in spans) or (
+        (center(6, 5), center(5, 5)) in spans
+    )
+    # The lone wrong cell is repainted as a dab.
+    assert (center(40, 40), center(40, 40)) in spans
+    # The main plan painted 55 row strokes; only two touch-up strokes follow.
+    assert len(spans) == 57
+
+
 def test_a_minimum_brush_wider_than_a_cell_stops_the_job() -> None:
     # fraction_for clamps to the measured range, so without a bottom-end guard
     # a Size track whose smallest dab dwarfs a logical cell would silently

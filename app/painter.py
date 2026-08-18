@@ -212,6 +212,9 @@ class PainterSettings:
     logical_pixel_spacing: float = 1.0
     brush_size: float = 1.0
     apply_brush_size: bool = False
+    # After painting, capture the canvas and repaint decisively wrong cells,
+    # up to this many correction passes. Zero disables verification.
+    verify_passes: int = 1
     brush_direction: str = "low_to_high"
     delay_after_brush_seconds: float = 0.06
     countdown_seconds: float = 3.0
@@ -257,6 +260,10 @@ class PainterSettings:
                 raise ValueError(f"{name} must be a finite non-negative number")
         if self.corner_abort_margin_pixels < 0:
             raise ValueError("corner_abort_margin_pixels cannot be negative")
+        if isinstance(self.verify_passes, bool) or not isinstance(
+            self.verify_passes, int
+        ) or not 0 <= self.verify_passes <= 5:
+            raise ValueError("verify_passes must be an integer between 0 and 5")
         if self.brush_direction not in {"low_to_high", "high_to_low"}:
             raise ValueError("brush_direction must be low_to_high or high_to_low")
         if not math.isfinite(self.brush_size) or not 0.0 <= self.brush_size <= 1.0:
@@ -309,6 +316,7 @@ class PainterSettings:
             logical_pixel_spacing=float(pick(painting, "logical_pixel_spacing", 1.0)),
             brush_size=float(pick(painting, "brush_size", 1.0)),
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
+            verify_passes=int(pick(painting, "verify_passes", 1)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.06)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
@@ -818,6 +826,7 @@ class Painter:
                 self._prepare_brush_for_job(job)
                 self._update_progress_state(PainterState.RUNNING, "Painting")
                 self._execute_plan(job)
+                self._verify_and_touch_up(job)
             self._checkpoint(check_focus=False)
             self._finish_completed()
             self._update_progress_state(PainterState.COMPLETED, "Completed")
@@ -1592,8 +1601,9 @@ class Painter:
             settings.delay_after_brush_seconds, epoch=epoch, check_focus=True
         )
 
-    def _execute_plan(self, job: _Job) -> None:
-        plan, target, settings = job.plan, job.target, job.settings
+    def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
+        plan = job.plan if plan is None else plan
+        target, settings = job.target, job.settings
         completed = 0
         total = sum(len(group.strokes) for group in plan.color_groups)
         total_colors = len(plan.color_groups)
@@ -1688,6 +1698,101 @@ class Painter:
                     settings.delay_between_strokes_seconds, check_focus=True
                 )
             self._interruptible_sleep(settings.delay_between_colors_seconds, check_focus=True)
+
+    def _verify_and_touch_up(self, job: _Job) -> None:
+        """Read the sign back and repaint the cells that missed their color.
+
+        The comparison is relative - a cell is wrong only when its captured
+        color sits decisively closer to a *different* plan color than to its
+        own - so lighting and the sign's material shift, which move every
+        color together, never trigger a repaint.  Each pass captures, decides,
+        and repaints; a clean capture or an implausible one ends the loop.
+        """
+
+        import numpy as np
+
+        from .verification import (
+            UNRELIABLE_CAPTURE_FRACTION,
+            mismatched_cells,
+            plan_expectations,
+            sample_cell_colors,
+            touch_up_plan,
+        )
+
+        plan, target, settings = job.plan, job.target, job.settings
+        if settings.verify_passes <= 0 or not getattr(
+            self.input, "emits_real_input", True
+        ):
+            return
+        if not any(group.strokes for group in plan.color_groups):
+            return
+        indices, palette = plan_expectations(plan)
+        covered = int((indices >= 0).sum())
+        if covered == 0:
+            return
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        # Parked over the color box, the cursor cannot shadow the capture.
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        pass_number = 1
+        while pass_number <= settings.verify_passes:
+            try:
+                epoch = self._pause_generation_value()
+                self._update_progress_state(
+                    PainterState.RUNNING,
+                    f"Verifying the painted sign (pass {pass_number})",
+                )
+                self._move(park, epoch)
+                self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+                self._checkpoint(epoch=epoch, check_focus=True)
+                capture = self._screen_capture(canvas)
+                sampled = sample_cell_colors(
+                    np.asarray(capture.convert("RGB"), dtype=np.float32),
+                    plan.width,
+                    plan.height,
+                )
+                mismatch = mismatched_cells(sampled, indices, palette)
+                wrong = int(mismatch.sum())
+                if wrong == 0:
+                    LOGGER.info(
+                        "Verification pass %d: the sign matches the plan", pass_number
+                    )
+                    self._update_progress_state(
+                        PainterState.RUNNING, "Verified: the sign matches the plan"
+                    )
+                    return
+                if wrong > covered * UNRELIABLE_CAPTURE_FRACTION:
+                    LOGGER.warning(
+                        "Verification read %d of %d cells as wrong; the capture "
+                        "looks unreliable (occluded sign, open menu, moved view), "
+                        "so no touch-up will be painted from it",
+                        wrong,
+                        covered,
+                    )
+                    return
+                LOGGER.info(
+                    "Verification pass %d: repainting %d of %d cells",
+                    pass_number,
+                    wrong,
+                    covered,
+                )
+                self._update_progress_state(
+                    PainterState.RUNNING,
+                    f"Touching up {wrong} cells (pass {pass_number})",
+                )
+                self._execute_plan(job, plan=touch_up_plan(mismatch, indices, palette))
+                pass_number += 1
+            except _RetryAction:
+                # A pause released the mouse mid-pass; redo this pass whole,
+                # from a fresh capture, once painting resumes.
+                continue
 
     def _select_color(
         self,
