@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from app.hotkeys import GlobalHotkeyManager, HotkeyRegistrationError
+
+
+class _NativeFunction:
+    def __init__(self, implementation: Callable[..., Any]) -> None:
+        object.__setattr__(self, "implementation", implementation)
+
+    def __call__(self, *args: Any) -> Any:
+        return self.implementation(*args)
+
+
+def test_unexpected_message_loop_exit_is_reported_after_running_is_cleared(
+    monkeypatch,
+) -> None:
+    states_seen_by_error_callback: list[bool] = []
+    fake_user32 = type(
+        "FakeUser32",
+        (),
+        {
+            "RegisterHotKey": _NativeFunction(lambda *_args: 1),
+            "UnregisterHotKey": _NativeFunction(lambda *_args: 1),
+            "GetMessageW": _NativeFunction(lambda *_args: 0),
+        },
+    )()
+    fake_kernel32 = type(
+        "FakeKernel32",
+        (),
+        {"GetCurrentThreadId": _NativeFunction(lambda: 1234)},
+    )()
+
+    def fake_windll(name: str, **_kwargs: Any) -> Any:
+        return fake_user32 if name == "user32" else fake_kernel32
+
+    monkeypatch.setattr("app.hotkeys.ctypes.WinDLL", fake_windll)
+    manager: GlobalHotkeyManager
+    manager = GlobalHotkeyManager(
+        on_error=lambda _error: states_seen_by_error_callback.append(manager.running)
+    )
+
+    manager._message_loop()
+
+    assert manager.running is False
+    assert isinstance(manager.startup_error, HotkeyRegistrationError)
+    assert "exited unexpectedly" in str(manager.startup_error)
+    assert states_seen_by_error_callback == [False]
+
+
+def test_callback_failure_tears_down_hotkeys(monkeypatch) -> None:
+    messages = [0x0312, 0]
+
+    def get_message(message_pointer, *_args: Any) -> int:
+        result = messages.pop(0)
+        if result:
+            message_pointer._obj.message = 0x0312
+            message_pointer._obj.wParam = GlobalHotkeyManager._IDS["abort"]
+        return result
+
+    fake_user32 = type(
+        "FakeUser32",
+        (),
+        {
+            "RegisterHotKey": _NativeFunction(lambda *_args: 1),
+            "UnregisterHotKey": _NativeFunction(lambda *_args: 1),
+            "GetMessageW": _NativeFunction(get_message),
+        },
+    )()
+    fake_kernel32 = type(
+        "FakeKernel32",
+        (),
+        {"GetCurrentThreadId": _NativeFunction(lambda: 1234)},
+    )()
+    monkeypatch.setattr(
+        "app.hotkeys.ctypes.WinDLL",
+        lambda name, **_kwargs: fake_user32 if name == "user32" else fake_kernel32,
+    )
+    errors: list[BaseException] = []
+    manager = GlobalHotkeyManager(
+        on_abort=lambda: (_ for _ in ()).throw(RuntimeError("broken abort callback")),
+        on_error=errors.append,
+    )
+
+    manager._message_loop()
+
+    assert manager.running is False
+    assert isinstance(manager.startup_error, HotkeyRegistrationError)
+    assert "abort hotkey callback failed" in str(manager.startup_error)
+    assert len(errors) == 1
+
+
+def test_stop_timeout_marks_emergency_hotkeys_unhealthy() -> None:
+    class HungThread:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, _timeout: float) -> None:
+            return None
+
+    errors: list[BaseException] = []
+    manager = GlobalHotkeyManager(on_error=errors.append)
+    manager._thread = HungThread()  # type: ignore[assignment]
+    manager._thread_id = None
+    manager._running = True
+
+    manager.stop(timeout=0.0)
+
+    assert manager.running is False
+    assert isinstance(manager.startup_error, HotkeyRegistrationError)
+    assert "Timed out stopping" in str(manager.startup_error)
+    assert errors == [manager.startup_error]

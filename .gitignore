@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data and logs
+data/
+*.log
+
+# PyInstaller output
+build/
+build-*/
+dist/
+dist-*/
+release/
+*.spec
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
