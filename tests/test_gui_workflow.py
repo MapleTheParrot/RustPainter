@@ -50,8 +50,8 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
     assert len(window._plan.color_groups) <= 32
     assert window._plan.stroke_count > 0
     assert not window.paint_preview._source.isNull()
-    # Dry run is the safe first-run default, so calibration is not required.
-    assert window.start_button.isEnabled()
+    assert not window.dry_run_check.isChecked()
+    assert not window.start_button.isEnabled()
 
 
 def test_text_overlay_is_editable_and_included_in_paint_plan(
@@ -158,6 +158,9 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert belongs_to(window.logical_height_spin, workspace)
     assert window.custom_resolution_panel.isHidden()
     assert belongs_to(window.stroke_speed_spin, settings)
+    assert belongs_to(window.dry_run_check, settings)
+    assert not belongs_to(window.dry_run_check, workspace)
+    assert not window.dry_run_check.isChecked()
     assert belongs_to(window.log_view, settings)
     assert not window.workspace_nav_button.icon().isNull()
     assert not window.settings_nav_button.icon().isNull()

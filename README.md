@@ -88,7 +88,7 @@ python main.py
 
 ## Quick start
 
-Paint a sign in six steps:
+Paint a sign in five steps:
 
 1. **Open the sign** in Rust and leave its painting interface stationary.
 2. **Calibrate.** In RustPainter, drag a box around each of three regions on
@@ -98,9 +98,8 @@ Paint a sign in six steps:
 3. **Load an image.** Browse or drag & drop. The defaults are ready to use.
 4. **Check the preview.** The paint simulation shows what will be painted,
    plus the stroke count and estimated time.
-5. **Dry run first.** Tick **Dry run**, press **F8**, and focus Rust during the
-   countdown. Progress should complete without any clicks reaching the game.
-6. **Paint.** Untick Dry run and start with a small, low-color test image.
+5. **Paint.** Start with a small, low-color test image and focus Rust during
+   the countdown.
 
 **Hotkeys:** `F8` start/resume, `F9` pause, `F10` abort. Abort immediately
 releases any held mouse button.
@@ -120,7 +119,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
-- Safety throughout: countdown, dry run, foreground-window guard, corner abort, pause/resume, and an abort that always releases the mouse
+- Safety throughout: countdown, foreground-window guard, corner abort, pause/resume, and an abort that always releases the mouse
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
 ## Detailed setup and first paint
@@ -132,9 +131,11 @@ painting unattended. Everything below is detail you only need when tuning.
 5. If automatic brush sizing is wanted, also calibrate the clickable **Size track** and the separate gray **brush-preview tile** that displays the current brush footprint.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
-8. Enable **Dry run** for the first test. Press Start, focus Rust during the countdown, and confirm that progress completes without clicks.
-9. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
-10. Disable Dry run and begin a small, low-color test image. Keep the abort hotkey available.
+8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
+9. Begin with a small, low-color test image. Keep the abort hotkey available.
+
+The niche **Run without mouse input** diagnostic remains available under
+**Settings → Diagnostics** for plan timing and troubleshooting, but is off by default.
 
 The current Rust picker layout is fixed in the application: hue runs bottom to top, saturation increases left to right, brightness decreases top to bottom, and brush size increases left to right.
 

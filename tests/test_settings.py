@@ -52,6 +52,7 @@ def test_default_settings_returns_independent_documents() -> None:
     second = default_settings()
     first["image"]["color_count"] = 8
     assert second["image"]["color_count"] == 32
+    assert second["execution"]["dry_run"] is False
     assert second["image"]["text_overlay"] == {
         "layers": [
             {

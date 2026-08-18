@@ -742,8 +742,8 @@ class MainWindow(QMainWindow):
         )
         speed_form.addRow("Preset", self.speed_preset_combo)
         speed_note = QLabel(
-            "Turbo can outrun Rust's UI on slower machines — dry run a small "
-            "test image first."
+            "Turbo can outrun Rust's UI on slower machines — test it with a "
+            "small image first."
         )
         speed_note.setWordWrap(True)
         speed_note.setObjectName("muted")
@@ -1121,14 +1121,8 @@ class MainWindow(QMainWindow):
         self._set_icon(self.abort_button, "abort", ON_ACCENT, size=16)
         run_buttons.addWidget(self.pause_button)
         run_buttons.addWidget(self.abort_button)
-        self.dry_run_check = QCheckBox("Dry run (no mouse input)")
-        self.dry_run_check.setChecked(True)
-        self.dry_run_check.setToolTip(
-            "Runs the whole plan without emitting input. Recommended for a new profile."
-        )
         run_layout.addWidget(self.start_button)
         run_layout.addLayout(run_buttons)
-        run_layout.addWidget(self.dry_run_check)
         layout.addWidget(run_group)
         layout.addStretch(1)
         return content
@@ -1247,6 +1241,22 @@ class MainWindow(QMainWindow):
         note.setObjectName("muted")
         layout.addWidget(title)
         layout.addWidget(note)
+
+        simulation_group = QGroupBox("Plan simulation")
+        simulation_layout = QVBoxLayout(simulation_group)
+        self.dry_run_check = QCheckBox("Run without mouse input")
+        self.dry_run_check.setChecked(False)
+        self.dry_run_check.setToolTip(
+            "Diagnostic mode that evaluates the paint plan without controlling Rust."
+        )
+        simulation_note = QLabel(
+            "Useful for timing or troubleshooting a plan. Leave this off for normal painting."
+        )
+        simulation_note.setWordWrap(True)
+        simulation_note.setObjectName("muted")
+        simulation_layout.addWidget(self.dry_run_check)
+        simulation_layout.addWidget(simulation_note)
+        layout.addWidget(simulation_group)
 
         debug_group = QGroupBox("Test actions")
         debug_layout = QGridLayout(debug_group)
@@ -2278,7 +2288,7 @@ class MainWindow(QMainWindow):
                 str(safety.get("expected_process_name", "") or "")
             )
             self.verify_ui_check.setChecked(bool(safety.get("verify_calibrated_ui", False)))
-            self.dry_run_check.setChecked(bool(execution.get("dry_run", True)))
+            self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
             self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
             self.pause_hotkey_combo.setCurrentText(str(hotkeys.get("pause", "F9")))
             self.abort_hotkey_combo.setCurrentText(str(hotkeys.get("abort", "F10")))

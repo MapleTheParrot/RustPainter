@@ -97,7 +97,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "verify_calibrated_ui": False,
     },
     "execution": {
-        "dry_run": True,
+        "dry_run": False,
         "debug_mouse_logging": False,
     },
     "ui": {
