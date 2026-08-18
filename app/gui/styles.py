@@ -1,9 +1,12 @@
 """Application palette and stylesheet.
 
-The theme is built around the baked artwork in ``assets/ui``: a seamless grain
-tile behind the window, a worn metal plate behind panels, a wide topbar
-texture behind the header, and two rounded rust fills used as border-images on
-the primary and destructive buttons.
+The theme is built around the baked artwork in ``assets/ui``. Every surface in
+the window is one of four seamless grain tiles rather than a flat colour — base
+behind the window, panel behind cards, raised for anything that sits above a
+panel (buttons, tabs, popups, metric cards) and inset for anything recessed into
+one (inputs, previews, progress grooves, the log) — plus a wide worn plate
+behind the header, a rust tile inside the progress bar, and two rounded rust
+fills used as border-images on the primary and destructive buttons.
 """
 
 from __future__ import annotations
@@ -37,20 +40,38 @@ ON_ACCENT = "#fff1e2"
 
 _BASE_TEXTURE = asset_url("surface-base")
 _PANEL_TEXTURE = asset_url("surface-panel")
+_RAISED_TEXTURE = asset_url("surface-raised")
+_INSET_TEXTURE = asset_url("surface-inset")
 _HEADER_TEXTURE = asset_url("surface-header")
 _ACCENT_FILL = asset_url("fill-accent")
 _DANGER_FILL = asset_url("fill-danger")
+_PROGRESS_FILL = asset_url("fill-progress")
+
+
+# Qt only tiles a background image through the shorthand form, and every rule
+# below repeats the colour so a missing asset still degrades to the flat theme.
+def _tile(color: str, texture: str) -> str:
+    return f"background: {color} url({texture}) repeat;"
+
+
+_BASE = _tile(BACKGROUND, _BASE_TEXTURE)
+_PANEL_SURFACE = _tile(PANEL, _PANEL_TEXTURE)
+_RAISED = _tile("#221c17", _RAISED_TEXTURE)
+_INSET = _tile("#0e0c0b", _INSET_TEXTURE)
+_POPUP = _tile(PANEL_RAISED, _RAISED_TEXTURE)
+# The warm plate under a selected tab or the checked navigation button.
+_SELECTED = _tile("#2d1c10", _RAISED_TEXTURE)
+_PROGRESS = _tile(ACCENT_HOVER, _PROGRESS_FILL)
 
 
 STYLE_SHEET = f"""
 QWidget {{
     color: {TEXT};
-    /* Qt only tiles a background image through the shorthand form. */
-    background: {BACKGROUND} url({_BASE_TEXTURE}) repeat;
+    {_BASE}
     font-family: "Segoe UI Variable Text", "Segoe UI";
     font-size: 9.5pt;
 }}
-QMainWindow, QDialog {{ background-color: {BACKGROUND}; }}
+QMainWindow, QDialog {{ {_BASE} }}
 QFrame#appHeader {{
     border: 1px solid {BORDER};
     border-radius: 12px;
@@ -69,12 +90,12 @@ QLabel#appMark {{
     border-radius: 8px;
 }}
 QFrame#panel, QGroupBox {{
-    background: {PANEL} url({_PANEL_TEXTURE}) repeat;
+    {_PANEL_SURFACE}
     border: 1px solid {BORDER};
     border-radius: 11px;
 }}
 QFrame#inlinePanel {{
-    background: #0f0d0b;
+    {_INSET}
     border: 1px solid {BORDER};
     border-radius: 8px;
 }}
@@ -127,21 +148,21 @@ QLabel#panelTitle {{
     letter-spacing: 1.4px;
 }}
 QFrame#metricCard {{
-    background: #100e0d;
+    {_RAISED}
     border: 1px solid {BORDER};
     border-radius: 9px;
 }}
 QLabel#muted, QLabel.muted {{ color: {MUTED}; }}
 QLabel#metricValue {{ font-size: 13pt; font-weight: 700; color: {TEXT}; }}
 QLabel#preview, QGraphicsView#preview {{
-    background: #0d0c0b;
+    {_INSET}
     border: 1px dashed {BORDER_LIGHT};
     border-radius: 10px;
     color: #7a6c60;
 }}
 QGraphicsView#preview {{ padding: 0; }}
 QPushButton {{
-    background: #221c17;
+    {_RAISED}
     border: 1px solid {BORDER_LIGHT};
     border-radius: 8px;
     padding: 7px 12px;
@@ -186,11 +207,11 @@ QPushButton#navButton {{
 QPushButton#navButton:hover {{ color: {TEXT}; background-color: #241a12; }}
 QPushButton#navButton:checked {{
     color: #ffd2a5;
-    background-color: #2d1c10;
+    {_SELECTED}
     border-color: {BORDER_LIGHT};
 }}
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QKeySequenceEdit {{
-    background: #0e0c0b;
+    {_INSET}
     border: 1px solid {BORDER};
     border-radius: 7px;
     padding: 5px 8px;
@@ -205,6 +226,36 @@ QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabl
     background-color: #161311;
     border-color: #2a221c;
 }}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    /* Left unstyled these draw a flat native block over the inset plate. */
+    background: transparent;
+    border: 0;
+    subcontrol-origin: padding;
+    width: 17px;
+    height: 11px;
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-position: top right; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-position: bottom right; }}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+    background: #2a1d14;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow,
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ border-bottom: 5px solid {ACCENT_SOFT}; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ border-top: 5px solid {ACCENT_SOFT}; }}
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{
+    border-bottom-color: #4a3d33;
+}}
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+    border-top-color: #4a3d33;
+}}
 QComboBox::drop-down {{ border: 0; width: 26px; }}
 QComboBox::down-arrow {{
     width: 0; height: 0;
@@ -214,7 +265,7 @@ QComboBox::down-arrow {{
     margin-right: 8px;
 }}
 QComboBox QAbstractItemView {{
-    background: {PANEL_RAISED};
+    {_POPUP}
     border: 1px solid {BORDER_LIGHT};
     border-radius: 6px;
     padding: 3px;
@@ -232,7 +283,7 @@ QCheckBox::indicator:checked {{ background: {ACCENT_DEEP}; border-color: {ACCENT
 QCheckBox::indicator:disabled {{ background: #1a1613; border-color: #2a221c; }}
 QTabWidget::pane {{
     border: 1px solid {BORDER};
-    background: {PANEL} url({_PANEL_TEXTURE}) repeat;
+    {_PANEL_SURFACE}
     border-radius: 10px;
     top: -1px;
 }}
@@ -249,13 +300,13 @@ QTabBar::tab {{
 }}
 QTabBar::tab:hover {{ color: {TEXT}; background-color: #241a12; }}
 QTabBar::tab:selected {{
-    background-color: #2d1c10;
+    {_SELECTED}
     color: #ffc793;
     border-color: {BORDER};
     border-bottom-color: #2d1c10;
 }}
 QProgressBar {{
-    background: #0c0a09;
+    {_INSET}
     border: 1px solid {BORDER};
     border-radius: 7px;
     text-align: center;
@@ -263,8 +314,7 @@ QProgressBar {{
     color: {TEXT};
 }}
 QProgressBar::chunk {{
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 {ACCENT}, stop:0.5 {ACCENT_HOVER}, stop:1 {ACCENT_PRESSED});
+    {_PROGRESS}
     border-radius: 6px;
 }}
 QSlider::groove:horizontal {{ height: 5px; background: #0e0c0b; border-radius: 2px; }}
@@ -282,7 +332,7 @@ QScrollBar::handle:horizontal {{ background: #4a3627; min-width: 30px; border-ra
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QSplitter::handle {{ background: transparent; width: 6px; }}
 QPlainTextEdit {{
-    background: #0b0a09;
+    {_INSET}
     border: 1px solid {BORDER};
     border-radius: 7px;
     color: #c8bcb0;
@@ -290,19 +340,19 @@ QPlainTextEdit {{
     font-size: 8.5pt;
 }}
 QStatusBar {{
-    background-color: {BACKGROUND};
+    {_BASE}
     color: {MUTED};
     border-top: 1px solid {BORDER};
 }}
 QStatusBar::item {{ border: 0; }}
 QToolTip {{
     color: {TEXT};
-    background-color: #241d18;
+    {_POPUP}
     border: 1px solid {BORDER_LIGHT};
     border-radius: 5px;
     padding: 5px 8px;
 }}
-QMessageBox {{ background-color: {SURFACE}; }}
+QMessageBox {{ {_PANEL_SURFACE} }}
 """
 
 

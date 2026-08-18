@@ -7,8 +7,10 @@ Run this after replacing anything in the source art folder:
 The raw art is 1254px-square glow renders and multi-megabyte textures, while
 the desktop UI only ever draws them at icon sizes or as stretched surfaces.
 The bake step trims them down, keys the flat black backdrop out of the opaque
-icon renders, and recolours the shared grain texture into the accent and
-danger button fills that the stylesheet references.
+icon renders, and recolours the shared grain textures into the four surface
+tiles and the three rust fills that the stylesheet references. The wear overlay
+is composited into the header plate here rather than shipped on its own, since
+Qt cannot stack two backgrounds on one widget.
 """
 
 from __future__ import annotations
@@ -49,12 +51,23 @@ ICONS = {
 
 ICON_SIZE = 192
 
-# Ramp endpoints used to recolour a grayscale grain into a themed surface.
-BACKGROUND_RAMP = ((14, 13, 12), (31, 27, 23))
-PANEL_RAMP = ((16, 14, 12), (48, 40, 34))
-HEADER_RAMP = ((13, 11, 10), (46, 33, 24))
-ACCENT_RAMP = ((88, 30, 4), (214, 96, 26))
-DANGER_RAMP = ((70, 12, 8), (168, 40, 30))
+# Edge length of the seamless surface tiles. Mirroring makes them symmetric, so
+# a large tile is what keeps the repeat from reading as a lattice behind the
+# window-sized panels.
+TILE_SIZE = 512
+
+# Ramp endpoints used to recolour a grayscale grain into a themed surface. The
+# ramp is applied to a contrast-normalised copy of the source (see _ramp), so
+# these two colours are the darkest and lightest pixels the surface can show.
+BACKGROUND_RAMP = ((11, 10, 9), (36, 31, 26))
+PANEL_RAMP = ((15, 13, 11), (52, 43, 36))
+PANEL_RAISED_RAMP = ((26, 21, 18), (68, 55, 45))
+INSET_RAMP = ((8, 7, 6), (28, 24, 20))
+HEADER_RAMP = ((12, 10, 9), (62, 42, 28))
+# The button fills were already reading as rust before the surfaces were
+# normalised, so their ramps are pulled in to keep the same weight on screen.
+ACCENT_RAMP = ((70, 24, 3), (176, 78, 21))
+DANGER_RAMP = ((56, 9, 6), (138, 33, 24))
 
 
 def _key_black_to_alpha(image: Image.Image) -> Image.Image:
@@ -91,12 +104,23 @@ def _ramp(
     dark: tuple[int, int, int],
     light: tuple[int, int, int],
 ) -> Image.Image:
-    """Map a texture's luminance onto a two-point colour ramp."""
+    """Map a texture's luminance onto a two-point colour ramp.
 
-    gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+    The source renders are dark: their luminance sits inside a narrow band near
+    the bottom of the range, so mapping it straight onto a ramp used only a
+    sliver of it and produced surfaces that were flat to the eye. Normalising
+    the band to the full ramp first is what makes the grain visible, and the
+    percentiles keep a few stray specks from stealing the whole range.
+    """
+
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    low_value, high_value = np.percentile(gray, (2.0, 98.0))
+    normalized = np.clip(
+        (gray - low_value) / max(float(high_value - low_value), 1.0), 0.0, 1.0
+    )
     low = np.asarray(dark, dtype=np.float32)
     high = np.asarray(light, dtype=np.float32)
-    rgb = low + gray[..., None] * (high - low)
+    rgb = low + normalized[..., None] * (high - low)
     return Image.fromarray(rgb.astype(np.uint8), "RGB")
 
 
@@ -111,6 +135,29 @@ def _mirror_tile(image: Image.Image, size: int) -> Image.Image:
     tile.paste(quadrant.transpose(Image.FLIP_TOP_BOTTOM), (0, half))
     tile.paste(quadrant.transpose(Image.ROTATE_180), (half, half))
     return tile
+
+
+def _mirror_strip(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Mirror a texture horizontally into a wide strip that tiles seamlessly.
+
+    Used for the progress fill, which only ever repeats sideways: a strip wider
+    than the bar keeps the grain from reading as a row of beads.
+    """
+
+    width, height = size
+    half = image.resize((width // 2, height), Image.LANCZOS)
+    strip = Image.new(image.mode, size)
+    strip.paste(half, (0, 0))
+    strip.paste(half.transpose(Image.FLIP_LEFT_RIGHT), (width // 2, 0))
+    return strip
+
+
+def _fade_alpha(image: Image.Image, strength: float) -> Image.Image:
+    """Scale an overlay's alpha so it wears a surface instead of hiding it."""
+
+    faded = image.copy()
+    faded.putalpha(image.getchannel("A").point(lambda value: int(value * strength)))
+    return faded
 
 
 def _rounded_fill(
@@ -170,7 +217,7 @@ def main(source_root: Path) -> int:
     base = Image.alpha_composite(
         base.convert("RGBA"), grunge.resize(base.size, Image.LANCZOS)
     ).convert("RGB")
-    _mirror_tile(_ramp(base, *BACKGROUND_RAMP), 384).save(
+    _mirror_tile(_ramp(base, *BACKGROUND_RAMP), TILE_SIZE).save(
         OUTPUT_ROOT / "surface-base.png", optimize=True
     )
 
@@ -181,14 +228,36 @@ def main(source_root: Path) -> int:
     panel = panel.crop(
         (width // 4, height // 4, width * 3 // 4, height * 3 // 4)
     )
-    _mirror_tile(_ramp(panel, *PANEL_RAMP), 320).save(
+    _mirror_tile(_ramp(panel, *PANEL_RAMP), TILE_SIZE).save(
         OUTPUT_ROOT / "surface-panel.png", optimize=True
     )
 
-    header = Image.open(assets / "T3_header-topbar-texture.png").convert("RGB")
-    _ramp(header.resize((1024, 341), Image.LANCZOS), *HEADER_RAMP).save(
-        OUTPUT_ROOT / "surface-header.png", optimize=True
+    # Buttons, cards, and popups sit above the panels; inputs and previews sit
+    # below them. Both reuse the panel plate at different ramps so every surface
+    # in the window carries the same grain.
+    _mirror_tile(_ramp(panel, *PANEL_RAISED_RAMP), TILE_SIZE).save(
+        OUTPUT_ROOT / "surface-raised.png", optimize=True
     )
+    _mirror_tile(_ramp(panel, *INSET_RAMP), TILE_SIZE).save(
+        OUTPUT_ROOT / "surface-inset.png", optimize=True
+    )
+
+    header = Image.open(assets / "T3_header-topbar-texture.png").convert("RGB")
+    wear = Image.open(assets / "T5_rust-edge-wear-overlay.png").convert("RGBA")
+    header_size = (1024, 341)
+    # The header is the one surface drawn as a single stretched image rather than
+    # a tile, so the edge wear can be baked into it without repeating.
+    header_plate = _ramp(header.resize(header_size, Image.LANCZOS), *HEADER_RAMP)
+    header_plate = Image.alpha_composite(
+        header_plate.convert("RGBA"),
+        _fade_alpha(
+            wear.resize(header_size, Image.LANCZOS).filter(
+                ImageFilter.GaussianBlur(0.4)
+            ),
+            0.45,
+        ),
+    ).convert("RGB")
+    header_plate.save(OUTPUT_ROOT / "surface-header.png", optimize=True)
 
     grain = Image.open(assets / "T8_red-danger-texture.png").convert("RGB")
     _rounded_fill(grain, ACCENT_RAMP).save(
@@ -197,10 +266,11 @@ def main(source_root: Path) -> int:
     _rounded_fill(grain, DANGER_RAMP, edge=(255, 108, 90)).save(
         OUTPUT_ROOT / "fill-danger.png", optimize=True
     )
-
-    wear = Image.open(assets / "T5_rust-edge-wear-overlay.png").convert("RGBA")
-    wear.resize((512, 512), Image.LANCZOS).filter(ImageFilter.GaussianBlur(0.4)).save(
-        OUTPUT_ROOT / "edge-wear.png", optimize=True
+    # The progress chunk keeps its rounded corners from the stylesheet, so its
+    # fill is a plain tile rather than a sliced button plate. It is taller than
+    # any progress bar, so only the horizontal repeat has to be seamless.
+    _mirror_strip(_ramp(grain, *ACCENT_RAMP), (512, 64)).save(
+        OUTPUT_ROOT / "fill-progress.png", optimize=True
     )
 
     print(f"Wrote {len(list(OUTPUT_ROOT.glob('*.png')))} files to {OUTPUT_ROOT}")

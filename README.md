@@ -109,7 +109,7 @@ painting unattended. Everything below is detail you only need when tuning.
 
 ## Features
 
-- Dark workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
+- Dark, rust-textured workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by browse or drag & drop
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
