@@ -47,6 +47,10 @@ Then grant two permissions under **System Settings > Privacy & Security**:
 
 Relaunch the app after granting them.
 
+macOS throttles background applications through App Nap, which would slow a
+paint job down for as long as the game is frontmost. RustPainter opts out of it
+automatically for the duration of each job, so no configuration is needed.
+
 > **After installing a new version**, macOS may stop honouring permissions you
 > granted to the previous build. An ad-hoc signature changes every time the app
 > is rebuilt, and the permission system tracks apps by signature. If hotkeys or
@@ -178,7 +182,7 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 ## Safety behavior
 
 - Starting uses a visible countdown so you can focus Rust.
-- With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. The default expected process is Windows' `RustClient.exe`; on macOS clear it or set the Mac client's process name, and note that reading the frontmost window title needs Screen Recording (otherwise the app name is matched instead). Loss of focus pauses and releases the mouse.
+- With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. On Windows the expected process defaults to `RustClient.exe`; on macOS it defaults to empty so the window title governs, because a Windows executable name can never match there and would pause the job the moment you focused the game. If you upgraded from an earlier build and the job pauses immediately after the countdown, clear **Expected process name** under Settings. Reading the frontmost window title needs Screen Recording on macOS (otherwise the application name is matched instead). Loss of focus pauses and releases the mouse.
 - F9 pauses at the next short cancellation checkpoint.
 - F10 aborts, clears pending work, and releases the mouse.
 - Optional rapid movement into a virtual-screen corner aborts the job.

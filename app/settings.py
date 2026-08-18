@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any
 
 
+# Rust's Windows client runs as RustClient.exe. On other platforms the
+# executable name differs, so a Windows name there can never match and would
+# make the foreground guard pause the moment the user focuses the game. The
+# window-title check governs instead, and the field stays editable for anyone
+# who wants the stricter two-part guard.
+DEFAULT_EXPECTED_PROCESS_NAME = "RustClient.exe" if os.name == "nt" else ""
+
 SETTINGS_SCHEMA_VERSION = 1
 DEFAULT_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "data" / "settings.json"
 
@@ -71,7 +78,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "corner_abort_enabled": True,
         "corner_abort_margin_pixels": 3,
         "require_rust_foreground": True,
-        "expected_process_name": "RustClient.exe",
+        "expected_process_name": DEFAULT_EXPECTED_PROCESS_NAME,
         "expected_window_title_contains": "Rust",
         "verify_calibrated_ui": False,
     },
