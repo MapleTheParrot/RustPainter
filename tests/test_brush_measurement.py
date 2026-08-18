@@ -340,6 +340,51 @@ def test_a_measured_curve_replaces_the_preview_search_while_painting() -> None:
     assert fraction == pytest.approx(0.24, abs=0.05)
 
 
+def test_a_minimum_brush_wider_than_a_cell_stops_the_job() -> None:
+    # fraction_for clamps to the measured range, so without a bottom-end guard
+    # a Size track whose smallest dab dwarfs a logical cell would silently
+    # smear every detail stroke over its neighbours. Stopping with the usable
+    # resolution in the message beats painting the wrong image.
+    profile = _profile()
+    profile.metadata["brush_response"] = build_brush_response(
+        [(0.0, 40.0), (1.0, 64.0)]
+    ).to_dict()
+    controller = MockInputController()
+    painter = Painter(controller, screen_capture=lambda rect: Image.new(
+        "RGB", (rect.width, rect.height), (21, 21, 12)
+    ))
+    # 70x55 logical cells on the 1400x1100 canvas are 20px; the smallest
+    # measured dab is twice that.
+    plan = PaintPlan(70, 55, (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),))
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(10.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.ERROR
+    assert "Lower the painting resolution" in painter.state_reason
+    # The suggested ceiling comes from the canvas and the measured minimum.
+    assert "35×27" in painter.state_reason
+
+
+def test_a_slightly_oversized_minimum_brush_still_paints() -> None:
+    # A dab a shade over its cell blurs a seam the sign texture hides; only
+    # runaway overshoot should stop a job.
+    profile = _profile()
+    profile.metadata["brush_response"] = build_brush_response(
+        [(0.0, 24.0), (1.0, 64.0)]
+    ).to_dict()
+    controller = MockInputController()
+    painter = Painter(controller, screen_capture=lambda rect: Image.new(
+        "RGB", (rect.width, rect.height), (21, 21, 12)
+    ))
+    plan = PaintPlan(70, 55, (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),))
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(10.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+
+
 def test_measuring_never_paints_a_background_it_does_not_need() -> None:
     # A dab out-contrasts the bare sign well enough to be measured, so the run
     # stamps six dabs and reads them. Priming the patches first cost two

@@ -240,3 +240,37 @@ def test_oversized_cells_cap_the_brush() -> None:
         capabilities=BrushCapabilities(sizing=True, square=True, cell_pixels=40.0),
     )
     assert all(group.brush_diameter == 1 for group in result.plan.color_groups)
+
+
+def test_a_measured_top_end_overrides_the_guessed_slider_range() -> None:
+    image = _rgb(64, 32, (20, 20, 20))
+    result = optimize_paint_plan(
+        image,
+        PaintMode.FAST,
+        # The guess would forbid 40px cells, but this Size track was measured
+        # reaching 130px, which comfortably paints a 3-cell (120px) band.
+        capabilities=BrushCapabilities(
+            sizing=True, square=True, cell_pixels=40.0, max_brush_pixels=130.0
+        ),
+    )
+    assert max(group.brush_diameter for group in result.plan.color_groups) == 3
+
+
+def test_a_measured_minimum_rules_out_overshooting_passes() -> None:
+    image = _rgb(64, 32, (20, 20, 20))
+    result = optimize_paint_plan(
+        image,
+        PaintMode.FAST,
+        # The smallest dab this track paints is 30px, so on 4px cells even a
+        # 5-cell band (20px nominal, one guard cell each side) would spill
+        # beyond the erosion's safety margin; only 7-cell passes may stay.
+        capabilities=BrushCapabilities(
+            sizing=True,
+            square=True,
+            cell_pixels=4.0,
+            min_brush_pixels=30.0,
+            max_brush_pixels=64.0,
+        ),
+    )
+    diameters = {group.brush_diameter for group in result.plan.color_groups}
+    assert 3 not in diameters and 5 not in diameters

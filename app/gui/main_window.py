@@ -597,6 +597,7 @@ class MainWindow(QMainWindow):
         ]
         self._selected_text_layer = 0
         self._syncing_text_controls = False
+        self._last_resolution_cap: tuple[int, int] | None = None
         self._closing = False
         self._painter_bridge = _PainterBridge()
         self._painter_bridge.progress.connect(self._on_paint_progress)
@@ -1706,18 +1707,28 @@ class MainWindow(QMainWindow):
         slider = self._profile_rect("brush_slider")
         preview = self._profile_rect("brush_preview")
         canvas = self._profile_rect("canvas")
-        measured = self._has_brush_response()
+        responses = self._stored_brush_responses()
         cell_pixels = 0.0
         if canvas is not None:
+            # The same capped resolution the plan itself will use, so the
+            # planner's cell size matches what actually lands on the canvas.
+            logical_width, logical_height = self._brush_fit_logical_size()
             cell_pixels = min(
-                canvas.width / max(1, self.logical_width_spin.value()),
-                canvas.height / max(1, self.logical_height_spin.value()),
+                canvas.width / max(1, logical_width),
+                canvas.height / max(1, logical_height),
             )
+        # A pass may end up under either measured shape, so the planner gets
+        # the worst case of each end: the widest minimum and narrowest maximum.
+        min_brush = 0.0
+        max_brush = 0.0
+        if responses is not None:
+            min_brush = max(curve.smallest_diameter for curve in responses.curves)
+            max_brush = min(curve.largest_diameter for curve in responses.curves)
         return BrushCapabilities(
             sizing=bool(
                 self.apply_brush_check.isChecked()
                 and slider is not None
-                and (preview is not None or measured)
+                and (preview is not None or responses is not None)
                 # Spacing above 1.0 spreads stroke geometry while the brush
                 # stays capped at one unspaced cell, so multi-cell bands would
                 # leave unpainted rows; keep those plans single-cell.
@@ -1726,6 +1737,8 @@ class MainWindow(QMainWindow):
             square=self._profile_rect("square_shape_button") is not None,
             circle=self._profile_rect("circle_shape_button") is not None,
             cell_pixels=cell_pixels,
+            min_brush_pixels=min_brush,
+            max_brush_pixels=max_brush,
         )
 
     @Slot()
@@ -2257,14 +2270,60 @@ class MainWindow(QMainWindow):
             return color.red(), color.green(), color.blue()
         return None
 
+    def _brush_fit_logical_size(self) -> tuple[int, int]:
+        """The user's painting resolution, capped to what the brush can paint.
+
+        Cells smaller than the smallest measured dab guarantee every detail
+        stroke overwrites its neighbours, so the sign could never match the
+        preview.  Both dimensions scale by one factor to keep the aspect the
+        canvas calibration established.
+        """
+
+        width = self.logical_width_spin.value()
+        height = self.logical_height_spin.value()
+        if not (self.apply_brush_check.isChecked() and self._profile_rect("brush_slider")):
+            return width, height
+        canvas = self._profile_rect("canvas")
+        responses = self._stored_brush_responses()
+        if canvas is None or responses is None:
+            return width, height
+        smallest = max(curve.smallest_diameter for curve in responses.curves)
+        if smallest <= 0:
+            return width, height
+        scale = min(
+            canvas.width / smallest / max(1, width),
+            canvas.height / smallest / max(1, height),
+            1.0,
+        )
+        if scale >= 1.0:
+            return width, height
+        capped = (max(8, int(width * scale)), max(8, int(height * scale)))
+        if capped != (width, height) and capped != self._last_resolution_cap:
+            self._last_resolution_cap = capped
+            self.statusBar().showMessage(
+                f"Painting resolution capped to {capped[0]}×{capped[1]} so each "
+                f"cell fits the measured {smallest:.0f}px minimum brush",
+                8000,
+            )
+            LOGGER.info(
+                "Resolution capped from %dx%d to %dx%d for the %.0fpx minimum brush",
+                width,
+                height,
+                capped[0],
+                capped[1],
+                smallest,
+            )
+        return capped
+
     def _processing_options(self) -> ImageProcessOptions:
         background = self._background_color()
         transparency = TransparencyMode(self.transparency_combo.currentData())
         transparent_fill = background or (255, 255, 255)
         removal_color = self.removal_color_button.color()
+        logical_width, logical_height = self._brush_fit_logical_size()
         return ImageProcessOptions(
-            logical_width=self.logical_width_spin.value(),
-            logical_height=self.logical_height_spin.value(),
+            logical_width=logical_width,
+            logical_height=logical_height,
             scale_mode=ScaleMode(self.scale_mode_combo.currentData()),
             crop_alignment=CropAlignment(self.crop_alignment_combo.currentData()),
             color_count=int(self.color_count_combo.currentData()),
@@ -3194,6 +3253,18 @@ class MainWindow(QMainWindow):
         profile = self._current_profile
         stored = profile.metadata.get("brush_response") if profile else None
         return isinstance(stored, Mapping)
+
+    def _stored_brush_responses(self) -> BrushResponseSet | None:
+        """The active profile's measured brush curves, or None if unusable."""
+
+        profile = self._current_profile
+        stored = profile.metadata.get("brush_response") if profile else None
+        if not isinstance(stored, Mapping):
+            return None
+        try:
+            return BrushResponseSet.from_dict(stored)
+        except (TypeError, ValueError):
+            return None
 
     def _profile_rect(self, name: str) -> ScreenRect | None:
         if self._current_profile is None:

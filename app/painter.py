@@ -904,6 +904,9 @@ class Painter:
             # that matters - how wide this brush paints - so the whole search,
             # and every preview capture it costs, is skipped.
             self._require_reachable_brush(response, target_diameter, diameter_cells)
+            self._require_cell_sized_brush(
+                response, diameter_cells, cell, job.target.canvas
+            )
             fraction = response.fraction_for(target_diameter)
             self._safe_click(self._slider_point(slider, fraction), epoch)
             self._interruptible_sleep(
@@ -994,6 +997,21 @@ class Painter:
                 f"{target_diameter:.0f}px this plan's {diameter_cells}-cell brush "
                 "needs. Choose a lower optimization mode or a higher painting "
                 "resolution, or recalibrate the Size track."
+            )
+        # The preview tile draws at its own scale, so this only catches gross
+        # mismatch - but a closest-achievable dab half again wider than a cell
+        # means the slider bottomed out, and painting on would smear every
+        # detail stroke over its neighbours.
+        if (
+            diameter_cells <= 1
+            and best_diameter > cell * self._DETAIL_OVERSHOOT_LIMIT + 0.75
+        ):
+            raise RuntimeError(
+                f"The smallest brush the Size track reached renders {best_diameter:.0f}px "
+                f"in the preview, but one logical cell is only {cell:.0f}px, so detail "
+                "strokes would overwrite their neighbours. Lower the painting "
+                "resolution, calibrate a larger sign, or measure the brush on the "
+                "canvas for an exact answer."
             )
         if current_fraction is None or abs(current_fraction - best_fraction) > 1e-6:
             self._safe_click(self._slider_point(slider, best_fraction), epoch)
@@ -1390,6 +1408,51 @@ class Painter:
             f"The Size slider paints at most {response.largest_diameter:.0f}px, and "
             f"this plan's {diameter_cells}-cell brush needs {target_diameter:.0f}px. "
             "Choose a lower optimization mode or a higher painting resolution."
+        )
+
+    # The plan treats a cell as final once its color's last stroke lands, so a
+    # brush that spills half a cell each side starts destroying finished
+    # neighbours.  Below this ratio the spill stays inside the seams the plan
+    # already tolerates; above it the painted sign visibly diverges from the
+    # preview, and stopping beats quietly painting the wrong image.
+    _DETAIL_OVERSHOOT_LIMIT = 1.5
+
+    @staticmethod
+    def _require_cell_sized_brush(
+        response: BrushResponse,
+        diameter_cells: int,
+        cell: float,
+        canvas: RectangleLike,
+    ) -> None:
+        """Refuse detail strokes when even the smallest brush dwarfs a cell.
+
+        ``fraction_for`` clamps to the measured range, so without this check a
+        Size track whose minimum dab is wider than a logical cell would simply
+        paint every single-cell stroke with that oversized dab - each stroke
+        overwriting its neighbours, which is exactly the smeared result the
+        guard exists to prevent.
+        """
+
+        if diameter_cells > 1:
+            return
+        smallest = response.smallest_diameter
+        if smallest > cell + 0.75:
+            LOGGER.warning(
+                "The smallest measured brush (%.1fpx) is wider than a %.1fpx "
+                "logical cell; detail strokes will bleed into their neighbours",
+                smallest,
+                cell,
+            )
+        if smallest <= cell * Painter._DETAIL_OVERSHOOT_LIMIT + 0.75:
+            return
+        fit_width = max(1, int(canvas.width / smallest))
+        fit_height = max(1, int(canvas.height / smallest))
+        raise RuntimeError(
+            f"The smallest brush this Size track paints is {smallest:.0f}px, but "
+            f"one logical cell is only {cell:.0f}px, so every detail stroke would "
+            "overwrite its neighbours and the sign would not match the preview. "
+            f"Lower the painting resolution to at most {fit_width}×{fit_height} "
+            "for this canvas, or calibrate a larger sign."
         )
 
     def _measure_brush_preview(self, preview: RectangleLike) -> BrushFootprint:
