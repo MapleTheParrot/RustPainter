@@ -118,7 +118,8 @@ painting unattended. Everything below is detail you only need when tuning.
 - Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
-- Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
+- Drag calibration for the canvas, color box, hue bar, and optional Size track, brush-preview tile, and Square/Circle shape buttons, with an on-screen overlay to verify them
+- Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
@@ -160,6 +161,38 @@ subject and the plan gets shorter by exactly those pixels.
 Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
+
+### Optimization modes
+
+The **Optimization** picker in quick settings chooses how boldly planning may
+simplify the image to paint faster. The Rust preview always shows the actual
+image the plan will reproduce, so the trade-off is visible before painting.
+
+- **Exact** - the classic plan: every quantized pixel, row by row. Use it when
+  pixel-level fidelity matters more than speed. Stroke merging stays available
+  in this mode only; the optimized modes handle it themselves.
+- **Quality** - very conservative: merges only colors that are genuinely
+  indistinguishable and cleans up single-pixel noise.
+- **Balanced** (recommended) - merges visually identical colors, absorbs
+  insignificant specks into their surroundings, and paints large regions first
+  with the largest safe brush.
+- **Fast** - aggressive merging and cleanup for the shortest paint time,
+  usually still within a few percent of the source's look.
+
+Optimized modes paint most-common colors first and may sweep straight across
+pixels a later color repaints anyway - the same idea as stroke merging, taken
+further. With **Automatic brush sizing** calibrated they also fill wide areas
+with a bigger brush before switching down for edges and detail; a resize costs
+real seconds, so the planner only fetches a big brush when it pays for the trip.
+Dithered images keep their deliberate speckle: region cleanup turns itself off
+when dithering is enabled.
+
+Two further optional calibrations, **Square shape** and **Circle shape**, mark
+Rust's solid brush-shape buttons. With neither calibrated, painting keeps
+whatever shape is selected in Rust. With one, optimized plans may select that
+shape when a large brush is used. With both, the planner picks square or circle
+per region - square for broad flat fills, circle where a square would spill
+into places that need cleaning up - and batches work so it rarely switches.
 
 ### How the image is prepared for the picker
 
@@ -306,6 +339,7 @@ app/
   color_calibration.py painted-chart response fitting
   coordinates.py       logical/screen coordinate conversion
   paint_plan.py        horizontal-run planning and estimates
+  paint_optimizer.py   artist-style optimized planning (modes, brushes)
   input_controller.py  SendInput and dry-run input
   hotkeys.py           Windows global hotkeys
   painter.py           resumable, abortable execution
