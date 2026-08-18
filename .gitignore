@@ -26,3 +26,6 @@ release/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local brush-diagnostic captures
+diagnostic/
