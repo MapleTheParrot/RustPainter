@@ -43,8 +43,11 @@ def _data_directory() -> Path:
         directory = Path(override).expanduser()
         directory.mkdir(parents=True, exist_ok=True)
         return directory
-    root = os.environ.get("LOCALAPPDATA")
-    directory = Path(root) / "RustPainter" if root else Path.cwd() / "data"
+    if sys.platform == "darwin":
+        directory = Path.home() / "Library" / "Application Support" / "RustPainter"
+    else:
+        root = os.environ.get("LOCALAPPDATA")
+        directory = Path(root) / "RustPainter" if root else Path.cwd() / "data"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 

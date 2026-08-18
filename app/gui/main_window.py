@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from copy import deepcopy
@@ -1694,8 +1695,11 @@ class MainWindow(QMainWindow):
             root = Path(override).expanduser()
             root.mkdir(parents=True, exist_ok=True)
             return root
-        local = os.environ.get("LOCALAPPDATA")
-        root = Path(local) / "RustPainter" if local else Path.cwd() / "data"
+        if sys.platform == "darwin":
+            root = Path.home() / "Library" / "Application Support" / "RustPainter"
+        else:
+            local = os.environ.get("LOCALAPPDATA")
+            root = Path(local) / "RustPainter" if local else Path.cwd() / "data"
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -3131,7 +3135,10 @@ class MainWindow(QMainWindow):
             self._set_idle_ui("Start cancelled")
             return
         try:
-            from app.input_controller import DryRunInputController, SendInputController
+            from app.input_controller import (
+                DryRunInputController,
+                create_system_input_controller,
+            )
             from app.painter import Painter, PainterSettings
 
             input_controller = (
@@ -3143,7 +3150,7 @@ class MainWindow(QMainWindow):
                     )
                 )
                 if dry_run
-                else SendInputController()
+                else create_system_input_controller()
             )
             settings_document = pending.settings
             # The visible Qt countdown has already completed.  Keeping the
@@ -3427,7 +3434,10 @@ class MainWindow(QMainWindow):
             return
         try:
             from app.color_mapping import map_hue_to_screen, map_sv_to_screen
-            from app.input_controller import DryRunInputController, SendInputController
+            from app.input_controller import (
+                DryRunInputController,
+                create_system_input_controller,
+            )
             from app.screen import foreground_window_matches, get_virtual_screen
 
             dry_run = self.dry_run_check.isChecked()
@@ -3513,7 +3523,7 @@ class MainWindow(QMainWindow):
                 controller = (
                     DryRunInputController(detailed_logging=detailed_logging)
                     if dry_run
-                    else SendInputController()
+                    else create_system_input_controller()
                 )
                 if self._pending_start_cancelled or self._debug_abort_event.is_set():
                     controller.release_all()

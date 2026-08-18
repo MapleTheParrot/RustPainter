@@ -178,7 +178,7 @@ def test_live_debug_stroke_is_immediately_abortable(
 
     controller = GatedDebugInput()
     monkeypatch.setattr(
-        "app.input_controller.SendInputController", lambda: controller
+        "app.input_controller.create_system_input_controller", lambda: controller
     )
     profile = window._current_profile
     profile.canvas = ScreenRect(100, 100, 400, 80)

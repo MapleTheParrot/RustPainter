@@ -1,10 +1,14 @@
-"""Windows screen, foreground-window, and lightweight reference utilities."""
+"""Screen, foreground-window, and lightweight reference utilities.
+
+Windows uses Win32 physical coordinates; macOS uses global display points
+(the Quartz/Qt coordinate space).  Both share the same public surface."""
 
 from __future__ import annotations
 
 import ctypes
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -131,12 +135,38 @@ def set_dpi_awareness() -> bool:
     return _DPI_AWARENESS_RESULT
 
 
+def _darwin_virtual_screen() -> VirtualScreen:
+    """Union of active display bounds in global points, top-left origin."""
+
+    import Quartz
+
+    error, display_ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+    if error or not count:
+        raise OSError(f"Could not enumerate macOS displays (error {error})")
+    left = top = None
+    right = bottom = None
+    for display_id in display_ids[:count]:
+        bounds = Quartz.CGDisplayBounds(display_id)
+        display_left = int(bounds.origin.x)
+        display_top = int(bounds.origin.y)
+        display_right = display_left + int(bounds.size.width)
+        display_bottom = display_top + int(bounds.size.height)
+        left = display_left if left is None else min(left, display_left)
+        top = display_top if top is None else min(top, display_top)
+        right = display_right if right is None else max(right, display_right)
+        bottom = display_bottom if bottom is None else max(bottom, display_bottom)
+    return VirtualScreen(left, top, right - left, bottom - top, int(count))
+
+
 def get_virtual_screen() -> VirtualScreen:
     """Return the physical bounding rectangle of all Windows monitors."""
 
+    if sys.platform == "darwin":
+        return _darwin_virtual_screen()
     if os.name != "nt":
         # This deterministic fallback supports dry runs and unit tests. Real
-        # capture/input methods still state clearly when Windows is required.
+        # capture/input methods still state clearly when a supported OS is
+        # required.
         return VirtualScreen(0, 0, 1920, 1080, 1)
     set_dpi_awareness()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -158,8 +188,13 @@ def get_virtual_screen_rect() -> ScreenRect:
 
 
 def get_cursor_position() -> tuple[int, int]:
+    if sys.platform == "darwin":
+        import Quartz
+
+        location = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        return int(round(location.x)), int(round(location.y))
     if os.name != "nt":
-        raise OSError("Global cursor position is available only on Windows")
+        raise OSError("Global cursor position is available only on Windows and macOS")
     from ctypes import wintypes
 
     class POINT(ctypes.Structure):
@@ -221,9 +256,54 @@ def _process_path(process_id: int) -> str | None:
         close_handle(handle)
 
 
+def _darwin_foreground_window() -> ForegroundWindowInfo | None:
+    """Describe the frontmost application via AppKit/Quartz.
+
+    The focused window's title is only visible with the Screen Recording
+    permission; without it the application name doubles as the title, which
+    still supports name-based foreground matching.
+    """
+
+    from AppKit import NSWorkspace
+
+    application = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if application is None:
+        return None
+    process_id = int(application.processIdentifier())
+    name = str(application.localizedName() or "")
+    executable_url = application.executableURL()
+    executable = str(executable_url.path()) if executable_url is not None else None
+    title = name
+    try:
+        import Quartz
+
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        for window in windows or ():
+            if int(window.get("kCGWindowOwnerPID", -1)) != process_id:
+                continue
+            if int(window.get("kCGWindowLayer", 0)) != 0:
+                continue
+            title = str(window.get("kCGWindowName") or name)
+            break
+    except Exception:
+        LOGGER.debug("Could not read the frontmost window title", exc_info=True)
+    return ForegroundWindowInfo(
+        hwnd=0,
+        title=title,
+        process_id=process_id,
+        executable=executable,
+    )
+
+
 def get_foreground_window() -> ForegroundWindowInfo | None:
     """Describe the active top-level window, including executable when allowed."""
 
+    if sys.platform == "darwin":
+        return _darwin_foreground_window()
     if os.name != "nt":
         return None
     from ctypes import wintypes
@@ -288,9 +368,51 @@ def _bbox(rect: RectangleLike) -> tuple[int, int, int, int]:
     return rect.left, rect.top, rect.left + rect.width, rect.top + rect.height
 
 
+def _darwin_capture_region(rect: RectangleLike) -> "Image":
+    """Capture a global-point rectangle on macOS, Retina-normalized.
+
+    ``CGWindowListCreateImage`` accepts the same global point coordinates the
+    rest of the app uses and captures across displays.  On Retina screens the
+    result arrives at pixel scale, so it is resized back to point dimensions
+    to preserve the "capture size == rectangle size" invariant relied on by
+    brush and color calibration.  Requires the Screen Recording permission.
+    """
+
+    import Quartz
+    from PIL import Image as PillowImage
+
+    left, top, right, bottom = _bbox(rect)
+    cg_rect = Quartz.CGRectMake(left, top, right - left, bottom - top)
+    image = Quartz.CGWindowListCreateImage(
+        cg_rect,
+        Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID,
+        Quartz.kCGWindowImageDefault,
+    )
+    if image is None:
+        raise OSError(
+            "Could not capture the screen. Grant this app the Screen Recording "
+            "permission under System Settings > Privacy & Security, then "
+            "restart it."
+        )
+    width = Quartz.CGImageGetWidth(image)
+    height = Quartz.CGImageGetHeight(image)
+    bytes_per_row = Quartz.CGImageGetBytesPerRow(image)
+    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(image))
+    captured = PillowImage.frombuffer(
+        "RGBA", (width, height), bytes(data), "raw", "BGRA", bytes_per_row, 1
+    ).convert("RGB")
+    expected = (rect.width, rect.height)
+    if captured.size != expected:
+        captured = captured.resize(expected, PillowImage.Resampling.LANCZOS)
+    return captured
+
+
 def capture_region(rect: RectangleLike) -> "Image":
     """Capture a calibrated physical-screen rectangle using Pillow."""
 
+    if sys.platform == "darwin":
+        return _darwin_capture_region(rect)
     from PIL import ImageGrab
 
     set_dpi_awareness()

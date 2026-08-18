@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,4 +51,46 @@ jobs:
           files: |
             dist/RustPainter.exe
             dist/RustPainter.exe.sha256
+          generate_release_notes: true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build app bundle
+        run: bash build.sh
+
+      - name: Write SHA256 checksum
+        run: |
+          hash=$(shasum -a 256 release/RustPainter-macOS.zip | cut -d' ' -f1)
+          echo "$hash  RustPainter-macOS.zip" > release/RustPainter-macOS.zip.sha256
+          echo "SHA256: $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustPainter-macOS
+          path: |
+            release/RustPainter-macOS.zip
+            release/RustPainter-macOS.zip.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/RustPainter-macOS.zip
+            release/RustPainter-macOS.zip.sha256
           generate_release_notes: true

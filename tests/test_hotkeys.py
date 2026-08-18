@@ -111,3 +111,17 @@ def test_stop_timeout_marks_emergency_hotkeys_unhealthy() -> None:
     assert isinstance(manager.startup_error, HotkeyRegistrationError)
     assert "Timed out stopping" in str(manager.startup_error)
     assert errors == [manager.startup_error]
+
+
+def test_darwin_bindings_resolve_mac_keycodes_and_modifiers() -> None:
+    manager = GlobalHotkeyManager(
+        bindings={"start_resume": "F8", "pause": "CTRL+SHIFT+F9", "abort": "F10"}
+    )
+    resolved = dict(
+        (name, (keycode, mask)) for name, keycode, mask in manager._darwin_bindings()
+    )
+    assert resolved["start_resume"] == (0x64, 0)
+    assert resolved["abort"] == (0x6D, 0)
+    keycode, mask = resolved["pause"]
+    assert keycode == 0x65
+    assert mask == (0x00040000 | 0x00020000)  # Control | Shift

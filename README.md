@@ -1,21 +1,37 @@
 # RustPainter
 
-RustPainter is a local Windows 10/11 desktop utility that recreates an image in Rust's sign-painting UI by using ordinary screen coordinates and Windows mouse input. It does **not** read game memory, inject code, hook graphics, modify game files, or attempt to bypass anti-cheat.
+RustPainter is a local desktop utility for Windows 10/11 and macOS that recreates an image in Rust's sign-painting UI by using ordinary screen coordinates and synthesized mouse input. It does **not** read game memory, inject code, hook graphics, modify game files, or attempt to bypass anti-cheat.
 
 The application keeps all profiles and settings on your PC. Every coordinate used for painting comes from a rectangle that you calibrate on your own display.
 
 ## Install
 
-**You need:** Windows 10/11, and Rust running in borderless or windowed mode
-(not exclusive fullscreen).
+**You need:** Windows 10/11 or macOS, and Rust running in borderless or
+windowed mode (not exclusive fullscreen).
 
 ### Download the app (easiest)
 
-Grab **`RustPainter.exe`** from the
+**Windows:** grab **`RustPainter.exe`** from the
 [latest release](https://github.com/YeheyaMohammad01/RustPainter/releases/latest)
 and double-click it. That single file is the whole application - there is no
 installer, no Python to set up, and no admin rights needed. To uninstall,
 delete the file.
+
+**macOS:** grab **`RustPainter-macOS.zip`** from the same release, unzip it,
+and move `RustPainter.app` to Applications (or anywhere). The first launch
+needs two one-time steps:
+
+1. **Gatekeeper:** the app is not notarized, so right-click the app and choose
+   **Open** the first time (or allow it under System Settings > Privacy &
+   Security after a blocked launch).
+2. **Permissions:** macOS will prompt for **Accessibility** (required to move
+   the mouse and for the global F8/F9/F10 hotkeys) and **Screen Recording**
+   (required for brush and color calibration captures). Grant both under
+   System Settings > Privacy & Security, then relaunch the app.
+
+If your keyboard uses F8-F10 as media keys, either hold **Fn** when pressing a
+hotkey or enable *Use F1, F2, etc. keys as standard function keys* under
+System Settings > Keyboard.
 
 > **Windows will warn you the first time.** The executable is not code-signed,
 > so SmartScreen shows "Windows protected your PC". Click **More info** ->
@@ -37,13 +53,24 @@ Want Start-menu and desktop shortcuts? Clone the repo and point
 
 ### Run from source
 
-Requires 64-bit Python 3.11-3.14:
+Requires 64-bit Python 3.11-3.14. On Windows:
 
 ```powershell
 git clone https://github.com/YeheyaMohammad01/RustPainter.git
 cd RustPainter
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python main.py
+```
+
+On macOS (the pyobjc frameworks install automatically from requirements.txt):
+
+```bash
+git clone https://github.com/YeheyaMohammad01/RustPainter.git
+cd RustPainter
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 python main.py
 ```
@@ -105,6 +132,8 @@ Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** abort.
 
 RustPainter opts into per-monitor DPI awareness before creating the GUI and stores virtual-desktop screen coordinates plus the current display layout with each profile. This supports Windows scaling and monitors left/above the primary display (negative coordinates). A display-layout warning means that the profile should be recalibrated before painting.
 
+On macOS the app works in global display points, which Qt, Quartz input events, and the calibration overlay all share, so Retina scaling needs no special handling; screen captures are normalized from pixel scale automatically. Synthetic input and hotkeys stop working if the Accessibility permission is revoked, and calibration captures require Screen Recording.
+
 Exclusive fullscreen applications can prevent overlays, screenshots, focus checks, or synthetic input from behaving normally. Borderless fullscreen is recommended. If Rust or Windows is running at a different privilege level than RustPainter, Windows may reject input; run both at the same privilege level.
 
 ## Settings that require experimentation
@@ -142,7 +171,7 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 ## Safety behavior
 
 - Starting uses a visible countdown so you can focus Rust.
-- With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. Loss of focus pauses and releases the mouse.
+- With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. The default expected process is Windows' `RustClient.exe`; on macOS clear it or set the Mac client's process name, and note that reading the frontmost window title needs Screen Recording (otherwise the app name is matched instead). Loss of focus pauses and releases the mouse.
 - F9 pauses at the next short cancellation checkpoint.
 - F10 aborts, clears pending work, and releases the mouse.
 - Optional rapid movement into a virtual-screen corner aborts the job.
