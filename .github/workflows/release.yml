@@ -87,6 +87,8 @@ jobs:
 
       - name: Build app bundle
         run: bash build.sh
+        env:
+          RUSTPAINTER_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}
 
       - name: Name the archive for this architecture
         run: |

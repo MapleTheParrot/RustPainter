@@ -19,39 +19,44 @@ delete the file.
 
 **macOS:** from the same release, grab **`RustPainter-macOS-arm64.zip`** on
 Apple Silicon (M1 and later) or **`RustPainter-macOS-x86_64.zip`** on an Intel
-Mac - check the Apple menu > About This Mac if unsure. Unzip it and move
-`RustPainter.app` to Applications (or anywhere). The first launch needs two
-one-time steps:
+Mac - check the Apple menu > About This Mac if unsure. Requires macOS 11 Big
+Sur or newer. Unzip it and move `RustPainter.app` to Applications.
 
-1. **Gatekeeper:** the app is not notarized, so right-click the app and choose
-   **Open** the first time (or allow it under System Settings > Privacy &
-   Security after a blocked launch).
-2. **Permissions:** macOS will prompt for **Accessibility** (required to move
-   the mouse and for the global F8/F9/F10 hotkeys) and **Screen Recording**
-   (required for brush and color calibration captures). Grant both under
-   System Settings > Privacy & Security, then relaunch the app.
+The app is **ad-hoc signed but not notarized**, because notarizing requires a
+paid Apple Developer account. macOS will therefore block it once, and you have
+to approve it by hand:
+
+1. Double-click the app. macOS refuses to open it.
+2. Open **System Settings > Privacy & Security**, scroll to the **Security**
+   section near the bottom, and click **Open Anyway** next to RustPainter.
+3. Confirm with **Open**.
+
+Control-clicking the app and choosing *Open* used to work for this and
+**no longer does** - Apple removed that shortcut in macOS 15 Sequoia. If you
+prefer the terminal, this achieves the same thing in one step:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/RustPainter.app
+```
+
+Then grant two permissions under **System Settings > Privacy & Security**:
+
+- **Accessibility** - required to move the mouse and for the global
+  F8/F9/F10 hotkeys.
+- **Screen Recording** - required for brush and color calibration captures.
+
+Relaunch the app after granting them.
+
+> **After installing a new version**, macOS may stop honouring permissions you
+> granted to the previous build. An ad-hoc signature changes every time the app
+> is rebuilt, and the permission system tracks apps by signature. If hotkeys or
+> calibration capture stop working after an update, remove RustPainter from the
+> Accessibility and Screen Recording lists (select it, press **-**) and add it
+> again.
 
 If your keyboard uses F8-F10 as media keys, either hold **Fn** when pressing a
 hotkey or enable *Use F1, F2, etc. keys as standard function keys* under
 System Settings > Keyboard.
-
-> **Windows will warn you the first time.** The executable is not code-signed,
-> so SmartScreen shows "Windows protected your PC". Click **More info** ->
-> **Run anyway**. Some antivirus tools also flag it, because it is an unsigned
-> program that synthesizes mouse input - exactly the shape of thing they watch
-> for. Every release is built from this repository by
-> [GitHub Actions](.github/workflows/release.yml), and each one ships a
-> `.sha256` file you can check with
-> `Get-FileHash RustPainter.exe -Algorithm SHA256`. If you would rather not
-> trust a prebuilt binary, build your own with the steps below.
-
-Want Start-menu and desktop shortcuts? Clone the repo and point
-[`install.ps1`](install.ps1) at your download. It copies the executable to
-`%LOCALAPPDATA%\Programs\RustPainter` and creates the shortcuts:
-
-```powershell
-.\install.ps1 -ExecutablePath $env:USERPROFILE\Downloads\RustPainter.exe
-```
 
 ### Run from source
 
