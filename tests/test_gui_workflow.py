@@ -997,6 +997,7 @@ def test_mouse_wheel_cannot_change_setting_controls(window: MainWindow) -> None:
         window.logical_width_spin,
         window.stroke_speed_spin,
         window.profile_combo,
+        window.text_font_combo,
     )
     for control in controls:
         before = (

@@ -48,7 +48,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFontComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -108,6 +107,7 @@ from .widgets import (
     CountdownDialog,
     NoWheelComboBox,
     NoWheelDoubleSpinBox,
+    NoWheelFontComboBox,
     NoWheelSpinBox,
     PreviewLabel,
     QtLogHandler,
@@ -1270,7 +1270,7 @@ class MainWindow(QMainWindow):
         self.text_edit = QLineEdit()
         self.text_edit.setPlaceholderText("Type text for the image")
         self.text_edit.setMaxLength(500)
-        self.text_font_combo = QFontComboBox()
+        self.text_font_combo = NoWheelFontComboBox()
         self.text_font_combo.setEditable(False)
         self.text_font_combo.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed

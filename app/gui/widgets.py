@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFontComboBox,
     QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -103,6 +104,18 @@ class Spinner(QWidget):
         # Qt angles are in sixteenths of a degree, counterclockwise.
         painter.drawArc(bounds, -self._angle * 16, 300 * 16)
         painter.end()
+
+
+class NoWheelFontComboBox(QFontComboBox):
+    """Font picker that changes only when opened and chosen from deliberately.
+
+    Scrolling the settings column with the pointer over this combo used to
+    change the selected font; the wheel now scrolls the surrounding area, and
+    the dropdown list still scrolls normally once it is open.
+    """
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
+        event.ignore()
 
 
 class NoWheelSpinBox(QSpinBox):
