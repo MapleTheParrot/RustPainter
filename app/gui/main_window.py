@@ -960,7 +960,56 @@ class MainWindow(QMainWindow):
         self.processing_label = QLabel("")
         self.processing_label.setObjectName("muted")
         grid.addWidget(self.processing_label, 2, 0, 1, 4)
-        layout.addWidget(analysis)
+
+        # While a job runs, the plan panel makes way for an enlarged progress
+        # readout in the same spot; the small always-on strip below is hidden
+        # so the numbers are not shown twice.
+        active = QFrame()
+        active.setObjectName("panel")
+        active_layout = QVBoxLayout(active)
+        active_layout.setContentsMargins(13, 11, 13, 13)
+        active_layout.setSpacing(8)
+        active_head = QHBoxLayout()
+        active_head.setSpacing(8)
+        self.active_progress_title = QLabel("PAINTING")
+        self.active_progress_title.setObjectName("pageTitle")
+        self.active_progress_state = QLabel("Starting…")
+        self.active_progress_state.setObjectName("muted")
+        active_head.addWidget(self.active_progress_title)
+        active_head.addStretch(1)
+        active_head.addWidget(self.active_progress_state)
+        active_layout.addLayout(active_head)
+        active_numbers = QHBoxLayout()
+        active_numbers.setSpacing(14)
+        self.active_percent_label = QLabel("0%")
+        self.active_percent_label.setStyleSheet(
+            "font-size: 34pt; font-weight: 800;"
+        )
+        self.active_remaining_label = QLabel("Estimating time left…")
+        self.active_remaining_label.setStyleSheet(
+            "font-size: 14pt; font-weight: 600;"
+        )
+        active_numbers.addWidget(self.active_percent_label)
+        active_numbers.addStretch(1)
+        active_numbers.addWidget(
+            self.active_remaining_label,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        active_layout.addLayout(active_numbers)
+        self.active_paint_progress = QProgressBar()
+        self.active_paint_progress.setRange(0, 1000)
+        self.active_paint_progress.setValue(0)
+        self.active_paint_progress.setMinimumHeight(22)
+        self.active_paint_progress.setTextVisible(False)
+        active_layout.addWidget(self.active_paint_progress)
+        self.active_detail_label = QLabel("")
+        self.active_detail_label.setObjectName("muted")
+        active_layout.addWidget(self.active_detail_label)
+
+        self.plan_progress_stack = QStackedWidget()
+        self.plan_progress_stack.addWidget(analysis)
+        self.plan_progress_stack.addWidget(active)
+        layout.addWidget(self.plan_progress_stack)
 
         progress_frame = QFrame()
         progress_frame.setObjectName("panel")
@@ -984,9 +1033,16 @@ class MainWindow(QMainWindow):
         self.paint_progress.setValue(0)
         progress_layout.addLayout(progress_head)
         progress_layout.addWidget(self.paint_progress)
+        self.progress_frame = progress_frame
         layout.addWidget(progress_frame)
 
         return content
+
+    def _set_active_progress_visible(self, active: bool) -> None:
+        """Swap the plan panel for the enlarged progress readout while painting."""
+
+        self.plan_progress_stack.setCurrentIndex(1 if active else 0)
+        self.progress_frame.setVisible(not active)
 
     def _build_profile_and_run_panel(self) -> QWidget:
         content = QWidget()
@@ -4252,11 +4308,23 @@ class MainWindow(QMainWindow):
             if progress.estimated_remaining_seconds is not None
             else ""
         )
-        self.progress_detail_label.setText(
+        detail = (
             f"Color {progress.color_index:,} / {progress.total_colors:,}  •  "
-            f"Stroke {progress.completed_strokes:,} / {progress.total_strokes:,}  •  "
-            f"{percent:.1f}%{remaining}"
+            f"Stroke {progress.completed_strokes:,} / {progress.total_strokes:,}"
         )
+        self.progress_detail_label.setText(f"{detail}  •  {percent:.1f}%{remaining}")
+        self.active_paint_progress.setValue(round(percent * 10))
+        self.active_progress_state.setText(
+            str(progress.message or progress.state.value)
+        )
+        self.active_percent_label.setText(f"{percent:.0f}%")
+        self.active_remaining_label.setText(
+            f"{self._format_duration(progress.estimated_remaining_seconds)} remaining"
+            if progress.estimated_remaining_seconds is not None
+            else "Estimating time left…"
+        )
+        elapsed = self._format_duration(progress.elapsed_seconds)
+        self.active_detail_label.setText(f"{detail}  •  {elapsed} elapsed")
 
     @Slot(int, object, str)
     def _on_paint_state(self, generation: int, state: Any, reason: str) -> None:
@@ -4278,6 +4346,12 @@ class MainWindow(QMainWindow):
             "aborted": "ABORTED",
         }.get(value, value.upper())
         self._set_state_badge(value, badge_text)
+        active = value in {"countdown", "running", "paused"}
+        self._set_active_progress_visible(active)
+        if active:
+            self.active_progress_title.setText(
+                {"countdown": "GET READY", "paused": "PAUSED"}.get(value, "PAINTING")
+            )
         if reason:
             self.statusBar().showMessage(f"{value.title()}: {reason}", 5000)
         LOGGER.info("Painter state: %s (%s)", value, reason)
@@ -4289,6 +4363,7 @@ class MainWindow(QMainWindow):
             return
         self.paint_progress.setValue(1000)
         self.progress_state_label.setText("Completed")
+        self._set_active_progress_visible(False)
         self._set_state_badge("completed", "COMPLETE")
         LOGGER.info("Paint plan completed")
         if self._painter is not None and getattr(self._painter.input, "is_dry_run", False):
@@ -4304,6 +4379,7 @@ class MainWindow(QMainWindow):
             return
         self.progress_state_label.setText("Error")
         self.progress_detail_label.setText(message)
+        self._set_active_progress_visible(False)
         self._set_state_badge("error", "ERROR")
         LOGGER.error("Painting error: %s", message)
         QMessageBox.critical(self, "Painting stopped", message)
@@ -4312,6 +4388,7 @@ class MainWindow(QMainWindow):
     def _set_idle_ui(self, detail: str = "No active paint job") -> None:
         self.progress_state_label.setText("Idle")
         self.progress_detail_label.setText(detail)
+        self._set_active_progress_visible(False)
         self._set_state_badge("idle", "SAFE IDLE")
         self._update_start_availability()
 

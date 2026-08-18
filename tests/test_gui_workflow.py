@@ -1315,3 +1315,50 @@ def test_close_ignores_an_image_decode_that_finishes_during_shutdown(
     assert window._closing
     assert window._original_image is None
     assert window._plan is None
+
+
+def test_running_job_swaps_the_plan_panel_for_large_progress(
+    window: MainWindow,
+) -> None:
+    from types import SimpleNamespace
+
+    assert window.plan_progress_stack.currentIndex() == 0
+    assert not window.progress_frame.isHidden()
+
+    generation = window._paint_generation
+    window._on_paint_state(generation, SimpleNamespace(value="running"), "started")
+    assert window.plan_progress_stack.currentIndex() == 1
+    assert window.progress_frame.isHidden()
+    assert window.active_progress_title.text() == "PAINTING"
+
+    window._on_paint_state(generation, SimpleNamespace(value="paused"), "user")
+    assert window.plan_progress_stack.currentIndex() == 1
+    assert window.active_progress_title.text() == "PAUSED"
+
+    window._on_paint_state(generation, SimpleNamespace(value="completed"), "done")
+    assert window.plan_progress_stack.currentIndex() == 0
+    assert not window.progress_frame.isHidden()
+
+
+def test_progress_updates_fill_the_large_readout(window: MainWindow) -> None:
+    from types import SimpleNamespace
+
+    progress = SimpleNamespace(
+        state=SimpleNamespace(value="running"),
+        message="Painting",
+        percent=42.5,
+        color_index=2,
+        total_colors=5,
+        completed_strokes=425,
+        total_strokes=1000,
+        estimated_remaining_seconds=95.0,
+        elapsed_seconds=70.0,
+    )
+    window._on_paint_progress(window._paint_generation, progress)
+
+    assert window.active_percent_label.text() == "42%"
+    assert "remaining" in window.active_remaining_label.text()
+    assert "1m 35s" in window.active_remaining_label.text()
+    assert "425" in window.active_detail_label.text()
+    assert "elapsed" in window.active_detail_label.text()
+    assert window.active_paint_progress.value() == 425
