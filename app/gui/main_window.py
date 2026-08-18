@@ -55,6 +55,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -663,6 +665,7 @@ class MainWindow(QMainWindow):
         workspace_layout.addWidget(splitter)
 
         self.page_stack.addWidget(workspace)
+        self.page_stack.addWidget(self._wrap_scroll(self._build_timelapse_page(), 0))
         self.page_stack.addWidget(self._build_settings_page())
         root_layout.addWidget(self.page_stack, 1)
         self.setCentralWidget(root)
@@ -698,13 +701,19 @@ class MainWindow(QMainWindow):
         self.workspace_nav_button.setAutoExclusive(True)
         self.workspace_nav_button.setChecked(True)
         self._set_icon(self.workspace_nav_button, "workspace", size=17)
+        self.timelapse_nav_button = QPushButton("Timelapse")
+        self.timelapse_nav_button.setObjectName("navButton")
+        self.timelapse_nav_button.setCheckable(True)
+        self.timelapse_nav_button.setAutoExclusive(True)
+        self._set_icon(self.timelapse_nav_button, "clock", size=17)
         self.settings_nav_button = QPushButton("Settings")
         self.settings_nav_button.setObjectName("navButton")
         self.settings_nav_button.setCheckable(True)
         self.settings_nav_button.setAutoExclusive(True)
         self._set_icon(self.settings_nav_button, "settings", size=17)
         self.workspace_nav_button.clicked.connect(lambda: self.page_stack.setCurrentIndex(0))
-        self.settings_nav_button.clicked.connect(lambda: self.page_stack.setCurrentIndex(1))
+        self.timelapse_nav_button.clicked.connect(self._show_timelapse_page)
+        self.settings_nav_button.clicked.connect(lambda: self.page_stack.setCurrentIndex(2))
 
         self.state_badge_frame = QFrame()
         self.state_badge_frame.setObjectName("stateBadge")
@@ -723,6 +732,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         layout.addStretch(1)
         layout.addWidget(self.workspace_nav_button)
+        layout.addWidget(self.timelapse_nav_button)
         layout.addWidget(self.settings_nav_button)
         layout.addSpacing(6)
         layout.addWidget(self.state_badge_frame)
@@ -904,8 +914,34 @@ class MainWindow(QMainWindow):
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
         layout.addWidget(advanced)
 
-        timelapse_group = QGroupBox("Timelapse")
-        timelapse_form = QFormLayout(timelapse_group)
+        layout.addStretch(1)
+        return content
+
+    def _build_timelapse_page(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        heading = QHBoxLayout()
+        title = QLabel("Timelapse")
+        title.setObjectName("pageTitle")
+        self.timelapse_status_badge = QLabel("Not recording")
+        self.timelapse_status_badge.setObjectName("muted")
+        heading.addWidget(title)
+        heading.addStretch(1)
+        heading.addWidget(self.timelapse_status_badge)
+        layout.addLayout(heading)
+        note = QLabel(
+            "Capture the sign at a regular interval while it is painted, then "
+            "assemble the frames into a video."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        capture_group = QGroupBox("Capture")
+        capture_form = QFormLayout(capture_group)
         self.timelapse_check = QCheckBox("Capture frames while painting")
         self.timelapse_check.setToolTip(
             "Saves a screenshot of the calibrated canvas at a regular interval\n"
@@ -917,20 +953,57 @@ class MainWindow(QMainWindow):
             "How often a frame is captured. Painting a large sign can take an\n"
             "hour, so a frame every 10 seconds is usually plenty."
         )
-        self.open_timelapse_button = QPushButton("Open timelapse folder")
-        timelapse_note = QLabel(
-            "Each paint job gets its own timestamped folder of numbered PNG "
-            "frames under the app's data directory."
+        self.timelapse_final_check = QCheckBox("Capture a final frame when a job finishes")
+        self.timelapse_final_check.setChecked(True)
+        self.timelapse_final_check.setToolTip(
+            "The interval rarely lands on the last stroke, so the finished sign\n"
+            "gets one extra frame of its own."
         )
-        timelapse_note.setWordWrap(True)
-        timelapse_note.setObjectName("muted")
-        timelapse_form.addRow("Timelapse", self.timelapse_check)
-        timelapse_form.addRow("Frame every", self.timelapse_interval_spin)
-        timelapse_form.addRow("", self.open_timelapse_button)
-        timelapse_form.addRow("", timelapse_note)
-        layout.addWidget(timelapse_group)
+        capture_form.addRow("Recording", self.timelapse_check)
+        capture_form.addRow("Frame every", self.timelapse_interval_spin)
+        capture_form.addRow("Finish", self.timelapse_final_check)
+        capture_note = QLabel(
+            "Frames cover the calibrated canvas, so the sign must be calibrated "
+            "in Rust setup. Recording follows the paint job: it starts when "
+            "painting starts, skips paused time, and stops when the job ends."
+        )
+        capture_note.setWordWrap(True)
+        capture_note.setObjectName("muted")
+        capture_form.addRow("", capture_note)
+        layout.addWidget(capture_group)
 
-        layout.addStretch(1)
+        sessions_group = QGroupBox("Recordings")
+        sessions_layout = QVBoxLayout(sessions_group)
+        self.timelapse_sessions = QListWidget()
+        self.timelapse_sessions.setAlternatingRowColors(True)
+        self.timelapse_sessions.setMinimumHeight(180)
+        sessions_layout.addWidget(self.timelapse_sessions)
+        session_buttons = QHBoxLayout()
+        self.open_timelapse_button = QPushButton("Open timelapse folder")
+        self.open_session_button = QPushButton("Open selected")
+        self.delete_session_button = QPushButton("Delete selected")
+        self.delete_session_button.setObjectName("danger")
+        self.refresh_sessions_button = QPushButton("Refresh")
+        for button in (
+            self.open_timelapse_button,
+            self.open_session_button,
+            self.delete_session_button,
+            self.refresh_sessions_button,
+        ):
+            session_buttons.addWidget(button)
+        sessions_layout.addLayout(session_buttons)
+        assemble_note = QLabel(
+            "Each job writes numbered PNG frames into its own timestamped "
+            "folder. Assemble one with any video tool, for example:\n"
+            "ffmpeg -framerate 30 -i frame_%05d.png timelapse.mp4"
+        )
+        assemble_note.setWordWrap(True)
+        assemble_note.setObjectName("muted")
+        assemble_note.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        sessions_layout.addWidget(assemble_note)
+        layout.addWidget(sessions_group, 1)
         return content
 
     def _build_preview_area(self) -> QWidget:
@@ -2677,6 +2750,7 @@ class MainWindow(QMainWindow):
         self._connect_service_controls()
         self._reload_profiles(self._settings.get("ui", {}).get("selected_profile_id"))
         self._register_hotkeys()
+        self._refresh_timelapse_sessions()
         if sys.platform == "win32":
             self._rust_monitor_timer.start()
 
@@ -2715,6 +2789,12 @@ class MainWindow(QMainWindow):
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
         self.move_to_rust_button.clicked.connect(self._move_calibration_to_rust_monitor)
         self.open_timelapse_button.clicked.connect(self._open_timelapse_folder)
+        self.open_session_button.clicked.connect(self._open_selected_session)
+        self.delete_session_button.clicked.connect(self._delete_selected_session)
+        self.refresh_sessions_button.clicked.connect(self._refresh_timelapse_sessions)
+        self.timelapse_sessions.currentRowChanged.connect(
+            lambda _row: self._sync_session_buttons()
+        )
 
         settings_controls = (
             self.scale_mode_combo,
@@ -2747,6 +2827,7 @@ class MainWindow(QMainWindow):
             self.apply_brush_check,
             self.timelapse_check,
             self.timelapse_interval_spin,
+            self.timelapse_final_check,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -2926,6 +3007,9 @@ class MainWindow(QMainWindow):
             self.timelapse_interval_spin.setValue(
                 int(timelapse.get("interval_seconds", 10))
             )
+            self.timelapse_final_check.setChecked(
+                bool(timelapse.get("capture_final_frame", True))
+            )
             merge_index = self.merge_combo.findData(
                 str(painting.get("stroke_merge_mode", "balanced"))
             )
@@ -3030,6 +3114,7 @@ class MainWindow(QMainWindow):
             **current.get("timelapse", {}),
             "enabled": self.timelapse_check.isChecked(),
             "interval_seconds": self.timelapse_interval_spin.value(),
+            "capture_final_frame": self.timelapse_final_check.isChecked(),
         }
         current["hotkeys"] = {
             **current.get("hotkeys", {}),
@@ -4050,6 +4135,9 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.apply_brush_check,
+            self.timelapse_check,
+            self.timelapse_interval_spin,
+            self.timelapse_final_check,
             self.profile_combo,
             self.new_profile_button,
             self.rename_profile_button,
@@ -4610,6 +4698,7 @@ class MainWindow(QMainWindow):
         self._timelapse_timer.start()
         # The first frame shows the sign as painting begins.
         self._schedule_timelapse_frame(recorder)
+        self._update_timelapse_status()
         LOGGER.info(
             "Timelapse recording to %s (a frame every %ds)",
             recorder.directory,
@@ -4629,8 +4718,30 @@ class MainWindow(QMainWindow):
         )
         # A paused job is not making visible progress; skip those frames.
         if state != "running":
+            self._update_timelapse_status()
             return
         self._schedule_timelapse_frame(recorder)
+        self._update_timelapse_status()
+
+    def _update_timelapse_status(self) -> None:
+        """Keep the page's badge honest about what recording is doing."""
+
+        recorder = self._timelapse_recorder
+        if recorder is None:
+            self.timelapse_status_badge.setText("Not recording")
+            return
+        painter = self._painter
+        state = (
+            getattr(getattr(painter, "state", None), "value", None)
+            if painter is not None
+            else None
+        )
+        frames = recorder.frame_count
+        label = "Paused" if state != "running" else "Recording"
+        self.timelapse_status_badge.setText(
+            f"{label} • {frames} frame{'s' if frames != 1 else ''} • "
+            f"{recorder.directory.name}"
+        )
 
     @staticmethod
     def _schedule_timelapse_frame(recorder: Any) -> None:
@@ -4648,9 +4759,7 @@ class MainWindow(QMainWindow):
             return
         self._timelapse_timer.stop()
         self._timelapse_recorder = None
-        capture_final = final and bool(
-            self._settings.get("timelapse", {}).get("capture_final_frame", True)
-        )
+        capture_final = final and self.timelapse_final_check.isChecked()
 
         def wrap_up() -> None:
             if capture_final:
@@ -4664,18 +4773,125 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=wrap_up, name="RustPainterTimelapseFinish", daemon=True
         ).start()
+        self._update_timelapse_status()
+        self._refresh_timelapse_sessions()
         self.statusBar().showMessage(
             f"Timelapse frames saved to {recorder.directory}", 8000
         )
 
+    def _timelapse_root(self) -> Path:
+        return self._local_data_directory() / "timelapse"
+
+    @Slot()
+    def _show_timelapse_page(self) -> None:
+        self.page_stack.setCurrentIndex(1)
+        self._refresh_timelapse_sessions()
+        self._update_timelapse_status()
+
+    @Slot()
+    def _refresh_timelapse_sessions(self) -> None:
+        """List every recorded session, newest first, with its frame count."""
+
+        selected = self._selected_session_path()
+        self.timelapse_sessions.clear()
+        root = self._timelapse_root()
+        try:
+            sessions = sorted(
+                (path for path in root.iterdir() if path.is_dir()),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+        except OSError:
+            sessions = []
+        for session in sessions:
+            try:
+                frames = sorted(session.glob("frame_*.png"))
+            except OSError:
+                frames = []
+            megabytes = sum(frame.stat().st_size for frame in frames) / (1024 * 1024)
+            item = QListWidgetItem(
+                f"{session.name}  •  {len(frames)} frame"
+                f"{'s' if len(frames) != 1 else ''}  •  {megabytes:.1f} MB"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, str(session))
+            self.timelapse_sessions.addItem(item)
+            if selected is not None and session == selected:
+                self.timelapse_sessions.setCurrentItem(item)
+        if not sessions:
+            placeholder = QListWidgetItem("No recordings yet")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.timelapse_sessions.addItem(placeholder)
+        self._sync_session_buttons()
+
+    def _selected_session_path(self) -> Path | None:
+        item = self.timelapse_sessions.currentItem()
+        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return Path(value) if isinstance(value, str) else None
+
+    def _sync_session_buttons(self) -> None:
+        has_selection = self._selected_session_path() is not None
+        self.open_session_button.setEnabled(has_selection)
+        self.delete_session_button.setEnabled(has_selection)
+
     @Slot()
     def _open_timelapse_folder(self) -> None:
+        directory = self._timelapse_root()
+        directory.mkdir(parents=True, exist_ok=True)
+        self._open_in_file_manager(directory)
+
+    @Slot()
+    def _open_selected_session(self) -> None:
+        session = self._selected_session_path()
+        if session is not None and session.is_dir():
+            self._open_in_file_manager(session)
+
+    @staticmethod
+    def _open_in_file_manager(directory: Path) -> None:
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
 
-        directory = self._local_data_directory() / "timelapse"
-        directory.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    @Slot()
+    def _delete_selected_session(self) -> None:
+        session = self._selected_session_path()
+        if session is None or not session.is_dir():
+            return
+        if (
+            self._timelapse_recorder is not None
+            and self._timelapse_recorder.directory == session
+        ):
+            QMessageBox.information(
+                self,
+                "Recording in progress",
+                "That session is still being recorded. Let the paint job finish "
+                "before deleting it.",
+            )
+            return
+        frames = len(list(session.glob("frame_*.png")))
+        if (
+            QMessageBox.question(
+                self,
+                "Delete recording",
+                f"Delete “{session.name}” and its {frames} frame"
+                f"{'s' if frames != 1 else ''}? This cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        try:
+            import shutil
+
+            shutil.rmtree(session)
+        except OSError as exc:
+            LOGGER.exception("Could not delete a timelapse session")
+            QMessageBox.warning(self, "Could not delete the recording", str(exc))
+            return
+        LOGGER.info("Deleted timelapse session %s", session.name)
+        self.statusBar().showMessage(f"Deleted {session.name}", 5000)
+        self._refresh_timelapse_sessions()
 
     def _set_idle_ui(self, detail: str = "No active paint job") -> None:
         self.progress_state_label.setText("Idle")

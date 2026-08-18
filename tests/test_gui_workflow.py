@@ -412,7 +412,8 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
         return False
 
     workspace = window.page_stack.widget(0)
-    settings = window.page_stack.widget(1)
+    timelapse = window.page_stack.widget(1)
+    settings = window.page_stack.widget(2)
     assert window.page_stack.currentWidget() is workspace
     assert belongs_to(window.browse_button, workspace)
     assert belongs_to(window.profile_combo, workspace)
@@ -429,11 +430,18 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert not belongs_to(window.dry_run_check, workspace)
     assert not window.dry_run_check.isChecked()
     assert belongs_to(window.log_view, settings)
+    assert belongs_to(window.timelapse_check, timelapse)
+    assert belongs_to(window.timelapse_sessions, timelapse)
+    assert not belongs_to(window.timelapse_check, settings)
     assert not window.workspace_nav_button.icon().isNull()
+    assert not window.timelapse_nav_button.icon().isNull()
     assert not window.settings_nav_button.icon().isNull()
 
     window.settings_nav_button.click()
     assert window.page_stack.currentWidget() is settings
+
+    window.timelapse_nav_button.click()
+    assert window.page_stack.currentWidget() is timelapse
 
     window.workspace_nav_button.click()
     window.quality_combo.setCurrentText("Custom")
@@ -1491,3 +1499,79 @@ def test_timelapse_settings_persist(window: MainWindow) -> None:
 
     assert document["timelapse"]["enabled"] is True
     assert document["timelapse"]["interval_seconds"] == 25
+
+
+def test_timelapse_page_lists_recordings_and_deletes_a_selected_one(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    root = window._timelapse_root()
+    for name, frames in (("20260818-100000", 3), ("20260818-090000", 1)):
+        session = root / name
+        session.mkdir(parents=True)
+        for index in range(1, frames + 1):
+            Image.new("RGB", (8, 4)).save(session / f"frame_{index:05d}.png")
+
+    window.timelapse_nav_button.click()
+
+    assert window.page_stack.currentIndex() == 1
+    labels = [
+        window.timelapse_sessions.item(row).text()
+        for row in range(window.timelapse_sessions.count())
+    ]
+    # Newest first, each with its own frame count.
+    assert labels[0].startswith("20260818-100000")
+    assert "3 frames" in labels[0]
+    assert labels[1].startswith("20260818-090000")
+    assert "1 frame" in labels[1] and "1 frames" not in labels[1]
+
+    # Nothing is selected yet, so the per-session actions stay disabled.
+    assert not window.open_session_button.isEnabled()
+    assert not window.delete_session_button.isEnabled()
+
+    window.timelapse_sessions.setCurrentRow(1)
+    assert window.delete_session_button.isEnabled()
+    assert window._selected_session_path() == root / "20260818-090000"
+
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_a, **_k: QMessageBox.StandardButton.Yes
+    )
+    window._delete_selected_session()
+
+    assert not (root / "20260818-090000").exists()
+    assert (root / "20260818-100000").exists()
+    assert window.timelapse_sessions.count() == 1
+
+
+def test_timelapse_page_reports_recording_status(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import app.timelapse as timelapse_module
+
+    monkeypatch.setattr(
+        timelapse_module,
+        "capture_region",
+        lambda region: Image.new("RGB", (region.width, region.height)),
+    )
+    assert window.timelapse_status_badge.text() == "Not recording"
+
+    window.timelapse_check.setChecked(True)
+    window._current_profile.canvas = ScreenRect(0, 0, 64, 32)
+    window._painter = SimpleNamespace(
+        input=SimpleNamespace(emits_real_input=True),
+        state=SimpleNamespace(value="running"),
+    )
+    window._maybe_start_timelapse()
+
+    assert window.timelapse_status_badge.text().startswith("Recording")
+
+    # A paused job keeps the session but stops adding frames.
+    window._painter.state = SimpleNamespace(value="paused")
+    window._capture_timelapse_frame()
+    assert window.timelapse_status_badge.text().startswith("Paused")
+
+    window._finish_timelapse(final=False)
+    assert window.timelapse_status_badge.text() == "Not recording"
