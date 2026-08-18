@@ -131,18 +131,21 @@ def _typed_values(controller: MockInputController) -> list[str]:
     """Every value the painter committed into the Size field, in order."""
 
     values: list[str] = []
-    digits = ""
+    text = ""
     for event in controller.events:
         if event.kind != "key_down":
             continue
-        if str(event.value).isdigit():
-            digits += str(event.value)
-        elif event.value == "ENTER":
-            if digits:
-                values.append(digits)
-            digits = ""
+        value = event.value
+        if value == 0xBE:  # VK_OEM_PERIOD
+            text += "."
+        elif isinstance(value, str) and len(value) == 1 and value.isdigit():
+            text += value
+        elif value == "ENTER":
+            if text:
+                values.append(text)
+            text = ""
         else:
-            digits = ""
+            text = ""
     return values
 
 
@@ -186,7 +189,7 @@ def test_brush_size_is_committed_by_clearing_the_field_and_pressing_enter() -> N
         if event.kind == "key_down"
     ]
     # Old contents go from both sides of the caret, wherever the click put it.
-    assert keys == ["BACKSPACE"] * 4 + ["DELETE"] * 4 + ["9", "ENTER"]
+    assert keys == ["BACKSPACE"] * 6 + ["DELETE"] * 6 + ["9", "ENTER"]
     box = profile.brush_size_box
     assert any(
         event.kind == "move"
@@ -293,10 +296,15 @@ def test_multi_cell_brush_beyond_the_size_field_is_refused_before_painting() -> 
         painter.configure(plan, profile, _settings(apply_brush_size=True))
 
 
-def test_resolution_finer_than_the_sign_is_refused_before_painting() -> None:
+def test_resolution_finer_than_the_sign_warns_but_still_paints() -> None:
+    """A calibrated sign must stay paintable; softened detail is the user's call.
+
+    40 sign rows under a 320px canvas: Rust's smallest brush is 8px while a
+    cell of this plan is only 2px, so strokes will overlap - the job warns and
+    paints rather than refusing the canvas it was given.
+    """
+
     controller = MockInputController()
-    # 40 sign rows under a 320px canvas: Rust's smallest brush is 8px while a
-    # cell of this plan is only 2px, so every detail stroke would smear.
     profile = _sized_profile("Coarse sign", sign_rows=40)
     plan = PaintPlan(
         320,
@@ -305,8 +313,12 @@ def test_resolution_finer_than_the_sign_is_refused_before_painting() -> None:
     )
     painter = Painter(controller, screen_capture=_panel_capture)
 
-    with pytest.raises(ValueError, match="smallest brush"):
-        painter.configure(plan, profile, _settings(apply_brush_size=True))
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(2.0))
+
+    assert painter.state is PainterState.COMPLETED
+    # The brush floor is 1.00, so the impossible sub-cell request lands there.
+    assert _typed_values(controller) == ["1"]
 
 
 def test_multi_size_plan_requires_brush_sizing_calibration() -> None:
@@ -781,11 +793,13 @@ def _sign_simulator(controller: MockInputController, canvas: ScreenRect, sign_ro
             if event.kind == "move" and event.x is not None and event.y is not None:
                 position = (event.x, event.y)
             elif event.kind == "key_down":
-                value = str(event.value)
-                if value.isdigit():
+                value = event.value
+                if value == 0xBE:  # VK_OEM_PERIOD
+                    digits += "."
+                elif isinstance(value, str) and len(value) == 1 and value.isdigit():
                     digits += value
                 elif value == "ENTER":
-                    size = int(digits) if digits else size
+                    size = float(digits) if digits else size
                     digits = ""
                 else:
                     digits = ""
@@ -860,10 +874,13 @@ def test_brush_measurement_probes_around_the_brush_the_plan_needs() -> None:
     assert painter.state is PainterState.COMPLETED
     typed = _typed_values(controller)
     assert typed[0] == "24"  # the scout, which is never fitted
-    assert typed[1:] == ["20", "10", "5", "2"]
+    assert typed[1:] == ["20", "10", "5", "2.5"]
     model = painter.measured_brush_size_model
     assert model is not None
-    assert model.clamped_size_for_fraction(5 / 128) == 5
+    # The simulator rounds bands to whole pixels, which feeds a small
+    # quantization error into the fit; a twentieth of a size unit is well
+    # under what one sign texel resolves.
+    assert model.clamped_size_for_fraction(5 / 128) == pytest.approx(5.0, abs=0.15)
 
 
 def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:

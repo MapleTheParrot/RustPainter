@@ -22,6 +22,7 @@ from .brush_calibration import (
     BrushSizeModel,
     StrokeBand,
     fit_brush_size_model,
+    format_brush_size,
     measure_stroke_band,
 )
 from .color_calibration import ColorCorrectionModel
@@ -847,21 +848,27 @@ class Painter:
             smallest, largest = model.fitted_range
             if size * 2 < smallest or size > largest * 2:
                 LOGGER.warning(
-                    "Brush size %d for %d cell(s) sits outside the %d-%d range this "
+                    "Brush size %s for %d cell(s) sits outside the %s-%s range this "
                     "profile was measured over, so it is an extrapolation. Re-run "
                     "Measure Brush Size at this painting resolution.",
-                    size,
+                    format_brush_size(size),
                     diameter,
-                    smallest,
-                    largest,
+                    format_brush_size(smallest),
+                    format_brush_size(largest),
                 )
             if diameter == 1 and painted > nominal * self._DETAIL_OVERSHOOT_LIMIT:
+                # A calibrated sign must stay paintable: the plan's cells are
+                # finer than the game's minimum brush, so detail will soften
+                # as neighbouring strokes overlap - a degraded image is the
+                # user's call to make, refusing to paint is not.
                 rows = max(1, int(model.sign_pixel_rows))
-                raise ValueError(
-                    f"Rust's smallest brush covers {painted / pitch:.1f} logical cells "
-                    "here, so detail strokes would overwrite their neighbours. This "
-                    f"sign is about {rows} rows tall - lower the painting resolution "
-                    f"to {rows} rows or fewer, or calibrate a larger sign."
+                LOGGER.warning(
+                    "Rust's smallest brush covers %.1f logical cells at this "
+                    "resolution, so fine detail will blur together. This sign "
+                    "resolves about %d rows; at or below that the plan is "
+                    "pixel-accurate.",
+                    painted / pitch,
+                    rows,
                 )
             # Adjacent multi-cell bands overlap one row, which tolerates a brush
             # up to one cell under its nominal footprint; anything narrower
@@ -990,26 +997,52 @@ class Painter:
         size = model.clamped_size_for_fraction(fraction)
         self._update_progress_state(
             PainterState.RUNNING,
-            f"Brush size {size} for {diameter_cells} logical "
+            f"Brush size {format_brush_size(size)} for {diameter_cells} logical "
             f"cell{'s' if diameter_cells != 1 else ''}",
         )
         self._write_brush_size(box, size, settings, epoch)
         LOGGER.info(
-            "Brush size %d typed for %d cell(s): wanted %.5f of the sign, paints %.5f",
-            size,
+            "Brush size %s typed for %d cell(s): wanted %.5f of the sign, paints %.5f",
+            format_brush_size(size),
             diameter_cells,
             fraction,
             model.fraction_for_size(size),
         )
 
+    # The OEM period key, for the decimal point in sizes such as "1.35".
+    _VK_PERIOD = 0xBE
+
+    # Rust has been observed running its painting UI at 15 FPS, where a press
+    # and release inside one 67 ms frame can be sampled as nothing at all.  A
+    # dropped digit with the field unfocused is a hotbar key, so every
+    # keystroke is held across a frame boundary and separated from the next.
+    _KEY_HOLD_SECONDS = 0.03
+    _KEY_GAP_SECONDS = 0.02
+
+    def _press_field_key(self, key: int | str, epoch: int) -> None:
+        self._checkpoint(epoch=epoch, check_focus=True)
+        if self.input.emits_real_input:
+            self.input.press_key(key, hold_seconds=self._KEY_HOLD_SECONDS)
+            self._interruptible_sleep(
+                self._KEY_GAP_SECONDS, epoch=epoch, check_focus=True
+            )
+        else:
+            self.input.press_key(key)
+
     def _write_brush_size(
         self,
         box: RectangleLike,
-        size: int,
+        size: float,
         settings: PainterSettings,
         epoch: int,
     ) -> None:
-        """Focus Rust's Size field, replace its contents, and commit with Enter."""
+        """Focus Rust's Size field, replace its contents, and commit with Enter.
+
+        The field holds hundredths from 1.00 to 100.00 (verified by typing and
+        photographing it), so sizes are written as decimals: at the detail end
+        the gap between 1 and 2 is the difference between a correct brush and
+        one twice as wide as its cell.
+        """
 
         settle = (
             max(settings.delay_after_brush_seconds, 0.05)
@@ -1018,21 +1051,18 @@ class Painter:
         )
         self._safe_click(normalized_point(box, 0.5, 0.5), epoch)
         self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
-        # The field holds at most three digits, and clearing from both sides of
-        # the caret empties it wherever the click happened to place it.
-        for key in ("BACKSPACE",) * 4 + ("DELETE",) * 4:
-            self._checkpoint(epoch=epoch, check_focus=True)
-            self.input.press_key(key)
-        for digit in str(size):
-            self._checkpoint(epoch=epoch, check_focus=True)
-            self.input.press_key(digit)
-        self._checkpoint(epoch=epoch, check_focus=True)
-        self.input.press_key("ENTER")
+        # The field holds at most six characters, and clearing from both sides
+        # of the caret empties it wherever the click happened to place it.
+        for key in ("BACKSPACE",) * 6 + ("DELETE",) * 6:
+            self._press_field_key(key, epoch)
+        for char in format_brush_size(size):
+            self._press_field_key(self._VK_PERIOD if char == "." else char, epoch)
+        self._press_field_key("ENTER", epoch)
         self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
 
     # A first, throwaway stroke used only to learn the scale of the sign, so
     # the real probes can be placed around the brush the plan will ask for.
-    _BRUSH_SCOUT_SIZE = 24
+    _BRUSH_SCOUT_SIZE = 24.0
 
     # Probes are placed at these multiples of the brush one logical cell needs,
     # which brackets the working size from both sides.  Fitting a line and then
@@ -1042,7 +1072,7 @@ class Painter:
     _BRUSH_PROBE_MULTIPLES = (4.0, 2.0, 1.0, 0.5)
 
     # Fallback ladder for a measurement with no resolution to aim at.
-    _BRUSH_FALLBACK_SIZES = (32, 16, 8, 4)
+    _BRUSH_FALLBACK_SIZES = (32.0, 16.0, 8.0, 4.0)
 
     # One color per probe, so a stroke drawn inside a previous, wider band still
     # reads as a change against the capture taken just before it.
@@ -1086,15 +1116,16 @@ class Painter:
         start = (int(round(canvas.left + canvas.width * 0.15)), stroke_y)
         end = (int(round(canvas.left + canvas.width * 0.85)), stroke_y)
 
-        samples: list[tuple[int, float]] = []
-        clipped: list[int] = []
+        samples: list[tuple[float, float]] = []
+        clipped: list[float] = []
         probe_index = 0
 
-        def probe(size: int, label: str) -> "StrokeBand | None":
+        def probe(size: float, label: str) -> "StrokeBand | None":
             nonlocal probe_index
             epoch = self._pause_generation_value()
             self._update_progress_state(
-                PainterState.RUNNING, f"Measuring brush size {size} ({label})"
+                PainterState.RUNNING,
+                f"Measuring brush size {format_brush_size(size)} ({label})",
             )
             color = self._BRUSH_PROBE_COLORS[probe_index % len(self._BRUSH_PROBE_COLORS)]
             probe_index += 1
@@ -1106,11 +1137,15 @@ class Painter:
             try:
                 band = measure_stroke_band(before, after)
             except ValueError as exc:
-                LOGGER.info("Brush probe %d could not be measured: %s", size, exc)
+                LOGGER.info(
+                    "Brush probe %s could not be measured: %s",
+                    format_brush_size(size),
+                    exc,
+                )
                 return None
             LOGGER.info(
-                "Brush probe %d covered %.1f px of %d, touched %.1f px (%s)",
-                size,
+                "Brush probe %s covered %.1f px of %d, touched %.1f px (%s)",
+                format_brush_size(size),
                 band.height,
                 canvas.height,
                 band.touched_height,
@@ -1133,7 +1168,7 @@ class Painter:
         if len(samples) < 2:
             detail = (
                 "Sizes "
-                + ", ".join(str(size) for size in clipped)
+                + ", ".join(format_brush_size(size) for size in clipped)
                 + " covered the whole sign, so stand closer or calibrate a larger sign."
                 if clipped
                 else "Confirm the paint tool is selected and the sign fills the "
@@ -1178,15 +1213,17 @@ class Painter:
         # the probes it chooses are what actually get fitted.
         per_unit = (band.height / canvas.height) / self._BRUSH_SCOUT_SIZE
         wanted = cell_fraction / per_unit
-        sizes: list[int] = []
+        sizes: list[float] = []
         for multiple in self._BRUSH_PROBE_MULTIPLES:
-            size = int(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, round(wanted * multiple))))
-            if size not in sizes:
+            size = float(
+                min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, round(wanted * multiple * 4) / 4))
+            )
+            if all(abs(size - existing) >= 0.25 for existing in sizes):
                 sizes.append(size)
         LOGGER.info(
-            "Brush scout: one cell needs about size %.1f, probing %s",
+            "Brush scout: one cell needs about size %.2f, probing %s",
             wanted,
-            ", ".join(str(size) for size in sizes),
+            ", ".join(format_brush_size(size) for size in sizes),
         )
         return tuple(sizes)
 

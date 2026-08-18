@@ -28,11 +28,15 @@ if TYPE_CHECKING:
 
 BRUSH_SIZE_MODEL_SCHEMA = 1
 
-# Rust accepts 0 in the Size field, but a zero-width brush paints nothing and
-# would read back as a failed stroke rather than a small one, so the usable
-# range starts at one.
-BRUSH_SIZE_MIN = 1
-BRUSH_SIZE_MAX = 100
+# Probed against the live field with typed values and photographed readbacks:
+# 0.99 clamps to 1.00, 150 clamps to 100.0, and 1.05 / 1.35 / 2.33 all hold
+# exactly.  The field is continuous from 1.00 to 100.00 in hundredths.
+BRUSH_SIZE_MIN = 1.0
+BRUSH_SIZE_MAX = 100.0
+
+# Sizes are quantized to this step before typing.  Finer steps than the
+# measurement noise would express precision the model does not have.
+BRUSH_SIZE_STEP = 0.05
 
 # A stroke has to shift a pixel's color by at least this much to count as
 # painted.  The sign is a lit, textured surface, so two captures of the same
@@ -173,7 +177,7 @@ class BrushSizeModel:
 
     slope: float
     intercept: float
-    samples: tuple[tuple[int, float], ...]
+    samples: tuple[tuple[float, float], ...]
     captured_at: str = ""
 
     def __post_init__(self) -> None:
@@ -198,11 +202,16 @@ class BrushSizeModel:
 
         return (float(fraction) - self.intercept) / self.slope
 
-    def clamped_size_for_fraction(self, fraction: float) -> int:
-        """``size_for_fraction`` rounded and held inside Rust's accepted range."""
+    def clamped_size_for_fraction(self, fraction: float) -> float:
+        """``size_for_fraction`` quantized and held inside Rust's accepted range.
 
-        size = round(self.size_for_fraction(fraction))
-        return int(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, size)))
+        The field takes hundredths, so the answer is a float: at the detail end
+        of the scale the gap between 1.0 and 2.0 is the difference between a
+        correct brush and one twice as wide as the cell it paints.
+        """
+
+        size = round(self.size_for_fraction(fraction) / BRUSH_SIZE_STEP) * BRUSH_SIZE_STEP
+        return float(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, size)))
 
     @property
     def smallest_fraction(self) -> float:
@@ -213,7 +222,7 @@ class BrushSizeModel:
         return self.fraction_for_size(BRUSH_SIZE_MAX)
 
     @property
-    def fitted_range(self) -> tuple[int, int]:
+    def fitted_range(self) -> tuple[float, float]:
         """Smallest and largest Size number this model was actually measured at.
 
         A line read well outside its own data is guesswork, however tidy its
@@ -239,17 +248,17 @@ class BrushSizeModel:
             "schemaVersion": BRUSH_SIZE_MODEL_SCHEMA,
             "slope": self.slope,
             "intercept": self.intercept,
-            "samples": [[int(size), float(fraction)] for size, fraction in self.samples],
+            "samples": [[float(size), float(fraction)] for size, fraction in self.samples],
             "capturedAt": self.captured_at,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "BrushSizeModel":
         raw_samples = value.get("samples") or ()
-        samples: list[tuple[int, float]] = []
+        samples: list[tuple[float, float]] = []
         for entry in raw_samples:
             if isinstance(entry, Sequence) and len(entry) >= 2:
-                samples.append((int(entry[0]), float(entry[1])))
+                samples.append((float(entry[0]), float(entry[1])))
         return cls(
             slope=float(value["slope"]),
             intercept=float(value.get("intercept", 0.0)),
@@ -258,8 +267,20 @@ class BrushSizeModel:
         )
 
 
+def format_brush_size(size: float) -> str:
+    """The exact text typed into Rust's Size field: "1", "1.5", "2.35".
+
+    Trailing zeros are trimmed because every keystroke is a chance for a
+    15 FPS frame to drop it - and a dropped digit with the field unfocused
+    is a hotbar key.
+    """
+
+    text = f"{size:.2f}".rstrip("0").rstrip(".")
+    return text or "1"
+
+
 def fit_brush_size_model(
-    samples: Sequence[tuple[int, float]], *, captured_at: str | None = None
+    samples: Sequence[tuple[float, float]], *, captured_at: str | None = None
 ) -> BrushSizeModel:
     """Least-squares fit of Size number to painted canvas fraction.
 
@@ -268,7 +289,7 @@ def fit_brush_size_model(
     up in the constant instead of bending every stroke's size.
     """
 
-    usable = [(int(size), float(fraction)) for size, fraction in samples]
+    usable = [(float(size), float(fraction)) for size, fraction in samples]
     if len({size for size, _ in usable}) < 2:
         raise ValueError(
             "Brush calibration needs at least two different Size values to measure"
@@ -293,6 +314,8 @@ def fit_brush_size_model(
 __all__ = [
     "BRUSH_SIZE_MAX",
     "BRUSH_SIZE_MIN",
+    "BRUSH_SIZE_STEP",
+    "format_brush_size",
     "BRUSH_SIZE_MODEL_SCHEMA",
     "BrushSizeModel",
     "StrokeBand",
