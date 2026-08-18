@@ -582,6 +582,9 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer = QTimer(self)
         self._rust_monitor_timer.setInterval(5000)
         self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
+        self._timelapse_recorder: Any = None
+        self._timelapse_timer = QTimer(self)
+        self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
 
         self._profile_store: Any = None
         self._settings_store: Any = None
@@ -900,6 +903,32 @@ class MainWindow(QMainWindow):
         advanced_layout.addRow("Between colors", self.color_delay_spin)
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
         layout.addWidget(advanced)
+
+        timelapse_group = QGroupBox("Timelapse")
+        timelapse_form = QFormLayout(timelapse_group)
+        self.timelapse_check = QCheckBox("Capture frames while painting")
+        self.timelapse_check.setToolTip(
+            "Saves a screenshot of the calibrated canvas at a regular interval\n"
+            "while a job paints, so the finished frames can be assembled into\n"
+            "a timelapse video."
+        )
+        self.timelapse_interval_spin = self._int_spin(1, 600, 10, " s")
+        self.timelapse_interval_spin.setToolTip(
+            "How often a frame is captured. Painting a large sign can take an\n"
+            "hour, so a frame every 10 seconds is usually plenty."
+        )
+        self.open_timelapse_button = QPushButton("Open timelapse folder")
+        timelapse_note = QLabel(
+            "Each paint job gets its own timestamped folder of numbered PNG "
+            "frames under the app's data directory."
+        )
+        timelapse_note.setWordWrap(True)
+        timelapse_note.setObjectName("muted")
+        timelapse_form.addRow("Timelapse", self.timelapse_check)
+        timelapse_form.addRow("Frame every", self.timelapse_interval_spin)
+        timelapse_form.addRow("", self.open_timelapse_button)
+        timelapse_form.addRow("", timelapse_note)
+        layout.addWidget(timelapse_group)
 
         layout.addStretch(1)
         return content
@@ -2685,6 +2714,7 @@ class MainWindow(QMainWindow):
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
         self.move_to_rust_button.clicked.connect(self._move_calibration_to_rust_monitor)
+        self.open_timelapse_button.clicked.connect(self._open_timelapse_folder)
 
         settings_controls = (
             self.scale_mode_combo,
@@ -2715,6 +2745,8 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.apply_brush_check,
+            self.timelapse_check,
+            self.timelapse_interval_spin,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -2889,6 +2921,11 @@ class MainWindow(QMainWindow):
                 float(painting.get("stroke_interpolation_step_pixels", 4.0))
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
+            timelapse = settings.get("timelapse", {})
+            self.timelapse_check.setChecked(bool(timelapse.get("enabled", False)))
+            self.timelapse_interval_spin.setValue(
+                int(timelapse.get("interval_seconds", 10))
+            )
             merge_index = self.merge_combo.findData(
                 str(painting.get("stroke_merge_mode", "balanced"))
             )
@@ -2988,6 +3025,11 @@ class MainWindow(QMainWindow):
             "apply_brush_size": self.apply_brush_check.isChecked(),
             "brush_direction": "low_to_high",
             "stroke_merge_mode": str(self.merge_combo.currentData() or "balanced"),
+        }
+        current["timelapse"] = {
+            **current.get("timelapse", {}),
+            "enabled": self.timelapse_check.isChecked(),
+            "interval_seconds": self.timelapse_interval_spin.value(),
         }
         current["hotkeys"] = {
             **current.get("hotkeys", {}),
@@ -4505,6 +4547,10 @@ class MainWindow(QMainWindow):
             self.active_progress_title.setText(
                 {"countdown": "GET READY", "paused": "PAUSED"}.get(value, "PAINTING")
             )
+        if value == "running":
+            self._maybe_start_timelapse()
+        elif value in {"completed", "aborted", "error"}:
+            self._finish_timelapse(final=value == "completed")
         if reason:
             self.statusBar().showMessage(f"{value.title()}: {reason}", 5000)
         LOGGER.info("Painter state: %s (%s)", value, reason)
@@ -4537,6 +4583,99 @@ class MainWindow(QMainWindow):
         LOGGER.error("Painting error: %s", message)
         QMessageBox.critical(self, "Painting stopped", message)
         self._update_start_availability()
+
+    # -------------------------------------------------------------- timelapse
+
+    def _maybe_start_timelapse(self) -> None:
+        """Begin recording frames when a real paint job enters RUNNING."""
+
+        if self._timelapse_recorder is not None or self._closing:
+            return
+        if not self.timelapse_check.isChecked():
+            return
+        painter = self._painter
+        if painter is None or not getattr(painter.input, "emits_real_input", True):
+            return
+        canvas = self._profile_rect("canvas")
+        if canvas is None:
+            return
+        from app.timelapse import TimelapseRecorder
+
+        recorder = TimelapseRecorder(
+            self._local_data_directory() / "timelapse", canvas
+        )
+        self._timelapse_recorder = recorder
+        interval = max(1, self.timelapse_interval_spin.value())
+        self._timelapse_timer.setInterval(interval * 1000)
+        self._timelapse_timer.start()
+        # The first frame shows the sign as painting begins.
+        self._schedule_timelapse_frame(recorder)
+        LOGGER.info(
+            "Timelapse recording to %s (a frame every %ds)",
+            recorder.directory,
+            interval,
+        )
+
+    @Slot()
+    def _capture_timelapse_frame(self) -> None:
+        recorder = self._timelapse_recorder
+        if recorder is None or self._closing:
+            return
+        painter = self._painter
+        state = (
+            getattr(getattr(painter, "state", None), "value", None)
+            if painter is not None
+            else None
+        )
+        # A paused job is not making visible progress; skip those frames.
+        if state != "running":
+            return
+        self._schedule_timelapse_frame(recorder)
+
+    @staticmethod
+    def _schedule_timelapse_frame(recorder: Any) -> None:
+        # Captured off the GUI thread so encoding a large PNG never stalls
+        # progress updates; the recorder skips a frame if one is in flight.
+        threading.Thread(
+            target=recorder.capture_frame,
+            name="RustPainterTimelapse",
+            daemon=True,
+        ).start()
+
+    def _finish_timelapse(self, *, final: bool) -> None:
+        recorder = self._timelapse_recorder
+        if recorder is None:
+            return
+        self._timelapse_timer.stop()
+        self._timelapse_recorder = None
+        capture_final = final and bool(
+            self._settings.get("timelapse", {}).get("capture_final_frame", True)
+        )
+
+        def wrap_up() -> None:
+            if capture_final:
+                recorder.capture_frame()
+            LOGGER.info(
+                "Timelapse saved %d frames to %s",
+                recorder.frame_count,
+                recorder.directory,
+            )
+
+        threading.Thread(
+            target=wrap_up, name="RustPainterTimelapseFinish", daemon=True
+        ).start()
+        self.statusBar().showMessage(
+            f"Timelapse frames saved to {recorder.directory}", 8000
+        )
+
+    @Slot()
+    def _open_timelapse_folder(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        directory = self._local_data_directory() / "timelapse"
+        directory.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def _set_idle_ui(self, detail: str = "No active paint job") -> None:
         self.progress_state_label.setText("Idle")
@@ -4882,6 +5021,9 @@ class MainWindow(QMainWindow):
         self._pending_paint = None
         self._process_timer.stop()
         self._settings_timer.stop()
+        self._rust_monitor_timer.stop()
+        self._timelapse_timer.stop()
+        self._timelapse_recorder = None
         try:
             if self._calibration_preview is not None:
                 self._calibration_preview.close()

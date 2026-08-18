@@ -1434,3 +1434,60 @@ def test_rust_on_another_monitor_offers_and_applies_a_move(
     )
     window._check_rust_monitor()
     assert window.rust_monitor_label.isHidden()
+
+
+def test_timelapse_records_only_real_running_jobs(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    from types import SimpleNamespace
+
+    import app.timelapse as timelapse_module
+
+    frames: list[object] = []
+    monkeypatch.setattr(
+        timelapse_module,
+        "capture_region",
+        lambda region: frames.append(region)
+        or Image.new("RGB", (region.width, region.height)),
+    )
+
+    window.timelapse_check.setChecked(True)
+    window.timelapse_interval_spin.setValue(1)
+    profile = window._current_profile
+    profile.canvas = ScreenRect(0, 0, 64, 32)
+
+    # A dry run never records.
+    window._painter = SimpleNamespace(
+        input=SimpleNamespace(emits_real_input=False),
+        state=SimpleNamespace(value="running"),
+    )
+    window._maybe_start_timelapse()
+    assert window._timelapse_recorder is None
+    assert not window._timelapse_timer.isActive()
+
+    # A real job records from the moment it runs.
+    window._painter = SimpleNamespace(
+        input=SimpleNamespace(emits_real_input=True),
+        state=SimpleNamespace(value="running"),
+    )
+    window._maybe_start_timelapse()
+    recorder = window._timelapse_recorder
+    assert recorder is not None
+    assert window._timelapse_timer.isActive()
+    qtbot.waitUntil(lambda: recorder.frame_count >= 1, timeout=3000)
+
+    # Finishing stops the timer and detaches the recorder.
+    window._finish_timelapse(final=True)
+    assert window._timelapse_recorder is None
+    assert not window._timelapse_timer.isActive()
+    qtbot.waitUntil(lambda: recorder.frame_count >= 2, timeout=3000)
+
+
+def test_timelapse_settings_persist(window: MainWindow) -> None:
+    window.timelapse_check.setChecked(True)
+    window.timelapse_interval_spin.setValue(25)
+
+    document = window._settings_document()
+
+    assert document["timelapse"]["enabled"] is True
+    assert document["timelapse"]["interval_seconds"] == 25

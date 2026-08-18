@@ -123,6 +123,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
+- Optional timelapse capture: a PNG frame of the sign at a set interval while painting, ready to assemble into a video
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
@@ -258,6 +259,20 @@ Perfectly edge-to-edge pixels need the **square** brush: a circle of one cell
 across leaves gaps at the cell corners, and widening it to close them overlaps
 its neighbours by 40%. Along a horizontal run the two shapes behave alike; the
 difference shows at run ends and on isolated pixels.
+
+## Timelapse
+
+Under **Settings → Painting → Timelapse**, the app can capture the calibrated
+canvas region at a regular interval while a job paints. Each paint job gets its
+own timestamped folder of numbered PNG frames (``frame_00001.png``, …) under
+the app's data directory; **Open timelapse folder** takes you straight there.
+The interval is adjustable from 1 to 600 seconds, paused time is skipped, and a
+final frame of the finished sign is captured when the job completes. Assemble
+the frames with any video tool, for example:
+
+```
+ffmpeg -framerate 30 -i frame_%05d.png timelapse.mp4
+```
 
 ## Sign color correction
 

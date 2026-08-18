@@ -101,6 +101,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # does not match the plan - up to this many correction passes.
         "verify_passes": 1,
     },
+    "timelapse": {
+        # Capture the calibrated canvas region while painting, one PNG frame
+        # per interval, into a per-job session folder under data/timelapse.
+        "enabled": False,
+        "interval_seconds": 10,
+        "capture_final_frame": True,
+    },
     "hotkeys": {
         "start_resume": "F8",
         "pause": "F9",
@@ -159,6 +166,7 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[st
 def _validate(settings: Mapping[str, Any]) -> None:
     image = settings.get("image")
     painting = settings.get("painting")
+    timelapse = settings.get("timelapse")
     hotkeys = settings.get("hotkeys")
     safety = settings.get("safety")
     execution = settings.get("execution")
@@ -166,6 +174,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
     for label, section in (
         ("image", image),
         ("painting", painting),
+        ("timelapse", timelapse),
         ("hotkeys", hotkeys),
         ("safety", safety),
         ("execution", execution),
@@ -348,6 +357,21 @@ def _validate(settings: Mapping[str, Any]) -> None:
         or not 0 <= verify_passes <= 5
     ):
         raise SettingsError("painting.verify_passes must be an integer from 0 to 5")
+
+    assert isinstance(timelapse, Mapping)
+    for key in ("enabled", "capture_final_frame"):
+        if not isinstance(timelapse.get(key), bool):
+            raise SettingsError(f"timelapse.{key} must be true or false")
+    interval = timelapse.get("interval_seconds")
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(float(interval))
+        or not 1 <= float(interval) <= 3600
+    ):
+        raise SettingsError(
+            "timelapse.interval_seconds must be between 1 and 3600 seconds"
+        )
 
     assert isinstance(hotkeys, Mapping)
     allowed_hotkeys = {f"F{number}" for number in range(5, 13)}
