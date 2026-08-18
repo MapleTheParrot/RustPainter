@@ -141,3 +141,47 @@ def test_the_model_is_independent_of_how_close_the_camera_stands() -> None:
 
     assert near.slope == pytest.approx(far.slope)
     assert near.sign_pixel_rows == pytest.approx(far.sign_pixel_rows)
+
+
+def test_a_faded_brush_rim_is_not_counted_as_coverage() -> None:
+    """The rim changes color without hiding what was under it.
+
+    Rust's brush fades out over its last texture pixel or so.  Counting that
+    fade inflates every band by the same couple of pixels, which is invisible
+    on a wide brush and doubles the answer on a narrow one - the bug that made
+    automatic sizing pick 2 where 5 was needed.
+    """
+
+    before = _canvas()
+    after = before.copy()
+    draw = ImageDraw.Draw(after)
+    solid = (255, 0, 255)
+    # Half way between the sign and the stroke: changed, but not covered.
+    rim = (175, 48, 175)
+    draw.rectangle((60, 85, 340, 89), fill=rim)
+    draw.rectangle((60, 90, 340, 109), fill=solid)
+    draw.rectangle((60, 110, 340, 114), fill=rim)
+
+    band = measure_stroke_band(before, after)
+
+    assert band.height == pytest.approx(20.0)
+    assert band.touched_height == pytest.approx(30.0)
+
+
+def test_coverage_is_judged_against_the_color_the_stroke_rendered_as() -> None:
+    """The sign's material shifts every color, so the commanded one proves nothing.
+
+    A stroke that lands nowhere near the requested magenta is still fully
+    covering wherever it is uniform - which is why the rim is found by
+    comparing against what the stroke actually rendered as rather than against
+    what the picker was asked for.
+    """
+
+    before = _canvas()
+    after = before.copy()
+    ImageDraw.Draw(after).rectangle((60, 90, 340, 109), fill=(175, 48, 175))
+
+    band = measure_stroke_band(before, after)
+
+    assert band.height == pytest.approx(20.0)
+    assert band.touched_height == pytest.approx(20.0)

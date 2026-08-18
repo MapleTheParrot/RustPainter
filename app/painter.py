@@ -17,7 +17,10 @@ from enum import Enum
 from typing import Any, Callable, Iterator
 
 from .brush_calibration import (
+    BRUSH_SIZE_MAX,
+    BRUSH_SIZE_MIN,
     BrushSizeModel,
+    StrokeBand,
     fit_brush_size_model,
     measure_stroke_band,
 )
@@ -369,6 +372,9 @@ class _Job:
     # "paint" runs the plan; "measure_brush" paints probe strokes instead and
     # fits what Rust's Size numbers actually cover.
     mode: str = "paint"
+    # Canvas-height fraction of one logical cell, so a measurement can place its
+    # probes around the brush the plan will really ask for.
+    cell_fraction: float | None = None
 
 
 class _AbortRequested(Exception):
@@ -552,6 +558,7 @@ class Painter:
         settings: PainterSettings | Mapping[str, Any] | None = None,
         *,
         target: PaintingTarget | None = None,
+        cell_fraction: float | None = None,
     ) -> None:
         """Prepare a job that measures Rust's Size numbers instead of painting.
 
@@ -579,7 +586,13 @@ class Painter:
                 self._thread is not None and self._thread.is_alive()
             ):
                 raise RuntimeError("Cannot replace a paint job while one is active")
-            self._job = _Job(placeholder, target, resolved_settings, mode="measure_brush")
+            self._job = _Job(
+                placeholder,
+                target,
+                resolved_settings,
+                mode="measure_brush",
+                cell_fraction=cell_fraction,
+            )
             self._measured_brush_size_model = None
             self._abort_requested = False
             self._abort_event.clear()
@@ -831,6 +844,17 @@ class Painter:
             size = model.clamped_size_for_fraction(wanted)
             painted = model.fraction_for_size(size) * canvas.height
             nominal = pitch * diameter
+            smallest, largest = model.fitted_range
+            if size * 2 < smallest or size > largest * 2:
+                LOGGER.warning(
+                    "Brush size %d for %d cell(s) sits outside the %d-%d range this "
+                    "profile was measured over, so it is an extrapolation. Re-run "
+                    "Measure Brush Size at this painting resolution.",
+                    size,
+                    diameter,
+                    smallest,
+                    largest,
+                )
             if diameter == 1 and painted > nominal * self._DETAIL_OVERSHOOT_LIMIT:
                 rows = max(1, int(model.sign_pixel_rows))
                 raise ValueError(
@@ -1006,15 +1030,29 @@ class Painter:
         self.input.press_key("ENTER")
         self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
 
-    # Sizes probed when measuring what Rust's Size numbers paint.  Descending,
-    # so the widest band goes down first and the narrower ones are drawn inside
-    # it: every probe then sits clear of the sign's edges, where a clipped band
-    # would measure short and bend the fit.
-    _BRUSH_PROBE_SIZES = (60, 30, 12)
+    # A first, throwaway stroke used only to learn the scale of the sign, so
+    # the real probes can be placed around the brush the plan will ask for.
+    _BRUSH_SCOUT_SIZE = 24
+
+    # Probes are placed at these multiples of the brush one logical cell needs,
+    # which brackets the working size from both sides.  Fitting a line and then
+    # reading it far below its data is what made an earlier version answer 2
+    # where 5 was wanted: a couple of pixels of error is nothing at size 60 and
+    # is the entire answer at size 2.
+    _BRUSH_PROBE_MULTIPLES = (4.0, 2.0, 1.0, 0.5)
+
+    # Fallback ladder for a measurement with no resolution to aim at.
+    _BRUSH_FALLBACK_SIZES = (32, 16, 8, 4)
 
     # One color per probe, so a stroke drawn inside a previous, wider band still
     # reads as a change against the capture taken just before it.
-    _BRUSH_PROBE_COLORS = ((255, 0, 255), (0, 255, 0), (255, 200, 0))
+    _BRUSH_PROBE_COLORS = (
+        (255, 0, 255),
+        (0, 255, 0),
+        (255, 200, 0),
+        (0, 200, 255),
+        (255, 80, 80),
+    )
 
     def _measure_brush_size_model(self, job: _Job) -> BrushSizeModel:
         """Paint probe strokes and fit Size number to painted canvas fraction.
@@ -1050,27 +1088,41 @@ class Painter:
 
         samples: list[tuple[int, float]] = []
         clipped: list[int] = []
-        for index, size in enumerate(self._BRUSH_PROBE_SIZES):
+        probe_index = 0
+
+        def probe(size: int, label: str) -> "StrokeBand | None":
+            nonlocal probe_index
             epoch = self._pause_generation_value()
             self._update_progress_state(
-                PainterState.RUNNING,
-                f"Measuring brush size {size} "
-                f"({index + 1} of {len(self._BRUSH_PROBE_SIZES)})",
+                PainterState.RUNNING, f"Measuring brush size {size} ({label})"
             )
-            color = self._BRUSH_PROBE_COLORS[index % len(self._BRUSH_PROBE_COLORS)]
+            color = self._BRUSH_PROBE_COLORS[probe_index % len(self._BRUSH_PROBE_COLORS)]
+            probe_index += 1
             self._select_color(color, target, settings, epoch, apply_correction=False)
             self._write_brush_size(box, size, settings, epoch)
             before = self._capture_parked(canvas, park, epoch)
             self._screen_stroke(start, end, settings, epoch)
             after = self._capture_parked(canvas, park, epoch)
-            band = measure_stroke_band(before, after)
+            try:
+                band = measure_stroke_band(before, after)
+            except ValueError as exc:
+                LOGGER.info("Brush probe %d could not be measured: %s", size, exc)
+                return None
             LOGGER.info(
-                "Brush probe %d painted a %.1f px band of %d (%s)",
+                "Brush probe %d covered %.1f px of %d, touched %.1f px (%s)",
                 size,
                 band.height,
                 canvas.height,
+                band.touched_height,
                 "clipped" if band.clipped else "clear",
             )
+            return band
+
+        sizes = self._probe_sizes(job, canvas, probe)
+        for index, size in enumerate(sizes):
+            band = probe(size, f"{index + 1} of {len(sizes)}")
+            if band is None:
+                continue
             if band.clipped:
                 # The band ran off the sign, so its height is a floor rather
                 # than a measurement. A smaller probe still carries the fit.
@@ -1099,6 +1151,44 @@ class Painter:
             model.intercept,
         )
         return model
+
+    def _probe_sizes(
+        self,
+        job: _Job,
+        canvas: ScreenRect,
+        probe: Callable[[int, str], Any],
+    ) -> tuple[int, ...]:
+        """Choose probe sizes that bracket the brush this profile will use.
+
+        A scout stroke establishes roughly how much of the sign one Size unit
+        covers, which turns the requested cell size into a number.  The probes
+        then straddle it, so the fitted line is read inside its own data rather
+        than extrapolated down to a brush several times narrower than anything
+        measured.
+        """
+
+        cell_fraction = job.cell_fraction
+        if not cell_fraction or cell_fraction <= 0.0:
+            return self._BRUSH_FALLBACK_SIZES
+        band = probe(self._BRUSH_SCOUT_SIZE, "finding the scale")
+        if band is None or band.clipped or band.height <= 0.0:
+            LOGGER.info("Brush scout was unusable; probing the fallback sizes")
+            return self._BRUSH_FALLBACK_SIZES
+        # The scout ignores any offset, so this is only ever a placement hint -
+        # the probes it chooses are what actually get fitted.
+        per_unit = (band.height / canvas.height) / self._BRUSH_SCOUT_SIZE
+        wanted = cell_fraction / per_unit
+        sizes: list[int] = []
+        for multiple in self._BRUSH_PROBE_MULTIPLES:
+            size = int(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, round(wanted * multiple))))
+            if size not in sizes:
+                sizes.append(size)
+        LOGGER.info(
+            "Brush scout: one cell needs about size %.1f, probing %s",
+            wanted,
+            ", ".join(str(size) for size in sizes),
+        )
+        return tuple(sizes)
 
     def _capture_parked(
         self, canvas: ScreenRect, park: tuple[int, int], epoch: int

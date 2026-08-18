@@ -826,8 +826,44 @@ def test_brush_measurement_fits_the_sign_it_probes() -> None:
     # 128 rows over a 320px canvas: the fit has to recover the sign, not the
     # screen pixels it happened to be measured in.
     assert model.sign_pixel_rows == pytest.approx(128.0, rel=0.02)
-    assert _typed_values(controller) == ["60", "30", "12"]
+    # With no resolution to aim at, the fallback ladder is what gets probed.
+    assert _typed_values(controller) == ["32", "16", "8", "4"]
     assert not controller.held_buttons
+
+
+def test_brush_measurement_probes_around_the_brush_the_plan_needs() -> None:
+    """Reading a fitted line far below its own data is what broke sizing.
+
+    A scout stroke turns the wanted cell into a rough Size number, and the real
+    probes then straddle it, so the model is interpolated where it is used
+    instead of extrapolated down from a brush ten times wider.
+    """
+
+    controller = MockInputController()
+    profile = CalibrationProfile.new(
+        "Bracketed",
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
+    )
+    painter = Painter(
+        controller,
+        screen_capture=_sign_simulator(controller, profile.canvas, sign_rows=128),
+    )
+
+    # One cell wants five Size units on a 128-row sign.
+    painter.configure_brush_measurement(profile, _settings(), cell_fraction=5 / 128)
+    assert painter.start()
+    assert painter.wait(_t(5.0))
+
+    assert painter.state is PainterState.COMPLETED
+    typed = _typed_values(controller)
+    assert typed[0] == "24"  # the scout, which is never fitted
+    assert typed[1:] == ["20", "10", "5", "2"]
+    model = painter.measured_brush_size_model
+    assert model is not None
+    assert model.clamped_size_for_fraction(5 / 128) == 5
 
 
 def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:

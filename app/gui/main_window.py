@@ -228,6 +228,9 @@ class _PendingPaint:
     # "paint" runs the plan; "measure_brush" paints probe strokes instead and
     # fits what Rust's Size numbers cover on this sign.
     mode: str = "paint"
+    # Canvas-height fraction of one logical cell, so a measurement can probe
+    # around the brush this resolution will actually ask for.
+    cell_fraction: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3952,6 +3955,22 @@ class MainWindow(QMainWindow):
                 "Brush size not measured - run Measure Brush Size once for this sign"
             )
 
+    def _logical_cell_fraction(self, profile: Any) -> float | None:
+        """One logical cell as a fraction of the canvas height.
+
+        This is the footprint automatic sizing will keep asking for, so it is
+        what a measurement should place its probes around.
+        """
+
+        canvas = getattr(profile, "canvas", None)
+        if canvas is None or canvas.height <= 0:
+            return None
+        pitch = min(
+            canvas.width / max(1, self.logical_width_spin.value()),
+            canvas.height / max(1, self.logical_height_spin.value()),
+        )
+        return pitch / canvas.height
+
     def _canvas_shape_changed(self, rectangle: Any) -> bool:
         """Whether a new canvas rectangle describes a differently shaped sign.
 
@@ -4047,6 +4066,7 @@ class MainWindow(QMainWindow):
                 dry_run=False,
                 display_snapshot=capture_display_metadata(),
                 mode="measure_brush",
+                cell_fraction=self._logical_cell_fraction(profile),
             )
             self._pending_start_cancelled = False
         except Exception as exc:
@@ -4700,7 +4720,9 @@ class MainWindow(QMainWindow):
             # Publish only a configured READY painter. The hotkey thread can
             # then abort it atomically even before its worker thread starts.
             if pending.mode == "measure_brush":
-                painter.configure_brush_measurement(pending.profile, settings)
+                painter.configure_brush_measurement(
+                    pending.profile, settings, cell_fraction=pending.cell_fraction
+                )
             else:
                 painter.configure(pending.plan, pending.profile, settings)
             if self._pending_start_cancelled:

@@ -44,6 +44,14 @@ _NOISE_FLOOR = 24.0
 # that exact color.
 _MIN_STROKE_CONTRAST = 40.0
 
+# How far a pixel may sit from the stroke's rendered color and still count as
+# painted, as a fraction of the full old-to-new color change.  Rust's brush
+# fades out over roughly a pixel of sign texture, and those rim pixels change
+# color without covering what was underneath - counting them inflates every
+# band by the same couple of texture pixels, which is invisible on a wide brush
+# and doubles the answer on a narrow one.
+_SOLID_TOLERANCE = 0.30
+
 # One size unit has to cover at least this much of the sign for the fit to
 # describe a real brush.  Anything shallower implies a sign a hundred thousand
 # rows tall, which is what a least-squares fit returns when every probe
@@ -63,20 +71,44 @@ class StrokeBand:
     height: float
     changed_pixels: int
     clipped: bool
+    # Everything the stroke touched, rim included.  Only ever a diagnostic: the
+    # gap between it and ``height`` is how much of the brush fades out instead
+    # of covering, which is what makes a narrow brush behave unlike a wide one.
+    touched_height: float = 0.0
 
     @property
     def bottom(self) -> float:
         return self.top + self.height
 
 
-def measure_stroke_band(before: "Image", after: "Image") -> StrokeBand:
-    """Height, in capture pixels, of the band a horizontal stroke painted.
+def _band_thickness(mask: np.ndarray) -> float:
+    """Median height of a horizontal band, ignoring its end caps.
 
-    Thickness is read as the median of the per-column pixel counts over the
-    stroke's core rather than from a bounding box.  A round brush tapers at
-    both ends of the drag and a bounding box would report that taper as extra
-    height; the median describes the straight middle section, which is what
-    actually decides whether adjacent rows collide.
+    Reading the median of the per-column pixel counts rather than a bounding
+    box keeps a round brush honest: it tapers at both ends of the drag, and a
+    bounding box would report that taper as extra height.  The median describes
+    the straight middle section, which is what decides whether adjacent rows
+    collide.
+    """
+
+    columns = mask.sum(axis=0)
+    peak_column = int(columns.max())
+    if peak_column <= 0:
+        return 0.0
+    # Columns holding at least half the thickest column are the straight
+    # section; the rest are the brush's end caps or stray noise.
+    return float(np.median(columns[columns >= peak_column * 0.5]))
+
+
+def measure_stroke_band(before: "Image", after: "Image") -> StrokeBand:
+    """Height, in capture pixels, of the band a horizontal stroke actually covered.
+
+    "Covered" is deliberately stricter than "changed".  Rust's brush fades out
+    over its last texture pixel or so, and those rim pixels shift color without
+    hiding what was underneath - a cell left under the rim still reads as
+    unpainted on the finished sign.  So the band is measured as the pixels that
+    ended up *the stroke's color*, found by taking the color the stroke rendered
+    as and keeping what landed close to it.
     """
 
     before_pixels = np.asarray(before.convert("RGB"), dtype=np.float32)
@@ -89,32 +121,43 @@ def measure_stroke_band(before: "Image", after: "Image") -> StrokeBand:
     if width < 8 or height < 8:
         raise ValueError("The calibrated canvas is too small to measure a brush")
 
-    distance = np.linalg.norm(after_pixels - before_pixels, axis=2)
-    peak = float(distance.max())
+    change = np.linalg.norm(after_pixels - before_pixels, axis=2)
+    peak = float(change.max())
     if peak < _MIN_STROKE_CONTRAST:
         raise ValueError(
             "The calibration stroke did not change the sign. Confirm the paint "
             "tool is selected, the sign is in view, and the canvas calibration "
             "covers only the sign."
         )
-    changed = distance >= max(_NOISE_FLOOR, peak * 0.4)
-
-    columns = changed.sum(axis=0)
-    peak_column = int(columns.max())
-    if peak_column <= 0:
+    touched = change >= max(_NOISE_FLOOR, peak * 0.25)
+    if not touched.any():
         raise ValueError("No painted band was found in the calibration capture")
-    # Columns holding at least half the thickest column are the straight
-    # section; the rest are the brush's end caps or stray noise.
-    core = columns[columns >= peak_column * 0.5]
-    band_height = float(np.median(core))
 
-    rows = changed.any(axis=1)
-    top = int(np.argmax(rows))
+    # The stroke's rendered color, read from the pixels it changed hardest.  A
+    # median shrugs off the rim and the sign's grain, and using the rendered
+    # color rather than the commanded one means the sign's material and
+    # lighting are already baked in.
+    strong = change >= max(_NOISE_FLOOR, peak * 0.6)
+    core_mask = strong if strong.any() else touched
+    painted_color = np.median(after_pixels[core_mask], axis=0)
+    full_change = float(np.median(change[core_mask]))
+    to_painted = np.linalg.norm(after_pixels - painted_color, axis=2)
+    solid = touched & (to_painted <= max(_NOISE_FLOOR, full_change * _SOLID_TOLERANCE))
+
+    band_height = _band_thickness(solid)
+    if band_height <= 0.0:
+        raise ValueError(
+            "The calibration stroke only blended the sign instead of covering it, "
+            "so this brush size paints nothing solid."
+        )
+
+    rows = touched.any(axis=1)
     return StrokeBand(
-        top=top,
+        top=int(np.argmax(rows)),
         height=band_height,
-        changed_pixels=int(changed.sum()),
+        changed_pixels=int(solid.sum()),
         clipped=bool(rows[0] or rows[-1]),
+        touched_height=_band_thickness(touched),
     )
 
 
@@ -168,6 +211,18 @@ class BrushSizeModel:
     @property
     def largest_fraction(self) -> float:
         return self.fraction_for_size(BRUSH_SIZE_MAX)
+
+    @property
+    def fitted_range(self) -> tuple[int, int]:
+        """Smallest and largest Size number this model was actually measured at.
+
+        A line read well outside its own data is guesswork, however tidy its
+        residuals looked: a couple of pixels of error is nothing on a wide brush
+        and is the whole answer on a narrow one.
+        """
+
+        sizes = [size for size, _ in self.samples]
+        return (min(sizes), max(sizes)) if sizes else (BRUSH_SIZE_MIN, BRUSH_SIZE_MAX)
 
     @property
     def sign_pixel_rows(self) -> float:
