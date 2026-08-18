@@ -111,6 +111,7 @@ from .widgets import (
     NoWheelSpinBox,
     PreviewLabel,
     QtLogHandler,
+    Spinner,
     TextEditorPreview,
     dropped_image_path,
 )
@@ -607,6 +608,7 @@ class MainWindow(QMainWindow):
         ]
         self._selected_text_layer = 0
         self._syncing_text_controls = False
+        self._plan_processing = False
         self._closing = False
         self._painter_bridge = _PainterBridge()
         self._painter_bridge.progress.connect(self._on_paint_progress)
@@ -941,9 +943,16 @@ class MainWindow(QMainWindow):
         grid.setContentsMargins(13, 11, 13, 13)
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(9)
+        analysis_head = QHBoxLayout()
+        analysis_head.setSpacing(8)
         title = QLabel("PAINT PLAN")
         title.setObjectName("pageTitle")
-        grid.addWidget(title, 0, 0, 1, 4)
+        self.processing_spinner = Spinner(16)
+        self.processing_spinner.setToolTip("Recalculating the paint plan…")
+        analysis_head.addWidget(title)
+        analysis_head.addWidget(self.processing_spinner)
+        analysis_head.addStretch(1)
+        grid.addLayout(analysis_head, 0, 0, 1, 4)
         self.analysis_resolution = self._metric("Resolution", "—", "resolution")
         self.analysis_colors = self._metric("Colors", "—", "palette")
         self.analysis_strokes = self._metric("Strokes", "—", "brush")
@@ -2106,6 +2115,7 @@ class MainWindow(QMainWindow):
         self.image_name_label.setText(path.name)
         self.image_dimensions_label.setText("Loading…")
         self.processing_label.setText("Decoding image…")
+        self._set_plan_processing(True)
         self._refresh_statistics()
         self._update_start_availability()
 
@@ -2142,6 +2152,8 @@ class MainWindow(QMainWindow):
             return
         self.image_dimensions_label.setText("Could not load image")
         self.processing_label.setText(f"Could not load image: {message}")
+        self._set_plan_processing(False)
+        self._refresh_statistics()
         self._update_start_availability()
         QMessageBox.critical(self, "Could not load image", message)
 
@@ -2269,8 +2281,18 @@ class MainWindow(QMainWindow):
         self._plan_dot_count = 0
         self._process_timer.start()
         self.processing_label.setText("Updating paint simulation…")
+        self._set_plan_processing(True)
         self._refresh_statistics()
         self._update_start_availability()
+
+    def _set_plan_processing(self, processing: bool) -> None:
+        """Show or hide the visible signs that the plan is being recalculated."""
+
+        self._plan_processing = processing
+        if processing:
+            self.processing_spinner.start()
+        else:
+            self.processing_spinner.stop()
 
     def _background_color(self) -> tuple[int, int, int] | None:
         mode = self.background_combo.currentData()
@@ -2372,6 +2394,7 @@ class MainWindow(QMainWindow):
     def _on_processing_complete(self, result: _ProcessResult) -> None:
         if result.serial != self._process_serial or self._closing:
             return
+        self._set_plan_processing(False)
         self._processed = result.processed
         self._plan = result.plan
         self._plan_metric_source = result.plan
@@ -2433,6 +2456,7 @@ class MainWindow(QMainWindow):
     def _on_processing_failed(self, serial: int, message: str) -> None:
         if serial != self._process_serial or self._closing:
             return
+        self._set_plan_processing(False)
         self.processing_label.setText(f"Could not process image: {message}")
         self._plan = None
         self._processed = None
@@ -2443,13 +2467,16 @@ class MainWindow(QMainWindow):
     def _refresh_statistics(self, *_args: Any) -> None:
         plan = self._plan
         if plan is None:
+            # While a recalculation is in flight the metrics read as pending
+            # rather than absent, so the numbers do not just vanish.
+            placeholder = "…" if self._plan_processing else "—"
             for widget in (
                 self.analysis_resolution,
                 self.analysis_colors,
                 self.analysis_strokes,
                 self.analysis_time,
             ):
-                widget.value_label.setText("—")  # type: ignore[attr-defined]
+                widget.value_label.setText(placeholder)  # type: ignore[attr-defined]
             return
         self.analysis_resolution.value_label.setText(  # type: ignore[attr-defined]
             f"{plan.width} × {plan.height}"

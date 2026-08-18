@@ -1362,3 +1362,25 @@ def test_progress_updates_fill_the_large_readout(window: MainWindow) -> None:
     assert "425" in window.active_detail_label.text()
     assert "elapsed" in window.active_detail_label.text()
     assert window.active_paint_progress.value() == 425
+
+
+def test_plan_recalculation_shows_pending_feedback(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    source_path = tmp_path / "spin.png"
+    Image.new("RGB", (32, 16), (10, 120, 60)).save(source_path)
+
+    window.load_image(source_path)
+    assert window.processing_spinner.is_spinning
+    assert window.analysis_time.value_label.text() == "…"
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert not window.processing_spinner.is_spinning
+    assert window.analysis_time.value_label.text() != "…"
+
+    # Changing a setting that invalidates the plan restarts the feedback.
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    assert window.processing_spinner.is_spinning
+    assert window.analysis_time.value_label.text() == "…"
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert not window.processing_spinner.is_spinning
+    assert window.analysis_time.value_label.text() != "…"

@@ -48,6 +48,63 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+class Spinner(QWidget):
+    """A small rotating arc that signals background work is in flight.
+
+    Hidden while stopped, so it can live permanently in a layout and simply be
+    started when a worker kicks off and stopped when its result lands.
+    """
+
+    def __init__(
+        self,
+        diameter: int = 16,
+        line_width: int = 3,
+        color: str = ACCENT,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._line_width = max(1, line_width)
+        self._color = QColor(color)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._advance)
+        self.setFixedSize(diameter, diameter)
+        self.hide()
+
+    @property
+    def is_spinning(self) -> bool:
+        return self._timer.isActive()
+
+    def start(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.show()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 10) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = painter.pen()
+        pen.setColor(self._color)
+        pen.setWidth(self._line_width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        margin = self._line_width // 2 + 1
+        bounds = self.rect().adjusted(margin, margin, -margin, -margin)
+        # Qt angles are in sixteenths of a degree, counterclockwise.
+        painter.drawArc(bounds, -self._angle * 16, 300 * 16)
+        painter.end()
+
+
 class NoWheelSpinBox(QSpinBox):
     """Integer editor that changes only through deliberate editing/buttons."""
 
