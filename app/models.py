@@ -40,13 +40,6 @@ class PaintMode(str, Enum):
     FAST = "fast"
 
 
-class BrushShape(str, Enum):
-    """The two Rust brush shapes planning understands."""
-
-    SQUARE = "square"
-    CIRCLE = "circle"
-
-
 class CropAlignment(str, Enum):
     CENTER = "center"
     TOP = "top"
@@ -276,18 +269,18 @@ class Stroke:
 
 @dataclass(frozen=True, slots=True)
 class ColorGroup:
-    """Strokes sharing one color, and optionally one brush size and shape.
+    """Strokes sharing one color, and optionally one brush size.
 
-    ``brush_diameter`` is in logical cells.  The defaults describe every plan
+    ``brush_diameter`` is in logical cells.  The default describes every plan
     the classic pipeline produces, so existing plans keep their meaning: one
-    cell per stroke, whatever brush shape Rust currently has selected.
+    cell per stroke.  Whatever brush shape Rust currently has selected is used
+    as-is.
     """
 
     color: RGBColor
     strokes: tuple[Stroke, ...]
     pixel_count: int
     brush_diameter: int = 1
-    brush_shape: str | None = None
 
     @property
     def rgb(self) -> RGBColor:

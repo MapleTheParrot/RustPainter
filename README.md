@@ -118,7 +118,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
-- Drag calibration for the canvas, color box, hue bar, and optional Size track, brush-preview tile, and Square/Circle shape buttons, with an on-screen overlay to verify them
+- Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
@@ -187,12 +187,9 @@ real seconds, so the planner only fetches a big brush when it pays for the trip.
 Dithered images keep their deliberate speckle: region cleanup turns itself off
 when dithering is enabled.
 
-Two further optional calibrations, **Square shape** and **Circle shape**, mark
-Rust's solid brush-shape buttons. With neither calibrated, painting keeps
-whatever shape is selected in Rust. With one, optimized plans may select that
-shape when a large brush is used. With both, the planner picks square or circle
-per region - square for broad flat fills, circle where a square would spill
-into places that need cleaning up - and batches work so it rarely switches.
+Painting always keeps whatever brush shape is selected in Rust; the planner
+budgets every pass for the square brush's worst-case spill, so either solid
+shape stays safe.
 
 ### How the image is prepared for the picker
 

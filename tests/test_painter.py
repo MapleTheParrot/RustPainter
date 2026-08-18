@@ -180,20 +180,16 @@ def test_automatic_brush_size_matches_preview_to_logical_cell() -> None:
     assert (first_hue_move.x, first_hue_move.y) == tuple(round(v) for v in expected_hue)
 
 
-def test_optimized_plan_switches_brush_size_and_shape() -> None:
+def test_optimized_plan_switches_brush_size() -> None:
     controller = MockInputController()
     slider = ScreenRect(800, 100, 101, 12)
-    square_button = ScreenRect(750, 300, 20, 20)
-    circle_button = ScreenRect(780, 300, 20, 20)
     profile = CalibrationProfile.new(
-        "Shape aware",
+        "Size aware",
         canvas=ScreenRect(100, 100, 640, 320),
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_slider=slider,
         brush_preview=ScreenRect(800, 150, 100, 100),
-        square_shape_button=square_button,
-        circle_shape_button=circle_button,
     )
     measurements: list[int] = []
 
@@ -219,7 +215,6 @@ def test_optimized_plan_switches_brush_size_and_shape() -> None:
                 (Stroke(10, 10, 30, 10),),
                 105,
                 brush_diameter=5,
-                brush_shape="square",
             ),
             ColorGroup((30, 60, 200), (Stroke(0, 0, 5, 0),), 6),
             ColorGroup(
@@ -227,7 +222,6 @@ def test_optimized_plan_switches_brush_size_and_shape() -> None:
                 (Stroke(8, 20, 20, 20),),
                 65,
                 brush_diameter=5,
-                brush_shape="circle",
             ),
         ),
     )
@@ -238,23 +232,9 @@ def test_optimized_plan_switches_brush_size_and_shape() -> None:
     assert painter.state is PainterState.COMPLETED
     assert not controller.held_buttons
 
-    down_positions: list[tuple[int, int]] = []
-    position = (0, 0)
-    for event in controller.events:
-        if event.kind == "move" and event.x is not None and event.y is not None:
-            position = (event.x, event.y)
-        elif event.kind == "mouse_down":
-            down_positions.append(position)
-
-    def clicks_inside(rect: ScreenRect) -> int:
-        return sum(1 for x, y in down_positions if rect.contains(x, y))
-
-    assert clicks_inside(square_button) == 1
-    assert clicks_inside(circle_button) == 1
-    # Three searches at most: 5 cells under the square, 1 cell, and 5 cells
-    # again under the circle - a shape switch invalidates the cached fraction
-    # because the same slider position can render a different footprint.
-    assert len(measurements) <= 21
+    # Two searches at most: 5 cells and 1 cell.  Returning to 5 cells replays
+    # the cached slider fraction without a single preview measurement.
+    assert len(measurements) <= 14
 
 
 def test_multi_cell_brush_that_cannot_reach_its_target_fails_loudly() -> None:
@@ -321,35 +301,6 @@ def test_multi_size_plan_requires_brush_sizing_calibration() -> None:
     painter = Painter(controller)
     with pytest.raises(ValueError, match="brush sizes"):
         painter.configure(plan, _profile(), _settings())
-
-
-def test_shape_selecting_plan_requires_its_button() -> None:
-    profile = CalibrationProfile.new(
-        "No shape buttons",
-        canvas=ScreenRect(100, 100, 400, 80),
-        color_box=ScreenRect(600, 100, 100, 100),
-        hue_bar=ScreenRect(720, 100, 12, 100),
-        brush_slider=ScreenRect(800, 100, 101, 12),
-        brush_preview=ScreenRect(800, 150, 100, 100),
-    )
-    plan = PaintPlan(
-        8,
-        8,
-        (
-            ColorGroup(
-                (10, 20, 30),
-                (Stroke(0, 0, 0, 0),),
-                1,
-                brush_diameter=3,
-                brush_shape="circle",
-            ),
-        ),
-    )
-    controller = MockInputController()
-    controller.emits_real_input = True  # type: ignore[misc]
-    painter = Painter(controller)
-    with pytest.raises(ValueError, match="circle"):
-        painter.configure(plan, profile, _settings(apply_brush_size=True))
 
 
 def test_automatic_brush_size_retries_tiny_preview_with_center_crop() -> None:

@@ -1285,20 +1285,11 @@ class MainWindow(QMainWindow):
         self.hue_bar_status = CalibrationStatus("Hue bar")
         self.brush_slider_status = CalibrationStatus("Size track", optional=True)
         self.brush_preview_status = CalibrationStatus("Brush preview", optional=True)
-        self.square_shape_status = CalibrationStatus("Square shape", optional=True)
-        self.circle_shape_status = CalibrationStatus("Circle shape", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
         self.calibrate_brush_preview_button = QPushButton("Set")
-        self.calibrate_square_shape_button = QPushButton("Set")
-        self.calibrate_circle_shape_button = QPushButton("Set")
-        shape_hint = (
-            "Optional. With neither shape button calibrated, painting keeps\n"
-            "whatever brush shape Rust has selected; with both calibrated,\n"
-            "optimized modes switch between square and circle automatically."
-        )
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -1308,16 +1299,6 @@ class MainWindow(QMainWindow):
                 self.brush_preview_status,
                 self.calibrate_brush_preview_button,
                 "Calibrate brush preview",
-            ),
-            (
-                self.square_shape_status,
-                self.calibrate_square_shape_button,
-                "Calibrate the square brush-shape button.\n" + shape_hint,
-            ),
-            (
-                self.circle_shape_status,
-                self.calibrate_circle_shape_button,
-                "Calibrate the circle brush-shape button.\n" + shape_hint,
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -1714,8 +1695,6 @@ class MainWindow(QMainWindow):
                 # leave unpainted rows; keep those plans single-cell.
                 and self.pixel_spacing_spin.value() <= 1.0
             ),
-            square=self._profile_rect("square_shape_button") is not None,
-            circle=self._profile_rect("circle_shape_button") is not None,
             cell_pixels=cell_pixels,
         )
 
@@ -2448,9 +2427,8 @@ class MainWindow(QMainWindow):
             )
         travel = stroke_pixel_steps * cell_width
         # One walk over the groups tracks everything the painter tracks: the
-        # picker is selected once per run of same-color groups, the slider
-        # cache is keyed by (diameter, shape), and a shape click both costs a
-        # trip and invalidates the sizing.
+        # picker is selected once per run of same-color groups, and the slider
+        # cache is keyed by diameter.
         sizing = (
             self.apply_brush_check.isChecked()
             and self._profile_rect("brush_slider") is not None
@@ -2458,28 +2436,22 @@ class MainWindow(QMainWindow):
         )
         selections = 0
         previous_color: tuple[int, int, int] | None = None
-        shape_changes = 0
-        tracked_shape: str | None = None
-        searched: set[tuple[int, str | None]] = set()
-        previous_key: tuple[int, str | None] | None = None
+        searched: set[int] = set()
+        previous_diameter: int | None = None
         revisits = 0
         for group in plan.color_groups:
             if group.color != previous_color:
                 selections += 1
                 previous_color = group.color
-            if group.brush_shape is not None and group.brush_shape != tracked_shape:
-                shape_changes += 1
-                tracked_shape = group.brush_shape
-                previous_key = None
             if sizing:
-                key = (max(1, group.brush_diameter), tracked_shape)
-                if key != previous_key:
-                    if key in searched:
+                diameter = max(1, group.brush_diameter)
+                if diameter != previous_diameter:
+                    if diameter in searched:
                         revisits += 1
                     else:
-                        searched.add(key)
-                    previous_key = key
-        # A fresh (diameter, shape) binary-searches the slider with ~7 preview
+                        searched.add(diameter)
+                    previous_diameter = diameter
+        # A fresh diameter binary-searches the slider with ~7 preview
         # measurements, each of which also selects a temporary color; a
         # revisit replays one remembered click.
         settle = max(self.brush_delay_spin.value() / 1000.0, 0.16)
@@ -2495,15 +2467,11 @@ class MainWindow(QMainWindow):
         ) + len(plan.color_groups) * self.color_delay_spin.value()
         stroke_ms = plan.stroke_count * self.stroke_delay_spin.value()
         dot_ms = dot_count * self.dot_duration_spin.value()
-        shape_seconds = shape_changes * (
-            self.brush_delay_spin.value() + self.dot_duration_spin.value()
-        ) / 1000.0
         movement_seconds = travel / max(1.0, self.stroke_speed_spin.value())
         return (
             movement_seconds
             + (color_ms + stroke_ms + dot_ms) / 1000.0
             + brush_seconds
-            + shape_seconds
         )
 
     @staticmethod
@@ -2600,16 +2568,6 @@ class MainWindow(QMainWindow):
         self.calibrate_brush_preview_button.clicked.connect(
             lambda: self._begin_calibration(
                 "brush_preview", "gray brush-preview tile"
-            )
-        )
-        self.calibrate_square_shape_button.clicked.connect(
-            lambda: self._begin_calibration(
-                "square_shape_button", "square brush-shape button"
-            )
-        )
-        self.calibrate_circle_shape_button.clicked.connect(
-            lambda: self._begin_calibration(
-                "circle_shape_button", "circle brush-shape button"
             )
         )
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
@@ -3026,12 +2984,6 @@ class MainWindow(QMainWindow):
         self.brush_preview_status.set_calibrated(
             bool(status.get("brush_preview")), brush_optional
         )
-        self.square_shape_status.set_calibrated(
-            bool(status.get("square_shape_button")), True
-        )
-        self.circle_shape_status.set_calibrated(
-            bool(status.get("circle_shape_button")), True
-        )
         correction = (
             profile.metadata.get("color_correction")
             if profile and isinstance(profile.metadata, dict)
@@ -3091,8 +3043,6 @@ class MainWindow(QMainWindow):
                     "hue_bar",
                     "brush_slider",
                     "brush_preview",
-                    "square_shape_button",
-                    "circle_shape_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
@@ -3209,8 +3159,6 @@ class MainWindow(QMainWindow):
                 "hue_bar",
                 "brush_slider",
                 "brush_preview",
-                "square_shape_button",
-                "circle_shape_button",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -3253,12 +3201,7 @@ class MainWindow(QMainWindow):
         self._refresh_profile_ui()
         if field == "canvas":
             self._update_quality_dimensions()
-        elif field in {
-            "brush_slider",
-            "brush_preview",
-            "square_shape_button",
-            "circle_shape_button",
-        }:
+        elif field in {"brush_slider", "brush_preview"}:
             # These calibrations change what the optimizer may plan with.
             self._schedule_processing()
 
@@ -3299,8 +3242,6 @@ class MainWindow(QMainWindow):
                     ("Hue bar", getattr(profile, "hue_bar", None)),
                     ("Size track", getattr(profile, "brush_slider", None)),
                     ("Brush preview", getattr(profile, "brush_preview", None)),
-                    ("Square shape", getattr(profile, "square_shape_button", None)),
-                    ("Circle shape", getattr(profile, "circle_shape_button", None)),
                 )
                 if rect is not None
             ]
@@ -3867,8 +3808,6 @@ class MainWindow(QMainWindow):
             self.calibrate_hue_bar_button,
             self.calibrate_brush_button,
             self.calibrate_brush_preview_button,
-            self.calibrate_square_shape_button,
-            self.calibrate_circle_shape_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -4075,8 +4014,6 @@ class MainWindow(QMainWindow):
         names = ["canvas", "color_box", "hue_bar"]
         if apply_brush_size:
             names.extend(("brush_slider", "brush_preview"))
-        # The optional shape buttons are only checked when they exist.
-        names.extend(("square_shape_button", "circle_shape_button"))
         for name in names:
             rectangle = getattr(profile, name, None)
             if rectangle is None:

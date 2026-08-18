@@ -21,7 +21,7 @@ from .color_calibration import ColorCorrectionModel
 from .color_mapping import map_rgb_to_picker
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
-from .models import BrushShape, PaintPlan, RGBColor, ScreenRect
+from .models import PaintPlan, RGBColor, ScreenRect
 from .picker_calibration import trim_to_widget
 from .screen import (
     ForegroundRequirement,
@@ -136,8 +136,6 @@ class PaintingTarget:
     picker_directions: PickerDirections = PickerDirections()
     brush_preview: RectangleLike | None = None
     color_correction: ColorCorrectionModel | None = None
-    square_shape_button: RectangleLike | None = None
-    circle_shape_button: RectangleLike | None = None
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -168,8 +166,6 @@ class PaintingTarget:
             ),
             brush_preview=getattr(profile, "brush_preview", None),
             color_correction=correction,
-            square_shape_button=getattr(profile, "square_shape_button", None),
-            circle_shape_button=getattr(profile, "circle_shape_button", None),
         )
 
 
@@ -424,9 +420,9 @@ class Painter:
         self._mouse_drift_pixels = 0.0
         self._mouse_drift_started = 0.0
         # Slider fractions the binary search already found this job, keyed by
-        # (diameter in logical cells, brush shape), so returning to a diameter
-        # under the same shape is one deterministic click, not a fresh search.
-        self._brush_fractions: dict[tuple[int, str | None], float] = {}
+        # diameter in logical cells, so returning to a diameter is one
+        # deterministic click, not a fresh search.
+        self._brush_fractions: dict[int, float] = {}
         self._last_progress_emit = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
@@ -740,23 +736,6 @@ class Painter:
                 raise ValueError(
                     "Multi-cell brush passes need Logical spacing at 1.0 or below"
                 )
-            requested_shapes = {
-                group.brush_shape for group in plan.color_groups if group.brush_shape
-            }
-            if (
-                BrushShape.SQUARE.value in requested_shapes
-                and target.square_shape_button is None
-            ):
-                raise ValueError(
-                    "This plan selects the square brush, but no square shape button is calibrated"
-                )
-            if (
-                BrushShape.CIRCLE.value in requested_shapes
-                and target.circle_shape_button is None
-            ):
-                raise ValueError(
-                    "This plan selects the circle brush, but no circle shape button is calibrated"
-                )
 
     def _run(self) -> None:
         if getattr(self.input, "emits_real_input", True):
@@ -832,14 +811,12 @@ class Painter:
         job: _Job,
         diameter_cells: int,
         epoch: int,
-        shape_key: str | None,
     ) -> bool:
         """Size the brush to ``diameter_cells`` logical cells.
 
         Every input is guarded by ``epoch``: a pause raises ``_RetryAction`` to
-        the caller's stroke loop, which re-applies shape, size, and color once
-        painting resumes.  The slider cache is keyed by shape as well, because
-        the same slider position can render different footprints per shape.
+        the caller's stroke loop, which re-applies size and color once painting
+        resumes.
 
         Returns ``True`` when the preview had to be measured (which selects a
         temporary color), ``False`` when a cached slider fraction was reused.
@@ -867,7 +844,7 @@ class Painter:
             if self.input.emits_real_input
             else 0.0
         )
-        cached_fraction = self._brush_fractions.get((diameter_cells, shape_key))
+        cached_fraction = self._brush_fractions.get(diameter_cells)
         if cached_fraction is not None:
             # The Size track is click-to-set, so repeating the exact click the
             # earlier search settled on restores that diameter without a single
@@ -965,7 +942,7 @@ class Painter:
             self._interruptible_sleep(
                 preview_settle_seconds, epoch=epoch, check_focus=True
             )
-        self._brush_fractions[(diameter_cells, shape_key)] = best_fraction
+        self._brush_fractions[diameter_cells] = best_fraction
         LOGGER.info(
             "Brush auto-sized: %.1f px measured for %.1f px target (slider %.3f)",
             best_diameter,
@@ -1056,16 +1033,6 @@ class Painter:
         assert last_error is not None
         raise last_error
 
-    def _select_brush_shape(
-        self, button: RectangleLike, settings: PainterSettings, epoch: int
-    ) -> None:
-        """Click a calibrated Square/Circle toolbar button and let the UI settle."""
-
-        self._safe_click(normalized_point(button, 0.5, 0.5), epoch)
-        self._interruptible_sleep(
-            settings.delay_after_brush_seconds, epoch=epoch, check_focus=True
-        )
-
     def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
         plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
@@ -1099,43 +1066,23 @@ class Painter:
         )
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
-        # Rust, so an epoch bump re-applies shape and size before the next
-        # stroke - mirroring the (color, epoch) guard on the picker selection.
-        applied_shape: str | None = None
+        # Rust, so an epoch bump re-applies the size before the next stroke -
+        # mirroring the (color, epoch) guard on the picker selection.
         applied_diameter: int | None = None
         applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
         for color_index, group in enumerate(plan.color_groups, start=1):
             diameter = max(1, int(group.brush_diameter))
-            shape = group.brush_shape
-            shape_button = None
-            if shape is not None:
-                shape_button = (
-                    target.square_shape_button
-                    if shape == BrushShape.SQUARE.value
-                    else target.circle_shape_button
-                )
             for index_in_group, stroke in enumerate(group.strokes, start=1):
                 while True:
                     self._checkpoint(check_focus=True)
                     current_epoch = self._pause_generation_value()
                     try:
                         if applied_epoch != current_epoch:
-                            applied_shape = None
                             applied_diameter = None
                             applied_epoch = current_epoch
-                        if shape_button is not None and shape != applied_shape:
-                            self._select_brush_shape(
-                                shape_button, settings, current_epoch
-                            )
-                            applied_shape = shape
-                            # A new shape can render a different footprint at
-                            # the same slider position, so size again under it.
-                            applied_diameter = None
                         if sizing_enabled and diameter != applied_diameter:
-                            if self._apply_brush_size(
-                                job, diameter, current_epoch, applied_shape
-                            ):
+                            if self._apply_brush_size(job, diameter, current_epoch):
                                 # Measuring the preview selected the temporary
                                 # color.
                                 selected = None

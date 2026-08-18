@@ -297,10 +297,6 @@ class CalibrationProfile:
     hue_bar: Rect | None = None
     brush_slider: Rect | None = None
     brush_preview: Rect | None = None
-    # Optional Rust toolbar buttons for the two solid brush shapes. Leaving
-    # them uncalibrated simply keeps whatever shape is selected in Rust.
-    square_shape_button: Rect | None = None
-    circle_shape_button: Rect | None = None
     hue_direction: str = HueDirection.BOTTOM_TO_TOP.value
     saturation_direction: str = SaturationDirection.LEFT_LOW.value
     value_direction: str = ValueDirection.TOP_BRIGHT.value
@@ -354,8 +350,6 @@ class CalibrationProfile:
             "hue_bar": self.hue_bar is not None,
             "brush_slider": self.brush_slider is not None,
             "brush_preview": self.brush_preview is not None,
-            "square_shape_button": self.square_shape_button is not None,
-            "circle_shape_button": self.circle_shape_button is not None,
         }
 
     @property
@@ -386,8 +380,6 @@ class CalibrationProfile:
             "hueBar": _rect_dict(self.hue_bar),
             "brushSlider": _rect_dict(self.brush_slider),
             "brushPreview": _rect_dict(self.brush_preview),
-            "squareShapeButton": _rect_dict(self.square_shape_button),
-            "circleShapeButton": _rect_dict(self.circle_shape_button),
             "pickerDirections": {
                 "hue": self.hue_direction,
                 "saturation": self.saturation_direction,
@@ -422,16 +414,6 @@ class CalibrationProfile:
             brush_preview=_rect_from(
                 _first(value, "brushPreview", "brush_preview"),
                 "brush preview",
-                optional=True,
-            ),
-            square_shape_button=_rect_from(
-                _first(value, "squareShapeButton", "square_shape_button"),
-                "square shape button",
-                optional=True,
-            ),
-            circle_shape_button=_rect_from(
-                _first(value, "circleShapeButton", "circle_shape_button"),
-                "circle shape button",
                 optional=True,
             ),
             hue_direction=_first(

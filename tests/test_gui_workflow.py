@@ -72,10 +72,6 @@ def test_optimization_mode_merges_colors_and_gates_controls(
     window._set_combo_data(window.paint_mode_combo, "exact")
     assert window.merge_combo.isEnabled()
 
-    # The two brush-shape calibrations advertise themselves as optional.
-    assert window.square_shape_status._value.text() == "Optional"
-    assert window.circle_shape_status._value.text() == "Optional"
-
     source_path = tmp_path / "flat.png"
     image = Image.new("RGB", (64, 32), (250, 250, 250))
     for x in range(10):

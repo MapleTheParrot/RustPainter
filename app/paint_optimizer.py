@@ -23,7 +23,6 @@ import numpy as np
 from PIL import Image
 
 from .models import (
-    BrushShape,
     ColorGroup,
     PaintMode,
     PaintPlan,
@@ -49,8 +48,6 @@ _MAX_BRUSH_PIXELS = 64.0
 # delay, the button press, and the hop to the stroke's start point.
 _STROKE_OVERHEAD_CELLS = 10
 
-_UNSET = object()
-
 
 @dataclass(frozen=True, slots=True)
 class BrushCapabilities:
@@ -58,14 +55,11 @@ class BrushCapabilities:
 
     ``sizing`` requires the Size track and brush preview calibrations plus the
     automatic-brush-sizing option; without it every stroke stays one cell.
-    ``square``/``circle`` mirror the two optional shape-button calibrations.
     ``cell_pixels`` is the physical size of one logical cell, used to keep a
     planned brush inside the slider's realistic range; zero means unknown.
     """
 
     sizing: bool = False
-    square: bool = False
-    circle: bool = False
     cell_pixels: float = 0.0
 
 
@@ -90,11 +84,9 @@ class OptimizerOptions:
     # Execution costs expressed in cells of mouse travel, so a candidate pass
     # can be weighed directly against the detail strokes it would replace.
     # Searching a fresh diameter measures the preview repeatedly; revisiting a
-    # diameter replays one remembered slider click; a shape switch is a trip
-    # to the toolbar and back.
+    # diameter replays one remembered slider click.
     resize_cost_cells: int
     revisit_cost_cells: int
-    shape_switch_cost_cells: int
 
 
 MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
@@ -106,7 +98,6 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         brush_diameters=(3,),
         resize_cost_cells=450,
         revisit_cost_cells=110,
-        shape_switch_cost_cells=300,
     ),
     PaintMode.BALANCED: OptimizerOptions(
         merge_tolerance=5.0,
@@ -116,7 +107,6 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         brush_diameters=(5, 3),
         resize_cost_cells=400,
         revisit_cost_cells=90,
-        shape_switch_cost_cells=220,
     ),
     PaintMode.FAST: OptimizerOptions(
         merge_tolerance=9.0,
@@ -126,7 +116,6 @@ MODE_OPTIONS: dict[PaintMode, OptimizerOptions] = {
         brush_diameters=(7, 5, 3),
         resize_cost_cells=350,
         revisit_cost_cells=80,
-        shape_switch_cost_cells=150,
     ),
 }
 
@@ -140,7 +129,6 @@ class OptimizationStatistics:
     output_colors: int
     stroke_count: int
     brush_size_changes: int
-    brush_shape_changes: int
     mean_delta_e: float
     similarity_percent: float
 
@@ -396,36 +384,21 @@ def _brush_is_achievable(diameter: int, capabilities: BrushCapabilities) -> bool
     return diameter * cell <= _MAX_BRUSH_PIXELS
 
 
-def _shape_candidates(capabilities: BrushCapabilities) -> tuple[str | None, ...]:
-    if capabilities.square and capabilities.circle:
-        return (BrushShape.SQUARE.value, BrushShape.CIRCLE.value)
-    if capabilities.square:
-        return (BrushShape.SQUARE.value,)
-    if capabilities.circle:
-        return (BrushShape.CIRCLE.value,)
-    # Unknown brush shape: plan with the square's spill reach (the worst case)
-    # and the band coverage both shapes share, so whichever solid shape is
-    # actually selected in Rust stays safe.
-    return (None,)
-
-
-def _safety_offsets(diameter: int, shape: str | None) -> np.ndarray:
+def _safety_offsets(diameter: int) -> np.ndarray:
     """Neighbourhood that must be paintable for a brush centered on a cell.
 
     The reach includes one guard cell beyond the nominal footprint so slider
     rounding and sub-pixel alignment can never push paint onto a cell that is
-    only repainted earlier - or never repainted at all.
+    only repainted earlier - or never repainted at all.  Planning always uses
+    the square brush's spill reach (the worst case), so whichever solid shape
+    is actually selected in Rust stays safe.
     """
 
     coverage_radius = (diameter - 1) // 2
     reach = coverage_radius + 1
     span = np.arange(-reach, reach + 1)
     grid_y, grid_x = np.meshgrid(span, span, indexing="ij")
-    if shape == BrushShape.CIRCLE.value:
-        keep = (grid_y**2 + grid_x**2) <= (coverage_radius + 1.25) ** 2
-    else:
-        keep = np.ones_like(grid_y, dtype=np.bool_)
-    return np.stack((grid_y[keep], grid_x[keep]), axis=1)
+    return np.stack((grid_y.reshape(-1), grid_x.reshape(-1)), axis=1)
 
 
 def _erode(allowed: np.ndarray, offsets: np.ndarray) -> np.ndarray:
@@ -549,17 +522,16 @@ def _evaluate_pass(
     allowed: np.ndarray,
     uncovered: np.ndarray,
     diameter: int,
-    shape: str | None,
 ) -> tuple[np.ndarray, list[Stroke], int, float]:
     """Plan one candidate pass and score its benefit over painting as detail.
 
     The benefit is measured in cells of mouse travel: what the covered cells
     would have cost as single-cell runs, minus what the pass itself travels.
-    Fixed per-pass costs (a brush resize, a shape switch) are the caller's to
-    subtract, since they depend on what is already selected.
+    Fixed per-pass costs (a brush resize) are the caller's to subtract, since
+    they depend on what is already selected.
     """
 
-    safe = _erode(allowed, _safety_offsets(diameter, shape))
+    safe = _erode(allowed, _safety_offsets(diameter))
     trial = uncovered.copy()
     strokes, covered = _plan_brush_pass(safe, trial, diameter)
     replaced_runs = _row_run_count(uncovered & ~trial)
@@ -641,7 +613,6 @@ def optimize_paint_plan(
     )
 
     groups: list[ColorGroup] = []
-    current_shape: str | None = None
     last_diameter = 1
     # Mirrors the painter's per-diameter slider cache: the first use of a
     # diameter is a full search, returning to it later is a single click.
@@ -649,7 +620,6 @@ def optimize_paint_plan(
     for color_index, color in enumerate(colors):
         allowed = index_map >= color_index
         uncovered = index_map == color_index
-        shape_choice: object = _UNSET
         for diameter in diameters:
             remaining_cells = int(uncovered.sum())
             if remaining_cells < 32:
@@ -660,55 +630,22 @@ def optimize_paint_plan(
                 switch_cost = float(options.revisit_cost_cells)
             else:
                 switch_cost = float(options.resize_cost_cells)
-            if shape_choice is _UNSET:
-                best: (
-                    tuple[float, float, str | None, np.ndarray, list[Stroke], int]
-                    | None
-                ) = None
-                for shape in _shape_candidates(capabilities):
-                    trial, strokes, covered, benefit = _evaluate_pass(
-                        allowed, uncovered, diameter, shape
-                    )
-                    ranking = benefit
-                    if (
-                        shape is not None
-                        and current_shape is not None
-                        and shape != current_shape
-                    ):
-                        ranking -= options.shape_switch_cost_cells
-                    if best is None or ranking > best[0]:
-                        best = (ranking, benefit, shape, trial, strokes, covered)
-                assert best is not None
-                _ranking, benefit, shape_choice, trial, strokes, covered = best
-            else:
-                trial, strokes, covered, benefit = _evaluate_pass(
-                    allowed, uncovered, diameter, shape_choice  # type: ignore[arg-type]
-                )
-            # The toolbar trip stays on the bill for every diameter until a
-            # pass is actually accepted and the shape becomes current.
-            if (
-                isinstance(shape_choice, str)
-                and current_shape is not None
-                and shape_choice != current_shape
-            ):
-                switch_cost += options.shape_switch_cost_cells
+            trial, strokes, covered, benefit = _evaluate_pass(
+                allowed, uncovered, diameter
+            )
             if not strokes or benefit <= switch_cost:
                 continue
             uncovered = trial
-            resolved_shape = shape_choice if isinstance(shape_choice, str) else None
             groups.append(
                 ColorGroup(
                     color=color,
                     strokes=tuple(_serpentine(strokes)),
                     pixel_count=covered,
                     brush_diameter=diameter,
-                    brush_shape=resolved_shape,
                 )
             )
             last_diameter = diameter
             searched_diameters.add(diameter)
-            if resolved_shape is not None:
-                current_shape = resolved_shape
         if uncovered.any():
             detail = _plan_detail_runs(uncovered, allowed, options.overpaint_gap)
             groups.append(
@@ -717,7 +654,6 @@ def optimize_paint_plan(
                     strokes=tuple(_serpentine(detail)),
                     pixel_count=int(uncovered.sum()),
                     brush_diameter=1,
-                    brush_shape=None,
                 )
             )
             last_diameter = 1
@@ -765,16 +701,11 @@ def _build_statistics(
         mean_delta_e = 0.0
 
     size_changes = 0
-    shape_changes = 0
     previous_diameter = 1
-    tracked_shape: str | None = None
     for group in plan.color_groups:
         if group.brush_diameter != previous_diameter:
             size_changes += 1
             previous_diameter = group.brush_diameter
-        if group.brush_shape is not None and group.brush_shape != tracked_shape:
-            shape_changes += 1
-            tracked_shape = group.brush_shape
 
     return OptimizationStatistics(
         mode=mode.value,
@@ -782,7 +713,6 @@ def _build_statistics(
         output_colors=len(colors),
         stroke_count=plan.stroke_count,
         brush_size_changes=size_changes,
-        brush_shape_changes=shape_changes,
         mean_delta_e=mean_delta_e,
         similarity_percent=max(0.0, 100.0 - 2.0 * mean_delta_e),
     )

@@ -48,21 +48,11 @@ def _simulate(plan: PaintPlan, footprint: str) -> np.ndarray:
                 canvas[top:bottom, x0 : x1 + 1] = color
                 continue
             reach = radius + 1
-            if group.brush_shape == "circle":
-                limit = (radius + 1.25) ** 2
-                for cy in range(max(0, y - reach), min(plan.height, y + reach + 1)):
-                    for cx in range(
-                        max(0, x0 - reach), min(plan.width, x1 + reach + 1)
-                    ):
-                        gap_x = max(0, x0 - cx, cx - x1)
-                        if gap_x * gap_x + (cy - y) * (cy - y) <= limit:
-                            canvas[cy, cx] = color
-            else:
-                top = max(0, y - reach)
-                bottom = min(plan.height, y + reach + 1)
-                left = max(0, x0 - reach)
-                right = min(plan.width, x1 + reach + 1)
-                canvas[top:bottom, left:right] = color
+            top = max(0, y - reach)
+            bottom = min(plan.height, y + reach + 1)
+            left = max(0, x0 - reach)
+            right = min(plan.width, x1 + reach + 1)
+            canvas[top:bottom, left:right] = color
     return canvas
 
 
@@ -124,7 +114,6 @@ def test_without_sizing_every_group_stays_single_cell() -> None:
     result = optimize_paint_plan(image, PaintMode.BALANCED)
     assert result.plan.color_groups
     assert all(group.brush_diameter == 1 for group in result.plan.color_groups)
-    assert all(group.brush_shape is None for group in result.plan.color_groups)
     _assert_plan_paints_target(
         result.plan, np.asarray(result.image.convert("RGB")), result.paint_mask
     )
@@ -136,7 +125,7 @@ def test_large_region_earns_a_larger_brush() -> None:
     result = optimize_paint_plan(
         image,
         PaintMode.BALANCED,
-        capabilities=BrushCapabilities(sizing=True, square=True),
+        capabilities=BrushCapabilities(sizing=True),
     )
     diameters = {group.brush_diameter for group in result.plan.color_groups}
     assert max(diameters) > 1
@@ -146,7 +135,7 @@ def test_large_region_earns_a_larger_brush() -> None:
     )
 
 
-def test_layered_plan_reproduces_target_with_both_shapes() -> None:
+def test_layered_plan_reproduces_target() -> None:
     rng = np.random.default_rng(7)
     image = _rgb(96, 64, (60, 120, 220))  # sky
     image[40:64, :] = (60, 160, 60)  # ground
@@ -159,33 +148,13 @@ def test_layered_plan_reproduces_target_with_both_shapes() -> None:
     result = optimize_paint_plan(
         image,
         PaintMode.FAST,
-        capabilities=BrushCapabilities(sizing=True, square=True, circle=True),
+        capabilities=BrushCapabilities(sizing=True),
     )
     target = np.asarray(result.image.convert("RGB"))
     _assert_plan_paints_target(result.plan, target, result.paint_mask)
     statistics = result.statistics
     assert statistics.output_colors <= statistics.input_colors
     assert 0.0 <= statistics.similarity_percent <= 100.0
-    used_shapes = {
-        group.brush_shape
-        for group in result.plan.color_groups
-        if group.brush_diameter > 1
-    }
-    assert used_shapes <= {"square", "circle"}
-
-
-def test_unknown_shape_plans_conservatively() -> None:
-    image = _rgb(80, 48, (255, 255, 255))
-    image[8:40, 8:72] = (10, 10, 10)
-    result = optimize_paint_plan(
-        image,
-        PaintMode.BALANCED,
-        capabilities=BrushCapabilities(sizing=True),
-    )
-    assert all(group.brush_shape is None for group in result.plan.color_groups)
-    _assert_plan_paints_target(
-        result.plan, np.asarray(result.image.convert("RGB")), result.paint_mask
-    )
 
 
 def test_partial_mask_is_never_touched() -> None:
@@ -197,7 +166,7 @@ def test_partial_mask_is_never_touched() -> None:
     result = optimize_paint_plan(
         image,
         PaintMode.BALANCED,
-        capabilities=BrushCapabilities(sizing=True, square=True),
+        capabilities=BrushCapabilities(sizing=True),
         paint_mask=mask,
     )
     assert np.array_equal(result.paint_mask, mask)
@@ -237,7 +206,7 @@ def test_oversized_cells_cap_the_brush() -> None:
         image,
         PaintMode.FAST,
         # 40px cells: even a 3-cell brush would exceed the slider's safe range.
-        capabilities=BrushCapabilities(sizing=True, square=True, cell_pixels=40.0),
+        capabilities=BrushCapabilities(sizing=True, cell_pixels=40.0),
     )
     assert all(group.brush_diameter == 1 for group in result.plan.color_groups)
 
