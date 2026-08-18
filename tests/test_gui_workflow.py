@@ -1385,3 +1385,52 @@ def test_plan_recalculation_shows_pending_feedback(
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
     assert not window.processing_spinner.is_spinning
     assert window.analysis_time.value_label.text() != "…"
+
+
+def test_rust_on_another_monitor_offers_and_applies_a_move(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.screen as screen_module
+    from app.screen import ForegroundWindowInfo
+
+    profile = window._current_profile
+    assert profile is not None
+    profile.canvas = ScreenRect(100, 100, 800, 400)
+    profile.color_box = ScreenRect(1000, 100, 200, 200)
+    profile.hue_bar = ScreenRect(1250, 100, 20, 200)
+    profile.metadata["ui_reference"] = {"path": "stale.png", "rect": {"left": 0, "top": 0, "width": 1, "height": 1}}
+    window._current_profile = window._profile_store.save(profile)
+
+    calibrated_monitor = ScreenRect(0, 0, 1920, 1080)
+    rust_monitor = ScreenRect(1920, 0, 1920, 1080)
+    monkeypatch.setattr(
+        screen_module,
+        "find_window_matching",
+        lambda **_kwargs: ForegroundWindowInfo(hwnd=42, title="Rust", process_id=7),
+    )
+    monkeypatch.setattr(
+        screen_module, "window_monitor_rect", lambda _hwnd: rust_monitor
+    )
+    monkeypatch.setattr(
+        screen_module, "monitor_rect_at", lambda _x, _y: calibrated_monitor
+    )
+
+    window._check_rust_monitor()
+    assert window.rust_monitor_label.isVisible() or not window.rust_monitor_label.isHidden()
+    assert not window.move_to_rust_button.isHidden()
+
+    window._move_calibration_to_rust_monitor()
+
+    moved = window._current_profile
+    assert moved.canvas == ScreenRect(2020, 100, 800, 400)
+    assert moved.color_box == ScreenRect(2920, 100, 200, 200)
+    assert moved.hue_bar == ScreenRect(3170, 100, 20, 200)
+    assert "ui_reference" not in moved.metadata
+    assert window.move_to_rust_button.isHidden()
+
+    # Once Rust and the boxes share a monitor, the prompt goes away.
+    monkeypatch.setattr(
+        screen_module, "monitor_rect_at", lambda _x, _y: rust_monitor
+    )
+    window._check_rust_monitor()
+    assert window.rust_monitor_label.isHidden()

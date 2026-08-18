@@ -74,3 +74,29 @@ def test_executable_name_is_parsed_regardless_of_path_separator() -> None:
     )
     assert posix_style.executable_name == "Rust"
     assert foreground_window_matches(executable="Rust", info=posix_style)
+
+
+def test_rect_mapping_translates_between_same_size_monitors() -> None:
+    from app.models import ScreenRect
+    from app.screen import map_rect_between_monitors
+
+    source = ScreenRect(0, 0, 1920, 1080)
+    target = ScreenRect(1920, 0, 1920, 1080)
+    rect = ScreenRect(100, 200, 640, 320)
+
+    moved = map_rect_between_monitors(rect, source, target)
+
+    assert moved == ScreenRect(2020, 200, 640, 320)
+
+
+def test_rect_mapping_scales_between_different_resolutions() -> None:
+    from app.models import ScreenRect
+    from app.screen import map_rect_between_monitors
+
+    source = ScreenRect(0, 0, 1920, 1080)
+    target = ScreenRect(-2560, -100, 2560, 1440)
+    rect = ScreenRect(192, 108, 960, 540)
+
+    moved = map_rect_between_monitors(rect, source, target)
+
+    assert moved == ScreenRect(-2560 + 256, -100 + 144, 1280, 720)

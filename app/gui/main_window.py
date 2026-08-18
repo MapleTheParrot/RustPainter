@@ -576,6 +576,12 @@ class MainWindow(QMainWindow):
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(350)
         self._settings_timer.timeout.connect(self._save_settings)
+        # A calibrated profile follows the game: this poll notices Rust's
+        # window sitting on a different monitor than the calibrated boxes and
+        # offers a one-click move.
+        self._rust_monitor_timer = QTimer(self)
+        self._rust_monitor_timer.setInterval(5000)
+        self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
 
         self._profile_store: Any = None
         self._settings_store: Any = None
@@ -1395,6 +1401,18 @@ class MainWindow(QMainWindow):
         self.display_warning_label.setWordWrap(True)
         self.display_warning_label.setStyleSheet("color: #e0a34b;")
         profile_layout.addWidget(self.display_warning_label)
+        self.rust_monitor_label = QLabel("")
+        self.rust_monitor_label.setWordWrap(True)
+        self.rust_monitor_label.setStyleSheet("color: #e0a34b;")
+        self.rust_monitor_label.setVisible(False)
+        self.move_to_rust_button = QPushButton("Move boxes to Rust's monitor")
+        self.move_to_rust_button.setToolTip(
+            "Reprojects every calibrated rectangle onto the monitor the Rust\n"
+            "window is currently on, scaling for a resolution difference."
+        )
+        self.move_to_rust_button.setVisible(False)
+        profile_layout.addWidget(self.rust_monitor_label)
+        profile_layout.addWidget(self.move_to_rust_button)
         layout.addWidget(profile_group)
 
         run_group, run_layout = self._step_panel(3, "Paint")
@@ -2630,6 +2648,8 @@ class MainWindow(QMainWindow):
         self._connect_service_controls()
         self._reload_profiles(self._settings.get("ui", {}).get("selected_profile_id"))
         self._register_hotkeys()
+        if sys.platform == "win32":
+            self._rust_monitor_timer.start()
 
     def _connect_service_controls(self) -> None:
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
@@ -2664,6 +2684,7 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, action=name: self._run_debug_action(action))
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
+        self.move_to_rust_button.clicked.connect(self._move_calibration_to_rust_monitor)
 
         settings_controls = (
             self.scale_mode_combo,
@@ -3306,6 +3327,111 @@ class MainWindow(QMainWindow):
             )
         else:
             self.display_warning_label.setText("")
+
+    def _rust_monitor_mismatch(self) -> tuple[ScreenRect, ScreenRect] | None:
+        """(calibrated monitor, Rust's monitor) when they differ, else None."""
+
+        canvas = self._profile_rect("canvas")
+        if canvas is None:
+            return None
+        title = self.expected_window_edit.text().strip() or None
+        process = self.expected_process_edit.text().strip() or None
+        if not title and not process:
+            return None
+        from app.screen import (
+            find_window_matching,
+            monitor_rect_at,
+            window_monitor_rect,
+        )
+
+        try:
+            window = find_window_matching(title_contains=title, executable=process)
+            if window is None:
+                return None
+            rust_monitor = window_monitor_rect(window.hwnd)
+            center_x, center_y = canvas.center
+            calibrated_monitor = monitor_rect_at(int(center_x), int(center_y))
+        except Exception:
+            LOGGER.warning("Could not resolve Rust's monitor", exc_info=True)
+            return None
+        if rust_monitor is None or calibrated_monitor is None:
+            return None
+        if rust_monitor == calibrated_monitor:
+            return None
+        return calibrated_monitor, rust_monitor
+
+    @Slot()
+    def _check_rust_monitor(self) -> None:
+        """Offer to follow the game when it sits on a different monitor."""
+
+        if self._closing:
+            return
+        busy = (
+            self._painter_is_active()
+            or self._debug_running
+            or self._countdown_callback_running
+            or bool(self._countdown and self._countdown.isVisible())
+        )
+        mismatch = None if busy else self._rust_monitor_mismatch()
+        if mismatch is None:
+            self.rust_monitor_label.setVisible(False)
+            self.move_to_rust_button.setVisible(False)
+            return
+        _source, target = mismatch
+        self.rust_monitor_label.setText(
+            f"⚠ Rust is on the {target.width}×{target.height} monitor at "
+            f"({target.left}, {target.top}), but the calibrated boxes are on "
+            "another monitor."
+        )
+        self.rust_monitor_label.setVisible(True)
+        self.move_to_rust_button.setVisible(True)
+
+    @Slot()
+    def _move_calibration_to_rust_monitor(self) -> None:
+        """Reproject every calibrated rectangle onto Rust's current monitor."""
+
+        mismatch = self._rust_monitor_mismatch()
+        profile = self._current_profile
+        if mismatch is None or profile is None:
+            self._check_rust_monitor()
+            return
+        from app.screen import map_rect_between_monitors
+
+        source, target = mismatch
+        candidate = Profile.from_dict(profile.to_dict())
+        moved: list[str] = []
+        for name in ("canvas", "color_box", "hue_bar", "brush_slider", "brush_preview"):
+            rect = getattr(candidate, name, None)
+            if rect is None:
+                continue
+            setattr(candidate, name, map_rect_between_monitors(rect, source, target))
+            moved.append(name.replace("_", " "))
+        if not moved:
+            return
+        # The saved picker screenshot was captured at the old coordinates.
+        candidate.metadata.pop("ui_reference", None)
+        try:
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not move the calibration to Rust's monitor")
+            QMessageBox.warning(self, "Could not move the calibration", str(exc))
+            return
+        LOGGER.info(
+            "Moved the calibration to Rust's monitor at (%d, %d): %s",
+            target.left,
+            target.top,
+            ", ".join(moved),
+        )
+        self.statusBar().showMessage(
+            "Calibration boxes moved to Rust's monitor — verify them with "
+            "Show boxes on screen",
+            8000,
+        )
+        self.rust_monitor_label.setVisible(False)
+        self.move_to_rust_button.setVisible(False)
+        self._refresh_profile_ui()
+        self._update_quality_dimensions()
+        self._update_calibration_overlay()
 
     @Slot()
     def _on_show_calibration_toggled(self, *_args: Any) -> None:

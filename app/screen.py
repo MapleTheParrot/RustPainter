@@ -345,6 +345,167 @@ def get_foreground_window() -> ForegroundWindowInfo | None:
     )
 
 
+def find_window_matching(
+    *,
+    title_contains: str | None = None,
+    executable: str | None = None,
+    exclude_current_process: bool = True,
+) -> ForegroundWindowInfo | None:
+    """Find any visible top-level window matching the populated requirements.
+
+    Unlike :func:`get_foreground_window`, the window does not have to be
+    focused, so the app can locate the game while it is itself in front.
+    Windows only; other platforms return ``None``.
+    """
+
+    if os.name != "nt" or (not title_contains and not executable):
+        return None
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    is_visible = user32.IsWindowVisible
+    is_visible.argtypes = (wintypes.HWND,)
+    is_visible.restype = wintypes.BOOL
+    get_pid = user32.GetWindowThreadProcessId
+    get_pid.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    get_pid.restype = wintypes.DWORD
+
+    expected_name = _executable_basename(executable or "").casefold()
+    found: list[ForegroundWindowInfo] = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd: int, _lparam: int) -> bool:
+        if not is_visible(hwnd):
+            return True
+        title = _window_title(user32, hwnd)
+        if not title:
+            return True
+        if title_contains and title_contains.casefold() not in title.casefold():
+            return True
+        pid = wintypes.DWORD()
+        get_pid(hwnd, ctypes.byref(pid))
+        process_id = int(pid.value) if pid.value else None
+        if exclude_current_process and process_id == os.getpid():
+            return True
+        path = _process_path(process_id) if process_id is not None else None
+        if expected_name:
+            current_name = _executable_basename(path or "").casefold()
+            if not current_name or current_name != expected_name:
+                return True
+        found.append(
+            ForegroundWindowInfo(
+                hwnd=int(hwnd),
+                title=title,
+                process_id=process_id,
+                executable=path,
+            )
+        )
+        return False  # first match wins; stop enumerating
+
+    enumerate_windows = user32.EnumWindows
+    enumerate_windows.argtypes = (callback_type, wintypes.LPARAM)
+    enumerate_windows.restype = wintypes.BOOL
+    try:
+        # Stopping the enumeration early makes EnumWindows report failure;
+        # a hit in ``found`` is the actual result either way.
+        enumerate_windows(callback_type(visit), 0)
+    except OSError:
+        LOGGER.warning("Could not enumerate top-level windows", exc_info=True)
+        return None
+    return found[0] if found else None
+
+
+def _monitor_rect_from_handle(user32: ctypes.WinDLL, monitor: int) -> ScreenRect | None:
+    from ctypes import wintypes
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    if not monitor:
+        return None
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(info)
+    get_info = user32.GetMonitorInfoW
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(MonitorInfo))
+    get_info.restype = wintypes.BOOL
+    if not get_info(monitor, ctypes.byref(info)):
+        return None
+    bounds = info.rcMonitor
+    width = int(bounds.right - bounds.left)
+    height = int(bounds.bottom - bounds.top)
+    if width <= 0 or height <= 0:
+        return None
+    return ScreenRect(int(bounds.left), int(bounds.top), width, height)
+
+
+def window_monitor_rect(hwnd: int) -> ScreenRect | None:
+    """The physical bounds of the monitor showing most of ``hwnd``."""
+
+    if os.name != "nt" or not hwnd:
+        return None
+    from ctypes import wintypes
+
+    MONITOR_DEFAULTTONEAREST = 2
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    from_window = user32.MonitorFromWindow
+    from_window.argtypes = (wintypes.HWND, wintypes.DWORD)
+    from_window.restype = wintypes.HANDLE
+    try:
+        monitor = from_window(hwnd, MONITOR_DEFAULTTONEAREST)
+        return _monitor_rect_from_handle(user32, monitor)
+    except OSError:
+        LOGGER.warning("Could not resolve a window's monitor", exc_info=True)
+        return None
+
+
+def monitor_rect_at(x: int, y: int) -> ScreenRect | None:
+    """The physical bounds of the monitor nearest the given desktop point."""
+
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class POINT(ctypes.Structure):
+        _fields_ = (("x", wintypes.LONG), ("y", wintypes.LONG))
+
+    MONITOR_DEFAULTTONEAREST = 2
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    from_point = user32.MonitorFromPoint
+    from_point.argtypes = (POINT, wintypes.DWORD)
+    from_point.restype = wintypes.HANDLE
+    try:
+        monitor = from_point(POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST)
+        return _monitor_rect_from_handle(user32, monitor)
+    except OSError:
+        LOGGER.warning("Could not resolve a point's monitor", exc_info=True)
+        return None
+
+
+def map_rect_between_monitors(
+    rect: ScreenRect, source: ScreenRect, target: ScreenRect
+) -> ScreenRect:
+    """Reproject a rectangle from one monitor onto another.
+
+    Position and size scale with the monitor, so a calibration made on a
+    1080p display lands proportionally on a 1440p one. Same-sized monitors
+    reduce to a plain translation.
+    """
+
+    scale_x = target.width / source.width
+    scale_y = target.height / source.height
+    return ScreenRect(
+        round(target.left + (rect.left - source.left) * scale_x),
+        round(target.top + (rect.top - source.top) * scale_y),
+        max(1, round(rect.width * scale_x)),
+        max(1, round(rect.height * scale_y)),
+    )
+
+
 def foreground_window_matches(
     requirement: ForegroundRequirement | None = None,
     *,
@@ -502,11 +663,15 @@ __all__ = [
     "capture_region",
     "compare_images",
     "compare_region_to_reference",
+    "find_window_matching",
     "foreground_window_matches",
     "get_cursor_position",
     "get_foreground_window",
     "get_virtual_screen",
     "get_virtual_screen_rect",
+    "map_rect_between_monitors",
+    "monitor_rect_at",
     "save_reference",
     "set_dpi_awareness",
+    "window_monitor_rect",
 ]
