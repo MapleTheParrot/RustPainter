@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from PySide6.QtCore import QPointF, Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
@@ -125,25 +125,233 @@ class PreviewLabel(QLabel):
 
 
 class _MovableTextItem(QGraphicsTextItem):
-    """A text item that reports its normalized center while being dragged."""
+    """Movable text with direct editing and edge/corner resize handles."""
 
-    def __init__(self, index: int, moved: Callable[[int, float, float], None]) -> None:
+    def __init__(
+        self,
+        index: int,
+        moved: Callable[[int, float, float], None],
+        text_edited: Callable[[int, str], None],
+        resized: Callable[[int, int], None],
+        interaction_finished: Callable[[], None],
+    ) -> None:
         super().__init__()
         self.index = index
         self._moved = moved
-        self._syncing = False
+        self._text_edited = text_edited
+        self._resized = resized
+        self._interaction_finished = interaction_finished
+        self._syncing = True
+        self._editing = False
+        self._dragging = False
+        self._resize_handle: str | None = None
+        self._resize_start = QPointF()
+        self._resize_start_size = 24
+        self._resize_start_width = 1.0
+        self._resize_start_height = 1.0
+        self._resize_center = QPointF()
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.document().contentsChanged.connect(self._on_document_changed)
+
+    @property
+    def is_interacting(self) -> bool:
+        return self._editing or self._dragging or self._resize_handle is not None
 
     def set_center(self, x: float, y: float) -> None:
         bounds = self.boundingRect()
         self._syncing = True
         self.setPos(x - bounds.width() / 2.0, y - bounds.height() / 2.0)
         self._syncing = False
+
+    def finish_setup(self) -> None:
+        self._syncing = False
+
+    def _handle_rects(self) -> dict[str, QRectF]:
+        bounds = super().boundingRect()
+        size = max(4.0, min(9.0, max(1, self.font().pixelSize()) * 0.24))
+        half = size / 2.0
+        left, center_x, right = bounds.left(), bounds.center().x(), bounds.right()
+        top, center_y, bottom = bounds.top(), bounds.center().y(), bounds.bottom()
+        return {
+            "top_left": QRectF(left - half, top - half, size, size),
+            "top": QRectF(center_x - half, top - half, size, size),
+            "top_right": QRectF(right - half, top - half, size, size),
+            "right": QRectF(right - half, center_y - half, size, size),
+            "bottom_right": QRectF(right - half, bottom - half, size, size),
+            "bottom": QRectF(center_x - half, bottom - half, size, size),
+            "bottom_left": QRectF(left - half, bottom - half, size, size),
+            "left": QRectF(left - half, center_y - half, size, size),
+        }
+
+    def boundingRect(self) -> QRectF:  # noqa: N802 - Qt API
+        bounds = super().boundingRect()
+        size = max(4.0, min(9.0, max(1, self.font().pixelSize()) * 0.24))
+        return bounds.adjusted(-size / 2.0, -size / 2.0, size / 2.0, size / 2.0)
+
+    def shape(self) -> QPainterPath:
+        path = super().shape()
+        if self.isSelected() and not self._editing:
+            for rectangle in self._handle_rects().values():
+                path.addRect(rectangle)
+        return path
+
+    def _handle_at(self, position: QPointF) -> str | None:
+        if not self.isSelected() or self._editing:
+            return None
+        for name, rectangle in self._handle_rects().items():
+            if rectangle.contains(position):
+                return name
+        return None
+
+    @staticmethod
+    def _handle_cursor(handle: str | None) -> Qt.CursorShape:
+        if handle in {"top_left", "bottom_right"}:
+            return Qt.CursorShape.SizeFDiagCursor
+        if handle in {"top_right", "bottom_left"}:
+            return Qt.CursorShape.SizeBDiagCursor
+        if handle in {"left", "right"}:
+            return Qt.CursorShape.SizeHorCursor
+        if handle in {"top", "bottom"}:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.OpenHandCursor
+
+    def paint(self, painter, option, widget=None) -> None:
+        super().paint(painter, option, widget)
+        if not self.isSelected() or self._editing:
+            return
+        painter.save()
+        painter.setPen(QColor("#fff1e2"))
+        painter.setBrush(QColor(ACCENT))
+        for rectangle in self._handle_rects().values():
+            painter.drawRect(rectangle)
+        painter.restore()
+
+    def hoverMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self.setCursor(self._handle_cursor(self._handle_at(event.pos())))
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self.setCursor(Qt.CursorShape.IBeamCursor if self._editing else Qt.CursorShape.OpenHandCursor)
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        handle = self._handle_at(event.pos())
+        if handle is not None:
+            self._resize_handle = handle
+            self._resize_start = event.scenePos()
+            self._resize_start_size = max(1, self.font().pixelSize())
+            text_bounds = super().boundingRect()
+            self._resize_start_width = max(1.0, text_bounds.width())
+            self._resize_start_height = max(1.0, text_bounds.height())
+            self._resize_center = self.mapToScene(text_bounds.center())
+            event.accept()
+            return
+        self._dragging = not self._editing
+        self.setCursor(
+            Qt.CursorShape.IBeamCursor
+            if self._editing
+            else Qt.CursorShape.ClosedHandCursor
+        )
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._resize_handle is None:
+            super().mouseMoveEvent(event)
+            return
+        delta = event.scenePos() - self._resize_start
+        horizontal = (
+            -1
+            if "left" in self._resize_handle
+            else 1
+            if "right" in self._resize_handle
+            else 0
+        )
+        vertical = (
+            -1
+            if "top" in self._resize_handle
+            else 1
+            if "bottom" in self._resize_handle
+            else 0
+        )
+        outward = delta.x() * horizontal + delta.y() * vertical
+        axes = int(horizontal != 0) + int(vertical != 0)
+        if axes > 1:
+            outward /= axes
+        extent = max(
+            self._resize_start_width if horizontal else 0.0,
+            self._resize_start_height if vertical else 0.0,
+            1.0,
+        )
+        font_size = round(self._resize_start_size * (1.0 + 2.0 * outward / extent))
+        self._apply_font_size(min(max(font_size, 4), 256))
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        was_interacting = self._dragging or self._resize_handle is not None
+        if self._resize_handle is not None:
+            self._resize_handle = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+        self._dragging = False
+        self.setCursor(
+            Qt.CursorShape.IBeamCursor
+            if self._editing
+            else Qt.CursorShape.OpenHandCursor
+        )
+        if was_interacting:
+            self._interaction_finished()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._editing = True
+        self._dragging = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mouseDoubleClickEvent(event)
+        self.update()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape}:
+            self.clearFocus()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().focusOutEvent(event)
+        if not self._editing:
+            return
+        self._editing = False
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._interaction_finished()
+        self.update()
+
+    def _apply_font_size(self, font_size: int) -> None:
+        if font_size == self.font().pixelSize():
+            return
+        font = self.font()
+        font.setPixelSize(font_size)
+        self._syncing = True
+        self.setFont(font)
+        self.set_center(self._resize_center.x(), self._resize_center.y())
+        self._syncing = False
+        self._resized(self.index, font_size)
+        self.update()
+
+    def _on_document_changed(self) -> None:
+        if not self._syncing:
+            self._text_edited(self.index, self.toPlainText())
 
     def itemChange(self, change, value):  # noqa: N802 - Qt API
         if (
@@ -190,10 +398,13 @@ class _MovableTextItem(QGraphicsTextItem):
 
 
 class TextEditorPreview(QGraphicsView):
-    """Image preview with selectable, draggable text layers."""
+    """Image preview with selectable, editable, resizable text layers."""
 
     layerMoved = Signal(int, float, float)
     layerSelected = Signal(int)
+    layerTextEdited = Signal(int, str)
+    layerResized = Signal(int, int)
+    interactionFinished = Signal()
 
     def __init__(self, placeholder: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -214,6 +425,10 @@ class TextEditorPreview(QGraphicsView):
         self._items: list[_MovableTextItem] = []
         self._placeholder = placeholder
         self._placeholder_art = art_pixmap("preview-placeholder", 96)
+
+    @property
+    def is_interacting(self) -> bool:
+        return any(item.is_interacting for item in self._items)
 
     def set_source(self, pixmap: QPixmap | None) -> None:
         self._source = pixmap or QPixmap()
@@ -242,7 +457,13 @@ class TextEditorPreview(QGraphicsView):
             text = str(getattr(layer, "text", ""))
             if not text.strip():
                 continue
-            item = _MovableTextItem(index, self.layerMoved.emit)
+            item = _MovableTextItem(
+                index,
+                self.layerMoved.emit,
+                self.layerTextEdited.emit,
+                self.layerResized.emit,
+                self.interactionFinished.emit,
+            )
             item.setPlainText(text)
             font = QFont(str(getattr(layer, "font_family", "")))
             font.setPixelSize(max(1, int(getattr(layer, "font_size", 24))))
@@ -258,6 +479,7 @@ class TextEditorPreview(QGraphicsView):
                 float(getattr(layer, "y", 0.5)) * height,
             )
             item.setSelected(index == selected_index)
+            item.finish_setup()
             self._items.append(item)
 
     def select_layer(self, index: int) -> None:

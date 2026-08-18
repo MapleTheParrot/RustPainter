@@ -795,7 +795,7 @@ class MainWindow(QMainWindow):
         self.original_preview = PreviewLabel("Browse an image to begin")
         self.paint_preview = TextEditorPreview("Paint simulation will appear here")
         self.paint_preview.setToolTip(
-            "Select a text layer and drag it directly to position it."
+            "Drag text to move it, drag its handles to resize it, or double-click to edit it."
         )
         tabs.addTab(self.original_preview, "Source")
         tabs.addTab(self.paint_preview, "Rust preview")
@@ -1375,6 +1375,11 @@ class MainWindow(QMainWindow):
         self.text_italic_check.toggled.connect(self._on_text_control_changed)
         self.paint_preview.layerMoved.connect(self._on_text_layer_moved)
         self.paint_preview.layerSelected.connect(self._select_text_layer)
+        self.paint_preview.layerTextEdited.connect(self._on_canvas_text_edited)
+        self.paint_preview.layerResized.connect(self._on_canvas_text_resized)
+        self.paint_preview.interactionFinished.connect(
+            self._on_text_interaction_finished
+        )
         self.speed_preset_combo.currentIndexChanged.connect(self._apply_speed_preset)
         for timing in (
             self.stroke_speed_spin,
@@ -1517,6 +1522,42 @@ class MainWindow(QMainWindow):
         self._selected_text_layer = index
         self._schedule_processing()
         self._schedule_settings_save()
+
+    @Slot(int, str)
+    def _on_canvas_text_edited(self, index: int, text: str) -> None:
+        if not 0 <= index < len(self._text_layers):
+            return
+        self._text_layers[index] = replace(self._text_layers[index], text=text[:500])
+        self._selected_text_layer = index
+        self._syncing_text_controls = True
+        try:
+            self.text_edit.setText(self._text_layers[index].text)
+        finally:
+            self._syncing_text_controls = False
+        self._rebuild_text_layer_combo()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot(int, int)
+    def _on_canvas_text_resized(self, index: int, font_size: int) -> None:
+        if not 0 <= index < len(self._text_layers):
+            return
+        font_size = min(max(int(font_size), 4), 256)
+        self._text_layers[index] = replace(
+            self._text_layers[index], font_size=font_size
+        )
+        self._selected_text_layer = index
+        self._syncing_text_controls = True
+        try:
+            self.text_size_spin.setValue(font_size)
+        finally:
+            self._syncing_text_controls = False
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot()
+    def _on_text_interaction_finished(self) -> None:
+        QTimer.singleShot(0, self._refresh_text_editor_layers)
 
     def _refresh_text_editor_layers(self) -> None:
         self.paint_preview.set_layers(
@@ -1845,7 +1886,8 @@ class MainWindow(QMainWindow):
         self._plan_stroke_pixel_steps = result.stroke_pixel_steps
         self._plan_dot_count = result.dot_count
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
-        self._refresh_text_editor_layers()
+        if not self.paint_preview.is_interacting:
+            self._refresh_text_editor_layers()
         self.preview_tabs.setCurrentIndex(1)
         merged_away = result.unmerged_stroke_count - result.plan.stroke_count
         if merged_away > 0 and result.unmerged_stroke_count > 0:

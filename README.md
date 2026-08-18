@@ -114,7 +114,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by browse or drag & drop
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
-- Multiple draggable text layers with live font, size, color, bold, and italic editing
+- Multiple draggable text layers with inline editing, resize handles, and live font/color styling
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image

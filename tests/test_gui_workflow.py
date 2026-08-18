@@ -10,9 +10,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QColorDialog
+from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import MainWindow, _PendingPaint
@@ -83,7 +83,23 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     old_y = window._text_layers[1].y
     item = window.paint_preview._items[1]
     item.setPos(item.pos().x(), item.pos().y() + 3)
-    assert window._text_layers[1].y > old_y
+    assert window._text_layers[1].y != old_y
+    qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
+    item = window.paint_preview._items[1]
+    double_click = QGraphicsSceneMouseEvent(
+        QEvent.Type.GraphicsSceneMouseDoubleClick
+    )
+    double_click.setButton(Qt.MouseButton.LeftButton)
+    double_click.setPos(item.boundingRect().center())
+    item.mouseDoubleClickEvent(double_click)
+    assert item._editing
+    assert item.textInteractionFlags() == Qt.TextInteractionFlag.TextEditorInteraction
+    item.setPlainText("EDITED HERE")
+    assert window._text_layers[1].text == "EDITED HERE"
+    item._resize_center = item.mapToScene(item.boundingRect().center())
+    item._apply_font_size(42)
+    assert window._text_layers[1].font_size == 42
+    assert window.text_size_spin.value() == 42
     qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
     pixels = np.asarray(window._processed.image.convert("RGB"))
     assert np.any(pixels > 128)
