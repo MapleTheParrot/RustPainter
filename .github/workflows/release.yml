@@ -55,15 +55,18 @@ jobs:
           generate_release_notes: true
 
   macos:
-    # macos-14 is Apple Silicon, macos-13 is Intel. PySide6 has no universal2
-    # wheel, so each architecture needs its own build.
+    # macos-15 is Apple Silicon, macos-15-intel is x86_64. PySide6 has no
+    # universal2 wheel, so each architecture needs its own build. These are the
+    # oldest currently-supported images, which also keeps the resulting app
+    # compatible with older macOS releases. (macos-13 was retired; macos-14 is
+    # deprecated.)
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
