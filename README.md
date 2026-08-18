@@ -4,10 +4,40 @@ RustPainter is a local Windows 10/11 desktop utility that recreates an image in 
 
 The application keeps all profiles and settings on your PC. Every coordinate used for painting comes from a rectangle that you calibrate on your own display.
 
-## Quick start
+## Install
 
-**You need:** Windows 10/11, 64-bit Python 3.11-3.14, and Rust running in
-borderless or windowed mode (not exclusive fullscreen).
+**You need:** Windows 10/11, and Rust running in borderless or windowed mode
+(not exclusive fullscreen).
+
+### Download the app (easiest)
+
+Grab **`RustPainter.exe`** from the
+[latest release](https://github.com/YeheyaMohammad01/RustPainter/releases/latest)
+and double-click it. That single file is the whole application - there is no
+installer, no Python to set up, and no admin rights needed. To uninstall,
+delete the file.
+
+> **Windows will warn you the first time.** The executable is not code-signed,
+> so SmartScreen shows "Windows protected your PC". Click **More info** ->
+> **Run anyway**. Some antivirus tools also flag it, because it is an unsigned
+> program that synthesizes mouse input - exactly the shape of thing they watch
+> for. Every release is built from this repository by
+> [GitHub Actions](.github/workflows/release.yml), and each one ships a
+> `.sha256` file you can check with
+> `Get-FileHash RustPainter.exe -Algorithm SHA256`. If you would rather not
+> trust a prebuilt binary, build your own with the steps below.
+
+Want Start-menu and desktop shortcuts? Clone the repo and point
+[`install.ps1`](install.ps1) at your download. It copies the executable to
+`%LOCALAPPDATA%\Programs\RustPainter` and creates the shortcuts:
+
+```powershell
+.\install.ps1 -ExecutablePath $env:USERPROFILE\Downloads\RustPainter.exe
+```
+
+### Run from source
+
+Requires 64-bit Python 3.11-3.14:
 
 ```powershell
 git clone https://github.com/YeheyaMohammad01/RustPainter.git
@@ -18,7 +48,9 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-Then paint a sign in six steps:
+## Quick start
+
+Paint a sign in six steps:
 
 1. **Open the sign** in Rust and leave its painting interface stationary.
 2. **Calibrate.** In RustPainter, drag a box around each of three regions on
@@ -143,6 +175,22 @@ If PowerShell blocks local scripts under its execution policy, run the build onc
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
+
+### Cutting a release
+
+Releases are built and published by
+[`.github/workflows/release.yml`](.github/workflows/release.yml). Pushing a
+version tag builds the executable on a clean Windows runner, runs the test
+suite, and attaches `RustPainter.exe` plus its SHA256 checksum to a new GitHub
+release:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+You can also run the workflow by hand from the Actions tab to get a test build
+as a downloadable artifact without tagging anything.
 
 ## Local data and logs
 

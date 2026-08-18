@@ -1,8 +1,36 @@
+<#
+.SYNOPSIS
+Install RustPainter for the current user and create shortcuts.
+
+.PARAMETER ExecutablePath
+Path to RustPainter.exe. Defaults to the local build output produced by
+build.ps1; pass a downloaded release executable to install that one instead.
+
+.EXAMPLE
+.\install.ps1
+Installs the executable built by .\build.ps1.
+
+.EXAMPLE
+.\install.ps1 -ExecutablePath $env:USERPROFILE\Downloads\RustPainter.exe
+Installs a downloaded release executable.
+#>
+[CmdletBinding()]
+param(
+    [string] $ExecutablePath
+)
+
 $ErrorActionPreference = "Stop"
 
-$sourceExecutable = Join-Path $PSScriptRoot "dist\RustPainter.exe"
-if (-not (Test-Path -LiteralPath $sourceExecutable)) {
-    throw "Build RustPainter first by running .\build.ps1"
+if ($ExecutablePath) {
+    if (-not (Test-Path -LiteralPath $ExecutablePath)) {
+        throw "No executable at $ExecutablePath"
+    }
+    $sourceExecutable = (Resolve-Path -LiteralPath $ExecutablePath).Path
+} else {
+    $sourceExecutable = Join-Path $PSScriptRoot "dist\RustPainter.exe"
+    if (-not (Test-Path -LiteralPath $sourceExecutable)) {
+        throw "No executable found. Run .\build.ps1 first, or pass a downloaded release with -ExecutablePath."
+    }
 }
 
 $installDirectory = Join-Path $env:LOCALAPPDATA "Programs\RustPainter"
