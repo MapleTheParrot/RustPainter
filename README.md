@@ -122,7 +122,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
-- Per-profile color correction measured from a painted 32-swatch chart
+- Per-profile color correction measured from a painted 32-swatch chart, and per-profile brush sizing measured from dabs painted on the canvas itself
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
@@ -253,7 +253,34 @@ Start with a low-resolution 8-color test. If adjacent rows bleed together, reduc
 
 **Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is almost always the fastest choice; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. The paint-plan panel reports how many strokes merging removed.
 
-Automatic brush sizing works with a solid square or circle. Before painting it temporarily selects a high-contrast color, measures the live preview, and searches the Size track for a footprint slightly smaller than one logical cell. Spray/noise brushes do not have a stable footprint and must be sized manually.
+Automatic brush sizing works with a solid square or circle. Spray/noise brushes do not have a stable footprint and must be sized manually.
+
+### Measuring the brush on the canvas
+
+The brush-preview tile draws the brush at the tile's own scale, which is not the
+canvas's scale. A footprint measured there therefore answers a different
+question than the planner asks - how many canvas pixels will this brush cover -
+so cells sized from it come out too large and bleed into their neighbours. This
+shows up worst on low-resolution pixel art, where the cells are big and a brush
+one step too wide smears several of them together.
+
+**Measure Brush on Canvas**, next to Automatic brush sizing, settles it by
+measuring what Rust actually paints:
+
+1. Use a blank or disposable sign with the profile's canvas, picker, and Size
+   track calibrated.
+2. Click **Measure Brush on Canvas** and focus Rust for the countdown.
+3. The painter primes six small squares of canvas with the widest brush, stamps
+   one dab in each at a different Size-track position, and reads back how wide
+   each dab came out. The probes crowd the low end of the track, where a
+   mis-sized brush does the most damage.
+4. The measured curve is stored on the profile.
+
+Painting then sets the brush straight from that curve. Nothing has to be
+measured mid-job, so a run never pauses to hunt the slider, and the measurement
+includes the brush's soft edge rather than modelling it. **Clear Measurement**
+returns to the preview-tile search. Re-measure after changing sign type, brush
+shape, or the canvas calibration.
 
 ## Sign color correction
 
@@ -330,7 +357,7 @@ Profiles, settings, calibration reference captures, and logs are stored under `%
 
 ## Known limitations
 
-- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient. Calibration and small test strokes are required.
+- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient. Calibration and small test strokes are required, and the brush is best measured on the canvas rather than read off the preview tile.
 - `SendInput` may be ignored by exclusive fullscreen, elevated, protected, or anti-cheat-managed windows. The utility does not work around those restrictions.
 - Horizontal runs are deliberately prioritized for reliability; complex images can still require many strokes.
 - Color accuracy is approximate because the displayed picker, monitor color, sign material, lighting, and in-game rendering can alter the result. Without a measured correction the preview shows the commanded RGB, which is what the picker is asked for and not what the lit sign returns.

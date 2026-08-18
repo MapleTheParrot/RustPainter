@@ -1,15 +1,31 @@
-"""Measure Rust's on-screen brush preview for automatic size matching."""
+"""Measure Rust's brush - in its preview tile, and on the canvas itself."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 
+from .models import ScreenRect
+
 if TYPE_CHECKING:
     from PIL.Image import Image
+
+
+BRUSH_RESPONSE_SCHEMA = 1
+
+# Probe patches are primed and then measured, so the primed square is larger
+# than the square the detector reads: the detector estimates its background
+# from the patch border, which therefore has to be paint rather than canvas.
+PROBE_PATCH_PIXELS = 176
+PROBE_PRIME_PIXELS = 200
+
+# How far apart the priming sweeps run.  Any brush at least this wide covers
+# the square without gaps, and Rust's largest brush is far wider than this.
+PROBE_PRIME_SPACING_PIXELS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,4 +147,190 @@ def measure_brush_footprint(image: "Image") -> BrushFootprint:
     )
 
 
-__all__ = ["BrushFootprint", "measure_brush_footprint"]
+@dataclass(frozen=True, slots=True)
+class ProbeSite:
+    """Where one test dab is stamped, and the region that measures it."""
+
+    point: tuple[int, int]
+    patch: ScreenRect
+    prime: ScreenRect
+
+
+def _square_columns(count: int) -> int:
+    columns = 1
+    while columns * columns < count:
+        columns += 1
+    return columns
+
+
+def _centered(center_x: int, center_y: int, size: int) -> ScreenRect:
+    return ScreenRect(center_x - size // 2, center_y - size // 2, size, size)
+
+
+def probe_sites(canvas: ScreenRect, count: int) -> tuple[ProbeSite, ...]:
+    """Lay ``count`` well-separated test dabs across a calibrated canvas.
+
+    Every dab shares one canvas and one capture, so they spread over a grid
+    rather than stack in one place.  Priming and measuring a small square per
+    dab costs a fraction of covering the whole canvas, and the spacing keeps a
+    large dab from reaching into its neighbour's patch.
+    """
+
+    if count < 2:
+        raise ValueError("Brush measurement needs at least two probes")
+    columns = _square_columns(count)
+    rows = -(-count // columns)
+    cell_width = canvas.width / columns
+    cell_height = canvas.height / rows
+    if min(cell_width, cell_height) < PROBE_PRIME_PIXELS:
+        raise ValueError(
+            "The calibrated canvas is too small to measure the brush on. "
+            "Calibrate a larger sign before measuring the brush."
+        )
+    sites: list[ProbeSite] = []
+    for index in range(count):
+        column, row = index % columns, index // columns
+        center_x = int(round(canvas.left + (column + 0.5) * cell_width))
+        center_y = int(round(canvas.top + (row + 0.5) * cell_height))
+        sites.append(
+            ProbeSite(
+                point=(center_x, center_y),
+                patch=_centered(center_x, center_y, PROBE_PATCH_PIXELS),
+                prime=_centered(center_x, center_y, PROBE_PRIME_PIXELS),
+            )
+        )
+    return tuple(sites)
+
+
+def prime_sweeps(square: ScreenRect) -> tuple[tuple[tuple[int, int], tuple[int, int]], ...]:
+    """Horizontal strokes that cover ``square`` with the brush at full size."""
+
+    sweeps: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    last = square.top + square.height - 1
+    right = square.left + square.width - 1
+    y = square.top
+    while y < last:
+        sweeps.append(((square.left, y), (right, y)))
+        y += PROBE_PRIME_SPACING_PIXELS
+    sweeps.append(((square.left, last), (right, last)))
+    return tuple(sweeps)
+
+
+@dataclass(frozen=True, slots=True)
+class BrushResponse:
+    """Size-track fraction to painted diameter, measured on the canvas itself.
+
+    The preview tile renders the brush at its own scale, which is not the
+    canvas's scale, so a footprint measured there is in the wrong units: a
+    brush matched against it lands too large or too small, and neighbouring
+    cells bleed into each other.  Measuring what Rust actually paints settles
+    the unit mismatch and the brush's soft edge in one step, and a stored curve
+    means a job never has to stop and measure at all.
+    """
+
+    samples: tuple[tuple[float, float], ...]
+    captured_at: str
+    shape: str | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.samples) < 2:
+            raise ValueError("A brush response needs at least two probes")
+        fractions = [fraction for fraction, _ in self.samples]
+        diameters = [diameter for _, diameter in self.samples]
+        if any(not 0.0 <= fraction <= 1.0 for fraction in fractions):
+            raise ValueError("Size-track fractions must be between 0 and 1")
+        if any(later <= earlier for earlier, later in zip(fractions, fractions[1:])):
+            raise ValueError("Brush response samples must ascend by fraction")
+        if any(not diameter > 0 for diameter in diameters):
+            raise ValueError("Measured brush diameters must be positive")
+        if max(diameters) - min(diameters) < 2.0:
+            raise ValueError(
+                "The Size track did not change the painted brush. Recalibrate the "
+                "Size track and confirm a solid square or circle brush is selected."
+            )
+
+    def _curve(self) -> tuple[list[float], list[float]]:
+        fractions = [fraction for fraction, _ in self.samples]
+        # Noise can leave one probe a hair under its predecessor, which would
+        # make the inversion ambiguous.  A running maximum keeps the curve
+        # single valued without discarding a measurement.
+        diameters: list[float] = []
+        for _, diameter in self.samples:
+            diameters.append(max(diameter, diameters[-1] if diameters else diameter))
+        return fractions, diameters
+
+    @property
+    def largest_diameter(self) -> float:
+        return self._curve()[1][-1]
+
+    @property
+    def smallest_diameter(self) -> float:
+        return self._curve()[1][0]
+
+    def diameter_for(self, fraction: float) -> float:
+        fractions, diameters = self._curve()
+        return float(np.interp(float(fraction), fractions, diameters))
+
+    def fraction_for(self, diameter: float) -> float:
+        """The Size-track fraction that paints closest to ``diameter``.
+
+        Clamped to the measured range; a target outside it is the caller's to
+        reject, with :attr:`largest_diameter` to report what was reachable.
+        """
+
+        fractions, diameters = self._curve()
+        return float(np.interp(float(diameter), diameters, fractions))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": BRUSH_RESPONSE_SCHEMA,
+            "samples": [
+                [float(fraction), float(diameter)] for fraction, diameter in self.samples
+            ],
+            "capturedAt": self.captured_at,
+            "shape": self.shape,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "BrushResponse":
+        raw = value.get("samples")
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            raise ValueError("Brush response samples are missing")
+        samples = tuple(
+            (float(pair[0]), float(pair[1]))
+            for pair in raw
+            if isinstance(pair, Sequence) and len(pair) == 2
+        )
+        shape = value.get("shape")
+        return cls(
+            samples=samples,
+            captured_at=str(value.get("capturedAt", value.get("captured_at", ""))),
+            shape=str(shape) if isinstance(shape, str) else None,
+        )
+
+
+def build_brush_response(
+    samples: Sequence[tuple[float, float]], *, shape: str | None = None
+) -> BrushResponse:
+    """Order and validate measured probes into a usable response curve."""
+
+    ordered = tuple(
+        sorted(((float(f), float(d)) for f, d in samples), key=lambda sample: sample[0])
+    )
+    return BrushResponse(
+        samples=ordered,
+        captured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        shape=shape,
+    )
+
+
+__all__ = [
+    "BRUSH_RESPONSE_SCHEMA",
+    "BrushFootprint",
+    "BrushResponse",
+    "ProbeSite",
+    "build_brush_response",
+    "measure_brush_footprint",
+    "prime_sweeps",
+    "probe_sites",
+]
