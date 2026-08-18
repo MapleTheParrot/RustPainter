@@ -58,6 +58,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                     "text": "",
                     "font_family": "",
                     "font_size": 24,
+                    # Font height as a fraction of the logical canvas height.
+                    # The GUI keeps this fixed and re-derives font_size, so text
+                    # stays the same size when the quality preset changes.
+                    "size_ratio": 0.1875,
                     "color": "#FFFFFF",
                     "x": 0.5,
                     "y": 0.5,
@@ -218,6 +222,14 @@ def _validate(settings: Mapping[str, Any]) -> None:
             or not 4 <= font_size <= 256
         ):
             raise SettingsError(f"{label}.font_size must be an integer from 4 to 256")
+        size_ratio = layer.get("size_ratio")
+        if size_ratio is not None and (
+            isinstance(size_ratio, bool)
+            or not isinstance(size_ratio, (int, float))
+            or not math.isfinite(float(size_ratio))
+            or not 0.0 < float(size_ratio) <= 32.0
+        ):
+            raise SettingsError(f"{label}.size_ratio must be between 0 and 32")
         text_color = layer.get("color")
         if not isinstance(text_color, str) or _HEX_COLOR.fullmatch(text_color) is None:
             raise SettingsError(f"{label}.color must use #RRGGBB format")

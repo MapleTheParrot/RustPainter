@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QColor,
     QCloseEvent,
     QDragEnterEvent,
+    QDragMoveEvent,
     QDropEvent,
     QFont,
     QImage,
@@ -101,6 +102,7 @@ from .widgets import (
     PreviewLabel,
     QtLogHandler,
     TextEditorPreview,
+    dropped_image_path,
 )
 
 
@@ -172,7 +174,11 @@ SPEED_PRESETS: dict[str, dict[str, float]] = {
 # Logical-pixel gap each stroke-merging mode may paint across.
 MERGE_MODE_GAPS: dict[str, int | None] = {"off": 0, "balanced": 6, "maximum": None}
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+# Bounds on the pixel font size of a text layer. Layers keep their size as a
+# fraction of the logical canvas height and derive pixels within these bounds,
+# so a caption keeps its proportions when the resolution changes.
+MIN_TEXT_SIZE = 4
+MAX_TEXT_SIZE = 256
 
 
 @dataclass(slots=True)
@@ -205,7 +211,14 @@ class _PendingPaint:
 
 @dataclass(frozen=True, slots=True)
 class _TextOverlayOptions:
-    """A small, worker-safe snapshot of the text controls."""
+    """A small, worker-safe snapshot of the text controls.
+
+    ``font_size`` is in logical canvas pixels, which is what both renderers
+    need, but it is derived from ``size_ratio`` — the height of the text as a
+    fraction of the canvas. The ratio is what survives a change of painting
+    resolution, so text keeps the same size on the finished sign whether it was
+    placed under the Very Fast or the Very High preset.
+    """
 
     text: str
     font_family: str
@@ -215,6 +228,7 @@ class _TextOverlayOptions:
     y: float = 0.5
     bold: bool = False
     italic: bool = False
+    size_ratio: float = 0.0
 
 
 class _WorkerSignals(QObject):
@@ -481,8 +495,10 @@ class MainWindow(QMainWindow):
         self._calibration_overlay: Any = None
         self._calibration_preview: CalibrationPreviewOverlay | None = None
         self._applying_speed_preset = False
+        # Seeded before the resolution controls exist, so this ratio is spelled
+        # out against the default 256x128 canvas.
         self._text_layers = [
-            _TextOverlayOptions("", "", 24, (255, 255, 255))
+            _TextOverlayOptions("", "", 24, (255, 255, 255), size_ratio=24 / 128)
         ]
         self._selected_text_layer = 0
         self._syncing_text_controls = False
@@ -784,7 +800,7 @@ class MainWindow(QMainWindow):
         heading = QHBoxLayout()
         title = QLabel("PREVIEW")
         title.setObjectName("pageTitle")
-        hint = QLabel("Drop an image anywhere to open it")
+        hint = QLabel("Click the preview or drop an image anywhere to open it")
         hint.setObjectName("muted")
         heading.addWidget(title)
         heading.addStretch(1)
@@ -792,11 +808,22 @@ class MainWindow(QMainWindow):
         layout.addLayout(heading)
 
         tabs = QTabWidget()
-        self.original_preview = PreviewLabel("Browse an image to begin")
-        self.paint_preview = TextEditorPreview("Paint simulation will appear here")
-        self.paint_preview.setToolTip(
-            "Drag text to move it, drag its handles to resize it, or double-click to edit it."
+        browse_hint = "Click here or drop an image"
+        self.original_preview = PreviewLabel(
+            "Browse an image to begin", hint=browse_hint
         )
+        self.paint_preview = TextEditorPreview(
+            "Paint simulation will appear here", hint=browse_hint
+        )
+        self.paint_preview.setToolTip(
+            "Drag text to move it, drag its handles to resize it, double-click to "
+            "edit it, or press Delete to remove it."
+        )
+        for preview in (self.original_preview, self.paint_preview):
+            preview.browseRequested.connect(self._browse_image)
+            preview.imageDropped.connect(
+                lambda dropped: self.load_image(Path(dropped))
+            )
         tabs.addTab(self.original_preview, "Source")
         tabs.addTab(self.paint_preview, "Rust preview")
         self.preview_tabs = tabs
@@ -1387,6 +1414,7 @@ class MainWindow(QMainWindow):
         self.paint_preview.layerSelected.connect(self._select_text_layer)
         self.paint_preview.layerTextEdited.connect(self._on_canvas_text_edited)
         self.paint_preview.layerResized.connect(self._on_canvas_text_resized)
+        self.paint_preview.layerDeleteRequested.connect(self._delete_text_layer)
         self.paint_preview.interactionFinished.connect(
             self._on_text_interaction_finished
         )
@@ -1455,16 +1483,18 @@ class MainWindow(QMainWindow):
     def _add_text_layer(self) -> None:
         color = self.text_color_button.color()
         offset = min(0.24, len(self._text_layers) * 0.06)
+        font_size = self.text_size_spin.value()
         self._text_layers.append(
             _TextOverlayOptions(
                 "",
                 self.text_font_combo.currentFont().family(),
-                self.text_size_spin.value(),
+                font_size,
                 (color.red(), color.green(), color.blue()),
                 x=min(0.85, 0.5 + offset),
                 y=min(0.85, 0.5 + offset),
                 bold=self.text_bold_check.isChecked(),
                 italic=self.text_italic_check.isChecked(),
+                size_ratio=self._text_size_ratio(font_size),
             )
         )
         self._selected_text_layer = len(self._text_layers) - 1
@@ -1476,13 +1506,23 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _remove_text_layer(self) -> None:
+        self._delete_text_layer(self._selected_text_layer)
+
+    @Slot(int)
+    def _delete_text_layer(self, index: int) -> None:
+        """Drop one text layer, keeping a single empty layer to type into."""
+
+        if not 0 <= index < len(self._text_layers):
+            return
         if len(self._text_layers) > 1:
-            self._text_layers.pop(self._selected_text_layer)
-            self._selected_text_layer = min(
-                self._selected_text_layer, len(self._text_layers) - 1
-            )
+            self._text_layers.pop(index)
+            selected = self._selected_text_layer
+            if index < selected:
+                selected -= 1
+            self._selected_text_layer = min(max(selected, 0), len(self._text_layers) - 1)
         else:
             self._text_layers[0] = replace(self._text_layers[0], text="")
+            self._selected_text_layer = 0
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
@@ -1506,14 +1546,16 @@ class MainWindow(QMainWindow):
             return
         current = self._text_layers[self._selected_text_layer]
         color = self.text_color_button.color()
+        font_size = self.text_size_spin.value()
         self._text_layers[self._selected_text_layer] = replace(
             current,
             text=self.text_edit.text(),
             font_family=self.text_font_combo.currentFont().family(),
-            font_size=self.text_size_spin.value(),
+            font_size=font_size,
             color=(color.red(), color.green(), color.blue()),
             bold=self.text_bold_check.isChecked(),
             italic=self.text_italic_check.isChecked(),
+            size_ratio=self._text_size_ratio(font_size),
         )
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
@@ -1552,9 +1594,11 @@ class MainWindow(QMainWindow):
     def _on_canvas_text_resized(self, index: int, font_size: int) -> None:
         if not 0 <= index < len(self._text_layers):
             return
-        font_size = min(max(int(font_size), 4), 256)
+        font_size = min(max(int(font_size), MIN_TEXT_SIZE), MAX_TEXT_SIZE)
         self._text_layers[index] = replace(
-            self._text_layers[index], font_size=font_size
+            self._text_layers[index],
+            font_size=font_size,
+            size_ratio=self._text_size_ratio(font_size),
         )
         self._selected_text_layer = index
         self._syncing_text_controls = True
@@ -1574,6 +1618,45 @@ class MainWindow(QMainWindow):
             self._text_layers,
             self._selected_text_layer,
         )
+
+    def _logical_height(self) -> int:
+        return max(1, self.logical_height_spin.value())
+
+    def _text_size_ratio(self, font_size: int) -> float:
+        """Express a pixel font size as a fraction of the logical canvas."""
+
+        return float(font_size) / self._logical_height()
+
+    def _text_font_size(self, size_ratio: float) -> int:
+        """The pixel font size that reproduces a ratio at the current canvas."""
+
+        return min(
+            max(round(size_ratio * self._logical_height()), MIN_TEXT_SIZE),
+            MAX_TEXT_SIZE,
+        )
+
+    def _rescale_text_layers(self) -> None:
+        """Re-derive every layer's pixel size for the current canvas height.
+
+        The stored ratio is never rewritten here, so clamping a layer at a tiny
+        resolution does not lose its real size: raising the quality preset again
+        restores it exactly.
+        """
+
+        changed = False
+        for index, layer in enumerate(self._text_layers):
+            ratio = layer.size_ratio or self._text_size_ratio(layer.font_size)
+            font_size = self._text_font_size(ratio)
+            if (font_size, ratio) != (layer.font_size, layer.size_ratio):
+                self._text_layers[index] = replace(
+                    layer, font_size=font_size, size_ratio=ratio
+                )
+                changed = True
+        if not changed:
+            return
+        self._sync_text_controls()
+        self._refresh_text_editor_layers()
+        self._schedule_settings_save()
 
     def _speed_preset_values(self) -> dict[str, float]:
         return {
@@ -1626,28 +1709,19 @@ class MainWindow(QMainWindow):
             self.speed_preset_combo.blockSignals(False)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt API
-        if self._dropped_image_path(event) is not None:
+        if dropped_image_path(event) is not None:
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802 - Qt API
+        if dropped_image_path(event) is not None:
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt API
-        path = self._dropped_image_path(event)
+        path = dropped_image_path(event)
         if path is None:
             return
         event.acceptProposedAction()
         self.load_image(path)
-
-    @staticmethod
-    def _dropped_image_path(event: Any) -> Path | None:
-        mime = event.mimeData()
-        if not mime.hasUrls():
-            return None
-        for url in mime.urls():
-            if not url.isLocalFile():
-                continue
-            path = Path(url.toLocalFile())
-            if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file():
-                return path
-        return None
 
     @Slot()
     def _browse_image(self) -> None:
@@ -1766,6 +1840,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.setCurrentText("Custom")
             self.quality_combo.blockSignals(False)
         self._sync_custom_resolution(axis)
+        self._rescale_text_layers()
         self._schedule_processing()
 
     def _sync_custom_resolution(self, source_axis: str = "width") -> None:
@@ -1817,6 +1892,7 @@ class MainWindow(QMainWindow):
             self.logical_height_spin.blockSignals(False)
         else:
             self._sync_custom_resolution("width")
+        self._rescale_text_layers()
         self._schedule_processing()
 
     @Slot()
@@ -2213,21 +2289,32 @@ class MainWindow(QMainWindow):
             self._text_layers = []
             for layer_value in layer_values:
                 color = QColor(str(layer_value.get("color", "#FFFFFF")))
+                font_size = int(layer_value.get("font_size", 24))
+                # Documents written before sizes were stored as a ratio only
+                # have pixels, which belong to the resolution saved with them.
                 self._text_layers.append(
                     _TextOverlayOptions(
                         text=str(layer_value.get("text", "")),
                         font_family=str(layer_value.get("font_family", "")),
-                        font_size=int(layer_value.get("font_size", 24)),
+                        font_size=font_size,
                         color=(color.red(), color.green(), color.blue()),
                         x=float(layer_value.get("x", 0.5)),
                         y=float(layer_value.get("y", 0.5)),
                         bold=bool(layer_value.get("bold", False)),
                         italic=bool(layer_value.get("italic", False)),
+                        size_ratio=float(layer_value.get("size_ratio", 0.0))
+                        or self._text_size_ratio(font_size),
                     )
                 )
             if not self._text_layers:
                 self._text_layers = [
-                    _TextOverlayOptions("", "", 24, (255, 255, 255))
+                    _TextOverlayOptions(
+                        "",
+                        "",
+                        24,
+                        (255, 255, 255),
+                        size_ratio=self._text_size_ratio(24),
+                    )
                 ]
             self._selected_text_layer = 0
             self._rebuild_text_layer_combo()
@@ -2323,6 +2410,8 @@ class MainWindow(QMainWindow):
                         "text": layer.text,
                         "font_family": layer.font_family,
                         "font_size": layer.font_size,
+                        "size_ratio": layer.size_ratio
+                        or self._text_size_ratio(layer.font_size),
                         "color": "#{:02X}{:02X}{:02X}".format(*layer.color),
                         "x": layer.x,
                         "y": layer.y,

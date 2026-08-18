@@ -160,6 +160,9 @@ QLabel#preview, QGraphicsView#preview {{
     border-radius: 10px;
     color: #7a6c60;
 }}
+QLabel#preview[dropActive="true"], QGraphicsView#preview[dropActive="true"] {{
+    border: 1px dashed {ACCENT};
+}}
 QGraphicsView#preview {{ padding: 0; }}
 QPushButton {{
     {_RAISED}

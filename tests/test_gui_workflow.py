@@ -10,8 +10,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeyEvent
 from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
@@ -104,6 +104,159 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     pixels = np.asarray(window._processed.image.convert("RGB"))
     assert np.any(pixels > 128)
     assert len(window._plan.color_groups) >= 2
+
+
+def test_text_size_survives_a_change_of_quality_preset(window: MainWindow) -> None:
+    """Text keeps its proportions when the painting resolution changes.
+
+    Sizes are stored in logical canvas pixels, so a 40px caption placed under
+    "High" used to cover most of a "Very Fast" canvas (and shrink to nothing
+    going the other way). The layer now stores the size as a fraction of the
+    canvas height, and the pixel size is re-derived per resolution.
+    """
+
+    window.quality_combo.setCurrentText("High")
+    window.text_edit.setText("RUST")
+    window.text_size_spin.setValue(40)
+    high_height = window.logical_height_spin.value()
+    high_ratio = window._text_layers[0].size_ratio
+    assert high_ratio == pytest.approx(40 / high_height)
+
+    window.quality_combo.setCurrentText("Very Fast")
+    fast_layer = window._text_layers[0]
+    assert fast_layer.size_ratio == pytest.approx(high_ratio)
+    assert fast_layer.font_size == pytest.approx(
+        round(high_ratio * window.logical_height_spin.value())
+    )
+    assert fast_layer.font_size < 40
+    assert window.text_size_spin.value() == fast_layer.font_size
+
+    window.quality_combo.setCurrentText("High")
+    assert window._text_layers[0].font_size == 40
+    assert window.text_size_spin.value() == 40
+
+
+def test_delete_key_removes_the_selected_text_layer(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    source_path = tmp_path / "two-layers.png"
+    Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
+    window.text_edit.setText("FIRST")
+    window.add_text_button.click()
+    window.text_edit.setText("SECOND")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 2, timeout=5000)
+
+    window.paint_preview.select_layer(1)
+    assert window.paint_preview.selected_index() == 1
+    window.paint_preview.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
+    )
+
+    assert [layer.text for layer in window._text_layers] == ["FIRST"]
+
+    # The last layer is emptied rather than removed, so there is always one to
+    # type into, and Backspace does the same job as Delete.
+    window.paint_preview.select_layer(0)
+    window.paint_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier
+        )
+    )
+    assert [layer.text for layer in window._text_layers] == [""]
+
+
+def test_delete_key_edits_text_while_a_layer_is_being_edited(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Inside the inline editor both keys belong to the text cursor."""
+
+    source_path = tmp_path / "editing.png"
+    Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
+    window.text_edit.setText("FIRST")
+    window.add_text_button.click()
+    window.text_edit.setText("SECOND")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 2, timeout=5000)
+
+    item = window.paint_preview._items[1]
+    double_click = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseDoubleClick)
+    double_click.setButton(Qt.MouseButton.LeftButton)
+    double_click.setPos(item.boundingRect().center())
+    item.mouseDoubleClickEvent(double_click)
+    assert window.paint_preview.is_editing_text
+
+    window.paint_preview.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
+    )
+    assert len(window._text_layers) == 2
+
+
+def _url_drop_event(mime: QMimeData, event_type: QEvent.Type):
+    """Build a drag/drop event around mime data the caller keeps alive.
+
+    The event does not own its mime data, so a QMimeData created and dropped
+    inside this helper would leave the handler with a dangling pointer.
+    """
+
+    dropping = event_type == QEvent.Type.Drop
+    factory = QDropEvent if dropping else QDragEnterEvent
+    return factory(
+        QPointF(10.0, 10.0) if dropping else QPoint(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+@pytest.mark.parametrize("preview_name", ["original_preview", "paint_preview"])
+def test_previews_accept_dropped_images(
+    window: MainWindow, tmp_path: Path, qtbot, preview_name: str
+) -> None:
+    """Both preview tabs are drop targets themselves.
+
+    A QGraphicsView accepts drag events so its items can see them, so the Rust
+    preview tab used to swallow every drop before the window's handler ran.
+    """
+
+    source_path = tmp_path / "dropped.png"
+    Image.new("RGB", (48, 24), (200, 40, 40)).save(source_path)
+    preview = getattr(window, preview_name)
+    assert preview.acceptDrops()
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(source_path))])
+    enter = _url_drop_event(mime, QEvent.Type.DragEnter)
+    preview.dragEnterEvent(enter)
+    assert enter.isAccepted()
+
+    preview.dropEvent(_url_drop_event(mime, QEvent.Type.Drop))
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert window._image_path == source_path
+
+
+@pytest.mark.parametrize("preview_name", ["original_preview", "paint_preview"])
+def test_clicking_an_empty_preview_opens_the_file_browser(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, qtbot, preview_name: str
+) -> None:
+    opened: list[str] = []
+
+    def fake_dialog(*args, **kwargs):
+        opened.append("browse")
+        return "", ""
+
+    monkeypatch.setattr(
+        main_window_module.QFileDialog, "getOpenFileName", staticmethod(fake_dialog)
+    )
+    preview = getattr(window, preview_name)
+    viewport = getattr(preview, "viewport", None)
+    qtbot.mouseClick(
+        viewport() if viewport is not None else preview, Qt.MouseButton.LeftButton
+    )
+
+    assert opened == ["browse"]
+    assert preview.cursor().shape() == Qt.CursorShape.PointingHandCursor
 
 
 def test_dithering_uses_a_single_labeled_checkbox(window: MainWindow) -> None:

@@ -12,6 +12,7 @@ def _text_layer(**overrides):
         "text": "",
         "font_family": "",
         "font_size": 24,
+        "size_ratio": 0.1875,
         "color": "#FFFFFF",
         "x": 0.5,
         "y": 0.5,
@@ -59,6 +60,7 @@ def test_default_settings_returns_independent_documents() -> None:
                 "text": "",
                 "font_family": "",
                 "font_size": 24,
+                "size_ratio": 0.1875,
                 "color": "#FFFFFF",
                 "x": 0.5,
                 "y": 0.5,
@@ -115,6 +117,10 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
         (
             {"image": {"text_overlay": {"layers": [_text_layer(font_size=2)]}}},
             "font_size",
+        ),
+        (
+            {"image": {"text_overlay": {"layers": [_text_layer(size_ratio=0.0)]}}},
+            "size_ratio",
         ),
         (
             {"image": {"text_overlay": {"layers": [_text_layer(color="white")]}}},

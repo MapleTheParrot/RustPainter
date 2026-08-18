@@ -95,7 +95,8 @@ Paint a sign in five steps:
    your screen: the sign **canvas**, the **color box** (the large
    white-to-color-to-black square), and the **hue bar** (the narrow rainbow
    strip). Drag just inside each region - do not include its border.
-3. **Load an image.** Browse or drag & drop. The defaults are ready to use.
+3. **Load an image.** Click the preview, use **Choose image**, or drag & drop
+   a file anywhere in the window. The defaults are ready to use.
 4. **Check the preview.** The paint simulation shows what will be painted,
    plus the stroke count and estimated time.
 5. **Paint.** Start with a small, low-color test image and focus Rust during
@@ -110,10 +111,11 @@ painting unattended. Everything below is detail you only need when tuning.
 ## Features
 
 - Dark, rust-textured workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
-- Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by browse or drag & drop
+- Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by clicking either preview, browsing, or dropping a file anywhere in the window
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
-- Multiple draggable text layers with inline editing, resize handles, and live font/color styling
+- Multiple draggable text layers with inline editing, resize handles, Delete to remove the selected layer, and live font/color styling
+- Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
