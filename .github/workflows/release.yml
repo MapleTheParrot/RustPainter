@@ -54,7 +54,17 @@ jobs:
           generate_release_notes: true
 
   macos:
-    runs-on: macos-latest
+    # macos-14 is Apple Silicon, macos-13 is Intel. PySide6 has no universal2
+    # wheel, so each architecture needs its own build.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,24 +83,26 @@ jobs:
       - name: Build app bundle
         run: bash build.sh
 
-      - name: Write SHA256 checksum
+      - name: Name the archive for this architecture
         run: |
-          hash=$(shasum -a 256 release/RustPainter-macOS.zip | cut -d' ' -f1)
-          echo "$hash  RustPainter-macOS.zip" > release/RustPainter-macOS.zip.sha256
+          name="release/RustPainter-macOS-${{ matrix.arch }}.zip"
+          mv release/RustPainter-macOS.zip "$name"
+          hash=$(shasum -a 256 "$name" | cut -d' ' -f1)
+          echo "$hash  RustPainter-macOS-${{ matrix.arch }}.zip" > "$name.sha256"
           echo "SHA256: $hash"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RustPainter-macOS
+          name: RustPainter-macOS-${{ matrix.arch }}
           path: |
-            release/RustPainter-macOS.zip
-            release/RustPainter-macOS.zip.sha256
+            release/RustPainter-macOS-${{ matrix.arch }}.zip
+            release/RustPainter-macOS-${{ matrix.arch }}.zip.sha256
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/RustPainter-macOS.zip
-            release/RustPainter-macOS.zip.sha256
+            release/RustPainter-macOS-${{ matrix.arch }}.zip
+            release/RustPainter-macOS-${{ matrix.arch }}.zip.sha256
           generate_release_notes: true

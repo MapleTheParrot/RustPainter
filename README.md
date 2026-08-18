@@ -17,9 +17,11 @@ and double-click it. That single file is the whole application - there is no
 installer, no Python to set up, and no admin rights needed. To uninstall,
 delete the file.
 
-**macOS:** grab **`RustPainter-macOS.zip`** from the same release, unzip it,
-and move `RustPainter.app` to Applications (or anywhere). The first launch
-needs two one-time steps:
+**macOS:** from the same release, grab **`RustPainter-macOS-arm64.zip`** on
+Apple Silicon (M1 and later) or **`RustPainter-macOS-x86_64.zip`** on an Intel
+Mac - check the Apple menu > About This Mac if unsure. Unzip it and move
+`RustPainter.app` to Applications (or anywhere). The first launch needs two
+one-time steps:
 
 1. **Gatekeeper:** the app is not notarized, so right-click the app and choose
    **Open** the first time (or allow it under System Settings > Privacy &
