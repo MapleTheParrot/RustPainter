@@ -5,6 +5,8 @@ import os
 import pytest
 from PIL import Image, ImageDraw
 
+import numpy as np
+
 from app.brush_calibration import (
     BrushResponse,
     BrushResponseSet,
@@ -12,11 +14,20 @@ from app.brush_calibration import (
     prime_spacing,
     prime_sweeps,
     probe_sites,
+    probe_sites_within,
+    PROBE_PRIME_PIXELS,
 )
 from app.input_controller import MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
+from app.paint_plan import plan_painted_mask
 from app.painter import Painter, PainterSettings, PainterState
 from app.profiles import CalibrationProfile
+
+
+class _RealishInputController(MockInputController):
+    """A mock that claims to emit real input, so inline measurement runs."""
+
+    emits_real_input = True
 
 
 CANVAS = ScreenRect(200, 150, 1400, 1100)
@@ -338,6 +349,106 @@ def test_a_measured_curve_replaces_the_preview_search_while_painting() -> None:
     assert slider_x, "the Size track was never clicked"
     fraction = (slider_x[-1] - SLIDER.left) / float(SLIDER.width - 1)
     assert fraction == pytest.approx(0.24, abs=0.05)
+
+
+def test_probe_sites_within_avoid_unpainted_canvas() -> None:
+    # The plan repaints only the left half, so every dab must land there -
+    # anywhere else it would survive the job as a visible blot.
+    plan = PaintPlan(
+        70,
+        55,
+        (
+            ColorGroup(
+                (10, 10, 10),
+                tuple(Stroke(0, y, 34, y) for y in range(55)),
+                35 * 55,
+            ),
+        ),
+    )
+    mask = plan_painted_mask(plan)
+    assert mask[:, :35].all() and not mask[:, 35:].any()
+    sites = probe_sites_within(CANVAS, 5, mask)
+    assert len(sites) >= 3
+    painted_right_edge = CANVAS.left + CANVAS.width * 35 // 70
+    for site in sites:
+        assert site.prime.left >= CANVAS.left
+        assert site.prime.left + site.prime.width <= painted_right_edge
+    for index, site in enumerate(sites):
+        for other in sites[index + 1 :]:
+            dx = site.point[0] - other.point[0]
+            dy = site.point[1] - other.point[1]
+            assert dx * dx + dy * dy >= PROBE_PRIME_PIXELS**2
+
+
+def test_probe_sites_within_report_a_hopeless_region_as_empty() -> None:
+    # A plan that repaints a sliver smaller than one priming square cannot
+    # hide any dab, and the caller falls back rather than stamping blots.
+    plan = PaintPlan(70, 55, (ColorGroup((10, 10, 10), (Stroke(0, 0, 3, 0),), 4),))
+    assert probe_sites_within(CANVAS, 5, plan_painted_mask(plan)) == ()
+
+
+def test_a_paint_job_measures_the_brush_on_its_own_painted_area() -> None:
+    # No stored curve and no preview tile: the job must measure the brush on
+    # the canvas by itself before painting, and only where it repaints.
+    profile = _profile()
+    profile.brush_preview = None
+    controller = _RealishInputController()
+    painter = Painter(controller, screen_capture=_canvas_capture(controller))
+    plan = PaintPlan(
+        70,
+        55,
+        (
+            ColorGroup(
+                (40, 80, 160),
+                tuple(Stroke(0, y, 34, y) for y in range(55)),
+                35 * 55,
+            ),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(60.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    measured = painter.brush_responses
+    assert measured is not None
+    curve = measured.for_shape(None)
+    assert curve is not None and len(curve.samples) >= 3
+    # Every dab (a press that never moved) stayed on the repainted half.
+    painted_right_edge = CANVAS.left + CANVAS.width * 35 // 70
+    dabs = [
+        start
+        for start, end in _held_travel(controller)
+        if start == end
+        and CANVAS.left <= start[0] < CANVAS.left + CANVAS.width
+        and CANVAS.top <= start[1] < CANVAS.top + CANVAS.height
+    ]
+    assert dabs, "no probe dabs were stamped"
+    assert all(start[0] < painted_right_edge for start in dabs)
+
+
+def test_a_stored_curve_skips_the_inline_measurement() -> None:
+    profile = _profile()
+    profile.brush_preview = None
+    profile.metadata["brush_response"] = build_brush_response(
+        [(0.0, 4.0), (1.0, 64.0)]
+    ).to_dict()
+    controller = _RealishInputController()
+    painter = Painter(controller, screen_capture=_canvas_capture(controller))
+    plan = PaintPlan(70, 55, (ColorGroup((40, 80, 160), (Stroke(0, 0, 34, 0),), 35),))
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(30.0 * _TIMEOUT_SCALE)
+
+    assert painter.state is PainterState.COMPLETED
+    dabs = [
+        start
+        for start, end in _held_travel(controller)
+        if start == end
+        and CANVAS.left <= start[0] < CANVAS.left + CANVAS.width
+        and CANVAS.top <= start[1] < CANVAS.top + CANVAS.height
+    ]
+    assert dabs == [], "a stored curve must make inline probing unnecessary"
 
 
 def test_a_minimum_brush_wider_than_a_cell_stops_the_job() -> None:

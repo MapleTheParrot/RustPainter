@@ -209,6 +209,96 @@ def probe_sites(canvas: ScreenRect, count: int) -> tuple[ProbeSite, ...]:
     return tuple(sites)
 
 
+def probe_sites_within(
+    canvas: ScreenRect, count: int, painted_mask: np.ndarray
+) -> tuple[ProbeSite, ...]:
+    """Up to ``count`` well-separated probe sites the plan will repaint.
+
+    Measuring right before painting means the test dabs land on the user's
+    sign, so every dab must sit where the plan paints over it afterwards.
+    Candidates come from progressively denser grids; the selection keeps
+    chosen sites a full priming square apart, which is the same separation the
+    plain grid guarantees, so a large dab still cannot reach a neighbour's
+    patch.  Fewer than ``count`` sites - possibly none - come back when the
+    painted region is too small or too fragmented to host more.
+    """
+
+    mask = np.asarray(painted_mask, dtype=np.bool_)
+    height, width = mask.shape
+    if count < 1 or not mask.any() or height == 0 or width == 0:
+        return ()
+
+    def cells_under(rect: ScreenRect) -> np.ndarray:
+        x0 = (rect.left - canvas.left) * width // canvas.width
+        x1 = (rect.left + rect.width - 1 - canvas.left) * width // canvas.width
+        y0 = (rect.top - canvas.top) * height // canvas.height
+        y1 = (rect.top + rect.height - 1 - canvas.top) * height // canvas.height
+        return mask[y0 : y1 + 1, x0 : x1 + 1]
+
+    candidates: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    base_columns = _square_columns(count)
+    base_rows = -(-count // base_columns)
+    for factor in (1, 2, 3, 4):
+        columns = base_columns * factor
+        rows = base_rows * factor
+        cell_width = canvas.width / columns
+        cell_height = canvas.height / rows
+        for index in range(columns * rows):
+            center_x = int(round(canvas.left + (index % columns + 0.5) * cell_width))
+            center_y = int(round(canvas.top + (index // columns + 0.5) * cell_height))
+            if (center_x, center_y) in seen:
+                continue
+            seen.add((center_x, center_y))
+            prime = _centered(center_x, center_y, PROBE_PRIME_PIXELS)
+            if (
+                prime.left < canvas.left
+                or prime.top < canvas.top
+                or prime.left + prime.width > canvas.left + canvas.width
+                or prime.top + prime.height > canvas.top + canvas.height
+            ):
+                continue
+            covered = cells_under(prime)
+            if covered.size and bool(covered.all()):
+                candidates.append((center_x, center_y))
+
+    if not candidates:
+        return ()
+    # Farthest-point selection, seeded near the canvas center, spreads the
+    # dabs as evenly as the painted region allows.
+    canvas_center = (canvas.left + canvas.width / 2.0, canvas.top + canvas.height / 2.0)
+    chosen = [
+        min(
+            candidates,
+            key=lambda p: (p[0] - canvas_center[0]) ** 2 + (p[1] - canvas_center[1]) ** 2,
+        )
+    ]
+    while len(chosen) < count:
+        best: tuple[int, int] | None = None
+        best_distance = -1.0
+        for candidate in candidates:
+            if candidate in chosen:
+                continue
+            nearest = min(
+                (candidate[0] - point[0]) ** 2 + (candidate[1] - point[1]) ** 2
+                for point in chosen
+            )
+            if nearest > best_distance:
+                best_distance = nearest
+                best = candidate
+        if best is None or best_distance < PROBE_PRIME_PIXELS**2:
+            break
+        chosen.append(best)
+    return tuple(
+        ProbeSite(
+            point=point,
+            patch=_centered(point[0], point[1], PROBE_PATCH_PIXELS),
+            prime=_centered(point[0], point[1], PROBE_PRIME_PIXELS),
+        )
+        for point in chosen
+    )
+
+
 def prime_spacing(widest_diameter: float | None) -> int:
     """How far apart priming sweeps may run for a brush of this width."""
 
@@ -416,4 +506,5 @@ __all__ = [
     "prime_spacing",
     "prime_sweeps",
     "probe_sites",
+    "probe_sites_within",
 ]

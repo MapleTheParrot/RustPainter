@@ -25,6 +25,7 @@ from .brush_calibration import (
     prime_spacing,
     prime_sweeps,
     probe_sites,
+    probe_sites_within,
     ProbeSite,
 )
 from .color_calibration import ColorCorrectionModel
@@ -535,6 +536,9 @@ class Painter:
             ):
                 raise RuntimeError("Cannot replace a paint job while one is active")
             self._job = _Job(plan, target, resolved_settings)
+            # Curves surfaced by the previous job must never be mistaken for
+            # this one's; an inline measurement will repopulate them.
+            self._brush_responses = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -731,7 +735,13 @@ class Painter:
                 raise ValueError(
                     "Brush-size application is enabled, but no brush slider is calibrated"
                 )
-            if target.brush_preview is None and target.brush_responses is None:
+            if (
+                target.brush_preview is None
+                and target.brush_responses is None
+                # Real input can measure the brush on the canvas at job start,
+                # so only input that cannot paint probes needs a source now.
+                and not getattr(self.input, "emits_real_input", True)
+            ):
                 raise ValueError(
                     "Automatic brush sizing is enabled, but the brush has neither a "
                     "measured response nor a calibrated preview tile"
@@ -746,14 +756,11 @@ class Painter:
         # that real input could not honor with the current calibration.
         if getattr(self.input, "emits_real_input", True):
             if any(group.brush_diameter > 1 for group in plan.color_groups) and not (
-                settings.apply_brush_size
-                and target.brush_slider
-                and (target.brush_preview or target.brush_responses)
+                settings.apply_brush_size and target.brush_slider
             ):
                 raise ValueError(
                     "This plan uses multiple brush sizes, which needs automatic brush "
-                    "sizing enabled with the Size track calibrated, and either a "
-                    "measured brush or the preview tile"
+                    "sizing enabled with the Size track calibrated"
                 )
             if (
                 any(group.brush_diameter > 1 for group in plan.color_groups)
@@ -808,6 +815,7 @@ class Painter:
                 self._update_progress_state(PainterState.RUNNING, "Measuring the brush")
                 self._execute_brush_measurement(job)
             else:
+                self._prepare_brush_for_job(job)
                 self._update_progress_state(PainterState.RUNNING, "Painting")
                 self._execute_plan(job)
             self._checkpoint(check_focus=False)
@@ -1234,7 +1242,90 @@ class Painter:
                 failures.append(f"{named}: too few probes to build a curve")
         return curves, failures
 
-    def _execute_brush_measurement(self, job: _Job) -> None:
+    def _prepare_brush_for_job(self, job: _Job) -> None:
+        """Measure the brush on the canvas at job start when no curve exists.
+
+        The manual measurement run needed a blank sign because its dabs land
+        on a full grid.  A paint job already knows exactly which cells it will
+        repaint, so the dabs can be placed only there and the whole ritual
+        disappears into the first seconds of the job.  The measured curves are
+        left on :attr:`brush_responses` for the caller to persist.
+        """
+
+        target, settings = job.target, job.settings
+        if (
+            not getattr(self.input, "emits_real_input", True)
+            or not settings.apply_brush_size
+            or target.brush_slider is None
+            or target.brush_responses is not None
+            or not any(group.strokes for group in job.plan.color_groups)
+        ):
+            return
+        self._update_progress_state(
+            PainterState.RUNNING, "Measuring the brush before painting"
+        )
+        measured = self._measure_brush_inline(job)
+        if measured is not None:
+            job.target = replace(target, brush_responses=measured)
+            return
+        if target.brush_preview is not None:
+            # The preview tile answers at the wrong scale, but a wrong-scale
+            # answer with the gross-mismatch guard beats stopping the job.
+            LOGGER.warning(
+                "Could not measure the brush on this plan's painted area; "
+                "falling back to the preview tile"
+            )
+            return
+        raise RuntimeError(
+            "Automatic brush sizing needs a measured brush, and this plan's "
+            "painted area is too small to measure on. Run Measure Brush on "
+            "Canvas once on a blank sign, or calibrate the brush preview tile."
+        )
+
+    def _measure_brush_inline(self, job: _Job) -> BrushResponseSet | None:
+        """Measure using only probe sites the plan repaints, or ``None``."""
+
+        from .paint_plan import plan_painted_mask
+
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        shapes = self._measured_shapes(target)
+        per_shape = 5
+        sites = probe_sites_within(
+            canvas, per_shape * len(shapes), plan_painted_mask(job.plan)
+        )
+        available = len(sites) // len(shapes)
+        if available < 3:
+            LOGGER.warning(
+                "Only %d probe sites fit the plan's painted area; not enough "
+                "to measure the brush inline",
+                len(sites),
+            )
+            return None
+        per_shape = min(per_shape, available)
+        try:
+            self._execute_brush_measurement(
+                job, sites=sites[: per_shape * len(shapes)], per_shape=per_shape
+            )
+        except (_AbortRequested, _RetryAction):
+            raise
+        except RuntimeError as exc:
+            LOGGER.warning("Measuring the brush before painting failed: %s", exc)
+            return None
+        return self._brush_responses
+
+    def _execute_brush_measurement(
+        self,
+        job: _Job,
+        *,
+        sites: "tuple[ProbeSite, ...] | None" = None,
+        per_shape: int | None = None,
+    ) -> None:
         """Stamp one dab per Size-track position on the canvas and measure them.
 
         Rust's preview tile draws the brush at the tile's own scale, so a
@@ -1261,8 +1352,10 @@ class Painter:
             target.canvas.height,
         )
         shapes = self._measured_shapes(target)
-        per_shape = job.probe_count
-        sites = probe_sites(canvas, per_shape * len(shapes))
+        if per_shape is None:
+            per_shape = job.probe_count
+        if sites is None:
+            sites = probe_sites(canvas, per_shape * len(shapes))
         # The smallest positions of the track are where a mis-sized brush hurts
         # most, so the probes crowd the low end rather than spreading evenly.
         fractions = tuple(

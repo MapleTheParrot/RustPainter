@@ -1705,7 +1705,6 @@ class MainWindow(QMainWindow):
         """What the optimizer may plan with, given the current calibration."""
 
         slider = self._profile_rect("brush_slider")
-        preview = self._profile_rect("brush_preview")
         canvas = self._profile_rect("canvas")
         responses = self._stored_brush_responses()
         cell_pixels = 0.0
@@ -1728,7 +1727,8 @@ class MainWindow(QMainWindow):
             sizing=bool(
                 self.apply_brush_check.isChecked()
                 and slider is not None
-                and (preview is not None or responses is not None)
+                # A missing preview tile and curve no longer block sizing: a
+                # real paint job measures the brush on the canvas at start.
                 # Spacing above 1.0 spreads stroke geometry while the brush
                 # stays capped at one unspaced cell, so multi-cell bands would
                 # leave unpainted rows; keep those plans single-cell.
@@ -3847,6 +3847,35 @@ class MainWindow(QMainWindow):
             LOGGER.exception("Could not store the measured brush")
             QMessageBox.warning(self, "Could not store the measurement", str(exc))
 
+    def _store_inline_brush_measurement(self) -> None:
+        """Keep a curve a paint job measured at start, without any dialogs.
+
+        The measurement cost real strokes; storing it means the next job (and
+        the honest preview) reuses it instead of measuring again.  A profile
+        that already carries a curve keeps it - the job would not have
+        measured inline in that case anyway.
+        """
+
+        painter = self._painter
+        response = getattr(painter, "brush_responses", None)
+        profile = self._current_profile
+        if (
+            response is None
+            or profile is None
+            or isinstance(profile.metadata.get("brush_response"), dict)
+        ):
+            return
+        try:
+            candidate = Profile.from_dict(profile.to_dict())
+            candidate.metadata["brush_response"] = response.to_dict()
+            self._current_profile = self._profile_store.save(candidate)
+            self._refresh_profile_ui()
+            LOGGER.info(
+                "Stored the brush curve measured at paint start for %s", profile.name
+            )
+        except Exception:
+            LOGGER.exception("Could not store the inline brush measurement")
+
     @Slot()
     def _clear_brush_response(self) -> None:
         profile = self._current_profile
@@ -4618,6 +4647,7 @@ class MainWindow(QMainWindow):
             self._set_idle_ui("Brush measured")
             self._save_measured_brush()
             return
+        self._store_inline_brush_measurement()
         self.paint_progress.setValue(1000)
         self.progress_state_label.setText("Completed")
         self._set_state_badge("completed", "COMPLETE")

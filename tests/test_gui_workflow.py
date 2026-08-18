@@ -977,8 +977,9 @@ def test_preview_ignores_the_correction_while_the_chart_is_loaded(
 
 
 def test_a_measured_brush_stands_in_for_the_preview_tile(window: MainWindow) -> None:
-    # The preview tile draws the brush at its own scale, so a profile that has
-    # been measured on the canvas must not still be asked to calibrate it.
+    # A calibrated Size track is enough for sizing now: a real job measures
+    # the brush on the canvas at start when no curve is stored yet. A stored
+    # curve additionally hands the planner its measured extremes.
     profile = window._current_profile
     assert profile is not None
     profile.canvas = ScreenRect(200, 150, 1400, 1100)
@@ -987,14 +988,20 @@ def test_a_measured_brush_stands_in_for_the_preview_tile(window: MainWindow) -> 
     window.apply_brush_check.setChecked(True)
 
     assert not window._has_brush_response()
-    assert not window._brush_capabilities().sizing
+    capabilities = window._brush_capabilities()
+    assert capabilities.sizing
+    assert capabilities.min_brush_pixels == 0.0
+    assert capabilities.max_brush_pixels == 0.0
 
     profile.metadata["brush_response"] = build_brush_response(
         [(0.0, 4.0), (0.5, 34.0), (1.0, 64.0)]
     ).to_dict()
 
     assert window._has_brush_response()
-    assert window._brush_capabilities().sizing
+    capabilities = window._brush_capabilities()
+    assert capabilities.sizing
+    assert capabilities.min_brush_pixels == pytest.approx(4.0)
+    assert capabilities.max_brush_pixels == pytest.approx(64.0)
 
 
 def test_the_profile_panel_reports_the_measured_brush_range(window: MainWindow) -> None:
