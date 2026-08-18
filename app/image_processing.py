@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import ceil, floor
+from math import ceil, floor, sqrt
 from pathlib import Path
 from typing import TypeAlias
 
@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .models import (
+    BackgroundRemovalScope,
     CropAlignment,
     ImageProcessOptions,
     ProcessedImage,
@@ -20,6 +21,10 @@ from .models import (
 
 
 ImageSource: TypeAlias = str | Path | Image.Image
+
+# The longest possible distance between two RGB colors, which turns a
+# background tolerance percentage into a concrete color distance.
+_MAX_RGB_DISTANCE = sqrt(3.0) * 255.0
 
 try:
     _LANCZOS = Image.Resampling.LANCZOS
@@ -262,6 +267,185 @@ def scale_image(
     return result, paint_mask
 
 
+def _removal_scope(value: BackgroundRemovalScope | str) -> BackgroundRemovalScope:
+    aliases = {
+        "connected": BackgroundRemovalScope.CONNECTED,
+        "edges": BackgroundRemovalScope.CONNECTED,
+        "touching": BackgroundRemovalScope.CONNECTED,
+        "everywhere": BackgroundRemovalScope.EVERYWHERE,
+        "anywhere": BackgroundRemovalScope.EVERYWHERE,
+        "all": BackgroundRemovalScope.EVERYWHERE,
+    }
+    try:
+        return aliases[_enum_key(value)]
+    except KeyError as exc:
+        raise ValueError(f"Unknown background removal scope: {value!r}") from exc
+
+
+def _resolved_mask(image: Image.Image, paint_mask: np.ndarray | None) -> np.ndarray:
+    if paint_mask is None:
+        return np.asarray(image.convert("RGBA"), dtype=np.uint8)[:, :, 3] > 0
+    mask = np.asarray(paint_mask, dtype=np.bool_)
+    if mask.shape != (image.height, image.width):
+        raise ValueError("Paint mask dimensions must match the image")
+    return mask
+
+
+def _painted_border(paint_mask: np.ndarray) -> np.ndarray:
+    """A one-pixel ring around the painted area's bounding box.
+
+    Fit leaves unpainted bars around the artwork, so the canvas edge is not
+    always where the background starts.  Working from the painted bounding box
+    means one ring serves letterboxed, cropped, and stretched layouts alike.
+    """
+
+    border = np.zeros(paint_mask.shape, dtype=np.bool_)
+    rows = np.flatnonzero(np.any(paint_mask, axis=1))
+    columns = np.flatnonzero(np.any(paint_mask, axis=0))
+    if rows.size == 0 or columns.size == 0:
+        return border
+    top, bottom = int(rows[0]), int(rows[-1])
+    left, right = int(columns[0]), int(columns[-1])
+    border[top, left : right + 1] = True
+    border[bottom, left : right + 1] = True
+    border[top : bottom + 1, left] = True
+    border[top : bottom + 1, right] = True
+    return border & paint_mask
+
+
+def detect_background_color(
+    image: Image.Image, paint_mask: np.ndarray | None = None
+) -> RGBColor | None:
+    """Guess the background from the colors ringing the painted artwork.
+
+    Edge pixels are bucketed coarsely before voting so a noisy or JPEG-blurred
+    backdrop still lands in one bucket; the winning bucket then reports the
+    average of its real colors rather than a quantized stand-in.
+    """
+
+    mask = _resolved_mask(image, paint_mask)
+    border = _painted_border(mask)
+    samples = np.asarray(image.convert("RGB"), dtype=np.uint8)[border]
+    if samples.size == 0:
+        return None
+    buckets = samples >> 4
+    packed = (
+        (buckets[:, 0].astype(np.int32) << 8)
+        | (buckets[:, 1].astype(np.int32) << 4)
+        | buckets[:, 2].astype(np.int32)
+    )
+    values, counts = np.unique(packed, return_counts=True)
+    winner = values[int(np.argmax(counts))]
+    average = samples[packed == winner].mean(axis=0)
+    red, green, blue = (int(round(float(channel))) for channel in average)
+    return (red, green, blue)
+
+
+def _fill_runs(similar: np.ndarray, seeded: np.ndarray) -> np.ndarray:
+    """Grow seeds across every horizontal run of ``similar`` that they touch.
+
+    Filling whole runs at once is what keeps the flood fill affordable: a plain
+    one-pixel dilation needs a pass for every pixel of travel, while alternating
+    row and column runs crosses an open background in a handful of passes.
+    """
+
+    height, width = similar.shape
+    flat = np.ascontiguousarray(similar).reshape(-1)
+    previous = np.empty_like(flat)
+    previous[0] = False
+    previous[1:] = flat[:-1]
+    row_start = np.zeros(flat.size, dtype=np.bool_)
+    row_start[::width] = True
+    starts = flat & (row_start | ~previous)
+    run_count = int(starts.sum())
+    if run_count == 0:
+        return seeded
+    run_index = np.cumsum(starts) - 1
+    touched = np.zeros(run_count, dtype=np.bool_)
+    seeds_flat = np.ascontiguousarray(seeded).reshape(-1) & flat
+    touched[run_index[seeds_flat]] = True
+    filled = flat & touched[np.clip(run_index, 0, run_count - 1)]
+    return filled.reshape(height, width) | seeded
+
+
+def _connected_region(similar: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    """Every ``similar`` pixel reachable from a seed along rows and columns."""
+
+    filled = similar & seeds
+    if not filled.any():
+        return filled
+    transposed = np.ascontiguousarray(similar.T)
+    previous = -1
+    # Row/column passes settle an open background almost immediately; the cap
+    # only stops a pathological maze-shaped region from spinning forever.
+    for _ in range(256):
+        count = int(filled.sum())
+        if count == previous:
+            break
+        previous = count
+        filled = _fill_runs(similar, filled)
+        filled = _fill_runs(transposed, np.ascontiguousarray(filled.T)).T
+    return np.ascontiguousarray(filled)
+
+
+def background_mask(
+    image: Image.Image,
+    paint_mask: np.ndarray | None = None,
+    *,
+    color: RGBColor | None = None,
+    tolerance: float = 12.0,
+    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.CONNECTED,
+) -> np.ndarray:
+    """Return the painted pixels that count as background for ``color``.
+
+    ``tolerance`` is a percentage of the longest possible RGB distance, so 0
+    matches a single exact color and 100 matches everything.  ``color=None``
+    reads the key color off the artwork edges.
+    """
+
+    _validate_color(color, "Background removal color")
+    if not 0.0 <= float(tolerance) <= 100.0:
+        raise ValueError("Background removal tolerance must be between 0 and 100")
+    resolved_scope = _removal_scope(scope)
+    mask = _resolved_mask(image, paint_mask)
+    if not mask.any():
+        return np.zeros(mask.shape, dtype=np.bool_)
+    key = color if color is not None else detect_background_color(image, mask)
+    if key is None:
+        return np.zeros(mask.shape, dtype=np.bool_)
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    difference = (rgb - np.asarray(key, dtype=np.int16)).astype(np.float32)
+    distance = np.sqrt(np.einsum("ijk,ijk->ij", difference, difference))
+    limit = float(tolerance) / 100.0 * _MAX_RGB_DISTANCE
+    similar = mask & (distance <= limit)
+    if resolved_scope is BackgroundRemovalScope.EVERYWHERE:
+        return similar
+    return _connected_region(similar, _painted_border(mask))
+
+
+def remove_background(
+    image: Image.Image,
+    paint_mask: np.ndarray | None = None,
+    *,
+    color: RGBColor | None = None,
+    tolerance: float = 12.0,
+    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.CONNECTED,
+) -> tuple[Image.Image, np.ndarray]:
+    """Drop background pixels from the paint mask so Rust never paints them."""
+
+    mask = _resolved_mask(image, paint_mask)
+    removed = background_mask(
+        image, mask, color=color, tolerance=tolerance, scope=scope
+    )
+    if not removed.any():
+        return image, mask
+    remaining = mask & ~removed
+    array = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    array[:, :, 3] = np.where(remaining, array[:, :, 3], 0)
+    return Image.fromarray(array, mode="RGBA"), remaining
+
+
 def quantize_image(
     image: Image.Image,
     color_count: int,
@@ -338,6 +522,14 @@ def process_image(
         transparent_fill_color=options.transparent_fill_color,
         alpha_threshold=options.alpha_threshold,
     )
+    if options.remove_background:
+        scaled, paint_mask = remove_background(
+            scaled,
+            paint_mask,
+            color=options.background_removal_color,
+            tolerance=options.background_removal_tolerance,
+            scope=options.background_removal_scope,
+        )
     quantized = quantize_image(
         scaled,
         options.color_count,
@@ -355,14 +547,17 @@ resize_image = scale_image
 
 __all__ = [
     "ImageSource",
+    "background_mask",
     "calculate_fill_size",
     "calculate_fit_size",
     "calculate_scaled_size",
+    "detect_background_color",
     "fill_size",
     "fit_size",
     "load_image",
     "process_image",
     "quantize_image",
+    "remove_background",
     "resize_image",
     "scale_image",
 ]

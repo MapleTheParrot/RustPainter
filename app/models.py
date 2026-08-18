@@ -39,6 +39,13 @@ class TransparencyMode(str, Enum):
     USE_BACKGROUND = "use_background"
 
 
+class BackgroundRemovalScope(str, Enum):
+    """How far a background match is allowed to reach into the image."""
+
+    CONNECTED = "connected"
+    EVERYWHERE = "everywhere"
+
+
 class HueDirection(str, Enum):
     TOP_TO_BOTTOM = "top_to_bottom"
     BOTTOM_TO_TOP = "bottom_to_top"
@@ -170,6 +177,13 @@ class ImageProcessOptions:
     transparency_mode: TransparencyMode | str = TransparencyMode.LEAVE_UNPAINTED
     transparent_fill_color: RGBColor | None = None
     alpha_threshold: int = 0
+    remove_background: bool = False
+    # ``None`` asks the processor to read the key color off the artwork edges.
+    background_removal_color: RGBColor | None = None
+    background_removal_tolerance: float = 12.0
+    background_removal_scope: BackgroundRemovalScope | str = (
+        BackgroundRemovalScope.CONNECTED
+    )
 
     def __post_init__(self) -> None:
         if self.logical_width <= 0 or self.logical_height <= 0:
@@ -178,6 +192,8 @@ class ImageProcessOptions:
             raise ValueError("Color count must be between 1 and 256")
         if not 0 <= self.alpha_threshold <= 255:
             raise ValueError("Alpha threshold must be between 0 and 255")
+        if not 0.0 <= float(self.background_removal_tolerance) <= 100.0:
+            raise ValueError("Background removal tolerance must be between 0 and 100")
 
 
 @dataclass(slots=True)

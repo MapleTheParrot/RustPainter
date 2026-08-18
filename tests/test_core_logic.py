@@ -13,12 +13,16 @@ from app.color_mapping import (
 )
 from app.coordinates import logical_pixel_center, screen_to_logical_pixel
 from app.image_processing import (
+    background_mask,
     calculate_fill_size,
     calculate_fit_size,
+    detect_background_color,
+    process_image,
     quantize_image,
+    remove_background,
     scale_image,
 )
-from app.models import ScreenRect
+from app.models import ImageProcessOptions, ScreenRect
 from app.paint_plan import generate_paint_plan, group_horizontal_runs
 
 
@@ -255,6 +259,85 @@ class PaintPlanTests(unittest.TestCase):
         self.assertEqual(plan.color_groups[0].color, (255, 0, 0))
         green_group = plan.color_groups[1]
         self.assertEqual(len(green_group.strokes), 3)
+
+
+class BackgroundRemovalTests(unittest.TestCase):
+    """A ring of one color around a subject that encloses the same color."""
+
+    def setUp(self) -> None:
+        size = 32
+        pixels = np.full((size, size, 4), 255, dtype=np.uint8)
+        rows, columns = np.mgrid[0:size, 0:size]
+        radius = (rows - 16) ** 2 + (columns - 16) ** 2
+        pixels[radius < 100] = (200, 30, 40, 255)
+        pixels[radius < 9] = (255, 255, 255, 255)
+        self.image = Image.fromarray(pixels, mode="RGBA")
+        self.subject = radius < 100
+        self.hole = radius < 9
+
+    def test_edge_color_is_detected_from_the_border_ring(self) -> None:
+        self.assertEqual(detect_background_color(self.image), (255, 255, 255))
+
+    def test_connected_removal_keeps_an_enclosed_pocket_painted(self) -> None:
+        removed = background_mask(self.image, tolerance=5)
+        self.assertFalse(bool(removed[16, 16]))
+        self.assertFalse(bool(removed[16, 8]))
+        self.assertTrue(bool(removed[0, 0]))
+
+    def test_everywhere_removal_also_drops_enclosed_pockets(self) -> None:
+        removed = background_mask(self.image, tolerance=5, scope="everywhere")
+        self.assertTrue(bool(removed[16, 16]))
+        self.assertFalse(bool(removed[16, 8]))
+
+    def test_removal_updates_both_the_mask_and_the_alpha_channel(self) -> None:
+        stripped, mask = remove_background(self.image, tolerance=5)
+        expected = int(self.subject.sum())
+        self.assertEqual(int(mask.sum()), expected)
+        self.assertEqual(stripped.getpixel((16, 16))[3], 255)
+        self.assertEqual(stripped.getpixel((0, 0))[3], 0)
+
+    def test_an_explicit_color_only_removes_what_it_matches(self) -> None:
+        untouched = background_mask(self.image, color=(0, 0, 255), tolerance=0)
+        self.assertEqual(int(untouched.sum()), 0)
+        subject = background_mask(
+            self.image, color=(200, 30, 40), tolerance=2, scope="everywhere"
+        )
+        self.assertEqual(int(subject.sum()), int((self.subject & ~self.hole).sum()))
+
+    def _processed(self, **overrides: object):
+        options = ImageProcessOptions(
+            logical_width=32,
+            logical_height=32,
+            scale_mode="stretch",
+            color_count=8,
+            remove_background=True,
+            background_removal_tolerance=5.0,
+            **overrides,  # type: ignore[arg-type]
+        )
+        return process_image(self.image, options)
+
+    def test_processing_paints_the_subject_and_nothing_around_it(self) -> None:
+        processed = self._processed()
+        self.assertEqual(processed.painted_pixel_count, int(self.subject.sum()))
+        self.assertEqual(processed.image.getpixel((0, 0))[3], 0)
+        self.assertEqual(processed.image.getpixel((16, 8))[3], 255)
+
+    def test_a_fully_removed_background_frees_its_palette_entry(self) -> None:
+        processed = self._processed(background_removal_scope="everywhere")
+        painted = np.asarray(processed.image.convert("RGB"))[processed.paint_mask]
+        colors = {tuple(int(channel) for channel in color) for color in painted}
+        self.assertNotIn((255, 255, 255), colors)
+
+    def test_letterbox_bars_do_not_hide_the_artwork_edge(self) -> None:
+        """Fit leaves unpainted bars, so the ring must follow the artwork."""
+
+        source = Image.new("RGBA", (32, 8), (255, 255, 255, 255))
+        source.paste(Image.new("RGBA", (8, 4), (10, 120, 200, 255)), (12, 2))
+        scaled, mask = scale_image(source, (32, 32), "fit")
+        self.assertEqual(detect_background_color(scaled, mask), (255, 255, 255))
+        _, remaining = remove_background(scaled, mask, tolerance=6)
+        self.assertLess(int(remaining.sum()), int(mask.sum()))
+        self.assertGreater(int(remaining.sum()), 0)
 
 
 if __name__ == "__main__":

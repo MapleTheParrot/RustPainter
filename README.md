@@ -114,7 +114,8 @@ painting unattended. Everything below is detail you only need when tuning.
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by clicking either preview, browsing, or dropping a file anywhere in the window
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
-- Multiple draggable text layers with inline editing, resize handles, Delete to remove the selected layer, and live font/color styling
+- One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
+- Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and optional Size track and brush-preview tile, with an on-screen overlay to verify them
@@ -138,6 +139,27 @@ painting unattended. Everything below is detail you only need when tuning.
 
 The niche **Run without mouse input** diagnostic remains available under
 **Settings → Diagnostics** for plan timing and troubleshooting, but is off by default.
+
+### Skipping a background you do not want painted
+
+A plain backdrop is usually most of the strokes in a sign. **Remove background**
+in the workspace's quick settings leaves it unpainted, so Rust paints only the
+subject and the plan gets shorter by exactly those pixels.
+
+- **Background** - *Detect from the edges* votes on the colors ringing the
+  artwork, which suits a product shot or a logo on a flat field. Switch to
+  *Pick a color* when the subject reaches the edges or a specific color should go.
+- **Tolerance** - how far a pixel may drift from that color and still be
+  skipped. Raise it for photographs and JPEG artifacts; lower it when part of
+  the subject starts disappearing.
+- **Touching the edges / Anywhere in the image** - edge matching only removes
+  background reachable from outside the artwork, so enclosed areas (the hole in
+  an O, a white eye) keep their paint. *Anywhere* also removes every matching
+  pocket inside the subject.
+
+Removal happens before the palette is chosen, so a skipped backdrop no longer
+consumes one of the requested colors. Text layers still paint over removed
+areas.
 
 The current Rust picker layout is fixed in the application: hue runs bottom to top, saturation increases left to right, brightness decreases top to bottom, and brush size increases left to right.
 
@@ -259,7 +281,7 @@ app/
   calibration.py       full-screen rectangle selector
   profiles.py          profile JSON persistence
   settings.py          defaults and local settings
-  image_processing.py  composition and palette reduction
+  image_processing.py  composition, background removal, palette reduction
   color_mapping.py     RGB/HSV picker mapping
   brush_calibration.py live brush-preview measurement
   color_calibration.py painted-chart response fitting

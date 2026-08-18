@@ -571,6 +571,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     layerTextEdited = Signal(int, str)
     layerResized = Signal(int, int)
     layerDeleteRequested = Signal(int)
+    layerDuplicateRequested = Signal(int)
     interactionFinished = Signal()
     browseRequested = Signal()
     imageDropped = Signal(str)
@@ -675,18 +676,27 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
-        """Delete or Backspace removes the selected layer.
+        """Edit the selected layer with the keyboard.
 
-        While a layer is being edited both keys belong to the text cursor, so
-        the shortcut only applies to a layer that is merely selected.
+        Delete or Backspace removes it; Ctrl+D or Ctrl+C copies it. While a
+        layer is being edited every one of those keys belongs to the text
+        cursor instead, so the shortcuts only apply to a layer that is merely
+        selected.
         """
 
-        deletes = event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
-        if deletes and not self.is_editing_text:
+        if not self.is_editing_text:
             selected = self.selected_index()
-            if selected is not None:
+            control = bool(
+                event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            )
+            deletes = event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
+            duplicates = control and event.key() in {Qt.Key.Key_D, Qt.Key.Key_C}
+            if selected is not None and (deletes or duplicates):
                 event.accept()
-                self.layerDeleteRequested.emit(selected)
+                if deletes:
+                    self.layerDeleteRequested.emit(selected)
+                else:
+                    self.layerDuplicateRequested.emit(selected)
                 return
         super().keyPressEvent(event)
 

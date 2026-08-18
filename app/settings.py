@@ -52,6 +52,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "background_mode": "unpainted",
         "background_color": "#FFFFFF",
         "transparent_pixels": "leave_unpainted",
+        "remove_background": False,
+        # "auto" reads the key color off the artwork edges; "custom" uses
+        # background_removal_color as typed.
+        "background_removal_source": "auto",
+        "background_removal_color": "#FFFFFF",
+        "background_removal_tolerance": 12,
+        "background_removal_scope": "connected",
         "text_overlay": {
             "layers": [
                 {
@@ -201,6 +208,33 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "transparent_pixels"
     ) not in {"leave_unpainted", "use_background"}:
         raise SettingsError("image.transparent_pixels is invalid")
+    if not isinstance(image.get("remove_background"), bool):
+        raise SettingsError("image.remove_background must be true or false")
+    if not isinstance(image.get("background_removal_source"), str) or image.get(
+        "background_removal_source"
+    ) not in {"auto", "custom"}:
+        raise SettingsError("image.background_removal_source must be auto or custom")
+    removal_color = image.get("background_removal_color")
+    if not isinstance(removal_color, str) or _HEX_COLOR.fullmatch(removal_color) is None:
+        raise SettingsError(
+            "image.background_removal_color must use #RRGGBB format"
+        )
+    tolerance = image.get("background_removal_tolerance")
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not math.isfinite(float(tolerance))
+        or not 0 <= float(tolerance) <= 100
+    ):
+        raise SettingsError(
+            "image.background_removal_tolerance must be between 0 and 100"
+        )
+    if not isinstance(image.get("background_removal_scope"), str) or image.get(
+        "background_removal_scope"
+    ) not in {"connected", "everywhere"}:
+        raise SettingsError(
+            "image.background_removal_scope must be connected or everywhere"
+        )
     text_overlay = image.get("text_overlay")
     if not isinstance(text_overlay, Mapping):
         raise SettingsError("image.text_overlay must be a JSON object")

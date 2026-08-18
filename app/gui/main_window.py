@@ -78,6 +78,7 @@ from app.calibration import (
     select_screen_rect,
 )
 from app.models import (
+    BackgroundRemovalScope,
     CropAlignment,
     ImageProcessOptions,
     PaintPlan,
@@ -179,6 +180,10 @@ MERGE_MODE_GAPS: dict[str, int | None] = {"off": 0, "balanced": 6, "maximum": No
 # so a caption keeps its proportions when the resolution changes.
 MIN_TEXT_SIZE = 4
 MAX_TEXT_SIZE = 256
+
+# Matches the limit the settings schema validates, so a sign that fills up
+# says so instead of failing the next save.
+MAX_TEXT_LAYERS = 20
 
 
 @dataclass(slots=True)
@@ -816,8 +821,9 @@ class MainWindow(QMainWindow):
             "Paint simulation will appear here", hint=browse_hint
         )
         self.paint_preview.setToolTip(
-            "Drag text to move it, drag its handles to resize it, double-click to "
-            "edit it, or press Delete to remove it."
+            "Drag text to move it, drag its handles to resize it, double-click "
+            "to edit it, press Ctrl+D or Ctrl+C to copy it, or press Delete to "
+            "remove it."
         )
         for preview in (self.original_preview, self.paint_preview):
             preview.browseRequested.connect(self._browse_image)
@@ -943,6 +949,12 @@ class MainWindow(QMainWindow):
         self.dither_check.setToolTip(
             "Dithering improves gradients but usually creates many more strokes."
         )
+        self.remove_background_check = QCheckBox("Remove background")
+        self.remove_background_check.setToolTip(
+            "Leave the backdrop unpainted so Rust only paints the subject.\n"
+            "An even backdrop — a white product shot, a flat logo field — is\n"
+            "usually most of the strokes, so skipping it saves a lot of time."
+        )
         for column, (label, control) in enumerate(
             (("Scaling", self.scale_mode_combo), ("Quality", self.quality_combo))
         ):
@@ -950,12 +962,13 @@ class MainWindow(QMainWindow):
             quick_grid.addWidget(control, 1, column)
         quick_grid.addWidget(QLabel("Crop alignment"), 2, 0)
         quick_grid.addWidget(self.crop_alignment_combo, 3, 0)
-        quick_grid.addWidget(
-            self.dither_check,
-            3,
-            1,
-            alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-        )
+        for row, checkbox in ((2, self.remove_background_check), (3, self.dither_check)):
+            quick_grid.addWidget(
+                checkbox,
+                row,
+                1,
+                alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            )
 
         self.custom_resolution_panel = QFrame()
         self.custom_resolution_panel.setObjectName("inlinePanel")
@@ -980,6 +993,60 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
         quick_grid.addWidget(self.custom_resolution_panel, 4, 0, 1, 2)
+
+        self.background_removal_panel = QFrame()
+        self.background_removal_panel.setObjectName("inlinePanel")
+        removal_grid = QGridLayout(self.background_removal_panel)
+        removal_grid.setContentsMargins(10, 8, 10, 8)
+        removal_grid.setHorizontalSpacing(8)
+        removal_grid.setVerticalSpacing(6)
+        self.removal_source_combo = NoWheelComboBox()
+        self.removal_source_combo.addItem("Detect from the edges", "auto")
+        self.removal_source_combo.addItem("Pick a color", "custom")
+        self.removal_source_combo.setToolTip(
+            "Detection votes on the colors ringing the artwork, which suits a\n"
+            "plain backdrop. Pick a color when the subject reaches the edges."
+        )
+        self.removal_color_button = ColorButton(
+            "#ffffff", dialog_title="Choose the background color to skip"
+        )
+        self.removal_color_button.setEnabled(False)
+        self.removal_tolerance_spin = NoWheelSpinBox()
+        self.removal_tolerance_spin.setRange(0, 100)
+        self.removal_tolerance_spin.setValue(12)
+        self.removal_tolerance_spin.setSuffix(" %")
+        self.removal_tolerance_spin.setToolTip(
+            "How far a pixel may drift from the background color and still be\n"
+            "skipped. Raise it for photos and gradients; lower it when part of\n"
+            "the subject starts disappearing."
+        )
+        self.removal_scope_combo = NoWheelComboBox()
+        self.removal_scope_combo.addItem(
+            "Touching the edges", BackgroundRemovalScope.CONNECTED.value
+        )
+        self.removal_scope_combo.addItem(
+            "Anywhere in the image", BackgroundRemovalScope.EVERYWHERE.value
+        )
+        self.removal_scope_combo.setToolTip(
+            "Edge matching keeps enclosed areas — the hole in an O, a white\n"
+            "eye — painted. Anywhere also skips every matching inner pocket."
+        )
+        for control in (self.removal_source_combo, self.removal_scope_combo):
+            control.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            control.setMinimumContentsLength(10)
+            control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        removal_grid.addWidget(QLabel("Background"), 0, 0)
+        removal_grid.addWidget(self.removal_source_combo, 0, 1)
+        removal_grid.addWidget(self.removal_color_button, 0, 2)
+        removal_grid.addWidget(QLabel("Tolerance"), 1, 0)
+        removal_grid.addWidget(self.removal_tolerance_spin, 1, 1)
+        removal_grid.addWidget(self.removal_scope_combo, 1, 2)
+        removal_grid.setColumnStretch(1, 1)
+        removal_grid.setColumnStretch(2, 1)
+        self.background_removal_panel.setVisible(False)
+        quick_grid.addWidget(self.background_removal_panel, 5, 0, 1, 2)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)
@@ -989,11 +1056,18 @@ class MainWindow(QMainWindow):
         text_title.setObjectName("sectionTitle")
         self.add_text_button = QPushButton("Add text")
         self.add_text_button.setObjectName("compactButton")
+        self.duplicate_text_button = QPushButton("Duplicate")
+        self.duplicate_text_button.setObjectName("compactButton")
+        self.duplicate_text_button.setToolTip(
+            "Copy the selected text layer. Ctrl+D or Ctrl+C does the same to\n"
+            "the layer selected in the Rust preview."
+        )
         self.remove_text_button = QPushButton("Remove")
         self.remove_text_button.setObjectName("compactButton")
         text_heading.addWidget(text_title)
         text_heading.addStretch(1)
         text_heading.addWidget(self.add_text_button)
+        text_heading.addWidget(self.duplicate_text_button)
         text_heading.addWidget(self.remove_text_button)
         image_layout.addLayout(text_heading)
 
@@ -1398,6 +1472,13 @@ class MainWindow(QMainWindow):
         self.crop_alignment_combo.currentIndexChanged.connect(self._schedule_processing)
         self.background_combo.currentIndexChanged.connect(self._on_background_changed)
         self.background_color_button.colorChanged.connect(self._schedule_processing)
+        self.remove_background_check.toggled.connect(self._on_background_removal_changed)
+        self.removal_source_combo.currentIndexChanged.connect(
+            self._on_background_removal_changed
+        )
+        self.removal_color_button.colorChanged.connect(self._schedule_processing)
+        self.removal_tolerance_spin.valueChanged.connect(self._schedule_processing)
+        self.removal_scope_combo.currentIndexChanged.connect(self._schedule_processing)
         self.transparency_combo.currentIndexChanged.connect(self._on_transparency_changed)
         self.quality_combo.currentIndexChanged.connect(self._update_quality_dimensions)
         self.logical_width_spin.valueChanged.connect(
@@ -1410,6 +1491,7 @@ class MainWindow(QMainWindow):
         self.dither_check.toggled.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
         self.add_text_button.clicked.connect(self._add_text_layer)
+        self.duplicate_text_button.clicked.connect(self._duplicate_selected_text_layer)
         self.remove_text_button.clicked.connect(self._remove_text_layer)
         self.text_layer_combo.currentIndexChanged.connect(self._select_text_layer)
         self.text_edit.textChanged.connect(self._on_text_control_changed)
@@ -1423,6 +1505,7 @@ class MainWindow(QMainWindow):
         self.paint_preview.layerTextEdited.connect(self._on_canvas_text_edited)
         self.paint_preview.layerResized.connect(self._on_canvas_text_resized)
         self.paint_preview.layerDeleteRequested.connect(self._delete_text_layer)
+        self.paint_preview.layerDuplicateRequested.connect(self._duplicate_text_layer)
         self.paint_preview.interactionFinished.connect(
             self._on_text_interaction_finished
         )
@@ -1489,6 +1572,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _add_text_layer(self) -> None:
+        if len(self._text_layers) >= MAX_TEXT_LAYERS:
+            self.statusBar().showMessage(
+                f"A sign can hold at most {MAX_TEXT_LAYERS} text layers", 4000
+            )
+            return
         color = self.text_color_button.color()
         offset = min(0.24, len(self._text_layers) * 0.06)
         font_size = self.text_size_spin.value()
@@ -1510,6 +1598,36 @@ class MainWindow(QMainWindow):
         self._sync_text_controls()
         self._refresh_text_editor_layers()
         self.text_edit.setFocus()
+        self._schedule_settings_save()
+
+    @Slot()
+    def _duplicate_selected_text_layer(self) -> None:
+        self._duplicate_text_layer(self._selected_text_layer)
+
+    @Slot(int)
+    def _duplicate_text_layer(self, index: int) -> None:
+        """Insert a copy of one text layer, nudged clear of the original."""
+
+        if not 0 <= index < len(self._text_layers):
+            return
+        if len(self._text_layers) >= MAX_TEXT_LAYERS:
+            self.statusBar().showMessage(
+                f"A sign can hold at most {MAX_TEXT_LAYERS} text layers", 4000
+            )
+            return
+        source = self._text_layers[index]
+        offset = self._text_size_ratio(source.font_size) * 0.5
+        copy = replace(
+            source,
+            x=min(max(source.x + offset * 0.5, 0.0), 1.0),
+            y=min(max(source.y + offset, 0.0), 1.0),
+        )
+        self._text_layers.insert(index + 1, copy)
+        self._selected_text_layer = index + 1
+        self._rebuild_text_layer_combo()
+        self._sync_text_controls()
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
         self._schedule_settings_save()
 
     @Slot()
@@ -1833,6 +1951,15 @@ class MainWindow(QMainWindow):
         self._schedule_processing()
 
     @Slot()
+    def _on_background_removal_changed(self, *_args: Any) -> None:
+        enabled = self.remove_background_check.isChecked()
+        self.background_removal_panel.setVisible(enabled)
+        self.removal_color_button.setEnabled(
+            enabled and self.removal_source_combo.currentData() == "custom"
+        )
+        self._schedule_processing()
+
+    @Slot()
     def _on_transparency_changed(self) -> None:
         alpha_fill = (
             self.transparency_combo.currentData()
@@ -1933,6 +2060,7 @@ class MainWindow(QMainWindow):
         background = self._background_color()
         transparency = TransparencyMode(self.transparency_combo.currentData())
         transparent_fill = background or (255, 255, 255)
+        removal_color = self.removal_color_button.color()
         return ImageProcessOptions(
             logical_width=self.logical_width_spin.value(),
             logical_height=self.logical_height_spin.value(),
@@ -1944,6 +2072,16 @@ class MainWindow(QMainWindow):
             transparency_mode=transparency,
             transparent_fill_color=transparent_fill,
             alpha_threshold=0,
+            remove_background=self.remove_background_check.isChecked(),
+            background_removal_color=(
+                (removal_color.red(), removal_color.green(), removal_color.blue())
+                if self.removal_source_combo.currentData() == "custom"
+                else None
+            ),
+            background_removal_tolerance=float(self.removal_tolerance_spin.value()),
+            background_removal_scope=BackgroundRemovalScope(
+                self.removal_scope_combo.currentData()
+            ),
         )
 
     def _text_overlay_options(self) -> tuple[_TextOverlayOptions, ...]:
@@ -1992,10 +2130,21 @@ class MainWindow(QMainWindow):
             )
         else:
             merge_note = ""
-        self.processing_label.setText(
-            f"{result.processed.painted_pixel_count:,} logical pixels will be painted"
-            + merge_note
-        )
+        if (
+            result.processed.painted_pixel_count == 0
+            and self.remove_background_check.isChecked()
+        ):
+            # An over-wide tolerance swallows the subject too, and an empty
+            # plan otherwise looks like a plain "0" in the statistics.
+            self.processing_label.setText(
+                "Background removal skipped the whole image — lower the "
+                "tolerance or choose a different background color"
+            )
+        else:
+            self.processing_label.setText(
+                f"{result.processed.painted_pixel_count:,} logical pixels will "
+                "be painted" + merge_note
+            )
         LOGGER.info(
             "Generated %dx%d plan: %d colors, %d strokes",
             result.plan.width,
@@ -2196,6 +2345,11 @@ class MainWindow(QMainWindow):
             self.merge_combo,
             self.show_calibration_check,
             self.background_color_button,
+            self.remove_background_check,
+            self.removal_source_combo,
+            self.removal_color_button,
+            self.removal_tolerance_spin,
+            self.removal_scope_combo,
             self.pixel_spacing_spin,
             self.stroke_speed_spin,
             self.dot_duration_spin,
@@ -2269,6 +2423,23 @@ class MainWindow(QMainWindow):
             self._set_combo_data(
                 self.transparency_combo,
                 image.get("transparent_pixels", "leave_unpainted"),
+            )
+            self.remove_background_check.setChecked(
+                bool(image.get("remove_background", False))
+            )
+            self._set_combo_data(
+                self.removal_source_combo,
+                image.get("background_removal_source", "auto"),
+            )
+            self.removal_color_button.set_color(
+                image.get("background_removal_color", "#FFFFFF")
+            )
+            self.removal_tolerance_spin.setValue(
+                int(image.get("background_removal_tolerance", 12))
+            )
+            self._set_combo_data(
+                self.removal_scope_combo,
+                image.get("background_removal_scope", "connected"),
             )
             text_overlay = image.get("text_overlay", {})
             layer_values = text_overlay.get("layers", [])
@@ -2398,6 +2569,7 @@ class MainWindow(QMainWindow):
             else logging.INFO
         )
         self._on_transparency_changed()
+        self._on_background_removal_changed()
         self._refresh_text_editor_layers()
 
     def _settings_document(self) -> dict[str, Any]:
@@ -2414,6 +2586,13 @@ class MainWindow(QMainWindow):
             "background_mode": self.background_combo.currentData(),
             "background_color": self.background_color_button.color().name().upper(),
             "transparent_pixels": self.transparency_combo.currentData(),
+            "remove_background": self.remove_background_check.isChecked(),
+            "background_removal_source": self.removal_source_combo.currentData(),
+            "background_removal_color": self.removal_color_button.color()
+            .name()
+            .upper(),
+            "background_removal_tolerance": self.removal_tolerance_spin.value(),
+            "background_removal_scope": self.removal_scope_combo.currentData(),
             "text_overlay": {
                 "layers": [
                     {
@@ -3335,6 +3514,11 @@ class MainWindow(QMainWindow):
             self.background_combo,
             self.background_color_button,
             self.transparency_combo,
+            self.remove_background_check,
+            self.removal_source_combo,
+            self.removal_color_button,
+            self.removal_tolerance_spin,
+            self.removal_scope_combo,
             self.quality_combo,
             self.logical_width_spin,
             self.logical_height_spin,
@@ -3392,6 +3576,10 @@ class MainWindow(QMainWindow):
             self.background_color_button.setEnabled(
                 (is_fit or alpha_fill)
                 and self.background_combo.currentData() == "custom"
+            )
+            self.removal_color_button.setEnabled(
+                self.remove_background_check.isChecked()
+                and self.removal_source_combo.currentData() == "custom"
             )
             custom = self.quality_combo.currentText() == "Custom"
             self.logical_width_spin.setEnabled(custom)

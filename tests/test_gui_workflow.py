@@ -166,6 +166,86 @@ def test_delete_key_removes_the_selected_text_layer(
     assert [layer.text for layer in window._text_layers] == [""]
 
 
+@pytest.mark.parametrize("key", [Qt.Key.Key_D, Qt.Key.Key_C])
+def test_control_d_and_control_c_copy_the_selected_text_layer(
+    window: MainWindow, tmp_path: Path, qtbot, key
+) -> None:
+    source_path = tmp_path / "one-layer.png"
+    Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
+    window.text_edit.setText("FIRST")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 1, timeout=5000)
+
+    window.paint_preview.select_layer(0)
+    window.paint_preview.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.ControlModifier)
+    )
+
+    assert [layer.text for layer in window._text_layers] == ["FIRST", "FIRST"]
+    # The copy is selected and offset, so dragging it does not move the original.
+    assert window._selected_text_layer == 1
+    original, copy = window._text_layers
+    assert (copy.x, copy.y) != (original.x, original.y)
+    assert copy.font_size == original.font_size
+
+
+def test_control_c_copies_characters_while_a_layer_is_being_edited(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    source_path = tmp_path / "editing-copy.png"
+    Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
+    window.text_edit.setText("FIRST")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 1, timeout=5000)
+
+    item = window.paint_preview._items[0]
+    double_click = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseDoubleClick)
+    double_click.setButton(Qt.MouseButton.LeftButton)
+    double_click.setPos(item.boundingRect().center())
+    item.mouseDoubleClickEvent(double_click)
+    assert window.paint_preview.is_editing_text
+
+    window.paint_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert len(window._text_layers) == 1
+
+
+def test_background_removal_toggles_its_options_and_shrinks_the_plan(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    source_path = tmp_path / "logo-on-white.png"
+    source = Image.new("RGB", (64, 64), (255, 255, 255))
+    source.paste(Image.new("RGB", (16, 16), (200, 30, 40)), (24, 24))
+    source.save(source_path)
+
+    # The window itself is never shown offscreen, so ask whether the panel is
+    # hidden in its own right rather than whether it is on screen.
+    assert window.background_removal_panel.isHidden()
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    with_background = window._plan.painted_pixels
+
+    window.remove_background_check.setChecked(True)
+    qtbot.waitUntil(
+        lambda: window._plan is not None
+        and window._plan.painted_pixels < with_background,
+        timeout=5000,
+    )
+    assert not window.background_removal_panel.isHidden()
+    assert not window.removal_color_button.isEnabled()
+
+    window._set_combo_data(window.removal_source_combo, "custom")
+    assert window.removal_color_button.isEnabled()
+
+    document = window._settings_document()
+    assert document["image"]["remove_background"] is True
+    assert document["image"]["background_removal_source"] == "custom"
+    assert document["image"]["background_removal_scope"] == "connected"
+
+
 def test_delete_key_edits_text_while_a_layer_is_being_edited(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
