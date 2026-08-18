@@ -98,6 +98,7 @@ from app.paint_optimizer import (
     optimize_paint_plan,
     simplify_colors,
 )
+from app.paint_simulation import simulate_painted_plan
 from app.profiles import Profile, ProfileStore
 from app.settings import SettingsStore, default_settings
 
@@ -217,6 +218,16 @@ class _LoadResult:
 
 
 @dataclass(slots=True)
+class _BrushSimulationInputs:
+    """What the worker needs to preview the physical brush, worker-safe."""
+
+    responses: BrushResponseSet
+    canvas_width: int
+    canvas_height: int
+    spacing: float = 1.0
+
+
+@dataclass(slots=True)
 class _PendingPaint:
     plan: PaintPlan
     profile: Any
@@ -282,12 +293,14 @@ def _predicted_sign_colors(
     return result
 
 
-def _build_simulation_image(
-    processed: ProcessedImage, correction: ColorCorrectionModel | None = None
+def _compose_checker_backdrop(
+    source: np.ndarray,
+    mask: np.ndarray,
+    correction: ColorCorrectionModel | None = None,
 ) -> Image.Image:
-    """Build the checker-backed preview without touching Qt GUI objects."""
+    """Put painted pixels over the unpainted-checker, without Qt objects."""
 
-    width, height = processed.image.size
+    height, width = mask.shape
     scale = max(1, min(8, 800 // max(1, max(width, height))))
     tile = max(1, 8 // scale)
     row_tiles = (np.arange(height, dtype=np.int32) // tile)[:, None]
@@ -296,12 +309,22 @@ def _build_simulation_image(
     checker = np.empty((height, width, 3), dtype=np.uint8)
     checker[:] = (38, 40, 37)
     checker[dark_tiles] = (58, 61, 56)
-    source = np.asarray(processed.image.convert("RGB"), dtype=np.uint8)
-    mask = np.asarray(processed.paint_mask, dtype=np.bool_)
     if correction is not None:
         source = _predicted_sign_colors(source, mask, correction)
     checker[mask] = source[mask]
     return Image.fromarray(checker, mode="RGB")
+
+
+def _build_simulation_image(
+    processed: ProcessedImage, correction: ColorCorrectionModel | None = None
+) -> Image.Image:
+    """Build the checker-backed preview of the plan's logical target."""
+
+    return _compose_checker_backdrop(
+        np.asarray(processed.image.convert("RGB"), dtype=np.uint8),
+        np.asarray(processed.paint_mask, dtype=np.bool_),
+        correction,
+    )
 
 
 def _apply_text_overlays(
@@ -368,6 +391,7 @@ class _ImageWorker(QRunnable):
         color_correction: ColorCorrectionModel | None = None,
         paint_mode: str = PaintMode.EXACT.value,
         capabilities: BrushCapabilities | None = None,
+        brush_simulation: "_BrushSimulationInputs | None" = None,
     ) -> None:
         super().__init__()
         self.serial = serial
@@ -378,6 +402,7 @@ class _ImageWorker(QRunnable):
         self.color_correction = color_correction
         self.paint_mode = paint_mode
         self.capabilities = capabilities
+        self.brush_simulation = brush_simulation
         self.signals = _WorkerSignals()
 
     @Slot()
@@ -385,6 +410,7 @@ class _ImageWorker(QRunnable):
         try:
             base_processed = process_image(self.image, self.options)
             processed = _apply_text_overlays(base_processed, self.text_overlays)
+            has_text = processed is not base_processed
             mode = PaintMode(self.paint_mode)
             optimization = None
             if mode is PaintMode.EXACT:
@@ -431,9 +457,26 @@ class _ImageWorker(QRunnable):
                 processed = optimized_processed
             # Text stays as live vector items in the editor preview. The paint
             # plan above still uses the composited, palette-limited result.
-            simulation = _build_simulation_image(
-                simulation_processed, self.color_correction
-            )
+            brush = self.brush_simulation
+            if brush is not None and not has_text and plan.color_groups:
+                # A measured curve predicts what each stroke physically
+                # paints, so the preview can show the sign rather than the
+                # grid. Text plans keep the logical backdrop - stamping would
+                # bake the text under its own live vector item.
+                rgb, painted = simulate_painted_plan(
+                    plan,
+                    brush.canvas_width,
+                    brush.canvas_height,
+                    brush.responses,
+                    spacing=brush.spacing,
+                )
+                simulation = _compose_checker_backdrop(
+                    rgb, painted, self.color_correction
+                )
+            else:
+                simulation = _build_simulation_image(
+                    simulation_processed, self.color_correction
+                )
             stroke_pixel_steps = sum(
                 max(0, stroke.pixel_count - 1)
                 for group in plan.color_groups
@@ -2315,6 +2358,29 @@ class MainWindow(QMainWindow):
             )
         return capped
 
+    def _brush_simulation_inputs(self) -> _BrushSimulationInputs | None:
+        """What the preview worker needs to show the physical brush's work.
+
+        Only a brush measured on this canvas can predict footprints, and only
+        a job that sizes the brush will reproduce them - anything less keeps
+        the logical-grid preview.
+        """
+
+        if not self.apply_brush_check.isChecked():
+            return None
+        if self._profile_rect("brush_slider") is None:
+            return None
+        canvas = self._profile_rect("canvas")
+        responses = self._stored_brush_responses()
+        if canvas is None or responses is None:
+            return None
+        return _BrushSimulationInputs(
+            responses=responses,
+            canvas_width=canvas.width,
+            canvas_height=canvas.height,
+            spacing=float(self.pixel_spacing_spin.value()),
+        )
+
     def _processing_options(self) -> ImageProcessOptions:
         background = self._background_color()
         transparency = TransparencyMode(self.transparency_combo.currentData())
@@ -2396,6 +2462,7 @@ class MainWindow(QMainWindow):
             self._color_correction_model(),
             self._current_paint_mode(),
             self._brush_capabilities(),
+            self._brush_simulation_inputs(),
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
