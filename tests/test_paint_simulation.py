@@ -79,6 +79,40 @@ def test_square_passes_fill_their_corners_and_circles_do_not() -> None:
         assert bool(corner) is corner_painted, shape
 
 
+def test_a_well_fitted_brush_renders_solid_coverage_without_seams() -> None:
+    # Detail strokes are deliberately sized a shade under their cell; Rust's
+    # soft brush edge closes that seam on the sign, so the preview must not
+    # show a grid of gapped dots where the sign will look solid.
+    responses = BrushResponseSet(
+        # The curve can hit any target, so every row paints at 0.9 cells.
+        (build_brush_response([(0.0, 4.0), (1.0, 64.0)]),)
+    )
+    plan = _plan(
+        (
+            ColorGroup(
+                (120, 40, 40),
+                tuple(Stroke(0, y, 9, y) for y in range(10)),
+                100,
+            ),
+        )
+    )
+    _rgb, painted = simulate_painted_plan(plan, 200, 200, responses)
+    assert painted.all(), "full-coverage plans must preview with no checker gaps"
+
+
+def test_only_overshoot_extends_past_the_nominal_cells() -> None:
+    responses = BrushResponseSet(
+        (build_brush_response([(0.0, 4.0), (1.0, 64.0)]),)
+    )
+    plan = _plan((ColorGroup((10, 200, 10), (Stroke(3, 5, 6, 5),), 4),))
+    _rgb, painted = simulate_painted_plan(plan, 200, 200, responses)
+    ys, xs = np.nonzero(painted)
+    # A reachable 18px target on a 20px cell: coverage is exactly the four
+    # nominal cells, with no bleed into the neighbouring rows or columns.
+    assert ys.min() >= 100 and ys.max() <= 120
+    assert xs.min() >= 60 and xs.max() <= 140
+
+
 def test_the_simulation_downscales_a_huge_canvas() -> None:
     responses = BrushResponseSet(
         (build_brush_response([(0.0, 10.0), (1.0, 64.0)]),)

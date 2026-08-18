@@ -50,23 +50,39 @@ def _stamp_horizontal(
     y: float,
     radius: float,
     square: bool,
+    nominal_half_width: float,
+    nominal_half_height: float,
 ) -> None:
-    """Stamp one horizontal drag (or dab) of the brush onto the buffers."""
+    """Stamp one horizontal drag (or dab) of the brush onto the buffers.
+
+    Two footprints union per stroke: the *nominal* cell rectangle the plan
+    counts as covered, and the *measured* brush capsule.  The painter sizes
+    detail strokes a shade under their cell on purpose - Rust's soft brush
+    edge and the sign texture close that seam - so rendering the measured
+    disc alone would punch honest-looking but false gaps into the preview.
+    Painting the nominal rectangle always, and the capsule only where it is
+    larger, keeps the preview solid where the sign will look solid while
+    still showing every pixel of real overshoot.
+    """
 
     height, width = painted.shape
-    left = max(0, floor(min(x0, x1) - radius))
-    right = min(width, ceil(max(x0, x1) + radius) + 1)
-    top = max(0, floor(y - radius))
-    bottom = min(height, ceil(y + radius) + 1)
+    reach_x = max(radius, nominal_half_width)
+    reach_y = max(radius, nominal_half_height)
+    left = max(0, floor(min(x0, x1) - reach_x))
+    right = min(width, ceil(max(x0, x1) + reach_x) + 1)
+    top = max(0, floor(y - reach_y))
+    bottom = min(height, ceil(y + reach_y) + 1)
     if left >= right or top >= bottom:
         return
     ys = np.arange(top, bottom, dtype=np.float32)[:, None] - y
     xs = np.arange(left, right, dtype=np.float32)[None, :]
     beyond = np.maximum(np.maximum(min(x0, x1) - xs, xs - max(x0, x1)), 0.0)
-    if square:
-        mask = (np.abs(ys) <= radius) & (beyond <= radius)
-    else:
-        mask = beyond**2 + ys**2 <= radius**2
+    mask = (np.abs(ys) <= nominal_half_height) & (beyond <= nominal_half_width)
+    if radius > min(nominal_half_width, nominal_half_height):
+        if square:
+            mask |= (np.abs(ys) <= radius) & (beyond <= radius)
+        else:
+            mask |= beyond**2 + ys**2 <= radius**2
     rgb[top:bottom, left:right][mask] = color
     painted[top:bottom, left:right][mask] = True
 
@@ -99,12 +115,18 @@ def simulate_painted_plan(
     center_x = width / 2.0
     center_y = height / 2.0
 
+    cell_x = width / plan.width
+    cell_y = height / plan.height
     for group in plan.color_groups:
         response = responses.for_shape(group.brush_shape) if responses else None
-        diameter = painted_diameter(
-            response, cell, max(1, group.brush_diameter), spacing
-        )
+        diameter_cells = max(1, group.brush_diameter)
+        diameter = painted_diameter(response, cell, diameter_cells, spacing)
         radius = max(0.5, diameter * scale / 2.0)
+        # What the plan counts as covered: the stroke's own cells, its band
+        # height included. Per-axis cell sizes keep adjacent rows tiling
+        # seamlessly even when the canvas box is not perfectly proportional.
+        nominal_half_width = cell_x / 2.0
+        nominal_half_height = diameter_cells * cell_y / 2.0
         square = group.brush_shape == BrushShape.SQUARE.value
         for stroke in group.strokes:
             x0 = (stroke.start_x + 0.5) / plan.width * width
@@ -117,7 +139,16 @@ def simulate_painted_plan(
                 x1 = center_x + (x1 - center_x) * spacing
                 y0 = center_y + (y0 - center_y) * spacing
             _stamp_horizontal(
-                rgb, painted, group.color, x0, x1, y0, radius, square
+                rgb,
+                painted,
+                group.color,
+                x0,
+                x1,
+                y0,
+                radius,
+                square,
+                nominal_half_width,
+                nominal_half_height,
             )
     return rgb, painted
 
