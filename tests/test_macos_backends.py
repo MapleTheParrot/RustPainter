@@ -21,12 +21,31 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _require_display() -> None:
+    """Skip when the runner exposes no usable display.
+
+    Everything below reads or drives the window server. A CI image without an
+    attached display cannot exercise it, and that is an environment limit
+    rather than a defect worth failing the build over.
+    """
+
+    from app.screen import get_virtual_screen
+
+    try:
+        screen = get_virtual_screen()
+    except OSError as exc:
+        pytest.skip(f"No usable display on this runner: {exc}")
+    if screen.width <= 0 or screen.height <= 0:
+        pytest.skip("Display reports an empty rectangle")
+
+
 def test_pyobjc_frameworks_are_installed() -> None:
     import AppKit  # noqa: F401
     import Quartz  # noqa: F401
 
 
 def test_virtual_screen_is_sane() -> None:
+    _require_display()
     from app.screen import get_virtual_screen
 
     screen = get_virtual_screen()
@@ -36,6 +55,7 @@ def test_virtual_screen_is_sane() -> None:
 
 
 def test_cursor_position_is_reported_as_integers() -> None:
+    _require_display()
     from app.screen import get_cursor_position
 
     x, y = get_cursor_position()
@@ -43,6 +63,7 @@ def test_cursor_position_is_reported_as_integers() -> None:
 
 
 def test_controller_constructs_and_reports_position() -> None:
+    _require_display()
     from app.input_controller import QuartzInputController, create_system_input_controller
 
     controller = create_system_input_controller()
@@ -52,6 +73,7 @@ def test_controller_constructs_and_reports_position() -> None:
 
 
 def test_move_mouse_rejects_targets_outside_the_desktop() -> None:
+    _require_display()
     from app.input_controller import create_system_input_controller
     from app.screen import get_virtual_screen
 
@@ -71,6 +93,7 @@ def test_quartz_event_calls_use_correct_api_signatures() -> None:
     wrong argument type or arity, which is exactly the porting mistake worth
     catching.
     """
+    _require_display()
 
     from app.input_controller import MouseButton, create_system_input_controller
     from app.screen import get_virtual_screen
@@ -99,6 +122,7 @@ def test_quartz_event_calls_use_correct_api_signatures() -> None:
 
 def test_capture_region_matches_the_requested_rectangle() -> None:
     """Retina displays capture at pixel scale; we must return point size."""
+    _require_display()
 
     from app.models import ScreenRect
     from app.screen import capture_region, get_virtual_screen

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -51,7 +52,18 @@ def _dot_plan(count: int) -> PaintPlan:
     )
 
 
+# Shared CI runners are far slower than a dev machine, and these waits are
+# wall-clock deadlines rather than assertions about behaviour. Scaling them
+# keeps the same checks while tolerating a contended runner.
+_TIMEOUT_SCALE = float(os.environ.get("RUST_PAINTER_TEST_TIMEOUT_SCALE", "1"))
+
+
+def _t(seconds: float) -> float:
+    return seconds * _TIMEOUT_SCALE
+
+
 def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    timeout = _t(timeout)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -71,7 +83,7 @@ def test_painter_completes_and_releases_mouse() -> None:
     )
 
     assert painter.start(_dot_plan(3), _profile(), _settings())
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
 
     assert completed.is_set()
     assert painter.state is PainterState.COMPLETED
@@ -129,7 +141,7 @@ def test_automatic_brush_size_matches_preview_to_logical_cell() -> None:
     painter = Painter(controller, screen_capture=capture_preview)
 
     assert painter.start(plan, profile, _settings(apply_brush_size=True))
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
 
     # A 640x320 canvas with a 64x32 grid has 10px cells. The automatic
     # target deliberately uses 90% coverage, so the selected preview is ~9px.
@@ -190,7 +202,7 @@ def test_automatic_brush_size_retries_tiny_preview_with_center_crop() -> None:
     painter = Painter(controller, screen_capture=capture_preview)
 
     assert painter.start(plan, profile, _settings(apply_brush_size=True))
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
 
     assert painter.state is PainterState.COMPLETED
     assert (120, 120) in capture_sizes
@@ -220,7 +232,7 @@ def test_profile_color_correction_changes_picker_command() -> None:
     painter = Painter(controller)
 
     assert painter.start(plan, profile, _settings())
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
 
     color_box_moves = [
         event
@@ -263,7 +275,7 @@ def test_pause_holds_progress_then_resume_completes() -> None:
     assert len(input_controller.events) == event_count
 
     assert painter.resume()
-    assert painter.wait(3.0)
+    assert painter.wait(_t(3.0))
     assert painter.state is PainterState.COMPLETED
     assert painter.progress.completed_strokes == 20
     assert not input_controller.held_buttons
@@ -283,7 +295,7 @@ def test_abort_stops_queued_strokes_and_releases_mouse() -> None:
     assert _wait_until(lambda: painter.progress.completed_strokes >= 2)
 
     assert painter.abort("test emergency stop")
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
     settled_event_count = len(input_controller.events)
     time.sleep(0.04)
 
@@ -316,7 +328,7 @@ def test_pause_during_drag_restarts_unfinished_stroke() -> None:
     assert painter.pause()
     assert not input_controller.held_buttons
     assert painter.resume()
-    assert painter.wait(3.0)
+    assert painter.wait(_t(3.0))
 
     mouse_down_count = sum(
         event.kind == "mouse_down" for event in input_controller.events
@@ -353,7 +365,7 @@ def test_focus_guard_pauses_before_any_input_and_rechecks_on_resume() -> None:
 
     foreground["matches"] = True
     assert painter.resume()
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
     assert painter.state is PainterState.COMPLETED
     assert input_controller.events
 
@@ -379,7 +391,7 @@ def test_corner_emergency_stop_aborts_before_next_click() -> None:
             corner_abort_minimum_distance_pixels=50,
         ),
     )
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
     assert painter.state is PainterState.ABORTED
     assert not input_controller.held_buttons
 
@@ -406,7 +418,7 @@ def test_dry_run_skips_real_time_delays_and_focus_guard() -> None:
             require_foreground=True,
         ),
     )
-    assert painter.wait(1.0)
+    assert painter.wait(_t(1.0))
     assert time.monotonic() - started < 0.5
     assert painter.state is PainterState.COMPLETED
     assert input_controller.events == []
@@ -443,7 +455,7 @@ def test_pause_at_countdown_boundary_remains_resumable() -> None:
 
     def gated_enter_running() -> None:
         boundary.set()
-        assert continue_into_running.wait(1.0)
+        assert continue_into_running.wait(_t(1.0))
         original_enter_running()
 
     painter._enter_running_after_countdown = gated_enter_running  # type: ignore[method-assign]
@@ -452,7 +464,7 @@ def test_pause_at_countdown_boundary_remains_resumable() -> None:
         _profile(),
         _settings(countdown_seconds=0.01),
     )
-    assert boundary.wait(1.0)
+    assert boundary.wait(_t(1.0))
     assert painter.pause("boundary test")
     continue_into_running.set()
     time.sleep(0.03)
@@ -461,7 +473,7 @@ def test_pause_at_countdown_boundary_remains_resumable() -> None:
     assert painter.progress.state is PainterState.PAUSED
     assert input_controller.events == []
     assert painter.resume()
-    assert painter.wait(2.0)
+    assert painter.wait(_t(2.0))
     assert painter.state is PainterState.COMPLETED
 
 

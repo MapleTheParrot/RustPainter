@@ -43,3 +43,34 @@ def test_reference_comparison_is_coarse_and_deterministic() -> None:
     assert identical.passed and identical.similarity == 1.0
     assert not different.passed and different.similarity < 0.85
     assert not wrong_size.passed and wrong_size.reason == "image dimensions differ"
+
+def test_executable_name_is_parsed_regardless_of_path_separator() -> None:
+    """Path().name only understands the host separator.
+
+    A Windows-style executable path read (or configured) on macOS must still
+    reduce to its file name, otherwise the foreground guard silently never
+    matches. Regression test for the macOS CI failure.
+    """
+
+    from app.screen import _executable_basename
+
+    assert _executable_basename(r"C:\Games\Rust\RustClient.exe") == "RustClient.exe"
+    assert _executable_basename("/Applications/Rust.app/Contents/MacOS/Rust") == "Rust"
+    assert _executable_basename("RustClient.exe") == "RustClient.exe"
+    assert _executable_basename("") == ""
+
+    windows_style = ForegroundWindowInfo(
+        hwnd=1,
+        title="Rust",
+        process_id=123,
+        executable=r"C:\Games\Rust\RustClient.exe",
+    )
+    assert windows_style.executable_name == "RustClient.exe"
+    posix_style = ForegroundWindowInfo(
+        hwnd=1,
+        title="Rust",
+        process_id=123,
+        executable="/Applications/Rust.app/Contents/MacOS/Rust",
+    )
+    assert posix_style.executable_name == "Rust"
+    assert foreground_window_matches(executable="Rust", info=posix_style)

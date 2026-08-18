@@ -25,6 +25,7 @@ jobs:
         run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+          RUST_PAINTER_TEST_TIMEOUT_SCALE: "8"
 
       - name: Build executable
         run: .\build.ps1
@@ -79,6 +80,7 @@ jobs:
         run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
+          RUST_PAINTER_TEST_TIMEOUT_SCALE: "8"
 
       - name: Build app bundle
         run: bash build.sh

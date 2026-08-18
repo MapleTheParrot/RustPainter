@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
 
+import pytest
+
 from app.hotkeys import GlobalHotkeyManager, HotkeyRegistrationError
+
+# These two exercise the Win32 message loop by patching ctypes.WinDLL, which
+# only exists on Windows. The darwin event-tap path is covered separately by
+# tests/test_macos_backends.py.
+windows_only = pytest.mark.skipif(
+    os.name != "nt", reason="Win32 hotkey message loop requires Windows"
+)
 
 
 class _NativeFunction:
@@ -13,6 +23,7 @@ class _NativeFunction:
         return self.implementation(*args)
 
 
+@windows_only
 def test_unexpected_message_loop_exit_is_reported_after_running_is_cleared(
     monkeypatch,
 ) -> None:
@@ -49,6 +60,7 @@ def test_unexpected_message_loop_exit_is_reported_after_running_is_cleared(
     assert states_seen_by_error_callback == [False]
 
 
+@windows_only
 def test_callback_failure_tears_down_hotkeys(monkeypatch) -> None:
     messages = [0x0312, 0]
 

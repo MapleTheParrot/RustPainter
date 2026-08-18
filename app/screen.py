@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,20 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger("rust_painter.screen")
+
+
+def _executable_basename(value: str) -> str:
+    """Return the file name from either a Windows or a POSIX path.
+
+    ``Path(value).name`` only understands the host separator, so a Windows
+    path read on macOS -- or typed into the expected-process setting by a user
+    on either OS -- would otherwise be treated as one long file name and never
+    match.
+    """
+
+    if not value:
+        return ""
+    return re.split(r"[\\/]", value)[-1]
 
 
 class RectangleLike(Protocol):
@@ -59,7 +74,7 @@ class ForegroundWindowInfo:
 
     @property
     def executable_name(self) -> str:
-        return Path(self.executable).name if self.executable else ""
+        return _executable_basename(self.executable) if self.executable else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,7 +370,7 @@ def foreground_window_matches(
     if title_contains and title_contains.casefold() not in current.title.casefold():
         return False
     if executable:
-        expected_name = Path(executable).name.casefold()
+        expected_name = _executable_basename(executable).casefold()
         current_name = current.executable_name.casefold()
         if not current_name or expected_name != current_name:
             return False
