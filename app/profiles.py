@@ -152,6 +152,11 @@ class MonitorMetadata:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ProfileDataError("Monitor name must not be empty")
+        # Qt pads some EDID-derived screen names ("ATNA40CU05-0 ").  Deserialization
+        # strips names, so an unstripped captured name would never compare equal to
+        # its own saved copy and every calibration would look like a layout change.
+        if self.name != self.name.strip():
+            object.__setattr__(self, "name", self.name.strip())
         if not math.isfinite(self.device_pixel_ratio) or self.device_pixel_ratio <= 0:
             raise ProfileDataError("Monitor device_pixel_ratio must be positive")
 

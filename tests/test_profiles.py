@@ -165,3 +165,23 @@ def test_display_metadata_warns_when_coordinate_mode_changes() -> None:
     physical = DisplayMetadata(virtual_screen=bounds, coordinate_space="physical")
 
     assert "display coordinate mode changed" in logical.differences(physical)
+
+
+def test_padded_screen_name_survives_a_save_and_reload_without_looking_changed() -> None:
+    # Qt reports some EDID-derived names with trailing whitespace, e.g. the
+    # laptop panel "ATNA40CU05-0 ".  Deserialization strips names, so an
+    # unstripped captured name used to mismatch its own saved copy and make
+    # every recalibration report "connected displays changed".
+    captured = DisplayMetadata(
+        monitors=(
+            MonitorMetadata(name="ATNA40CU05-0 ", rect=Rect(0, 0, 2880, 1800), primary=True),
+            MonitorMetadata(name="CQ32G4", rect=Rect(149, -1440, 2560, 1440)),
+        ),
+        virtual_screen=Rect(0, -1440, 2880, 3240),
+    )
+
+    reloaded = DisplayMetadata.from_dict(json.loads(json.dumps(captured.to_dict())))
+
+    assert captured.monitors[0].name == "ATNA40CU05-0"
+    assert reloaded.differences(captured) == []
+    assert reloaded.is_compatible(captured)
