@@ -8,6 +8,7 @@ from app.brush_calibration import (
     BRUSH_SIZE_MAX,
     BRUSH_SIZE_MIN,
     BrushSizeModel,
+    canonical_texture_rows,
     fit_brush_size_model,
     measure_stroke_band,
 )
@@ -185,3 +186,27 @@ def test_coverage_is_judged_against_the_color_the_stroke_rendered_as() -> None:
 
     assert band.height == pytest.approx(20.0)
     assert band.touched_height == pytest.approx(20.0)
+
+
+def test_canonical_rows_snap_measurement_noise_to_the_texture_size() -> None:
+    """527 measured rows on a 512-row sign is noise, not a 527-row sign."""
+
+    assert canonical_texture_rows(527.0) == 512
+    assert canonical_texture_rows(495.0) == 512
+    assert canonical_texture_rows(250.0) == 256
+    assert canonical_texture_rows(1025.1) == 1024
+    assert canonical_texture_rows(128.0) == 128
+
+
+def test_canonical_rows_keep_a_measurement_far_from_every_power_of_two() -> None:
+    """A sign that truly is not a power of two must not be bent into one."""
+
+    assert canonical_texture_rows(100.0) == 100
+    assert canonical_texture_rows(768.4) == 768
+
+
+def test_canonical_rows_reject_nonsense_measurements() -> None:
+    assert canonical_texture_rows(0.0) == 0
+    assert canonical_texture_rows(-12.0) == 0
+    assert canonical_texture_rows(float("nan")) == 0
+    assert canonical_texture_rows(float("inf")) == 0

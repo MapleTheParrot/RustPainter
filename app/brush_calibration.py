@@ -62,6 +62,32 @@ _SOLID_TOLERANCE = 0.30
 # measured the same band - the digits never reached Rust's Size field.
 _MIN_SLOPE = 1e-5
 
+# Rust's sign textures come in power-of-two sizes.  A fitted row count carries
+# a few percent of band-measurement noise - reading 527 rows on a 512-row sign
+# is normal - so a measurement within this tolerance of a power of two *is*
+# that power of two.  A measurement far from every one is kept as measured:
+# rounding it to a size the sign cannot be would misalign every row.
+_CANONICAL_TEXTURE_SIZES = (32, 64, 128, 256, 512, 1024, 2048)
+_CANONICAL_TOLERANCE = 0.15
+
+
+def canonical_texture_rows(measured: float) -> int:
+    """Snap a measured texel count to the power of two it is within noise of.
+
+    The distinction matters most at native resolution: planning 527 rows on a
+    512-row sign guarantees fifteen collisions where two logical rows fight
+    over one texel, while planning exactly 512 lines every cell up with its
+    texel.  The measurement's job is to pick the right power of two, not to be
+    believed to the last row.
+    """
+
+    if not np.isfinite(measured) or measured <= 0:
+        return 0
+    for size in _CANONICAL_TEXTURE_SIZES:
+        if abs(measured / size - 1.0) <= _CANONICAL_TOLERANCE:
+            return size
+    return int(round(measured))
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -315,6 +341,7 @@ __all__ = [
     "BRUSH_SIZE_MAX",
     "BRUSH_SIZE_MIN",
     "BRUSH_SIZE_STEP",
+    "canonical_texture_rows",
     "format_brush_size",
     "BRUSH_SIZE_MODEL_SCHEMA",
     "BrushSizeModel",
