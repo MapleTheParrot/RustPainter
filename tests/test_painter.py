@@ -12,7 +12,7 @@ from app.color_calibration import ColorCorrectionModel
 from app.color_mapping import map_rgb_to_picker
 from app.input_controller import DryRunInputController, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
-from app.painter import Painter, PainterSettings, PainterState
+from app.painter import Painter, PainterSettings, PainterState, PaintingTarget
 from app.screen import VirtualScreen
 from app.brush_calibration import fit_brush_size_model
 from app.profiles import CalibrationProfile
@@ -1231,3 +1231,57 @@ def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:
     assert painter.state is PainterState.ERROR
     assert errors and "did not grow" in errors[0]
     assert painter.measured_brush_size_model is None
+
+
+def test_one_cell_overlap_tapers_from_half_a_texel_to_a_quarter() -> None:
+    """The stripe hedge shrinks as the cell grid approaches the texel grid.
+
+    With cells two texels or coarser, cell boundaries land at arbitrary
+    fractional texel positions and the in-game-proven half texel of overlap is
+    what closes the worst case.  At native resolution the grids line up by
+    construction, so only calibration slop remains: a quarter texel still
+    bridges a snapped-away row while bleeding half as far into the
+    neighbouring detail the native plan exists to keep.
+    """
+
+    # One Size unit is one screen pixel: a 320-row sign on a 320px canvas.
+    model = fit_brush_size_model([(size, size / 320.0) for size in (60, 30, 12)])
+    target = PaintingTarget(
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+    )
+
+    def texels(plan_width: int, plan_height: int) -> float:
+        plan = PaintPlan(plan_width, plan_height, ())
+        return Painter._brush_target_fraction(target, plan, 1, 1.0, model) * 320.0
+
+    # 10px cells are 10 texels: far above the taper, the full half texel.
+    assert texels(64, 32) == pytest.approx(10.5)
+    # 2px cells are exactly 2 texels: the taper's proven upper anchor.
+    assert texels(320, 160) == pytest.approx(2.5)
+    # 1.25 texels per cell sits inside the taper.
+    assert texels(512, 256) == pytest.approx(1.5625)
+    # Native resolution: one cell per texel, and only a quarter texel of hedge.
+    assert texels(640, 320) == pytest.approx(1.25)
+
+
+def test_native_resolution_types_a_size_barely_over_one() -> None:
+    """At one cell per texel the typed Size number stays next to Rust's minimum.
+
+    This is the whole quality budget of a Max-resolution plan: the earlier
+    fixed half-texel hedge would have typed 1.5 and smeared every stroke into
+    both neighbouring texel rows.
+    """
+
+    model = fit_brush_size_model([(size, size / 320.0) for size in (60, 30, 12)])
+    target = PaintingTarget(
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+    )
+    plan = PaintPlan(640, 320, ())
+
+    fraction = Painter._brush_target_fraction(target, plan, 1, 1.0, model)
+
+    assert model.clamped_size_for_fraction(fraction) == pytest.approx(1.25)

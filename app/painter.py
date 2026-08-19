@@ -995,22 +995,35 @@ class Painter:
         whichever pitch is tighter.  The result is expressed against the canvas
         height because that is the axis brush calibration measured.
 
-        A one-cell brush targets the full pitch plus half a sign texel.  The
-        sign renders every stroke snapped to its own texture rows, so a brush
-        sized exactly to the pitch still comes out half a texel narrow on the
+        A one-cell brush targets the full pitch plus a fraction of a sign
+        texel.  The sign renders every stroke snapped to its own texture rows,
+        so a brush sized exactly to the pitch still comes out narrow on the
         rows where snapping lands low - and those rows show as bare stripes
-        across the painting.  Half a texel of overlap costs nothing visible:
-        boundaries are texel-quantized either way, and the later-painted color
-        simply owns the shared texel.  (An earlier version undershot to 90%
-        instead, and the stripes were plainly visible in game.)
+        across the painting.  (An earlier version undershot to 90% instead,
+        and the stripes were plainly visible in game.)
+
+        How much overlap the hedge needs depends on how far the plan's cell
+        grid can drift from the texel grid.  With cells two texels or coarser,
+        cell boundaries land at arbitrary fractional texel positions, and half
+        a texel - proven in game - is what closes the worst case.  At native
+        resolution one cell *is* one texel, the grids line up by construction,
+        and the only residual error is canvas-calibration slop; a quarter
+        texel still bridges a snapped-away row there, while bleeding half as
+        far into neighbouring cells whose detail is the whole point of
+        painting at native resolution.  The taper between those anchors is
+        linear.  Either way the overlap costs nothing visible at its own
+        scale: boundaries are texel-quantized regardless, and the
+        later-painted color simply owns the shared texel.
         """
 
         canvas = target.canvas
         pitch = min(canvas.width / plan.width, canvas.height / plan.height)
         span = pitch * diameter_cells * min(spacing, 1.0)
         fraction = span / canvas.height
-        if diameter_cells <= 1 and model is not None:
-            fraction += 0.5 * model.slope
+        if diameter_cells <= 1 and model is not None and model.slope > 0:
+            texels_per_cell = fraction / model.slope
+            overlap = min(0.5, max(0.25, 0.25 * texels_per_cell))
+            fraction += overlap * model.slope
         return fraction
 
     def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:
