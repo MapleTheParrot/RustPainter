@@ -41,6 +41,18 @@ QUALITY_PRESETS: dict[str, dict[str, int]] = {
 }
 
 SUPPORTED_COLOR_COUNTS = {8, 16, 24, 32, 48, 64, 96, 128, 256}
+
+# New installs start at the richest palette Rust can be asked for.  Fewer
+# colors is a deliberate trade for speed, and someone who wants that trade
+# will go and make it; someone who never opens the setting should not have
+# their artwork quietly posterized on the way in.
+DEFAULT_COLOR_COUNT = max(SUPPORTED_COLOR_COUNTS)
+
+# Containers a recorded timelapse can be saved as.  Kept here rather than
+# imported from the exporter so validating a settings file never has to
+# load an image library.
+SUPPORTED_VIDEO_FORMATS = {"mp4", "avi", "gif"}
+
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
@@ -57,7 +69,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "paint_mode": "balanced",
         "logical_width": 256,
         "logical_height": 128,
-        "color_count": 32,
+        "color_count": DEFAULT_COLOR_COUNT,
         "dithering": False,
         "background_mode": "unpainted",
         "background_color": "#FFFFFF",
@@ -112,6 +124,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "enabled": False,
         "interval_seconds": 10,
         "capture_final_frame": True,
+        # Speed used both to play a recording back in the app and to encode it
+        # into a video file, so what the user watched is what they save.
+        "playback_frame_rate": 15,
+        "export_format": "avi",
     },
     "hotkeys": {
         "start_resume": "F8",
@@ -377,6 +393,20 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError(
             "timelapse.interval_seconds must be between 1 and 3600 seconds"
         )
+    frame_rate = timelapse.get("playback_frame_rate", 15)
+    if (
+        isinstance(frame_rate, bool)
+        or not isinstance(frame_rate, int)
+        or not 1 <= frame_rate <= 60
+    ):
+        raise SettingsError(
+            "timelapse.playback_frame_rate must be an integer from 1 to 60"
+        )
+    if timelapse.get("export_format", "avi") not in SUPPORTED_VIDEO_FORMATS:
+        raise SettingsError(
+            "timelapse.export_format must be one of: "
+            + ", ".join(sorted(SUPPORTED_VIDEO_FORMATS))
+        )
 
     assert isinstance(hotkeys, Mapping)
     for key in ("start_resume", "pause", "abort"):
@@ -558,10 +588,12 @@ class SettingsStore:
 
 
 __all__ = [
+    "DEFAULT_COLOR_COUNT",
     "DEFAULT_SETTINGS",
     "DEFAULT_SETTINGS_PATH",
     "QUALITY_PRESETS",
     "SETTINGS_SCHEMA_VERSION",
+    "SUPPORTED_VIDEO_FORMATS",
     "SettingsError",
     "SettingsStore",
     "default_settings",

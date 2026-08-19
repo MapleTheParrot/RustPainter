@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from app.settings import SettingsError, SettingsStore, default_settings
+from app.settings import (
+    DEFAULT_COLOR_COUNT,
+    SettingsError,
+    SettingsStore,
+    default_settings,
+)
 
 
 def _text_layer(**overrides):
@@ -52,7 +57,7 @@ def test_default_settings_returns_independent_documents() -> None:
     first = default_settings()
     second = default_settings()
     first["image"]["color_count"] = 8
-    assert second["image"]["color_count"] == 32
+    assert second["image"]["color_count"] == DEFAULT_COLOR_COUNT
     assert second["execution"]["dry_run"] is False
     assert second["image"]["text_overlay"] == {
         "layers": [

@@ -628,18 +628,24 @@ def test_brush_application_requires_the_size_value_box() -> None:
         )
 
 
-def test_brush_application_requires_a_measured_model() -> None:
-    """A calibrated box is only half of it; the numbers still mean nothing."""
+def test_brush_application_requires_a_way_to_clear_the_sign() -> None:
+    """The job measures the brush on the sign, so the probes must be erasable."""
 
     profile = _profile()
     profile.brush_size_box = ScreenRect(800, 100, 60, 24)
-    painter = Painter(MockInputController())
-    with pytest.raises(ValueError, match="Measure Brush Size"):
+    controller = MockInputController()
+    # The guard protects real input; mocks stand in for the system backend.
+    controller.emits_real_input = True  # type: ignore[misc]
+    painter = Painter(controller)
+    with pytest.raises(ValueError, match="clear control"):
         painter.configure(
             _dot_plan(1),
             profile,
             _settings(apply_brush_size=True),
         )
+
+    profile.clear_button = ScreenRect(880, 100, 24, 24)
+    painter.configure(_dot_plan(1), profile, _settings(apply_brush_size=True))
 
 
 def test_foreground_failure_reason_calls_out_an_impossible_windows_name() -> None:
@@ -818,6 +824,283 @@ def _sign_simulator(controller: MockInputController, canvas: ScreenRect, sign_ro
         return image
 
     return capture
+
+
+def _clearable_sign(
+    controller: MockInputController,
+    canvas: ScreenRect,
+    clear_button: ScreenRect,
+    sign_rows: int,
+):
+    """A fake sign that paints Size-wide bands and wipes on the clear click.
+
+    Like :func:`_sign_simulator` it replays the recorded events on every
+    capture, so it only ever knows what the painter really did - including
+    whether it actually clicked the control that clears the sign.
+    """
+
+    palette = ((255, 0, 255), (0, 255, 0), (255, 200, 0), (0, 200, 255))
+    scale = canvas.height / sign_rows
+
+    def capture(rect) -> Image.Image:
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            return Image.new("RGB", (rect.width, rect.height), (21, 21, 12))
+        image = Image.new("RGB", (rect.width, rect.height), (96, 96, 96))
+        draw = ImageDraw.Draw(image)
+        size = 0.0
+        digits = ""
+        position = (0, 0)
+        painted = 0
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+            elif event.kind == "key_down":
+                value = event.value
+                if value == 0xBE:  # VK_OEM_PERIOD
+                    digits += "."
+                elif isinstance(value, str) and len(value) == 1 and value.isdigit():
+                    digits += value
+                elif value == "ENTER":
+                    size = float(digits) if digits else size
+                    digits = ""
+                else:
+                    digits = ""
+            elif event.kind == "mouse_down":
+                if clear_button.contains(*position):
+                    image = Image.new("RGB", (rect.width, rect.height), (96, 96, 96))
+                    draw = ImageDraw.Draw(image)
+                    painted = 0
+                elif canvas.contains(*position):
+                    height = max(1, round(size * scale))
+                    top = round(rect.height / 2 - height / 2)
+                    draw.rectangle(
+                        (10, top, rect.width - 11, top + height - 1),
+                        fill=palette[painted % len(palette)],
+                    )
+                    painted += 1
+        return image
+
+    return capture
+
+
+def _impatient(painter: Painter) -> Painter:
+    """Strip the frame-rate waits a real Rust client needs but a fake does not.
+
+    The waits exist because Rust redraws at about 15 FPS; a simulated sign
+    repaints instantly, so leaving them in would spend ten seconds proving
+    nothing about the ordering these tests are checking.
+    """
+
+    painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
+    painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
+    return painter
+
+
+def _calibrating_profile(name: str) -> CalibrationProfile:
+    return CalibrationProfile.new(
+        name,
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
+        clear_button=ScreenRect(880, 100, 24, 24),
+    )
+
+
+def _position_at(controller: MockInputController, index: int) -> tuple[int, int]:
+    """Where the cursor had been commanded to by event ``index``."""
+
+    position = (0, 0)
+    for event in controller.events[: index + 1]:
+        if event.kind == "move" and event.x is not None and event.y is not None:
+            position = (event.x, event.y)
+    return position
+
+
+def _one_cell_plan() -> PaintPlan:
+    return PaintPlan(64, 32, (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),))
+
+
+def test_a_paint_job_measures_the_brush_then_wipes_it_before_painting() -> None:
+    """The whole point of dropping the manual step: it happens on every run.
+
+    A stored measurement describes a sign the user may since have re-framed or
+    walked away from, so the run measures the sign in front of it - and the
+    probes it paints have to be gone before the artwork starts.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Self calibrating")
+    assert profile.canvas is not None and profile.clear_button is not None
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller, profile.canvas, profile.clear_button, sign_rows=320
+            ),
+        )
+    )
+
+    assert painter.start(
+        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+    )
+    assert painter.wait(_t(10.0))
+    assert painter.state is PainterState.COMPLETED
+
+    # The job fitted its own model rather than leaning on the profile's.
+    model = painter.measured_brush_size_model
+    assert model is not None
+    assert model.sign_pixel_rows == pytest.approx(320.0, rel=0.05)
+
+    typed = _typed_values(controller)
+    # Probe sizes first, then the size the artwork actually wants: a 640x320
+    # canvas under a 64x32 grid is a 10px cell, plus half a texel of overlap.
+    assert len(typed) > 1
+    assert typed[-1] == "10.5"
+
+    # The clear click has to land after the last probe and before the artwork.
+    clicks = [
+        index
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down"
+    ]
+    cleared_at = next(
+        index
+        for index in clicks
+        if profile.clear_button.contains(*_position_at(controller, index))
+    )
+    on_canvas = [
+        index
+        for index in clicks
+        if profile.canvas.contains(*_position_at(controller, index))
+    ]
+    assert on_canvas, "the job never painted on the sign"
+    assert on_canvas[-1] > cleared_at
+    assert not controller.held_buttons
+
+
+def test_a_clear_control_that_clears_nothing_stops_the_job() -> None:
+    """A misdragged trash box would paint the artwork over the probe strokes."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Deaf clear")
+    assert profile.canvas is not None
+    # The simulated sign wipes on a control nothing will ever click, so its
+    # probe bands survive the painter's clear click.
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller,
+                profile.canvas,
+                ScreenRect(2000, 2000, 4, 4),
+                sign_rows=320,
+            ),
+        )
+    )
+    errors: list[str] = []
+    painter.set_callbacks(on_error=lambda exc: errors.append(str(exc)))
+
+    assert painter.start(
+        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+    )
+    assert painter.wait(_t(10.0))
+
+    assert painter.state is PainterState.ERROR
+    assert errors and "did not clear the sign" in errors[0]
+    assert not controller.held_buttons
+
+
+def test_a_pause_during_calibration_measures_again_instead_of_failing() -> None:
+    """Pausing in the first seconds must not throw the whole job away.
+
+    A pause hands the mouse back, so the probes on either side of it describe
+    different signs; the run restarts the measurement rather than fitting a
+    line through both halves.
+    """
+
+    from app.painter import _RetryAction
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Interrupted")
+    assert profile.canvas is not None and profile.clear_button is not None
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller, profile.canvas, profile.clear_button, sign_rows=320
+            ),
+        )
+    )
+    real_measure = painter._measure_brush_size_model
+    attempts: list[int] = []
+
+    def flaky(job):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _RetryAction
+        return real_measure(job)
+
+    painter._measure_brush_size_model = flaky  # type: ignore[method-assign]
+
+    assert painter.start(
+        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+    )
+    assert painter.wait(_t(10.0))
+
+    assert attempts == [1, 1]
+    assert painter.state is PainterState.COMPLETED
+    assert _typed_values(controller)[-1] == "10.5"
+
+
+def test_calibration_that_is_never_left_alone_stops_the_job() -> None:
+    from app.painter import _RetryAction
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Always interrupted")
+    painter = _impatient(Painter(controller, screen_capture=_panel_capture))
+
+    def never(_job):
+        raise _RetryAction
+
+    painter._measure_brush_size_model = never  # type: ignore[method-assign]
+    errors: list[str] = []
+    painter.set_callbacks(on_error=lambda exc: errors.append(str(exc)))
+
+    assert painter.start(
+        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+    )
+    assert painter.wait(_t(5.0))
+
+    assert painter.state is PainterState.ERROR
+    assert errors and "interrupted every time" in errors[0]
+    assert not controller.held_buttons
+
+
+def test_a_dry_run_never_paints_calibration_probes() -> None:
+    """Nothing that does not emit input may put strokes on somebody's sign."""
+
+    controller = MockInputController()  # emits_real_input is False
+    profile = _calibrating_profile("Dry")
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 320.0) for size in (60, 30, 12)]
+    ).to_dict()
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    assert painter.start(
+        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+    )
+    assert painter.wait(_t(2.0))
+
+    assert painter.state is PainterState.COMPLETED
+    assert painter.measured_brush_size_model is None
+    # Only the artwork's own brush number was typed; nothing was probed.
+    assert _typed_values(controller) == ["10.5"]
 
 
 def test_brush_measurement_fits_the_sign_it_probes() -> None:

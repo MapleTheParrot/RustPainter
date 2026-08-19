@@ -226,6 +226,13 @@ def main() -> None:
     arguments.out.mkdir(parents=True, exist_ok=True)
     store = ProfileStore(_data_directory() / "profiles")
     profile = store.get_default() or store.list_profiles()[0]
+    if profile.clear_button is None:
+        # Painting measures the brush itself and wipes the probes with this
+        # control.  The harness has always known where the trash icon is, so
+        # it stands in for a profile calibrated before the field existed.
+        profile.clear_button = ScreenRect(
+            TRASH_BUTTON[0] - 6, TRASH_BUTTON[1] - 6, 12, 12
+        )
     canvas = _rect(profile.canvas)
     park = (
         int(profile.color_box.left + profile.color_box.width / 2),
@@ -240,6 +247,9 @@ def main() -> None:
         print("canvas cleared")
 
     if arguments.measure:
+        # Painting now measures the brush on every run, so this only exists to
+        # score a measurement on its own, or to seed a model for the planner
+        # before the first paint of a new sign.
         cell = min(canvas.width / 256, canvas.height / 214)
         measure(store, profile, cell / canvas.height, arguments.out)
         profile = store.get_default() or store.list_profiles()[0]

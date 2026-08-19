@@ -45,6 +45,7 @@ def _complete_profile() -> Profile:
         color_box=Rect(1680, 610, 254, 252),
         hue_bar=Rect(1937, 610, 40, 252),
         brush_size_box=Rect(1760, 392, 62, 26),
+        clear_button=Rect(1690, 392, 30, 30),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -71,6 +72,7 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "color_box": True,
         "hue_bar": True,
         "brush_size_box": True,
+        "clear_button": True,
     }
     assert restored.display is not None
     assert restored.display.virtual_screen == Rect(-1920, 0, 4480, 1440)

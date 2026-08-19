@@ -118,13 +118,13 @@ painting unattended. Everything below is detail you only need when tuning.
 - Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
-- Drag calibration for the canvas, color box, hue bar, and the optional numeric Size field, with an on-screen overlay to verify them
-- Brush sizing measured from the sign itself: a few probe strokes fit what Rust's Size numbers really cover, and the result is stored as a fraction of the sign so it survives zooming, a new painting resolution, and a different monitor
+- Drag calibration for the canvas, color box, hue bar, and - for automatic brush sizing - the numeric Size field and Rust's clear button, with an on-screen overlay to verify them
+- Brush sizing measured from the sign itself at the start of every job: a few probe strokes fit what Rust's Size numbers really cover, the sign is wiped clean again, and only then does the artwork go down
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
-- A Timelapse tab that captures a PNG frame of the sign at a set interval while painting and manages the recorded sessions, ready to assemble into a video
+- A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
@@ -134,7 +134,7 @@ painting unattended. Everything below is detail you only need when tuning.
 2. Open the target sign's painting interface and leave it stationary.
 3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
 4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through and hide automatically while painting).
-5. If automatic brush sizing is wanted, calibrate the numeric **Size value box** beside Rust's size slider, then click **Measure Brush Size** once. Measuring paints a scout stroke to find the scale, then four probe strokes bracketing the brush your current resolution needs, and reads back how much of the sign each one actually covered; paint over them afterwards or clear the sign. Only solid coverage counts - Rust's brush fades out over its last texture pixel, and a cell left under that fade still looks unpainted. Because the result is a fraction of the sign rather than a pixel count, one measurement covers that sign type at any camera distance; re-measure after a large change of painting resolution, which the log warns about.
+5. If automatic brush sizing is wanted, calibrate the numeric **Size value box** beside Rust's size slider and the **Clear button** (Rust's trash icon, which wipes the sign). There is nothing to run by hand: every paint job measures the brush itself, then clears the sign before it paints. Measuring paints a scout stroke to find the scale, then a few probe strokes bracketing the brush your resolution needs, and reads back how much of the sign each one actually covered. Only solid coverage counts - Rust's brush fades out over its last texture pixel, and a cell left under that fade still looks unpainted. Measuring every run rather than once is what removes the step that used to be missed: a stored measurement describes a sign you may since have re-framed, walked away from, or replaced, and a stale one paints the whole image at the wrong width.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
 8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
@@ -249,7 +249,7 @@ Rust brush behavior can vary with sign type, selected in-game brush, frame rate,
 
 - Painting speed preset (Relaxed / Standard / Fast / Turbo); editing any timing value switches it to Custom
 - Stroke merging (Off / Balanced / Maximum) under Paint Quality
-- Automatic brush sizing, which types the Size number a logical cell needs (optional; needs the Size value box calibrated and measured)
+- Automatic brush sizing, which types the Size number a logical cell needs (optional; needs the Size value box and the clear button calibrated)
 - Logical pixel spacing
 - Stroke duration/speed and interpolation step
 - Mouse-down time for dots
@@ -288,13 +288,26 @@ the app's data directory. The interval is adjustable from 1 to 600 seconds,
 paused time is skipped, and a final frame of the finished sign is captured when
 the job completes.
 
-The tab lists every recording newest first with its frame count and size, shows
-what the current job is recording, and can open or delete a selected session.
-Assemble the frames with any video tool, for example:
+Recording starts when the artwork does, so a video opens on a blank sign
+rather than on the brush-calibration strokes the job wipes off first.
 
-```
-ffmpeg -framerate 30 -i frame_%05d.png timelapse.mp4
-```
+The tab lists every recording newest first with its frame count and size, and
+shows what the current job is recording. Select one and:
+
+- **Watch** plays it back in a window inside RustPainter. Space plays and
+  pauses, the arrow keys step one frame, and the slider scrubs. Double-clicking
+  a recording in the list opens it too.
+- **Save as video** writes the whole recording to one file. **Speed** sets both
+  the playback rate and the exported frame rate, so what you watched is what
+  you save.
+
+AVI (Motion JPEG) and animated GIF are written by RustPainter itself and need
+nothing installed. MP4 is offered as well when `ffmpeg` is on `PATH` (or named
+by the `RUST_PAINTER_FFMPEG` environment variable); it is smaller and travels
+better. Exporting never touches the captured PNG frames, so a recording can be
+saved again at a different speed or in a different format, and a cancelled or
+failed export deletes its half-written file rather than leaving a video that
+stops mid-paint.
 
 ## Sign color correction
 

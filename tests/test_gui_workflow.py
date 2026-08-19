@@ -28,7 +28,7 @@ from app.models import (
     Stroke,
     TransparencyMode,
 )
-from app.painter import Painter, PainterState
+from app.painter import PaintProgress, Painter, PainterState
 from app.brush_calibration import fit_brush_size_model
 from app.profiles import DisplayMetadata, Profile, Rect
 from app.screen import VirtualScreen
@@ -455,24 +455,34 @@ def test_automatic_brush_sizing_marks_its_calibration_as_required(
     window: MainWindow,
 ) -> None:
     window._current_profile.brush_size_box = None
+    window._current_profile.clear_button = None
     window.apply_brush_check.setChecked(False)
     window._refresh_profile_ui()
     assert window.brush_size_box_status._value.text() == "Optional"
+    assert window.clear_button_status._value.text() == "Optional"
 
+    # Sizing measures the brush on the sign every run, so the control that
+    # wipes the measurement off is as required as the Size field itself.
     window.apply_brush_check.setChecked(True)
     assert window.brush_size_box_status._value.text() == "Needed"
+    assert window.clear_button_status._value.text() == "Needed"
 
 
 def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> None:
+    window.apply_brush_check.setChecked(True)
     window._current_profile.brush_size_box = None
+    window._current_profile.clear_button = None
     window._current_profile.metadata.pop("brush_size_model", None)
     window._refresh_profile_ui()
-    assert "calibrate the Size value box" in window.brush_model_status.text()
-    assert not window.clear_brush_model_button.isEnabled()
+    assert "Size value box and clear button" in window.brush_model_status.text()
 
     window._current_profile.brush_size_box = ScreenRect(220, 120, 60, 24)
     window._refresh_profile_ui()
-    assert "run Measure Brush Size" in window.brush_model_status.text()
+    assert "clear button calibrated" in window.brush_model_status.text()
+
+    window._current_profile.clear_button = ScreenRect(300, 120, 24, 24)
+    window._refresh_profile_ui()
+    assert "measures this sign's brush" in window.brush_model_status.text()
 
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 128.0) for size in (60, 30, 12)]
@@ -481,7 +491,9 @@ def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> No
     # The derived row count is the number a user can sanity-check against the
     # sign they are actually looking at.
     assert "128 rows" in window.brush_model_status.text()
-    assert window.clear_brush_model_button.isEnabled()
+
+    window.apply_brush_check.setChecked(False)
+    assert "Automatic brush sizing is off" in window.brush_model_status.text()
 
 
 def test_dry_run_completes_without_sendinput(
@@ -1173,7 +1185,13 @@ def test_size_value_box_is_required_only_when_brush_application_is_enabled(
     with pytest.raises(ValueError, match="numeric Size field"):
         window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
 
+    # Sizing measures the brush on the sign, so it also needs the control that
+    # wipes the measurement off before the artwork goes down.
     profile.brush_size_box = ScreenRect(220, 120, 60, 24)
+    with pytest.raises(ValueError, match="clear button"):
+        window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
+
+    profile.clear_button = ScreenRect(300, 120, 24, 24)
     window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
 
 
@@ -1538,6 +1556,60 @@ def test_timelapse_records_only_real_running_jobs(
     qtbot.waitUntil(lambda: recorder.frame_count >= 2, timeout=3000)
 
 
+def test_recording_waits_for_the_artwork_and_does_not_restart_at_the_end(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run opens with brush-calibration strokes that get wiped off again.
+
+    Recording those would put the throwaway probes at the head of every video,
+    so the recorder waits for the painting phase - and the job's *final*
+    progress update is a painting one too, which must not open a fresh
+    recording the moment the finished one closes.
+    """
+
+    from types import SimpleNamespace
+
+    import app.timelapse as timelapse_module
+
+    monkeypatch.setattr(
+        timelapse_module,
+        "capture_region",
+        lambda region: Image.new("RGB", (region.width, region.height)),
+    )
+    window.timelapse_check.setChecked(True)
+    window._current_profile.canvas = ScreenRect(0, 0, 64, 32)
+    window._painter = SimpleNamespace(
+        input=SimpleNamespace(emits_real_input=True),
+        state=PainterState.RUNNING,
+    )
+
+    def progress(phase: str, state: PainterState) -> PaintProgress:
+        return PaintProgress(
+            state, 0, 1, 0, 1, 0, 1, 0.0, 0.0, None, "", phase
+        )
+
+    window._on_paint_progress(
+        window._paint_generation, progress("calibrate", PainterState.RUNNING)
+    )
+    assert window._timelapse_recorder is None
+
+    window._on_paint_progress(
+        window._paint_generation, progress("paint", PainterState.RUNNING)
+    )
+    assert window._timelapse_recorder is not None
+
+    window._finish_timelapse(final=False)
+    assert window._timelapse_recorder is None
+
+    # The completion update still reports the painting phase.
+    window._painter.state = PainterState.COMPLETED
+    window._on_paint_progress(
+        window._paint_generation, progress("paint", PainterState.COMPLETED)
+    )
+    assert window._timelapse_recorder is None
+    window._painter = None
+
+
 def test_timelapse_settings_persist(window: MainWindow) -> None:
     window.timelapse_check.setChecked(True)
     window.timelapse_interval_spin.setValue(25)
@@ -1640,3 +1712,174 @@ def test_disabled_start_button_names_the_blocker(window: MainWindow) -> None:
     assert not window.start_button.isEnabled()
     assert "color box" in tooltip and "hue bar" in tooltip
     assert "canvas" not in tooltip
+
+
+def test_start_names_the_rectangles_automatic_sizing_still_needs(
+    window: MainWindow,
+) -> None:
+    """Sizing now measures on the sign, so its calibration is a start blocker."""
+
+    window.dry_run_check.setChecked(False)
+    window.apply_brush_check.setChecked(True)
+    window._plan = PaintPlan(4, 4, (ColorGroup((10, 20, 30), (Stroke(0, 0, 3, 0),), 1),))
+    window._current_profile = Profile(
+        id="p",
+        name="Sign",
+        canvas=Rect(0, 0, 100, 100),
+        color_box=Rect(120, 0, 40, 40),
+        hue_bar=Rect(170, 0, 10, 40),
+    )
+    window._update_start_availability()
+
+    tooltip = window.start_button.toolTip()
+    assert not window.start_button.isEnabled()
+    assert "Size value box and clear button" in tooltip
+
+    window._current_profile.brush_size_box = Rect(200, 0, 40, 20)
+    window._current_profile.clear_button = Rect(250, 0, 20, 20)
+    window._update_start_availability()
+    assert "Size value box" not in window.start_button.toolTip()
+
+
+def _recorded_session(window: MainWindow, name: str, frames: int) -> Path:
+    directory = window._timelapse_root() / name
+    directory.mkdir(parents=True, exist_ok=True)
+    for index in range(1, frames + 1):
+        Image.new("RGB", (48, 24), (index * 30 % 256, 70, 150)).save(
+            directory / f"frame_{index:05d}.png"
+        )
+    return directory
+
+
+def _select_session(window: MainWindow, directory: Path) -> None:
+    window._refresh_timelapse_sessions()
+    for row in range(window.timelapse_sessions.count()):
+        item = window.timelapse_sessions.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == str(directory):
+            window.timelapse_sessions.setCurrentItem(item)
+            return
+    raise AssertionError(f"{directory} was not listed")
+
+
+def test_watching_and_saving_need_a_recording_with_frames(window: MainWindow) -> None:
+    empty = window._timelapse_root() / "20260101-000000"
+    empty.mkdir(parents=True, exist_ok=True)
+
+    _select_session(window, empty)
+    # An empty folder can still be opened and deleted, but there is nothing in
+    # it to play or encode.
+    assert not window.play_session_button.isEnabled()
+    assert not window.export_session_button.isEnabled()
+    assert window.delete_session_button.isEnabled()
+
+    recorded = _recorded_session(window, "20260101-000100", 4)
+    _select_session(window, recorded)
+    assert window.play_session_button.isEnabled()
+    assert window.export_session_button.isEnabled()
+
+
+def test_the_player_steps_scrubs_and_stops_at_the_last_frame(
+    window: MainWindow, qtbot
+) -> None:
+    from app.gui.timelapse_player import TimelapsePlayer
+    from app.timelapse_export import session_frames
+
+    directory = _recorded_session(window, "20260101-000200", 5)
+    player = TimelapsePlayer("20260101-000200", session_frames(directory), frame_rate=30)
+    qtbot.addWidget(player)
+
+    assert player.position_slider.maximum() == 4
+    assert "1 of 5" in player.counter_label.text()
+
+    player.step(2)
+    assert player.position_slider.value() == 2
+    assert "3 of 5" in player.counter_label.text()
+
+    # Scrubbing drives the frame, and the frame drives the counter.
+    player.position_slider.setValue(4)
+    assert "5 of 5" in player.counter_label.text()
+
+    player.play()
+    assert player.is_playing
+    # Play on the final frame means "watch it again" rather than sit still.
+    assert player.position_slider.value() == 0
+
+    player.pause()
+    assert not player.is_playing
+    player.close()
+
+
+def test_saving_a_recording_writes_a_video_the_user_chose(
+    window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    directory = _recorded_session(window, "20260101-000300", 6)
+    destination = tmp_path / "sign.avi"
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *args, **kwargs: (str(destination), "")),
+    )
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        MainWindow, "_open_in_file_manager", staticmethod(opened.append)
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        staticmethod(
+            lambda *args, **kwargs: main_window_module.QMessageBox.StandardButton.Close
+        ),
+    )
+
+    _select_session(window, directory)
+    window.timelapse_fps_spin.setValue(12)
+    window._set_combo_data(window.timelapse_format_combo, "avi")
+    window._export_selected_session()
+
+    qtbot.waitUntil(lambda: window._timelapse_export is None, timeout=10000)
+    assert destination.is_file()
+    assert destination.read_bytes()[:4] == b"RIFF"
+    # The frames themselves are never touched by an export.
+    assert len(list(directory.glob("frame_*.png"))) == 6
+    assert not opened
+
+
+def test_a_failed_export_says_so_and_leaves_the_button_usable(
+    window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    directory = _recorded_session(window, "20260101-000400", 3)
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *args, **kwargs: (str(tmp_path / "sign.avi"), "")),
+    )
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("the disk went away")
+
+    monkeypatch.setattr(main_window_module, "export_session", explode)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, _title, message, *a, **k: warnings.append(message)),
+    )
+
+    _select_session(window, directory)
+    window._export_selected_session()
+
+    qtbot.waitUntil(lambda: bool(warnings), timeout=10000)
+    assert "the disk went away" in warnings[0]
+    assert window._timelapse_export is None
+    assert window.export_session_button.isEnabled()
+    assert not window.timelapse_export_progress.isVisible()
+
+
+def test_the_playback_speed_and_format_survive_a_restart(window: MainWindow) -> None:
+    window.timelapse_fps_spin.setValue(24)
+    window._set_combo_data(window.timelapse_format_combo, "gif")
+
+    saved = window._settings_document()
+
+    assert saved["timelapse"]["playback_frame_rate"] == 24
+    assert saved["timelapse"]["export_format"] == "gif"

@@ -141,6 +141,7 @@ class PaintingTarget:
     color_box: RectangleLike
     hue_bar: RectangleLike
     brush_size_box: RectangleLike | None = None
+    clear_button: RectangleLike | None = None
     picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
     brush_size_model: BrushSizeModel | None = None
@@ -175,6 +176,7 @@ class PaintingTarget:
             color_box=color_box,
             hue_bar=hue_bar,
             brush_size_box=getattr(profile, "brush_size_box", None),
+            clear_button=getattr(profile, "clear_button", None),
             picker_directions=PickerDirections(
                 hue="bottom_to_top",
                 saturation="left_low",
@@ -353,6 +355,11 @@ class PaintProgress:
     elapsed_seconds: float
     estimated_remaining_seconds: float | None
     message: str = ""
+    # "calibrate" while the job measures this sign's brush and wipes the probe
+    # strokes; "paint" once the artwork itself is going down.  Clients that
+    # document a run - a timelapse recorder above all - use this to start when
+    # the picture starts rather than when the worker does.
+    phase: str = "paint"
 
     @property
     def stroke_index(self) -> int:
@@ -370,11 +377,12 @@ class _Job:
     plan: PaintPlan
     target: PaintingTarget
     settings: PainterSettings
-    # "paint" runs the plan; "measure_brush" paints probe strokes instead and
-    # fits what Rust's Size numbers actually cover.
+    # "paint" measures this sign's brush, wipes the probes off, and then runs
+    # the plan; "measure_brush" stops after the measurement.
     mode: str = "paint"
     # Canvas-height fraction of one logical cell, so a measurement can place its
-    # probes around the brush the plan will really ask for.
+    # probes around the brush the plan will really ask for.  A paint job fills
+    # this in from its own plan; a measurement-only job is told.
     cell_fraction: float | None = None
 
 
@@ -498,6 +506,7 @@ class Painter:
         color_box: RectangleLike | None = None,
         hue_bar: RectangleLike | None = None,
         brush_size_box: RectangleLike | None = None,
+        clear_button: RectangleLike | None = None,
         brush_size_model: BrushSizeModel | None = None,
         picker_directions: PickerDirections | None = None,
     ) -> None:
@@ -514,6 +523,7 @@ class Painter:
                     color_box=color_box,
                     hue_bar=hue_bar,
                     brush_size_box=brush_size_box,
+                    clear_button=clear_button,
                     picker_directions=picker_directions or PickerDirections(),
                     brush_size_model=brush_size_model,
                 )
@@ -561,11 +571,14 @@ class Painter:
         target: PaintingTarget | None = None,
         cell_fraction: float | None = None,
     ) -> None:
-        """Prepare a job that measures Rust's Size numbers instead of painting.
+        """Prepare a job that measures Rust's Size numbers and stops there.
 
-        The job paints its own probe strokes on the calibrated sign, so it
-        carries a placeholder plan purely to satisfy the shared machinery that
-        every job runs through.
+        Ordinary paint jobs measure the brush themselves, so this is the
+        standalone path: seeding a model for the planner before a sign's first
+        paint, and scoring a measurement on its own.  The job paints its own
+        probe strokes on the calibrated sign and does *not* clear them, so it
+        carries a placeholder plan purely to satisfy the shared machinery every
+        job runs through.
         """
 
         if target is None:
@@ -787,12 +800,24 @@ class Painter:
                 )
             if target.brush_size_box.width <= 0 or target.brush_size_box.height <= 0:
                 raise ValueError("Size value box calibration must have positive dimensions")
-            if target.brush_size_model is None:
-                raise ValueError(
-                    "Automatic brush sizing is enabled, but this profile has not "
-                    "measured what Rust's Size numbers paint. Run Measure Brush Size."
-                )
-            self._validate_brush_reach(plan, target, settings, target.brush_size_model)
+            # Every real paint job measures the brush itself, and the probe
+            # strokes it paints have to be wiped before the artwork goes down.
+            if getattr(self.input, "emits_real_input", True):
+                if target.clear_button is None:
+                    raise ValueError(
+                        "Automatic brush sizing is enabled, but Rust's clear "
+                        "control is not calibrated, so the brush calibration "
+                        "strokes could not be wiped before painting"
+                    )
+                if target.clear_button.width <= 0 or target.clear_button.height <= 0:
+                    raise ValueError(
+                        "Clear control calibration must have positive dimensions"
+                    )
+            if target.brush_size_model is not None:
+                # A stored model is only ever a preview of what the run will
+                # measure, but checking it here turns an unpaintable resolution
+                # into an error before the countdown instead of after it.
+                self._validate_brush_reach(plan, target, settings, target.brush_size_model)
         # A dry run only visualizes the plan, so it may carry brush metadata
         # that real input could not honor with the current calibration.
         if getattr(self.input, "emits_real_input", True):
@@ -848,9 +873,9 @@ class Painter:
             smallest, largest = model.fitted_range
             if size * 2 < smallest or size > largest * 2:
                 LOGGER.warning(
-                    "Brush size %s for %d cell(s) sits outside the %s-%s range this "
-                    "profile was measured over, so it is an extrapolation. Re-run "
-                    "Measure Brush Size at this painting resolution.",
+                    "Brush size %s for %d cell(s) sits outside the %s-%s range the "
+                    "probes covered, so it is an extrapolation. The next run "
+                    "re-measures around this painting resolution.",
                     format_brush_size(size),
                     diameter,
                     format_brush_size(smallest),
@@ -906,7 +931,10 @@ class Painter:
                 with self._condition:
                     self._measured_brush_size_model = measured
             else:
-                self._update_progress_state(PainterState.RUNNING, "Painting")
+                self._calibrate_brush_for_plan(job)
+                self._update_progress_state(
+                    PainterState.RUNNING, "Painting", phase="paint"
+                )
                 self._execute_plan(job)
                 self._verify_and_touch_up(job)
             self._checkpoint(check_focus=False)
@@ -1099,6 +1127,121 @@ class Painter:
         (255, 80, 80),
     )
 
+    def _calibrate_brush_for_plan(self, job: _Job) -> None:
+        """Measure this sign's brush, wipe the probes, then let painting start.
+
+        Measuring on every run instead of once behind a button is what makes
+        the sign the only thing the user has to get right.  A stored model is
+        a promise about a sign the user may since have walked away from,
+        re-framed, or replaced, and a stale promise here paints the whole
+        image at the wrong brush width.  A fresh measurement costs a handful
+        of strokes that are erased before the artwork goes down.
+        """
+
+        settings = job.settings
+        if not settings.apply_brush_size or not self.input.emits_real_input:
+            return
+        if job.target.brush_size_box is None or job.target.clear_button is None:
+            # ``_validate_job`` refuses this combination up front; a job that
+            # reaches here without the rectangles came from a caller that built
+            # its own target, and painting on a guessed brush is worse than not.
+            raise RuntimeError(
+                "Automatic brush sizing needs Rust's Size field and clear "
+                "control calibrated"
+            )
+        job.cell_fraction = self._brush_target_fraction(
+            job.target, job.plan, 1, settings.logical_pixel_spacing
+        )
+        for attempt in range(self._CALIBRATION_ATTEMPTS):
+            try:
+                model = self._measure_brush_size_model(job)
+                job.target = replace(job.target, brush_size_model=model)
+                with self._condition:
+                    self._measured_brush_size_model = model
+                self._clear_canvas(job)
+                break
+            except _RetryAction:
+                # A pause handed the mouse back partway through, so the probes
+                # after it describe a sign somebody may have been drawing on
+                # themselves. Measure the whole thing again once painting
+                # resumes rather than fit a line through both halves.
+                LOGGER.info(
+                    "Brush calibration was interrupted (attempt %d); measuring again",
+                    attempt + 1,
+                )
+        else:
+            raise RuntimeError(
+                "The brush measurement was interrupted every time it was tried. "
+                "Let the job run without pausing it during the first few strokes."
+            )
+        # Checked against the model that will actually be typed, so a sign the
+        # plan cannot be painted on is refused before any artwork goes down.
+        self._validate_brush_reach(job.plan, job.target, settings, model)
+
+    # How many times a paused-out measurement is restarted before the job gives
+    # up. Pausing during the opening strokes is easy to do by accident once;
+    # doing it three times running is somebody who wants the job stopped.
+    _CALIBRATION_ATTEMPTS = 3
+
+    # A cleared sign has to differ from the probed one by more than capture
+    # noise on a lit, textured surface, or the click missed the control.
+    _CLEAR_CONTRAST = 24.0
+
+    def _clear_canvas(self, job: _Job) -> None:
+        """Click Rust's clear control and confirm the sign actually went blank."""
+
+        button = job.target.clear_button
+        if button is None:
+            return
+        epoch = self._pause_generation_value()
+        self._update_progress_state(
+            PainterState.RUNNING, "Clearing the sign", phase="calibrate"
+        )
+        canvas = ScreenRect(
+            job.target.canvas.left,
+            job.target.canvas.top,
+            job.target.canvas.width,
+            job.target.canvas.height,
+        )
+        park = (
+            int(round(job.target.color_box.left + job.target.color_box.width / 2.0)),
+            int(round(job.target.color_box.top + job.target.color_box.height / 2.0)),
+        )
+        before = self._capture_parked(canvas, park, epoch)
+        self._safe_click(
+            normalized_point(button, 0.5, 0.5),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
+        # Rust redraws the sign asynchronously, so give it a beat before asking
+        # whether the strokes are gone.
+        self._interruptible_sleep(
+            max(job.settings.delay_between_colors_seconds, self._CAPTURE_SETTLE_SECONDS),
+            epoch=epoch,
+            check_focus=True,
+        )
+        after = self._capture_parked(canvas, park, epoch)
+        if not self._canvas_changed(before, after):
+            raise RuntimeError(
+                "Clicking Rust's clear control did not clear the sign, so the "
+                "brush calibration strokes would be painted over. Recalibrate "
+                "the clear control over the button that wipes the sign."
+            )
+        LOGGER.info("Cleared the sign after measuring the brush")
+
+    def _canvas_changed(self, before: Any, after: Any) -> bool:
+        """Whether two captures of the sign differ by more than capture noise."""
+
+        import numpy as np
+
+        first = np.asarray(before.convert("RGB"), dtype=np.float32)
+        second = np.asarray(after.convert("RGB"), dtype=np.float32)
+        if first.shape != second.shape:
+            return True
+        return bool(
+            float(np.linalg.norm(second - first, axis=2).max()) >= self._CLEAR_CONTRAST
+        )
+
     def _measure_brush_size_model(self, job: _Job) -> BrushSizeModel:
         """Paint probe strokes and fit Size number to painted canvas fraction.
 
@@ -1141,6 +1284,7 @@ class Painter:
             self._update_progress_state(
                 PainterState.RUNNING,
                 f"Measuring brush size {format_brush_size(size)} ({label})",
+                phase="calibrate",
             )
             color = self._BRUSH_PROBE_COLORS[probe_index % len(self._BRUSH_PROBE_COLORS)]
             probe_index += 1
@@ -1242,6 +1386,11 @@ class Painter:
         )
         return tuple(sizes)
 
+    # Rust has been observed running its painting UI at 15 FPS, so a capture
+    # taken the instant the cursor moves away can still hold the frame that had
+    # it in shot.  Five frames is comfortably past that.
+    _CAPTURE_SETTLE_SECONDS = 0.35
+
     def _capture_parked(
         self, canvas: ScreenRect, park: tuple[int, int], epoch: int
     ) -> Any:
@@ -1249,7 +1398,9 @@ class Painter:
 
         self._move(park, epoch)
         if self.input.emits_real_input:
-            self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+            self._interruptible_sleep(
+                self._CAPTURE_SETTLE_SECONDS, epoch=epoch, check_focus=True
+            )
         self._checkpoint(epoch=epoch, check_focus=True)
         return self._screen_capture(canvas)
 
@@ -1896,10 +2047,13 @@ class Painter:
                 elapsed,
                 remaining,
                 message,
+                self._progress.phase,
             )
         self._emit_progress(force=completed_strokes == total_strokes)
 
-    def _update_progress_state(self, state: PainterState, message: str) -> None:
+    def _update_progress_state(
+        self, state: PainterState, message: str, *, phase: str | None = None
+    ) -> None:
         with self._condition:
             # A pause/abort can win between the worker's checkpoint and this
             # presentation update. Never make progress claim an older state
@@ -1919,6 +2073,7 @@ class Painter:
                 self._active_elapsed(),
                 old.estimated_remaining_seconds,
                 message,
+                old.phase if phase is None else phase,
             )
         self._emit_progress(force=True)
 

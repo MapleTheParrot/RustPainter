@@ -100,7 +100,17 @@ from app.paint_optimizer import (
 )
 from app.hotkeys import SUPPORTED_HOTKEY_CHOICES
 from app.profiles import Profile, ProfileStore
-from app.settings import SettingsStore, default_settings
+from app.settings import DEFAULT_COLOR_COUNT, SettingsStore, default_settings
+from app.timelapse_export import (
+    DEFAULT_FRAME_RATE,
+    MAX_FRAME_RATE,
+    MIN_FRAME_RATE,
+    ExportCancelled,
+    available_formats,
+    export_session,
+    format_for,
+    session_frames,
+)
 
 from .assets import icon as art_icon, pixmap as art_pixmap, tinted_pixmap
 from .styles import ON_ACCENT, TEXT, badge_foreground, state_badge_style
@@ -226,12 +236,6 @@ class _PendingPaint:
     settings: dict[str, Any]
     dry_run: bool
     display_snapshot: Any = None
-    # "paint" runs the plan; "measure_brush" paints probe strokes instead and
-    # fits what Rust's Size numbers cover on this sign.
-    mode: str = "paint"
-    # Canvas-height fraction of one logical cell, so a measurement can probe
-    # around the brush this resolution will actually ask for.
-    cell_fraction: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +515,55 @@ class _ImageLoadWorker(QRunnable):
             self.signals.failed.emit(self.serial, str(exc))
 
 
+class _ExportSignals(QObject):
+    progress = Signal(int, int)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+
+class _TimelapseExportWorker(QRunnable):
+    """Encode one recorded session into a video without blocking the GUI."""
+
+    def __init__(
+        self,
+        frames: list[Path],
+        destination: Path,
+        frame_rate: int,
+        format_key: str,
+    ) -> None:
+        super().__init__()
+        self._frames = frames
+        self._destination = destination
+        self._frame_rate = frame_rate
+        self._format_key = format_key
+        self._cancelled = threading.Event()
+        self.signals = _ExportSignals()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            export_session(
+                self._frames,
+                self._destination,
+                frame_rate=self._frame_rate,
+                video_format=format_for(self._format_key),
+                on_progress=lambda done, total: self.signals.progress.emit(done, total),
+                should_cancel=self._cancelled.is_set,
+            )
+        except ExportCancelled:
+            LOGGER.info("Timelapse export cancelled: %s", self._destination)
+            self.signals.cancelled.emit()
+        except Exception as exc:
+            LOGGER.exception("Could not export the timelapse")
+            self.signals.failed.emit(str(exc))
+        else:
+            self.signals.completed.emit(str(self._destination))
+
+
 class _DebugCancelled(RuntimeError):
     """Internal control-flow marker for a safely interrupted debug action."""
 
@@ -594,6 +647,12 @@ class MainWindow(QMainWindow):
         self._timelapse_recorder: Any = None
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
+        self._timelapse_export_pool = QThreadPool(self)
+        self._timelapse_export_pool.setMaxThreadCount(1)
+        self._timelapse_export: _TimelapseExportWorker | None = None
+        # Players are modeless so a recording can be watched while the next
+        # image is set up; the window keeps them alive and closes them with it.
+        self._timelapse_players: list[Any] = []
 
         self._profile_store: Any = None
         self._settings_store: Any = None
@@ -603,9 +662,6 @@ class MainWindow(QMainWindow):
         self._painter: Any = None
         self._paint_generation = 0
         self._pending_paint: _PendingPaint | None = None
-        # Which kind of job the live painter is running, so completion knows
-        # whether a measurement result is waiting to be stored.
-        self._pending_mode = "paint"
         self._pending_start_cancelled = False
         self._color_chart_profile_id: str | None = None
         self._color_chart_path: Path | None = None
@@ -851,7 +907,7 @@ class MainWindow(QMainWindow):
         self.color_count_combo = NoWheelComboBox()
         for value in (8, 16, 24, 32, 48, 64, 96, 128, 256):
             self.color_count_combo.addItem(str(value), value)
-        self.color_count_combo.setCurrentText("32")
+        self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
         self.merge_combo = NoWheelComboBox()
         self.merge_combo.addItem("Off — exact strokes", "off")
         self.merge_combo.addItem("Balanced — small gaps", "balanced")
@@ -988,6 +1044,41 @@ class MainWindow(QMainWindow):
         self.timelapse_sessions.setAlternatingRowColors(True)
         self.timelapse_sessions.setMinimumHeight(180)
         sessions_layout.addWidget(self.timelapse_sessions)
+        playback_row = QHBoxLayout()
+        self.play_session_button = QPushButton("Watch")
+        self.play_session_button.setObjectName("accent")
+        self._set_icon(self.play_session_button, "play", ON_ACCENT, size=16)
+        self.play_session_button.setToolTip(
+            "Play the selected recording back inside RustPainter."
+        )
+        self.export_session_button = QPushButton("Save as video")
+        self.export_session_button.setToolTip(
+            "Write the selected recording to a single video file you can keep, "
+            "upload, or share."
+        )
+        self.timelapse_fps_spin = self._int_spin(
+            MIN_FRAME_RATE, MAX_FRAME_RATE, DEFAULT_FRAME_RATE, " fps"
+        )
+        self.timelapse_fps_spin.setToolTip(
+            "Frames per second for playback and for the exported video. A slow "
+            "sign painted over an hour is worth watching faster than it happened."
+        )
+        self.timelapse_format_combo = NoWheelComboBox()
+        for video_format in available_formats():
+            self.timelapse_format_combo.addItem(video_format.label, video_format.key)
+        self.timelapse_format_combo.setToolTip(
+            "Container for the exported video. AVI and GIF are written by "
+            "RustPainter itself; MP4 is offered when ffmpeg is installed."
+        )
+        playback_row.addWidget(self.play_session_button)
+        playback_row.addWidget(self.export_session_button)
+        playback_row.addStretch(1)
+        playback_row.addWidget(QLabel("Speed"))
+        playback_row.addWidget(self.timelapse_fps_spin)
+        playback_row.addWidget(QLabel("Format"))
+        playback_row.addWidget(self.timelapse_format_combo)
+        sessions_layout.addLayout(playback_row)
+
         session_buttons = QHBoxLayout()
         self.open_timelapse_button = QPushButton("Open timelapse folder")
         self.open_session_button = QPushButton("Open selected")
@@ -1002,16 +1093,19 @@ class MainWindow(QMainWindow):
         ):
             session_buttons.addWidget(button)
         sessions_layout.addLayout(session_buttons)
+
+        self.timelapse_export_progress = QProgressBar()
+        self.timelapse_export_progress.setVisible(False)
+        self.timelapse_export_progress.setTextVisible(True)
+        sessions_layout.addWidget(self.timelapse_export_progress)
+
         assemble_note = QLabel(
-            "Each job writes numbered PNG frames into its own timestamped "
-            "folder. Assemble one with any video tool, for example:\n"
-            "ffmpeg -framerate 30 -i frame_%05d.png timelapse.mp4"
+            "Each job keeps its own folder of numbered PNG frames, so the "
+            "original capture is never re-encoded. Saving as video leaves that "
+            "folder untouched."
         )
         assemble_note.setWordWrap(True)
         assemble_note.setObjectName("muted")
-        assemble_note.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
         sessions_layout.addWidget(assemble_note)
         layout.addWidget(sessions_group, 1)
         return content
@@ -1467,10 +1561,12 @@ class MainWindow(QMainWindow):
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
         self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
+        self.clear_button_status = CalibrationStatus("Clear button", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
+        self.calibrate_clear_button = QPushButton("Set")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -1479,6 +1575,12 @@ class MainWindow(QMainWindow):
                 self.brush_size_box_status,
                 self.calibrate_brush_button,
                 "Calibrate the numeric Size field beside Rust's size slider",
+            ),
+            (
+                self.clear_button_status,
+                self.calibrate_clear_button,
+                "Calibrate Rust's trash/clear icon, which wipes the sign between "
+                "the brush measurement and the painting",
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -1492,8 +1594,10 @@ class MainWindow(QMainWindow):
 
         self.apply_brush_check = QCheckBox("Automatic brush sizing")
         self.apply_brush_check.setToolTip(
-            "Types the Size number that paints exactly one logical image cell. "
-            "Needs the Size value box calibrated and Measure Brush Size run once."
+            "Types the Size number that paints exactly one logical image cell.\n"
+            "Every paint job measures this sign's brush first and wipes the "
+            "measurement off again, so there is nothing to run by hand - it "
+            "only needs the Size value box and the clear button calibrated."
         )
         self.show_calibration_check = QCheckBox("Show boxes on screen")
         self.show_calibration_check.setToolTip(
@@ -1502,27 +1606,10 @@ class MainWindow(QMainWindow):
             "are click-through and hide automatically while painting."
         )
         profile_layout.addWidget(self.apply_brush_check)
-        self.brush_model_status = QLabel("Brush size not measured")
+        self.brush_model_status = QLabel("Brush size measured at the start of each job")
         self.brush_model_status.setObjectName("muted")
         self.brush_model_status.setWordWrap(True)
-        self.measure_brush_button = QPushButton("Measure Brush Size")
-        self.measure_brush_button.setToolTip(
-            "Paints a few probe strokes on the sign and reads back how much of it "
-            "each Size number really covers.\nThe result is a fraction of the sign "
-            "rather than a pixel count, so it survives zooming, a different\n"
-            "painting resolution, and a different monitor - measure once per sign "
-            "type."
-        )
-        self.clear_brush_model_button = QPushButton("Clear")
-        self.clear_brush_model_button.setToolTip(
-            "Forget the measured brush model for this profile"
-        )
-        brush_model_row = QHBoxLayout()
-        brush_model_row.setContentsMargins(0, 0, 0, 0)
-        brush_model_row.addWidget(self.measure_brush_button, 1)
-        brush_model_row.addWidget(self.clear_brush_model_button)
         profile_layout.addWidget(self.brush_model_status)
-        profile_layout.addLayout(brush_model_row)
         profile_layout.addWidget(self.show_calibration_check)
         self.canvas_geometry_label = QLabel("Canvas: not calibrated  •  Aspect: —")
         self.canvas_geometry_label.setObjectName("muted")
@@ -2823,8 +2910,11 @@ class MainWindow(QMainWindow):
                 "brush_size_box", "numeric Size field beside the size slider"
             )
         )
-        self.measure_brush_button.clicked.connect(self._measure_brush_size)
-        self.clear_brush_model_button.clicked.connect(self._clear_brush_size_model)
+        self.calibrate_clear_button.clicked.connect(
+            lambda: self._begin_calibration(
+                "clear_button", "trash / clear icon that wipes the sign"
+            )
+        )
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
@@ -2841,8 +2931,13 @@ class MainWindow(QMainWindow):
         self.open_session_button.clicked.connect(self._open_selected_session)
         self.delete_session_button.clicked.connect(self._delete_selected_session)
         self.refresh_sessions_button.clicked.connect(self._refresh_timelapse_sessions)
+        self.play_session_button.clicked.connect(self._play_selected_session)
+        self.export_session_button.clicked.connect(self._export_selected_session)
         self.timelapse_sessions.currentRowChanged.connect(
             lambda _row: self._sync_session_buttons()
+        )
+        self.timelapse_sessions.itemDoubleClicked.connect(
+            lambda _item: self._play_selected_session()
         )
 
         settings_controls = (
@@ -2877,6 +2972,8 @@ class MainWindow(QMainWindow):
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,
+            self.timelapse_fps_spin,
+            self.timelapse_format_combo,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -2934,7 +3031,10 @@ class MainWindow(QMainWindow):
             )
             self.logical_width_spin.setValue(int(image.get("logical_width", 256)))
             self.logical_height_spin.setValue(int(image.get("logical_height", 128)))
-            self._set_combo_data(self.color_count_combo, int(image.get("color_count", 32)))
+            self._set_combo_data(
+                self.color_count_combo,
+                int(image.get("color_count", DEFAULT_COLOR_COUNT)),
+            )
             self.dither_check.setChecked(bool(image.get("dithering", False)))
             self._set_combo_data(
                 self.background_combo, image.get("background_mode", "unpainted")
@@ -3059,6 +3159,12 @@ class MainWindow(QMainWindow):
             self.timelapse_final_check.setChecked(
                 bool(timelapse.get("capture_final_frame", True))
             )
+            self.timelapse_fps_spin.setValue(
+                int(timelapse.get("playback_frame_rate", DEFAULT_FRAME_RATE))
+            )
+            self._set_combo_data(
+                self.timelapse_format_combo, str(timelapse.get("export_format", "avi"))
+            )
             merge_index = self.merge_combo.findData(
                 str(painting.get("stroke_merge_mode", "balanced"))
             )
@@ -3164,6 +3270,8 @@ class MainWindow(QMainWindow):
             "enabled": self.timelapse_check.isChecked(),
             "interval_seconds": self.timelapse_interval_spin.value(),
             "capture_final_frame": self.timelapse_final_check.isChecked(),
+            "playback_frame_rate": self.timelapse_fps_spin.value(),
+            "export_format": str(self.timelapse_format_combo.currentData() or "avi"),
         }
         current["hotkeys"] = {
             **current.get("hotkeys", {}),
@@ -3257,9 +3365,15 @@ class MainWindow(QMainWindow):
         self.canvas_status.set_calibrated(bool(status.get("canvas")))
         self.color_box_status.set_calibrated(bool(status.get("color_box")))
         self.hue_bar_status.set_calibrated(bool(status.get("hue_bar")))
+        # Automatic sizing measures the brush on every run and wipes the
+        # probes afterwards, so it needs both the Size field and the control
+        # that clears the sign; with it off, neither is used.
         brush_optional = not self.apply_brush_check.isChecked()
         self.brush_size_box_status.set_calibrated(
             bool(status.get("brush_size_box")), brush_optional
+        )
+        self.clear_button_status.set_calibrated(
+            bool(status.get("clear_button")), brush_optional
         )
         self._refresh_brush_model_status()
         correction = (
@@ -3320,6 +3434,7 @@ class MainWindow(QMainWindow):
                     "color_box",
                     "hue_bar",
                     "brush_size_box",
+                    "clear_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
@@ -3432,6 +3547,7 @@ class MainWindow(QMainWindow):
                 "color_box",
                 "hue_bar",
                 "brush_size_box",
+                "clear_button",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -3575,7 +3691,7 @@ class MainWindow(QMainWindow):
         source, target = mismatch
         candidate = Profile.from_dict(profile.to_dict())
         moved: list[str] = []
-        for name in ("canvas", "color_box", "hue_bar", "brush_size_box"):
+        for name in ("canvas", "color_box", "hue_bar", "brush_size_box", "clear_button"):
             rect = getattr(candidate, name, None)
             if rect is None:
                 continue
@@ -3625,6 +3741,7 @@ class MainWindow(QMainWindow):
                     ("Color box", getattr(profile, "color_box", None)),
                     ("Hue bar", getattr(profile, "hue_bar", None)),
                     ("Size value box", getattr(profile, "brush_size_box", None)),
+                    ("Clear button", getattr(profile, "clear_button", None)),
                 )
                 if rect is not None
             ]
@@ -3941,40 +4058,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could not clear correction", str(exc))
 
     def _refresh_brush_model_status(self) -> None:
-        """Describe the measured brush model, or say what is still missing."""
+        """Say what automatic sizing will do on the next run, or what it needs."""
 
+        if not self.apply_brush_check.isChecked():
+            self.brush_model_status.setText(
+                "Automatic brush sizing is off - Rust keeps whatever brush size "
+                "you set by hand"
+            )
+            return
+        missing = self._missing_sizing_rectangles()
+        if missing:
+            self.brush_model_status.setText(
+                "Automatic brush sizing needs the "
+                + " and ".join(missing)
+                + " calibrated"
+            )
+            return
         model = self._brush_size_model()
-        has_box = self._profile_rect("brush_size_box") is not None
-        if model is not None:
-            rows = model.sign_pixel_rows
+        if model is None:
             self.brush_model_status.setText(
-                f"Measured: size 1 covers {model.smallest_fraction * 100:.2f}% of the "
-                f"sign (about {rows:.0f} rows tall)"
+                "Ready - the next paint job measures this sign's brush and wipes "
+                "the measurement before painting"
             )
-        elif not has_box:
-            self.brush_model_status.setText(
-                "Brush size not measured - calibrate the Size value box first"
-            )
-        else:
-            self.brush_model_status.setText(
-                "Brush size not measured - run Measure Brush Size once for this sign"
-            )
-
-    def _logical_cell_fraction(self, profile: Any) -> float | None:
-        """One logical cell as a fraction of the canvas height.
-
-        This is the footprint automatic sizing will keep asking for, so it is
-        what a measurement should place its probes around.
-        """
-
-        canvas = getattr(profile, "canvas", None)
-        if canvas is None or canvas.height <= 0:
-            return None
-        pitch = min(
-            canvas.width / max(1, self.logical_width_spin.value()),
-            canvas.height / max(1, self.logical_height_spin.value()),
+            return
+        self.brush_model_status.setText(
+            f"Last measured: size 1 covers {model.smallest_fraction * 100:.2f}% of "
+            f"the sign (about {model.sign_pixel_rows:.0f} rows tall). Every job "
+            "measures again before it paints."
         )
-        return pitch / canvas.height
 
     def _canvas_shape_changed(self, rectangle: Any) -> bool:
         """Whether a new canvas rectangle describes a differently shaped sign.
@@ -3992,115 +4103,31 @@ class MainWindow(QMainWindow):
         after = rectangle.width / rectangle.height
         return abs(before - after) > before * 0.05
 
-    @Slot()
-    def _clear_brush_size_model(self) -> None:
-        profile = self._current_profile
-        if profile is None or "brush_size_model" not in profile.metadata:
-            return
-        try:
-            candidate = Profile.from_dict(profile.to_dict())
-            candidate.metadata.pop("brush_size_model", None)
-            self._current_profile = self._profile_store.save(candidate)
-            self._refresh_profile_ui()
-            self._schedule_processing()
-            self.statusBar().showMessage("Brush size measurement cleared", 5000)
-        except Exception as exc:
-            LOGGER.exception("Could not clear the brush size model")
-            QMessageBox.warning(self, "Could not clear the measurement", str(exc))
-
-    @Slot()
-    def _measure_brush_size(self) -> None:
-        """Paint probe strokes on the sign to learn what its Size numbers cover."""
-
-        profile = self._current_profile
-        if profile is None or not profile.is_ready:
-            QMessageBox.information(
-                self,
-                "Calibration incomplete",
-                "Measuring the brush needs a calibrated canvas, color box, and hue bar.",
-            )
-            return
-        if profile.brush_size_box is None:
-            QMessageBox.information(
-                self,
-                "Calibrate the Size value box",
-                "Calibrate Rust's numeric Size field before measuring what its "
-                "numbers paint.",
-            )
-            return
-        if self._painter_is_active() or self._debug_running:
-            QMessageBox.warning(
-                self,
-                "Painting is still active",
-                "Wait for the current job to finish before measuring the brush.",
-            )
-            return
-        if not self._emergency_hotkey_available():
-            QMessageBox.critical(
-                self,
-                "Emergency hotkey unavailable",
-                "Measuring paints on the sign, so it needs the global abort hotkey.",
-            )
-            return
-        try:
-            self._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
-        except ValueError as exc:
-            QMessageBox.critical(self, "Calibration is invalid", str(exc))
-            return
-        if (
-            QMessageBox.warning(
-                self,
-                "Measure brush size",
-                "This paints three short strokes across the middle of the sign and "
-                "reads back how wide each one came out.\n\nThe strokes stay on the "
-                "sign - paint over them afterwards, or clear the sign in Rust.\n\n"
-                "Focus Rust with the sign open, then continue.",
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            != QMessageBox.StandardButton.Ok
-        ):
-            return
-        try:
-            settings = self._settings_document()
-            settings["safety"]["countdown_seconds"] = 0
-            self._pending_paint = _PendingPaint(
-                plan=self._plan or PaintPlan(width=1, height=1, color_groups=()),
-                profile=Profile.from_dict(profile.to_dict()),
-                settings=settings,
-                dry_run=False,
-                display_snapshot=capture_display_metadata(),
-                mode="measure_brush",
-                cell_fraction=self._logical_cell_fraction(profile),
-            )
-            self._pending_start_cancelled = False
-        except Exception as exc:
-            LOGGER.exception("Could not prepare the brush measurement")
-            QMessageBox.critical(self, "Could not prepare the measurement", str(exc))
-            return
-        self._launch_countdown(
-            3,
-            self._begin_paint_after_countdown,
-            hint=f"{self.abort_hotkey_combo.currentText()} cancels",
-        )
-
     def _store_measured_brush_model(self) -> None:
-        """Persist the model the finished measurement job fitted."""
+        """Keep the model the finished job measured on its way in.
+
+        The run itself no longer needs it - it measured its own - but the
+        planner does: knowing what the sign's Size numbers reach is what lets
+        the optimizer offer multi-cell brush passes on the *next* image, and
+        what the preview needs to stop promising detail the brush cannot hold.
+        A failure to save is only logged: the paint job succeeded, and saying
+        so with an error dialog would be a lie about what just happened.
+        """
 
         painter = self._painter
         profile = self._current_profile
         model = painter.measured_brush_size_model if painter is not None else None
         if model is None or profile is None:
-            LOGGER.warning("Brush measurement finished without a model")
-            self.progress_detail_label.setText("Brush measurement produced no model")
+            return
+        stored = profile.metadata.get("brush_size_model")
+        if isinstance(stored, dict) and stored.get("slope") == model.slope:
             return
         try:
             candidate = Profile.from_dict(profile.to_dict())
             candidate.metadata["brush_size_model"] = model.to_dict()
             self._current_profile = self._profile_store.save(candidate)
-        except Exception as exc:
-            LOGGER.exception("Could not save the brush size model")
-            QMessageBox.warning(self, "Could not save the measurement", str(exc))
+        except Exception:
+            LOGGER.exception("Could not save the measured brush size model")
             return
         LOGGER.info(
             "Brush size measured: %.6f of the sign per unit (~%.0f rows)",
@@ -4109,11 +4136,6 @@ class MainWindow(QMainWindow):
         )
         self._refresh_profile_ui()
         self._schedule_processing()
-        self.progress_state_label.setText("Brush measured")
-        self.statusBar().showMessage(
-            f"Brush measured: this sign is about {model.sign_pixel_rows:.0f} rows tall",
-            8000,
-        )
 
     @Slot()
     def _register_hotkeys(self, *_args: Any) -> None:
@@ -4298,7 +4320,11 @@ class MainWindow(QMainWindow):
                 paused = self._painter.state == PainterState.PAUSED
             except Exception:
                 paused = False
-        profile_ready = bool(self._current_profile and self._current_profile.is_ready)
+        profile_ready = bool(
+            self._current_profile
+            and self._current_profile.is_ready
+            and not self._missing_sizing_rectangles()
+        )
         can_dry_run = self.dry_run_check.isChecked() and self._plan is not None
         can_start = (self._plan is not None and profile_ready) or can_dry_run or paused
         if (
@@ -4331,6 +4357,25 @@ class MainWindow(QMainWindow):
         self._set_job_controls_locked(job_locked)
         self._update_calibration_overlay()
 
+    def _missing_sizing_rectangles(self) -> list[str]:
+        """Rectangles automatic brush sizing needs but this profile lacks.
+
+        Both only matter while sizing is on: the run types a Size number it
+        measured on the sign, and it can only measure on the sign if it can
+        wipe the probe strokes off again afterwards.
+        """
+
+        if not self.apply_brush_check.isChecked():
+            return []
+        return [
+            label
+            for label, name in (
+                ("Size value box", "brush_size_box"),
+                ("clear button", "clear_button"),
+            )
+            if self._profile_rect(name) is None
+        ]
+
     def _start_blocked_reason(self, profile_ready: bool, paused: bool) -> str:
         if self._painter_is_active() and not paused:
             return "A paint job is already running."
@@ -4350,6 +4395,14 @@ class MainWindow(QMainWindow):
             ]
             if missing:
                 return "Calibrate the " + ", ".join(missing) + " before painting."
+            sizing = self._missing_sizing_rectangles()
+            if sizing:
+                return (
+                    "Automatic brush sizing measures this sign's brush before "
+                    "every job and wipes the measurement off again, so it needs "
+                    "the " + " and ".join(sizing) + " calibrated. Turn automatic "
+                    "brush sizing off to paint with whatever brush Rust has set."
+                )
             return "Finish calibrating this profile before painting."
         if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
             return (
@@ -4401,7 +4454,7 @@ class MainWindow(QMainWindow):
             self.calibrate_color_box_button,
             self.calibrate_hue_bar_button,
             self.calibrate_brush_button,
-            self.measure_brush_button,
+            self.calibrate_clear_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -4421,11 +4474,6 @@ class MainWindow(QMainWindow):
         )
         for control in controls:
             control.setEnabled(not locked)
-        # Clearing needs something measured to clear, so it answers to the
-        # profile as well as to the lock.
-        self.clear_brush_model_button.setEnabled(
-            not locked and self._brush_size_model() is not None
-        )
         if not locked:
             is_fit = self.scale_mode_combo.currentData() == ScaleMode.FIT.value
             is_fill = self.scale_mode_combo.currentData() == ScaleMode.FILL.value
@@ -4612,15 +4660,23 @@ class MainWindow(QMainWindow):
         desktop = get_virtual_screen()
         names = ["canvas", "color_box", "hue_bar"]
         if apply_brush_size:
-            names.append("brush_size_box")
+            names.extend(("brush_size_box", "clear_button"))
+        required = {
+            "brush_size_box": (
+                "Automatic brush sizing requires Rust's numeric Size field to be "
+                "calibrated."
+            ),
+            "clear_button": (
+                "Automatic brush sizing measures the brush on the sign before "
+                "painting, so it requires Rust's clear button to be calibrated - "
+                "that is what wipes the measurement off again."
+            ),
+        }
         for name in names:
             rectangle = getattr(profile, name, None)
             if rectangle is None:
-                if name == "brush_size_box":
-                    raise ValueError(
-                        "Automatic brush sizing requires Rust's numeric Size field "
-                        "to be calibrated."
-                    )
+                if name in required:
+                    raise ValueError(required[name])
                 continue
             if not (
                 desktop.left <= rectangle.left
@@ -4757,12 +4813,7 @@ class MainWindow(QMainWindow):
             )
             # Publish only a configured READY painter. The hotkey thread can
             # then abort it atomically even before its worker thread starts.
-            if pending.mode == "measure_brush":
-                painter.configure_brush_measurement(
-                    pending.profile, settings, cell_fraction=pending.cell_fraction
-                )
-            else:
-                painter.configure(pending.plan, pending.profile, settings)
+            painter.configure(pending.plan, pending.profile, settings)
             if self._pending_start_cancelled:
                 painter.shutdown(timeout=0.5)
                 self._set_idle_ui("Start cancelled")
@@ -4778,16 +4829,12 @@ class MainWindow(QMainWindow):
                     self._set_idle_ui("Start cancelled")
                     return
                 raise RuntimeError("The configured paint worker could not be started")
-            self._pending_mode = pending.mode
-            if pending.mode == "measure_brush":
-                LOGGER.info("Brush size measurement started")
-            else:
-                LOGGER.info(
-                    "%s started: %d colors, %d strokes",
-                    "Dry run" if dry_run else "Painting",
-                    len(pending.plan.color_groups),
-                    pending.plan.stroke_count,
-                )
+            LOGGER.info(
+                "%s started: %d colors, %d strokes",
+                "Dry run" if dry_run else "Painting",
+                len(pending.plan.color_groups),
+                pending.plan.stroke_count,
+            )
             self._update_start_availability()
         except Exception as exc:
             LOGGER.exception("Could not start painting")
@@ -4865,6 +4912,17 @@ class MainWindow(QMainWindow):
             f"Stroke {progress.completed_strokes:,} / {progress.total_strokes:,}"
         )
         self.progress_detail_label.setText(f"{detail}  •  {percent:.1f}%{remaining}")
+        if (
+            getattr(progress, "phase", "paint") == "paint"
+            and getattr(progress.state, "value", "") == "running"
+        ):
+            # Recording starts here rather than when the worker enters RUNNING,
+            # so the finished video opens on a blank sign instead of on the
+            # calibration strokes the job wipes off before it paints.  The
+            # state check matters: the job's final progress update is also a
+            # painting one, and without it a finished job would open a new
+            # recording the moment it closed the old one.
+            self._maybe_start_timelapse()
         self.active_paint_progress.setValue(round(percent * 10))
         self.active_progress_state.setText(
             str(progress.message or progress.state.value)
@@ -4904,9 +4962,7 @@ class MainWindow(QMainWindow):
             self.active_progress_title.setText(
                 {"countdown": "GET READY", "paused": "PAUSED"}.get(value, "PAINTING")
             )
-        if value == "running":
-            self._maybe_start_timelapse()
-        elif value in {"completed", "aborted", "error"}:
+        if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
         if reason:
             self.statusBar().showMessage(f"{value.title()}: {reason}", 5000)
@@ -4921,11 +4977,7 @@ class MainWindow(QMainWindow):
         self.progress_state_label.setText("Completed")
         self._set_active_progress_visible(False)
         self._set_state_badge("completed", "COMPLETE")
-        if self._pending_mode == "measure_brush":
-            self._pending_mode = "paint"
-            self._store_measured_brush_model()
-            self._update_start_availability()
-            return
+        self._store_measured_brush_model()
         LOGGER.info("Paint plan completed")
         if self._painter is not None and getattr(self._painter.input, "is_dry_run", False):
             LOGGER.info(
@@ -4949,15 +5001,11 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- timelapse
 
     def _maybe_start_timelapse(self) -> None:
-        """Begin recording frames when a real paint job enters RUNNING."""
+        """Begin recording frames once a real paint job starts on the artwork."""
 
         if self._timelapse_recorder is not None or self._closing:
             return
         if not self.timelapse_check.isChecked():
-            return
-        if self._pending_mode == "measure_brush":
-            # A measurement paints three throwaway probe strokes; recording them
-            # would open a timelapse of work nobody wants to watch back.
             return
         painter = self._painter
         if painter is None or not getattr(painter.input, "emits_real_input", True):
@@ -5082,10 +5130,7 @@ class MainWindow(QMainWindow):
         except OSError:
             sessions = []
         for session in sessions:
-            try:
-                frames = sorted(session.glob("frame_*.png"))
-            except OSError:
-                frames = []
+            frames = session_frames(session)
             megabytes = sum(frame.stat().st_size for frame in frames) / (1024 * 1024)
             item = QListWidgetItem(
                 f"{session.name}  •  {len(frames)} frame"
@@ -5107,9 +5152,179 @@ class MainWindow(QMainWindow):
         return Path(value) if isinstance(value, str) else None
 
     def _sync_session_buttons(self) -> None:
-        has_selection = self._selected_session_path() is not None
+        session = self._selected_session_path()
+        has_selection = session is not None
+        exporting = self._timelapse_export is not None
         self.open_session_button.setEnabled(has_selection)
-        self.delete_session_button.setEnabled(has_selection)
+        self.delete_session_button.setEnabled(has_selection and not exporting)
+        # An empty session folder can be opened and deleted but has nothing to
+        # watch, so the two buttons that need frames check for them.
+        has_frames = has_selection and bool(session_frames(session))
+        self.play_session_button.setEnabled(has_frames)
+        self.export_session_button.setEnabled(has_frames and not exporting)
+        self.timelapse_format_combo.setEnabled(not exporting)
+
+    @Slot()
+    def _play_selected_session(self) -> None:
+        """Open a modeless player for the selected recording."""
+
+        session = self._selected_session_path()
+        if session is None or not session.is_dir():
+            return
+        frames = session_frames(session)
+        if not frames:
+            QMessageBox.information(
+                self,
+                "Nothing to play",
+                f"“{session.name}” has no captured frames yet.",
+            )
+            return
+        try:
+            from .timelapse_player import TimelapsePlayer
+
+            player = TimelapsePlayer(
+                session.name,
+                frames,
+                self,
+                frame_rate=self.timelapse_fps_spin.value(),
+            )
+        except Exception as exc:
+            LOGGER.exception("Could not open the timelapse player")
+            QMessageBox.warning(self, "Could not play the recording", str(exc))
+            return
+        player.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        player.destroyed.connect(
+            lambda _obj=None, ref=player: self._forget_timelapse_player(ref)
+        )
+        self._timelapse_players.append(player)
+        player.show()
+        player.raise_()
+        player.activateWindow()
+        player.play()
+        LOGGER.info("Playing timelapse %s (%d frames)", session.name, len(frames))
+
+    def _forget_timelapse_player(self, player: Any) -> None:
+        try:
+            self._timelapse_players.remove(player)
+        except ValueError:
+            pass
+
+    @Slot()
+    def _export_selected_session(self) -> None:
+        """Encode the selected recording into a single video file."""
+
+        if self._timelapse_export is not None:
+            QMessageBox.information(
+                self,
+                "Export in progress",
+                "One recording is already being saved. Wait for it to finish.",
+            )
+            return
+        session = self._selected_session_path()
+        if session is None or not session.is_dir():
+            return
+        frames = session_frames(session)
+        if not frames:
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                f"“{session.name}” has no captured frames yet.",
+            )
+            return
+        video_format = format_for(str(self.timelapse_format_combo.currentData()))
+        suggested = (
+            self._last_export_directory() / f"{session.name}{video_format.suffix}"
+        )
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save timelapse as video",
+            str(suggested),
+            f"{video_format.filter_text};;All files (*)",
+        )
+        if not chosen:
+            return
+        destination = Path(chosen)
+        if not destination.suffix:
+            destination = destination.with_suffix(video_format.suffix)
+        worker = _TimelapseExportWorker(
+            frames,
+            destination,
+            self.timelapse_fps_spin.value(),
+            video_format.key,
+        )
+        worker.signals.progress.connect(self._on_export_progress)
+        worker.signals.completed.connect(self._on_export_completed)
+        worker.signals.failed.connect(self._on_export_failed)
+        worker.signals.cancelled.connect(self._on_export_cancelled)
+        self._timelapse_export = worker
+        self.timelapse_export_progress.setRange(0, len(frames))
+        self.timelapse_export_progress.setValue(0)
+        self.timelapse_export_progress.setFormat(
+            f"Saving {destination.name} — %v of %m frames"
+        )
+        self.timelapse_export_progress.setVisible(True)
+        self._sync_session_buttons()
+        LOGGER.info(
+            "Exporting %d frames of %s to %s at %d fps",
+            len(frames),
+            session.name,
+            destination,
+            self.timelapse_fps_spin.value(),
+        )
+        self._timelapse_export_pool.start(worker)
+
+    def _last_export_directory(self) -> Path:
+        stored = self._settings.get("ui", {}).get("last_video_export_directory")
+        if isinstance(stored, str) and stored:
+            candidate = Path(stored)
+            if candidate.is_dir():
+                return candidate
+        return Path.home()
+
+    @Slot(int, int)
+    def _on_export_progress(self, done: int, total: int) -> None:
+        if self._timelapse_export is None:
+            return
+        self.timelapse_export_progress.setRange(0, total)
+        self.timelapse_export_progress.setValue(done)
+
+    @Slot(str)
+    def _on_export_completed(self, destination: str) -> None:
+        path = Path(destination)
+        self._finish_export()
+        self._settings.setdefault("ui", {})["last_video_export_directory"] = str(
+            path.parent
+        )
+        self._schedule_settings_save()
+        self.statusBar().showMessage(f"Timelapse saved to {path}", 10000)
+        if (
+            QMessageBox.information(
+                self,
+                "Timelapse saved",
+                f"Saved to:\n{path}\n\nOpen the folder it is in?",
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close,
+                QMessageBox.StandardButton.Close,
+            )
+            == QMessageBox.StandardButton.Open
+        ):
+            self._open_in_file_manager(path.parent)
+
+    @Slot(str)
+    def _on_export_failed(self, message: str) -> None:
+        self._finish_export()
+        QMessageBox.warning(self, "Could not save the timelapse", message)
+
+    @Slot()
+    def _on_export_cancelled(self) -> None:
+        self._finish_export()
+        self.statusBar().showMessage("Timelapse export cancelled", 5000)
+
+    def _finish_export(self) -> None:
+        self._timelapse_export = None
+        self.timelapse_export_progress.setVisible(False)
+        self.timelapse_export_progress.reset()
+        if not self._closing:
+            self._sync_session_buttons()
 
     @Slot()
     def _open_timelapse_folder(self) -> None:
@@ -5518,6 +5733,18 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer.stop()
         self._timelapse_timer.stop()
         self._timelapse_recorder = None
+        if self._timelapse_export is not None:
+            # The worker deletes its half-written file on the way out, so the
+            # user is never left with a video that stops mid-paint.
+            self._timelapse_export.cancel()
+            self._timelapse_export = None
+        self._timelapse_export_pool.waitForDone(3000)
+        for player in list(self._timelapse_players):
+            try:
+                player.close()
+            except Exception:
+                LOGGER.exception("Could not close a timelapse player")
+        self._timelapse_players.clear()
         try:
             if self._calibration_preview is not None:
                 self._calibration_preview.close()

@@ -301,6 +301,9 @@ class CalibrationProfile:
     color_box: Rect | None = None
     hue_bar: Rect | None = None
     brush_size_box: Rect | None = None
+    # Rust's "clear the sign" control.  Painting wipes the sign with it after
+    # measuring the brush, so the probe strokes never end up under the artwork.
+    clear_button: Rect | None = None
     hue_direction: str = HueDirection.BOTTOM_TO_TOP.value
     saturation_direction: str = SaturationDirection.LEFT_LOW.value
     value_direction: str = ValueDirection.TOP_BRIGHT.value
@@ -353,6 +356,7 @@ class CalibrationProfile:
             "color_box": self.color_box is not None,
             "hue_bar": self.hue_bar is not None,
             "brush_size_box": self.brush_size_box is not None,
+            "clear_button": self.clear_button is not None,
         }
 
     @property
@@ -382,6 +386,7 @@ class CalibrationProfile:
             "colorBox": _rect_dict(self.color_box),
             "hueBar": _rect_dict(self.hue_bar),
             "brushSizeBox": _rect_dict(self.brush_size_box),
+            "clearButton": _rect_dict(self.clear_button),
             "pickerDirections": {
                 "hue": self.hue_direction,
                 "saturation": self.saturation_direction,
@@ -411,6 +416,11 @@ class CalibrationProfile:
             brush_size_box=_rect_from(
                 _first(value, "brushSizeBox", "brush_size_box"),
                 "brush size box",
+                optional=True,
+            ),
+            clear_button=_rect_from(
+                _first(value, "clearButton", "clear_button"),
+                "clear button",
                 optional=True,
             ),
             hue_direction=_first(
