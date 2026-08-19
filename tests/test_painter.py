@@ -162,11 +162,11 @@ def test_automatic_brush_size_types_the_number_for_one_logical_cell() -> None:
     assert painter.start(plan, profile, _settings(apply_brush_size=True))
     assert painter.wait(_t(2.0))
 
-    # A 640x320 canvas under a 64x32 grid has 10px cells, and a one-cell brush
-    # deliberately targets 90% of that. One Size unit is one screen pixel here,
-    # so the painter should ask Rust for exactly 9.
+    # A 640x320 canvas under a 64x32 grid has 10px cells; a one-cell brush
+    # targets the full pitch plus half a texel so the sign's snapping can never
+    # open a bare stripe. One Size unit is one screen pixel here, so 10.5.
     assert painter.state is PainterState.COMPLETED
-    assert _typed_values(controller) == ["9"]
+    assert _typed_values(controller) == ["10.5"]
     assert not controller.held_buttons
 
 
@@ -189,7 +189,9 @@ def test_brush_size_is_committed_by_clearing_the_field_and_pressing_enter() -> N
         if event.kind == "key_down"
     ]
     # Old contents go from both sides of the caret, wherever the click put it.
-    assert keys == ["BACKSPACE"] * 6 + ["DELETE"] * 6 + ["9", "ENTER"]
+    # The period arrives as the raw OEM virtual-key code, stringified by the
+    # event recorder.
+    assert keys == ["BACKSPACE"] * 6 + ["DELETE"] * 6 + ["1", "0", str(0xBE), "5", "ENTER"]
     box = profile.brush_size_box
     assert any(
         event.kind == "move"
@@ -265,9 +267,10 @@ def test_optimized_plan_switches_brush_size() -> None:
     assert painter.state is PainterState.COMPLETED
     assert not controller.held_buttons
 
-    # 5 cells of a 10px pitch is 50 units; one cell is 90% of 10.  Every switch
-    # is one computed number, so returning to 5 costs no search at all.
-    assert _typed_values(controller) == ["50", "9", "50"]
+    # 5 cells of a 10px pitch is 50 units; one cell is the 10px pitch plus a
+    # half-texel snap margin.  Every switch is one computed number, so
+    # returning to 5 costs no search at all.
+    assert _typed_values(controller) == ["50", "10.5", "50"]
 
 
 def test_multi_cell_brush_beyond_the_size_field_is_refused_before_painting() -> None:

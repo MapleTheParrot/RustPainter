@@ -840,7 +840,7 @@ class Painter:
         diameters = {max(1, int(group.brush_diameter)) for group in plan.color_groups}
         for diameter in sorted(diameters):
             wanted = self._brush_target_fraction(
-                target, plan, diameter, settings.logical_pixel_spacing
+                target, plan, diameter, settings.logical_pixel_spacing, model
             )
             size = model.clamped_size_for_fraction(wanted)
             painted = model.fraction_for_size(size) * canvas.height
@@ -957,6 +957,7 @@ class Painter:
         plan: PaintPlan,
         diameter_cells: int,
         spacing: float,
+        model: BrushSizeModel | None = None,
     ) -> float:
         """The canvas-height fraction a ``diameter_cells`` brush should paint.
 
@@ -965,16 +966,24 @@ class Painter:
         spans the same distance both ways and therefore has to respect
         whichever pitch is tighter.  The result is expressed against the canvas
         height because that is the axis brush calibration measured.
+
+        A one-cell brush targets the full pitch plus half a sign texel.  The
+        sign renders every stroke snapped to its own texture rows, so a brush
+        sized exactly to the pitch still comes out half a texel narrow on the
+        rows where snapping lands low - and those rows show as bare stripes
+        across the painting.  Half a texel of overlap costs nothing visible:
+        boundaries are texel-quantized either way, and the later-painted color
+        simply owns the shared texel.  (An earlier version undershot to 90%
+        instead, and the stripes were plainly visible in game.)
         """
 
         canvas = target.canvas
         pitch = min(canvas.width / plan.width, canvas.height / plan.height)
         span = pitch * diameter_cells * min(spacing, 1.0)
-        if diameter_cells <= 1:
-            # Slightly underfilling a cell is safer than overwriting both
-            # adjacent rows. Rust's sign texture visually hides the small seam.
-            span *= 0.90
-        return span / canvas.height
+        fraction = span / canvas.height
+        if diameter_cells <= 1 and model is not None:
+            fraction += 0.5 * model.slope
+        return fraction
 
     def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:
         """Type the Size number that paints ``diameter_cells`` logical cells.
@@ -992,7 +1001,7 @@ class Painter:
         if not settings.apply_brush_size or box is None or model is None:
             return
         fraction = self._brush_target_fraction(
-            job.target, job.plan, diameter_cells, settings.logical_pixel_spacing
+            job.target, job.plan, diameter_cells, settings.logical_pixel_spacing, model
         )
         size = model.clamped_size_for_fraction(fraction)
         self._update_progress_state(

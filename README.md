@@ -264,11 +264,14 @@ discovered as smearing. If the smallest brush Rust offers is wider than one
 logical cell, RustPainter says so and names the resolution that would fit -
 that limit is the sign's own texture resolution, which no setting can raise.
 
-A one-cell brush deliberately targets 90% of a logical cell, so rows meet with
-a hairline seam the sign texture hides rather than smearing into each other.
-Perfectly edge-to-edge pixels need the **square** brush: a circle of one cell
-across leaves gaps at the cell corners, and widening it to close them overlaps
-its neighbours by 40%. Along a horizontal run the two shapes behave alike; the
+A one-cell brush targets the full logical cell plus half a sign texel: the
+sign renders strokes snapped to its own texture rows, and a brush sized
+exactly to the row pitch still lands half a texel narrow wherever snapping
+rounds down - which shows as bare stripes across the painting. The half-texel
+overlap is invisible instead: boundaries are texel-quantized either way, and
+the later-painted color owns the shared texel. Perfectly edge-to-edge pixels
+still favor the **square** brush: a circle of one cell across leaves gaps at
+the cell corners. Along a horizontal run the two shapes behave alike; the
 difference shows at run ends and on isolated pixels.
 
 ## Timelapse
