@@ -172,3 +172,33 @@ def test_expected_process_default_is_platform_appropriate() -> None:
         assert safety["expected_process_name"] == "RustClient.exe"
     else:
         assert safety["expected_process_name"] == ""
+
+
+def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(
+    tmp_path,
+) -> None:
+    # Compact laptop keyboards swallow F5-F12 behind Fn, so the app was
+    # unusable there while only function keys were allowed.
+    store = SettingsStore(tmp_path / "settings.json")
+
+    saved = store.save(
+        {
+            "hotkeys": {
+                "start_resume": "CTRL+ALT+S",
+                "pause": "CTRL+ALT+P",
+                "abort": "CTRL+ALT+X",
+            }
+        }
+    )
+
+    assert saved["hotkeys"]["abort"] == "CTRL+ALT+X"
+    assert store.load()["hotkeys"]["start_resume"] == "CTRL+ALT+S"
+
+
+def test_settings_still_reject_a_modifier_hotkey_the_chooser_cannot_offer(
+    tmp_path,
+) -> None:
+    with pytest.raises(SettingsError, match="start_resume"):
+        SettingsStore(tmp_path / "settings.json").save(
+            {"hotkeys": {"start_resume": "CTRL+ALT+Q"}}
+        )

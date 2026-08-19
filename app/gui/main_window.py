@@ -98,6 +98,7 @@ from app.paint_optimizer import (
     optimize_paint_plan,
     simplify_colors,
 )
+from app.hotkeys import SUPPORTED_HOTKEY_CHOICES
 from app.profiles import Profile, ProfileStore
 from app.settings import SettingsStore, default_settings
 
@@ -1788,7 +1789,11 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _hotkey_combo(default: str) -> QComboBox:
         combo = NoWheelComboBox()
-        combo.addItems([f"F{number}" for number in range(5, 13)])
+        combo.addItems(list(SUPPORTED_HOTKEY_CHOICES))
+        combo.setToolTip(
+            "Laptop keyboards that need Fn for F5-F12 never deliver those presses "
+            "to the app. Pick a Ctrl+Alt combo instead."
+        )
         combo.setCurrentText(default)
         return combo
 

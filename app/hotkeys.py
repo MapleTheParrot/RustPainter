@@ -69,6 +69,27 @@ class HotkeySpec:
         return "+".join(pieces)
 
 
+# Compact laptop keyboards put F5-F12 behind an Fn key that the keyboard
+# firmware consumes, so those presses never reach RegisterHotKey and the app
+# looks unusable.  Offer modifier combos that every keyboard can produce.
+# Ctrl+Alt+letter avoids both Rust's bindings and the common Windows shortcuts.
+FUNCTION_KEY_CHOICES: tuple[str, ...] = tuple(f"F{number}" for number in range(5, 13))
+MODIFIER_KEY_CHOICES: tuple[str, ...] = tuple(
+    f"CTRL+ALT+{letter}" for letter in ("S", "P", "X", "B", "N", "M")
+)
+SUPPORTED_HOTKEY_CHOICES: tuple[str, ...] = FUNCTION_KEY_CHOICES + MODIFIER_KEY_CHOICES
+
+
+def normalize_hotkey(value: object) -> str:
+    """Return the canonical spelling used by settings and the chooser."""
+
+    return "+".join(part.strip() for part in str(value).strip().upper().split("+"))
+
+
+def is_supported_hotkey(value: object) -> bool:
+    return normalize_hotkey(value) in SUPPORTED_HOTKEY_CHOICES
+
+
 @dataclass(frozen=True, slots=True)
 class HotkeyBindings:
     start_resume: HotkeySpec | int | str = "F8"

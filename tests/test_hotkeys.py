@@ -5,7 +5,13 @@ from typing import Any, Callable
 
 import pytest
 
-from app.hotkeys import GlobalHotkeyManager, HotkeyRegistrationError
+from app.hotkeys import (
+    MOD_NOREPEAT,
+    GlobalHotkeyManager,
+    HotkeyRegistrationError,
+    HotkeySpec,
+)
+from app.input_controller import mac_virtual_key_code
 
 # These two exercise the Win32 message loop by patching ctypes.WinDLL, which
 # only exists on Windows. The darwin event-tap path is covered separately by
@@ -137,3 +143,19 @@ def test_darwin_bindings_resolve_mac_keycodes_and_modifiers() -> None:
     keycode, mask = resolved["pause"]
     assert keycode == 0x65
     assert mask == (0x00040000 | 0x00020000)  # Control | Shift
+
+
+def test_every_offered_hotkey_choice_resolves_on_both_platforms() -> None:
+    # The chooser, the settings validator, and both key-code tables must agree,
+    # or a selectable entry would fail to register at runtime.
+    from app.hotkeys import SUPPORTED_HOTKEY_CHOICES, is_supported_hotkey
+
+    assert len(set(SUPPORTED_HOTKEY_CHOICES)) == len(SUPPORTED_HOTKEY_CHOICES)
+    assert any("+" in choice for choice in SUPPORTED_HOTKEY_CHOICES)
+    for choice in SUPPORTED_HOTKEY_CHOICES:
+        assert is_supported_hotkey(choice.lower())
+        spec = HotkeySpec.parse(choice)
+        assert str(spec) == choice
+        assert spec.virtual_key > 0
+        assert spec.modifier_mask >= MOD_NOREPEAT
+        assert mac_virtual_key_code(spec.key) >= 0

@@ -217,6 +217,11 @@ The current Rust picker layout is fixed in the application: hue runs bottom to t
 
 Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** abort. Abort is designed to release any held mouse button immediately.
 
+Compact laptop keyboards often put F5-F12 behind an **Fn** key that the keyboard
+firmware handles itself, so those presses never reach the app and the hotkeys
+appear dead. Settings > Safety and hotkeys also offers **Ctrl+Alt+S / P / X / B /
+N / M**, which any keyboard can produce and which Rust does not bind.
+
 ## Calibration and DPI notes
 
 Before the first stroke of every job, the calibrated color box and hue bar are

@@ -13,6 +13,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from .hotkeys import (
+    SUPPORTED_HOTKEY_CHOICES,
+    is_supported_hotkey,
+    normalize_hotkey,
+)
 from .models import PaintMode
 
 
@@ -374,15 +379,15 @@ def _validate(settings: Mapping[str, Any]) -> None:
         )
 
     assert isinstance(hotkeys, Mapping)
-    allowed_hotkeys = {f"F{number}" for number in range(5, 13)}
     for key in ("start_resume", "pause", "abort"):
         if not isinstance(hotkeys.get(key), str) or not str(hotkeys[key]).strip():
             raise SettingsError(f"hotkeys.{key} must be a non-empty string")
-        if str(hotkeys[key]).strip().upper() not in allowed_hotkeys:
-            raise SettingsError(f"hotkeys.{key} must be one of F5 through F12")
+        if not is_supported_hotkey(hotkeys[key]):
+            raise SettingsError(
+                f"hotkeys.{key} must be one of: " + ", ".join(SUPPORTED_HOTKEY_CHOICES)
+            )
     normalized_hotkeys = {
-        str(hotkeys[key]).strip().upper()
-        for key in ("start_resume", "pause", "abort")
+        normalize_hotkey(hotkeys[key]) for key in ("start_resume", "pause", "abort")
     }
     if len(normalized_hotkeys) != 3:
         raise SettingsError("Start, pause, and abort hotkeys must be different")
