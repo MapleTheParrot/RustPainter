@@ -26,6 +26,17 @@ ImageSource: TypeAlias = str | Path | Image.Image
 # background tolerance percentage into a concrete color distance.
 _MAX_RGB_DISTANCE = sqrt(3.0) * 255.0
 
+# Where each Fill alignment anchors the kept region, as ``ImageOps.fit``
+# centering fractions.  Shared with the GUI so its canvas overlay and the
+# resampler can never disagree about which part of the source survives.
+CROP_CENTERING: dict[CropAlignment, tuple[float, float]] = {
+    CropAlignment.CENTER: (0.5, 0.5),
+    CropAlignment.TOP: (0.5, 0.0),
+    CropAlignment.BOTTOM: (0.5, 1.0),
+    CropAlignment.LEFT: (0.0, 0.5),
+    CropAlignment.RIGHT: (1.0, 0.5),
+}
+
 try:
     _LANCZOS = Image.Resampling.LANCZOS
     _DITHER_NONE = Image.Dither.NONE
@@ -171,7 +182,7 @@ def _linear_to_srgb(values: np.ndarray) -> np.ndarray:
 _SRGB_TO_LINEAR = _srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
 
 
-def _fill_crop_box(
+def fill_crop_box(
     source_size: tuple[int, int],
     target_size: tuple[int, int],
     centering: tuple[float, float],
@@ -180,7 +191,8 @@ def _fill_crop_box(
 
     Handing this box straight to the resampler is what stops an extreme source
     aspect ratio from allocating a huge intermediate image, which is why Fill
-    does not simply crop and then resize.
+    does not simply crop and then resize.  The GUI also reads it to know where
+    the sign canvas sits on the unscaled source image.
     """
 
     source_width, source_height = source_size
@@ -249,18 +261,12 @@ def _scale_layer(
         )
 
     if mode is ScaleMode.FILL:
-        centering = {
-            CropAlignment.CENTER: (0.5, 0.5),
-            CropAlignment.TOP: (0.5, 0.0),
-            CropAlignment.BOTTOM: (0.5, 1.0),
-            CropAlignment.LEFT: (0.0, 0.5),
-            CropAlignment.RIGHT: (1.0, 0.5),
-        }[alignment]
+        centering = CROP_CENTERING[alignment]
         return (
             _resample(
                 source,
                 target_size,
-                box=_fill_crop_box(source.size, target_size, centering),
+                box=fill_crop_box(source.size, target_size, centering),
             ),
             np.ones((target_height, target_width), dtype=np.bool_),
         )
@@ -673,12 +679,14 @@ resize_image = scale_image
 
 
 __all__ = [
+    "CROP_CENTERING",
     "ImageSource",
     "background_mask",
     "calculate_fill_size",
     "calculate_fit_size",
     "calculate_scaled_size",
     "detect_background_color",
+    "fill_crop_box",
     "fill_size",
     "fit_size",
     "load_image",

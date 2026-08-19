@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -892,6 +893,7 @@ def _impatient(painter: Painter) -> Painter:
     """
 
     painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
     return painter
@@ -981,8 +983,15 @@ def test_a_paint_job_measures_the_brush_then_wipes_it_before_painting() -> None:
     assert not controller.held_buttons
 
 
-def test_a_clear_control_that_clears_nothing_stops_the_job() -> None:
-    """A misdragged trash box would paint the artwork over the probe strokes."""
+def test_a_clear_control_that_clears_nothing_warns_but_keeps_painting(
+    caplog,
+) -> None:
+    """A clear click is trusted; a sign that looks unchanged only logs.
+
+    Rust's redraw can lag past the capture, so a stopped job here failed real
+    runs whose signs had genuinely cleared.  The suspicious capture is worth a
+    log line for a truly misdragged trash box, never an abort.
+    """
 
     controller = MockInputController()
     controller.emits_real_input = True  # type: ignore[misc]
@@ -1004,13 +1013,18 @@ def test_a_clear_control_that_clears_nothing_stops_the_job() -> None:
     errors: list[str] = []
     painter.set_callbacks(on_error=lambda exc: errors.append(str(exc)))
 
-    assert painter.start(
-        _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
-    )
-    assert painter.wait(_t(10.0))
+    with caplog.at_level(logging.WARNING, logger="rust_painter.painter"):
+        assert painter.start(
+            _one_cell_plan(), profile, _settings(apply_brush_size=True, verify_passes=0)
+        )
+        assert painter.wait(_t(10.0))
 
-    assert painter.state is PainterState.ERROR
-    assert errors and "did not clear the sign" in errors[0]
+    assert painter.state is PainterState.COMPLETED
+    assert not errors
+    assert any(
+        "unchanged after clicking Rust's clear control" in record.message
+        for record in caplog.records
+    )
     assert not controller.held_buttons
 
 

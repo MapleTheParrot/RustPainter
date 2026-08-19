@@ -115,7 +115,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
 - One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
-- Multiple draggable text layers with inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, and live font/color styling
+- Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, live font/color styling, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and - for automatic brush sizing - the numeric Size field and Rust's clear button, with an on-screen overlay to verify them

@@ -17,7 +17,15 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
@@ -357,7 +365,14 @@ class PreviewLabel(_ImageDropTarget, QLabel):
 
 
 class _MovableTextItem(QGraphicsTextItem):
-    """Movable text with direct editing and edge/corner resize handles."""
+    """Movable text with direct editing and edge/corner resize handles.
+
+    The item's own coordinates and font stay in logical canvas pixels; the
+    view scales the whole item so the same text covers the same fraction of
+    the sign however large the backdrop pixmap is.  ``canvas_rect`` reports
+    where that sign canvas sits in scene coordinates, which is what movement
+    is clamped to and what the emitted position fractions are relative to.
+    """
 
     def __init__(
         self,
@@ -366,6 +381,7 @@ class _MovableTextItem(QGraphicsTextItem):
         text_edited: Callable[[int, str], None],
         resized: Callable[[int, int], None],
         interaction_finished: Callable[[], None],
+        canvas_rect: Callable[[], QRectF] | None = None,
     ) -> None:
         super().__init__()
         self.index = index
@@ -373,6 +389,7 @@ class _MovableTextItem(QGraphicsTextItem):
         self._text_edited = text_edited
         self._resized = resized
         self._interaction_finished = interaction_finished
+        self._canvas_rect_getter = canvas_rect
         self._syncing = True
         self._editing = False
         self._dragging = False
@@ -401,13 +418,23 @@ class _MovableTextItem(QGraphicsTextItem):
         return self._editing
 
     def set_center(self, x: float, y: float) -> None:
-        bounds = self.boundingRect()
+        scale = max(self.scale(), 1e-6)
+        center = self.boundingRect().center()
         self._syncing = True
-        self.setPos(x - bounds.width() / 2.0, y - bounds.height() / 2.0)
+        self.setPos(x - center.x() * scale, y - center.y() * scale)
         self._syncing = False
 
     def finish_setup(self) -> None:
         self._syncing = False
+
+    def _canvas_bounds(self) -> QRectF:
+        if self._canvas_rect_getter is not None:
+            rect = self._canvas_rect_getter()
+            if rect.width() > 0 and rect.height() > 0:
+                return rect
+        if self.scene() is not None:
+            return self.scene().sceneRect()
+        return QRectF(0.0, 0.0, 1.0, 1.0)
 
     def _handle_rects(self) -> dict[str, QRectF]:
         bounds = super().boundingRect()
@@ -516,7 +543,11 @@ class _MovableTextItem(QGraphicsTextItem):
             if "bottom" in self._resize_handle
             else 0
         )
-        outward = delta.x() * horizontal + delta.y() * vertical
+        # The drag arrives in scene pixels while the text metrics are logical;
+        # a scaled item therefore shrinks the drag back into its own units.
+        outward = (delta.x() * horizontal + delta.y() * vertical) / max(
+            self.scale(), 1e-6
+        )
         axes = int(horizontal != 0) + int(vertical != 0)
         if axes > 1:
             outward /= axes
@@ -595,24 +626,27 @@ class _MovableTextItem(QGraphicsTextItem):
             and self.scene() is not None
         ):
             position = value
+            scale = max(self.scale(), 1e-6)
             bounds = self.boundingRect()
-            scene = self.scene().sceneRect()
-            if bounds.width() >= scene.width():
-                position.setX(scene.left() - bounds.left())
+            canvas = self._canvas_bounds()
+            left, top = bounds.left() * scale, bounds.top() * scale
+            width, height = bounds.width() * scale, bounds.height() * scale
+            if width >= canvas.width():
+                position.setX(canvas.left() - left)
             else:
                 position.setX(
                     min(
-                        max(position.x(), scene.left() - bounds.left()),
-                        scene.right() - bounds.right(),
+                        max(position.x(), canvas.left() - left),
+                        canvas.right() - left - width,
                     )
                 )
-            if bounds.height() >= scene.height():
-                position.setY(scene.top() - bounds.top())
+            if height >= canvas.height():
+                position.setY(canvas.top() - top)
             else:
                 position.setY(
                     min(
-                        max(position.y(), scene.top() - bounds.top()),
-                        scene.bottom() - bounds.bottom(),
+                        max(position.y(), canvas.top() - top),
+                        canvas.bottom() - top - height,
                     )
                 )
             return position
@@ -622,13 +656,13 @@ class _MovableTextItem(QGraphicsTextItem):
             and not self._syncing
             and self.scene() is not None
         ):
-            scene = self.scene().sceneRect()
+            canvas = self._canvas_bounds()
             center = self.mapToScene(self.boundingRect().center())
-            if scene.width() > 0 and scene.height() > 0:
+            if canvas.width() > 0 and canvas.height() > 0:
                 self._moved(
                     self.index,
-                    (center.x() - scene.left()) / scene.width(),
-                    (center.y() - scene.top()) / scene.height(),
+                    (center.x() - canvas.left()) / canvas.width(),
+                    (center.y() - canvas.top()) / canvas.height(),
                 )
         return result
 
@@ -651,11 +685,14 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         placeholder: str,
         parent: QWidget | None = None,
         *,
+        smooth: bool = False,
         hint: str = "",
     ) -> None:
         super().__init__(parent)
         self.setObjectName("preview")
         self.setMinimumSize(300, 250)
+        if smooth:
+            self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -669,6 +706,8 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._scene.selectionChanged.connect(self._on_selection_changed)
         self._source = QPixmap()
         self._items: list[_MovableTextItem] = []
+        self._canvas_rect: QRectF | None = None
+        self._font_scale = 1.0
         self._placeholder = placeholder
         self._hint = hint
         self._placeholder_art = art_pixmap("preview-placeholder", 96)
@@ -686,16 +725,51 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     def set_source(self, pixmap: QPixmap | None) -> None:
         self._source = pixmap or QPixmap()
         self._background.setPixmap(self._source)
-        if self._source.isNull():
-            self._scene.setSceneRect(0, 0, 1, 1)
-        else:
-            self._scene.setSceneRect(0, 0, self._source.width(), self._source.height())
-            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._update_scene_rect()
         self._refresh_empty_state()
         self.viewport().update()
 
+    def set_canvas_geometry(self, rect: QRectF | None, font_scale: float = 1.0) -> None:
+        """Locate the sign canvas on the displayed pixmap.
+
+        ``rect`` is in pixmap pixels and may extend past the pixmap (Fit
+        letterboxing) or cover only part of it (Fill cropping); ``None`` means
+        the whole pixmap is the canvas.  ``font_scale`` is how many pixmap
+        pixels one logical canvas pixel spans, which is the scale applied to
+        every text item so it covers the same fraction of the sign it will
+        cover when painted.
+        """
+
+        self._canvas_rect = QRectF(rect) if rect is not None else None
+        self._font_scale = max(float(font_scale), 1e-6)
+        self._update_scene_rect()
+        self.viewport().update()
+
+    def canvas_rect(self) -> QRectF:
+        if (
+            self._canvas_rect is not None
+            and self._canvas_rect.width() > 0
+            and self._canvas_rect.height() > 0
+        ):
+            return QRectF(self._canvas_rect)
+        return QRectF(0.0, 0.0, float(self._source.width()), float(self._source.height()))
+
+    def _update_scene_rect(self) -> None:
+        if self._source.isNull():
+            self._scene.setSceneRect(0, 0, 1, 1)
+            return
+        # Fit letterboxing places canvas area beyond the pixmap edges; keeping
+        # it inside the scene keeps text dropped there visible and reachable.
+        rect = QRectF(0.0, 0.0, self._source.width(), self._source.height())
+        if self._canvas_rect is not None:
+            rect = rect.united(self._canvas_rect)
+        self._scene.setSceneRect(rect)
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
     def clear_source(self, placeholder: str = "No image loaded") -> None:
         self._placeholder = placeholder
+        self._canvas_rect = None
+        self._font_scale = 1.0
         self.set_source(None)
         self.set_layers([], -1)
 
@@ -705,8 +779,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._items.clear()
         if self._source.isNull():
             return
-        width = float(self._source.width())
-        height = float(self._source.height())
+        canvas = self.canvas_rect()
         for index, layer in enumerate(layers):
             text = str(getattr(layer, "text", ""))
             if not text.strip():
@@ -717,6 +790,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
                 self.layerTextEdited.emit,
                 self.layerResized.emit,
                 self.interactionFinished.emit,
+                self.canvas_rect,
             )
             item.setPlainText(text)
             font = QFont(str(getattr(layer, "font_family", "")))
@@ -727,10 +801,11 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             color = getattr(layer, "color", (255, 255, 255))
             item.setDefaultTextColor(QColor(*color))
             item.setZValue(float(index))
+            item.setScale(self._font_scale)
             self._scene.addItem(item)
             item.set_center(
-                float(getattr(layer, "x", 0.5)) * width,
-                float(getattr(layer, "y", 0.5)) * height,
+                canvas.left() + float(getattr(layer, "x", 0.5)) * canvas.width(),
+                canvas.top() + float(getattr(layer, "y", 0.5)) * canvas.height(),
             )
             item.setSelected(index == selected_index)
             item.finish_setup()
@@ -787,6 +862,33 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
                 self._hint,
                 self._placeholder_active,
             )
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        """Mark the sign canvas when it is not simply the whole pixmap.
+
+        Fill mode dims the cropped-away margins so text cannot be parked on
+        pixels the sign never receives; the dashed border also outlines the
+        letterbox area Fit adds beyond the source.
+        """
+
+        super().drawForeground(painter, rect)
+        if self._source.isNull() or self._canvas_rect is None:
+            return
+        canvas = self.canvas_rect()
+        pixmap_rect = QRectF(0.0, 0.0, self._source.width(), self._source.height())
+        if canvas.contains(pixmap_rect) and pixmap_rect.contains(canvas):
+            return
+        cropped = QPainterPath()
+        cropped.addRect(pixmap_rect)
+        kept = QPainterPath()
+        kept.addRect(canvas.intersected(pixmap_rect))
+        painter.fillPath(cropped.subtracted(kept), QColor(0, 0, 0, 110))
+        border = QPen(QColor(ACCENT))
+        border.setCosmetic(True)
+        border.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(border)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(canvas)
 
     def _on_selection_changed(self) -> None:
         selected = self._scene.selectedItems()

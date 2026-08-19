@@ -73,7 +73,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.color_calibration import ColorCorrectionModel
-from app.image_processing import process_image, quantize_image
+from app.image_processing import (
+    CROP_CENTERING,
+    calculate_fit_size,
+    fill_crop_box,
+    process_image,
+    quantize_image,
+)
 from app.calibration import (
     CalibrationPreviewOverlay,
     capture_display_metadata,
@@ -96,7 +102,6 @@ from app.paint_optimizer import (
     OptimizationStatistics,
     mode_options,
     optimize_paint_plan,
-    simplify_colors,
 )
 from app.hotkeys import SUPPORTED_HOTKEY_CHOICES
 from app.profiles import Profile, ProfileStore
@@ -419,7 +424,7 @@ class _ImageWorker(QRunnable):
                     if self.overpaint_gap == 0
                     else count_unmerged_strokes(processed)
                 )
-                simulation_processed = base_processed
+                simulation_processed = processed
             else:
                 optimizer_options = mode_options(
                     mode, preserve_dither=self.options.dither
@@ -438,24 +443,12 @@ class _ImageWorker(QRunnable):
                 optimized_processed = ProcessedImage(
                     optimized.image, optimized.paint_mask, processed.requested_colors
                 )
-                if processed is base_processed:
-                    simulation_processed = optimized_processed
-                else:
-                    # Text stays a live vector overlay in the preview, so the
-                    # backdrop is simplified without the text baked in. Only
-                    # the color simplification runs here - brush planning has
-                    # no effect on how the target looks. Merge centers are
-                    # derived without the text pixels, so a backdrop shade can
-                    # differ very slightly from the painted plan's.
-                    backdrop_image, backdrop_mask = simplify_colors(
-                        base_processed, mode, options=optimizer_options
-                    )
-                    simulation_processed = ProcessedImage(
-                        backdrop_image, backdrop_mask, base_processed.requested_colors
-                    )
+                simulation_processed = optimized_processed
                 processed = optimized_processed
-            # Text stays as live vector items in the editor preview. The paint
-            # plan above still uses the composited, palette-limited result.
+            # The simulation is the plan's own target, text baked in and
+            # palette-limited, so the Rust preview promises exactly what the
+            # painter will put on the sign.  Text stays editable as vector
+            # items over the source image instead.
             simulation = _build_simulation_image(
                 simulation_processed, self.color_correction
             )
@@ -685,7 +678,13 @@ class MainWindow(QMainWindow):
         ]
         self._selected_text_layer = 0
         self._syncing_text_controls = False
+        self._source_preview_size: tuple[int, int] | None = None
+        # The Rust preview is only fronted once per imported image; afterwards
+        # the user's tab choice is respected so text editing on the Source tab
+        # is not interrupted by every reprocess.
+        self._show_preview_after_processing = False
         self._plan_processing = False
+        self._resolution_cap_note = ""
         self._closing = False
         self._painter_bridge = _PainterBridge()
         self._painter_bridge.progress.connect(self._on_paint_progress)
@@ -1128,16 +1127,21 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         browse_hint = "Click here or drop an image"
-        self.original_preview = PreviewLabel(
-            "Browse an image to begin", hint=browse_hint
+        self.original_preview = TextEditorPreview(
+            "Browse an image to begin", smooth=True, hint=browse_hint
         )
-        self.paint_preview = TextEditorPreview(
-            "Paint simulation will appear here", hint=browse_hint
-        )
-        self.paint_preview.setToolTip(
+        self.original_preview.setToolTip(
             "Drag text to move it, drag its handles to resize it, double-click "
             "to edit it, press Ctrl+D or Ctrl+C to copy it, or press Delete to "
-            "remove it."
+            "remove it. The dashed border is the part of the image the sign "
+            "will show."
+        )
+        self.paint_preview = PreviewLabel(
+            "Paint simulation will appear here", smooth=False, hint=browse_hint
+        )
+        self.paint_preview.setToolTip(
+            "Exactly what the painter will put on the sign - text is baked in "
+            "and every color is palette-limited."
         )
         for preview in (self.original_preview, self.paint_preview):
             preview.browseRequested.connect(self._browse_image)
@@ -1460,7 +1464,7 @@ class MainWindow(QMainWindow):
         self.duplicate_text_button.setObjectName("compactButton")
         self.duplicate_text_button.setToolTip(
             "Copy the selected text layer. Ctrl+D or Ctrl+C does the same to\n"
-            "the layer selected in the Rust preview."
+            "the layer selected in the Source tab."
         )
         self.remove_text_button = QPushButton("Remove")
         self.remove_text_button.setObjectName("compactButton")
@@ -1928,13 +1932,13 @@ class MainWindow(QMainWindow):
         self.text_color_button.colorChanged.connect(self._on_text_control_changed)
         self.text_bold_check.toggled.connect(self._on_text_control_changed)
         self.text_italic_check.toggled.connect(self._on_text_control_changed)
-        self.paint_preview.layerMoved.connect(self._on_text_layer_moved)
-        self.paint_preview.layerSelected.connect(self._select_text_layer)
-        self.paint_preview.layerTextEdited.connect(self._on_canvas_text_edited)
-        self.paint_preview.layerResized.connect(self._on_canvas_text_resized)
-        self.paint_preview.layerDeleteRequested.connect(self._delete_text_layer)
-        self.paint_preview.layerDuplicateRequested.connect(self._duplicate_text_layer)
-        self.paint_preview.interactionFinished.connect(
+        self.original_preview.layerMoved.connect(self._on_text_layer_moved)
+        self.original_preview.layerSelected.connect(self._select_text_layer)
+        self.original_preview.layerTextEdited.connect(self._on_canvas_text_edited)
+        self.original_preview.layerResized.connect(self._on_canvas_text_resized)
+        self.original_preview.layerDeleteRequested.connect(self._delete_text_layer)
+        self.original_preview.layerDuplicateRequested.connect(self._duplicate_text_layer)
+        self.original_preview.interactionFinished.connect(
             self._on_text_interaction_finished
         )
         self.speed_preset_combo.currentIndexChanged.connect(self._apply_speed_preset)
@@ -2166,7 +2170,7 @@ class MainWindow(QMainWindow):
             self.text_layer_combo.setCurrentIndex(index)
             self.text_layer_combo.blockSignals(False)
         self._sync_text_controls()
-        self.paint_preview.select_layer(index)
+        self.original_preview.select_layer(index)
 
     def _on_text_control_changed(self, *_args: Any) -> None:
         if self._syncing_text_controls or not self._text_layers:
@@ -2240,8 +2244,69 @@ class MainWindow(QMainWindow):
     def _on_text_interaction_finished(self) -> None:
         QTimer.singleShot(0, self._refresh_text_editor_layers)
 
+    def _source_canvas_geometry(self) -> tuple[QRectF, float] | None:
+        """Where the sign canvas lies on the source preview pixmap.
+
+        Text layers live in canvas fractions and logical pixels, but they are
+        edited over the raw source image, whose aspect ratio the sign rarely
+        shares.  The returned rectangle is the canvas in preview-pixmap pixels
+        - larger than the pixmap under Fit letterboxing, smaller under Fill
+        cropping - and the float is how many preview pixels one logical canvas
+        pixel spans, mirroring the mapping ``scale_image`` applies when the
+        text is baked.  Stretch distorts the source non-uniformly, so there
+        the text's on-screen aspect is approximated while its position and
+        painted size stay exact.
+        """
+
+        image = self._original_image
+        preview_size = self._source_preview_size
+        if image is None or preview_size is None:
+            return None
+        preview_width, preview_height = preview_size
+        if min(image.width, image.height, preview_width, preview_height) <= 0:
+            return None
+        logical_width = max(1, self.logical_width_spin.value())
+        logical_height = max(1, self.logical_height_spin.value())
+        mode = self.scale_mode_combo.currentData()
+        if mode == ScaleMode.FILL.value:
+            centering = CROP_CENTERING[
+                CropAlignment(self.crop_alignment_combo.currentData())
+            ]
+            left, top, right, bottom = fill_crop_box(
+                (image.width, image.height),
+                (logical_width, logical_height),
+                centering,
+            )
+            scale = preview_width / image.width
+            rect = QRectF(
+                left * scale,
+                top * scale,
+                (right - left) * scale,
+                (bottom - top) * scale,
+            )
+        elif mode == ScaleMode.FIT.value:
+            fitted_width, fitted_height = calculate_fit_size(
+                (image.width, image.height), (logical_width, logical_height)
+            )
+            # The integer paste offsets are the ones scale_image really uses.
+            paste_x = (logical_width - fitted_width) // 2
+            paste_y = (logical_height - fitted_height) // 2
+            scale = preview_width / fitted_width
+            rect = QRectF(
+                -paste_x * scale,
+                -paste_y * scale,
+                logical_width * scale,
+                logical_height * scale,
+            )
+        else:
+            rect = QRectF(0.0, 0.0, float(preview_width), float(preview_height))
+        return rect, rect.height() / logical_height
+
     def _refresh_text_editor_layers(self) -> None:
-        self.paint_preview.set_layers(
+        geometry = self._source_canvas_geometry()
+        if geometry is not None:
+            self.original_preview.set_canvas_geometry(*geometry)
+        self.original_preview.set_layers(
             self._text_layers,
             self._selected_text_layer,
         )
@@ -2375,6 +2440,8 @@ class MainWindow(QMainWindow):
         self._plan_metric_source = None
         self._plan_stroke_pixel_steps = 0
         self._plan_dot_count = 0
+        self._source_preview_size = None
+        self._show_preview_after_processing = True
         self.original_preview.clear_source("Decoding image…")
         self.paint_preview.clear_source("Waiting for the new image")
         self.image_name_label.setText(path.name)
@@ -2402,7 +2469,9 @@ class MainWindow(QMainWindow):
         self.image_dimensions_label.setText(
             f"{result.image.width:,} × {result.image.height:,} px  •  {result.image.mode}"
         )
+        self._source_preview_size = result.preview.size
         self.original_preview.set_source(self._pil_to_pixmap(result.preview))
+        self._refresh_text_editor_layers()
         LOGGER.info(
             "Loaded image: %s (%dx%d)",
             result.path,
@@ -2500,6 +2569,7 @@ class MainWindow(QMainWindow):
             if height < 8 or height > 2048:
                 height = max(8, min(2048, height))
                 width = round(height * aspect)
+        width, height = self._cap_to_sign_resolution(width, height)
         width = max(8, min(2048, width))
         height = max(8, min(2048, height))
         self.logical_width_spin.blockSignals(True)
@@ -2508,6 +2578,47 @@ class MainWindow(QMainWindow):
         self.logical_height_spin.setValue(height)
         self.logical_width_spin.blockSignals(False)
         self.logical_height_spin.blockSignals(False)
+
+    def _sign_resolution_cap(self) -> tuple[int, int] | None:
+        """The largest logical size this sign's texture actually resolves.
+
+        The brush measurement pins down how many texture rows the sign holds.
+        Planning more rows than that cannot add detail - Rust's smallest brush
+        already covers a full texel, so finer cells only make neighbouring
+        strokes overpaint each other.  ``None`` until a job has measured this
+        sign.
+        """
+
+        model = self._brush_size_model()
+        if model is None:
+            return None
+        rows = int(model.sign_pixel_rows)
+        if rows < 8:
+            return None
+        aspect = max(0.001, self._canvas_aspect_ratio())
+        height = min(rows, 2048)
+        width = max(8, min(2048, round(height * aspect)))
+        return width, height
+
+    def _cap_to_sign_resolution(self, width: int, height: int) -> tuple[int, int]:
+        """Hold a requested logical size at what the sign can actually show.
+
+        Records the note the plan summary appends, so a capped resolution is
+        announced next to the stroke counts rather than silently swapped in.
+        """
+
+        self._resolution_cap_note = ""
+        cap = self._sign_resolution_cap()
+        if cap is None:
+            return width, height
+        cap_width, cap_height = cap
+        if width <= cap_width and height <= cap_height:
+            return width, height
+        self._resolution_cap_note = (
+            f"  •  capped at {cap_width}×{cap_height}, all this sign's "
+            "texture resolves"
+        )
+        return cap_width, cap_height
 
     @Slot()
     def _update_quality_dimensions(self) -> None:
@@ -2523,6 +2634,7 @@ class MainWindow(QMainWindow):
                 width, height = longest, max(8, round(longest / aspect))
             else:
                 width, height = max(8, round(longest * aspect)), longest
+            width, height = self._cap_to_sign_resolution(width, height)
             self.logical_width_spin.blockSignals(True)
             self.logical_height_spin.blockSignals(True)
             self.logical_width_spin.setValue(width)
@@ -2666,9 +2778,13 @@ class MainWindow(QMainWindow):
         self._plan_stroke_pixel_steps = result.stroke_pixel_steps
         self._plan_dot_count = result.dot_count
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
-        if not self.paint_preview.is_interacting:
+        if not self.original_preview.is_interacting:
+            # Scale-mode or resolution changes land here, so the editor's
+            # canvas mapping is refreshed alongside the simulation.
             self._refresh_text_editor_layers()
-        self.preview_tabs.setCurrentIndex(1)
+        if self._show_preview_after_processing:
+            self._show_preview_after_processing = False
+            self.preview_tabs.setCurrentIndex(1)
         optimization = result.optimization
         merged_away = result.unmerged_stroke_count - result.plan.stroke_count
         if optimization is not None:
@@ -2705,7 +2821,7 @@ class MainWindow(QMainWindow):
         else:
             self.processing_label.setText(
                 f"{result.processed.painted_pixel_count:,} logical pixels will "
-                "be painted" + merge_note
+                "be painted" + merge_note + self._resolution_cap_note
             )
         LOGGER.info(
             "Generated %dx%d plan: %d colors, %d strokes",
@@ -4135,7 +4251,10 @@ class MainWindow(QMainWindow):
             model.sign_pixel_rows,
         )
         self._refresh_profile_ui()
-        self._schedule_processing()
+        # A fresh measurement can move the sign's resolution ceiling, and the
+        # capped dimensions feed text scaling, so the logical size is
+        # re-derived rather than only reprocessed.
+        self._update_quality_dimensions()
 
     @Slot()
     def _register_hotkeys(self, *_args: Any) -> None:

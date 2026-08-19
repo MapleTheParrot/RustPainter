@@ -112,15 +112,15 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     assert window.text_options_panel.isEnabled()
     assert window.text_font_combo.currentFont().family()
     assert len(window._text_layers) == 2
-    assert len(window.paint_preview._items) == 2
-    assert window.paint_preview._items[1].defaultTextColor().name() == "#55ff55"
+    assert len(window.original_preview._items) == 2
+    assert window.original_preview._items[1].defaultTextColor().name() == "#55ff55"
     assert window._processed is not None
     old_y = window._text_layers[1].y
-    item = window.paint_preview._items[1]
+    item = window.original_preview._items[1]
     item.setPos(item.pos().x(), item.pos().y() + 3)
     assert window._text_layers[1].y != old_y
     qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
-    item = window.paint_preview._items[1]
+    item = window.original_preview._items[1]
     double_click = QGraphicsSceneMouseEvent(
         QEvent.Type.GraphicsSceneMouseDoubleClick
     )
@@ -139,6 +139,15 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     pixels = np.asarray(window._processed.image.convert("RGB"))
     assert np.any(pixels > 128)
     assert len(window._plan.color_groups) >= 2
+
+    # The Rust preview bakes the text in rather than floating it as live
+    # vector items, so the black source must show bright text pixels there.
+    simulation = window.paint_preview._source.toImage()
+    assert any(
+        QColor(simulation.pixel(x, y)).value() > 128
+        for x in range(0, simulation.width(), 2)
+        for y in range(0, simulation.height(), 2)
+    )
 
 
 def test_text_size_survives_a_change_of_quality_preset(window: MainWindow) -> None:
@@ -171,6 +180,43 @@ def test_text_size_survives_a_change_of_quality_preset(window: MainWindow) -> No
     assert window.text_size_spin.value() == 40
 
 
+def test_text_editor_maps_the_sign_canvas_onto_the_source_image(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Layer fractions stay canvas fractions while editing over the source.
+
+    A square image on the default 2:1 canvas keeps only its middle band under
+    Fill, so the editor's canvas rectangle must cover exactly that band of the
+    displayed pixmap; under Fit the same canvas letterboxes and the rectangle
+    must extend past the pixmap's sides instead.
+    """
+
+    source_path = tmp_path / "square.png"
+    Image.new("RGB", (30, 30), (80, 80, 80)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._source_preview_size is not None, timeout=5000)
+    preview_width, preview_height = window._source_preview_size
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FILL.value)
+    geometry = window._source_canvas_geometry()
+    assert geometry is not None
+    rect, font_scale = geometry
+    assert rect.width() == pytest.approx(preview_width)
+    assert rect.height() == pytest.approx(preview_height / 2)
+    assert rect.top() == pytest.approx(preview_height / 4)
+    assert font_scale == pytest.approx(
+        rect.height() / window.logical_height_spin.value()
+    )
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FIT.value)
+    geometry = window._source_canvas_geometry()
+    assert geometry is not None
+    rect, _ = geometry
+    assert rect.left() < 0
+    assert rect.right() > preview_width
+    assert rect.top() == pytest.approx(0.0, abs=1e-6)
+
+
 def test_delete_key_removes_the_selected_text_layer(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
@@ -180,11 +226,11 @@ def test_delete_key_removes_the_selected_text_layer(
     window.add_text_button.click()
     window.text_edit.setText("SECOND")
     window.load_image(source_path)
-    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 2, timeout=5000)
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 2, timeout=5000)
 
-    window.paint_preview.select_layer(1)
-    assert window.paint_preview.selected_index() == 1
-    window.paint_preview.keyPressEvent(
+    window.original_preview.select_layer(1)
+    assert window.original_preview.selected_index() == 1
+    window.original_preview.keyPressEvent(
         QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
     )
 
@@ -192,8 +238,8 @@ def test_delete_key_removes_the_selected_text_layer(
 
     # The last layer is emptied rather than removed, so there is always one to
     # type into, and Backspace does the same job as Delete.
-    window.paint_preview.select_layer(0)
-    window.paint_preview.keyPressEvent(
+    window.original_preview.select_layer(0)
+    window.original_preview.keyPressEvent(
         QKeyEvent(
             QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier
         )
@@ -209,10 +255,10 @@ def test_control_d_and_control_c_copy_the_selected_text_layer(
     Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
     window.text_edit.setText("FIRST")
     window.load_image(source_path)
-    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 1, timeout=5000)
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 1, timeout=5000)
 
-    window.paint_preview.select_layer(0)
-    window.paint_preview.keyPressEvent(
+    window.original_preview.select_layer(0)
+    window.original_preview.keyPressEvent(
         QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.ControlModifier)
     )
 
@@ -231,16 +277,16 @@ def test_control_c_copies_characters_while_a_layer_is_being_edited(
     Image.new("RGB", (64, 32), (10, 10, 10)).save(source_path)
     window.text_edit.setText("FIRST")
     window.load_image(source_path)
-    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 1, timeout=5000)
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 1, timeout=5000)
 
-    item = window.paint_preview._items[0]
+    item = window.original_preview._items[0]
     double_click = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseDoubleClick)
     double_click.setButton(Qt.MouseButton.LeftButton)
     double_click.setPos(item.boundingRect().center())
     item.mouseDoubleClickEvent(double_click)
-    assert window.paint_preview.is_editing_text
+    assert window.original_preview.is_editing_text
 
-    window.paint_preview.keyPressEvent(
+    window.original_preview.keyPressEvent(
         QKeyEvent(
             QEvent.Type.KeyPress, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier
         )
@@ -292,16 +338,16 @@ def test_delete_key_edits_text_while_a_layer_is_being_edited(
     window.add_text_button.click()
     window.text_edit.setText("SECOND")
     window.load_image(source_path)
-    qtbot.waitUntil(lambda: len(window.paint_preview._items) == 2, timeout=5000)
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 2, timeout=5000)
 
-    item = window.paint_preview._items[1]
+    item = window.original_preview._items[1]
     double_click = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseDoubleClick)
     double_click.setButton(Qt.MouseButton.LeftButton)
     double_click.setPos(item.boundingRect().center())
     item.mouseDoubleClickEvent(double_click)
-    assert window.paint_preview.is_editing_text
+    assert window.original_preview.is_editing_text
 
-    window.paint_preview.keyPressEvent(
+    window.original_preview.keyPressEvent(
         QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
     )
     assert len(window._text_layers) == 2
@@ -494,6 +540,63 @@ def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> No
 
     window.apply_brush_check.setChecked(False)
     assert "Automatic brush sizing is off" in window.brush_model_status.text()
+
+
+def test_quality_presets_cap_at_the_signs_measured_resolution(
+    window: MainWindow,
+) -> None:
+    """A plan finer than the sign's texture is held at what the sign resolves.
+
+    Rust's smallest brush covers a full texture pixel, so extra logical rows
+    never land on the sign - they only make neighbouring strokes overpaint
+    each other and blur fine detail the preview promised.  Once a job has
+    measured the sign, the planner must stay inside that ceiling.
+    """
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 128.0) for size in (60, 30, 12)]
+    ).to_dict()
+    window._refresh_profile_ui()
+
+    # The preset wants 512×256; the sign resolves 128 rows.
+    window.quality_combo.setCurrentText("Very High")
+    assert window.logical_width_spin.value() == 256
+    assert window.logical_height_spin.value() == 128
+
+    # Custom asks are held to the same physics.
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(512)
+    assert window.logical_width_spin.value() == 256
+    assert window.logical_height_spin.value() == 128
+
+    # Requests below the ceiling pass through untouched.
+    window.quality_combo.setCurrentText("Very Fast")
+    assert window.logical_width_spin.value() == 64
+    assert window.logical_height_spin.value() == 32
+
+
+def test_plan_summary_announces_a_capped_resolution(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 128.0) for size in (60, 30, 12)]
+    ).to_dict()
+    window._refresh_profile_ui()
+    window.quality_combo.setCurrentText("Very High")
+
+    source_path = tmp_path / "source.png"
+    Image.new("RGB", (64, 32), (210, 30, 40)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    # The plan, and therefore the Rust preview, stays inside the ceiling and
+    # says so next to the stroke counts instead of silently swapping sizes.
+    assert (window._plan.width, window._plan.height) == (256, 128)
+    assert "capped at 256×128" in window.processing_label.text()
 
 
 def test_dry_run_completes_without_sendinput(

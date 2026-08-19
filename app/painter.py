@@ -1187,8 +1187,20 @@ class Painter:
     # noise on a lit, textured surface, or the click missed the control.
     _CLEAR_CONTRAST = 24.0
 
+    # Rust wipes the sign asynchronously and can take several frames to show
+    # it, so the sign gets a generous beat to go blank before painting starts.
+    _CLEAR_SETTLE_SECONDS = 0.5
+
     def _clear_canvas(self, job: _Job) -> None:
-        """Click Rust's clear control and confirm the sign actually went blank."""
+        """Click Rust's clear control and give the sign time to go blank.
+
+        The clear click is trusted.  A capture comparison used to stop the job
+        here, but Rust's redraw sometimes lags past the capture and the check
+        then failed signs that had genuinely cleared - and a job stopped by a
+        false alarm costs far more than probe strokes under the artwork ever
+        would.  The comparison survives only as a log line so a truly
+        miscalibrated clear button can still be diagnosed afterwards.
+        """
 
         button = job.target.clear_button
         if button is None:
@@ -1213,21 +1225,20 @@ class Painter:
             epoch,
             hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
         )
-        # Rust redraws the sign asynchronously, so give it a beat before asking
-        # whether the strokes are gone.
         self._interruptible_sleep(
-            max(job.settings.delay_between_colors_seconds, self._CAPTURE_SETTLE_SECONDS),
+            max(job.settings.delay_between_colors_seconds, self._CLEAR_SETTLE_SECONDS),
             epoch=epoch,
             check_focus=True,
         )
         after = self._capture_parked(canvas, park, epoch)
         if not self._canvas_changed(before, after):
-            raise RuntimeError(
-                "Clicking Rust's clear control did not clear the sign, so the "
-                "brush calibration strokes would be painted over. Recalibrate "
-                "the clear control over the button that wipes the sign."
+            LOGGER.warning(
+                "The sign looked unchanged after clicking Rust's clear control. "
+                "If probe strokes show through the artwork, recalibrate the "
+                "clear control over the button that wipes the sign."
             )
-        LOGGER.info("Cleared the sign after measuring the brush")
+        else:
+            LOGGER.info("Cleared the sign after measuring the brush")
 
     def _canvas_changed(self, before: Any, after: Any) -> bool:
         """Whether two captures of the sign differ by more than capture noise."""
