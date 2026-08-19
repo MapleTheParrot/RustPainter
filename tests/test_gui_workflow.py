@@ -1083,7 +1083,7 @@ def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> No
     window._refresh_profile_ui()
     # The derived row count is the number a user can sanity-check against the
     # sign they are actually looking at.
-    assert "128 rows" in window.brush_model_status.text()
+    assert "128-row texture" in window.brush_model_status.text()
 
     window.apply_brush_check.setChecked(False)
     assert "Automatic brush sizing is off" in window.brush_model_status.text()
@@ -1122,6 +1122,57 @@ def test_quality_presets_cap_at_the_signs_measured_resolution(
     window.quality_combo.setCurrentText("Very Fast")
     assert window.logical_width_spin.value() == 64
     assert window.logical_height_spin.value() == 32
+
+
+def test_max_quality_plans_one_cell_per_measured_texel(
+    window: MainWindow,
+) -> None:
+    """Max has no fixed long edge: it asks the sign what it holds.
+
+    The measured count carries noise - 130-ish rows on a 128-row sign - and
+    the preset must land on the canonical texture size, or every cell fights
+    its neighbour over a texel that is not there.
+    """
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 130.5) for size in (60, 30, 12)]
+    ).to_dict()
+    window._refresh_profile_ui()
+
+    window.quality_combo.setCurrentText("Max")
+    assert window.logical_width_spin.value() == 256
+    assert window.logical_height_spin.value() == 128
+
+
+def test_max_quality_needs_a_measured_sign(window: MainWindow) -> None:
+    """Without a measurement Max would mean nothing, so it is not on offer.
+
+    And a profile whose measurement goes away takes Max with it: the selection
+    falls back to Very High instead of silently planning against a stale sign.
+    """
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
+    window._current_profile.metadata.pop("brush_size_model", None)
+    window._refresh_profile_ui()
+
+    index = window.quality_combo.findText("Max")
+    assert index >= 0
+    assert not window.quality_combo.model().item(index).isEnabled()
+
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 128.0) for size in (60, 30, 12)]
+    ).to_dict()
+    window._refresh_profile_ui()
+    assert window.quality_combo.model().item(index).isEnabled()
+
+    window.quality_combo.setCurrentText("Max")
+    window._current_profile.metadata.pop("brush_size_model", None)
+    window._refresh_profile_ui()
+    assert window.quality_combo.currentText() == "Very High"
+    assert not window.quality_combo.model().item(index).isEnabled()
 
 
 def test_plan_summary_announces_a_capped_resolution(

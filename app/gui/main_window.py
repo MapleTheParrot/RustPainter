@@ -169,6 +169,12 @@ QUALITY_LONG_EDGE: dict[str, int] = {
     "Very High": 512,
 }
 
+# The quality entry with no fixed long edge: it asks the measured brush model
+# how many texture rows this sign actually holds and plans one logical cell
+# per texel.  Only selectable once a job has measured the sign, because until
+# then there is nothing to ask.
+MAX_QUALITY_PRESET = "Max"
+
 # All timing values one speed preset controls, in the spinbox units used below.
 SPEED_PRESETS: dict[str, dict[str, float]] = {
     "Relaxed": {
@@ -1355,7 +1361,9 @@ class MainWindow(QMainWindow):
         ):
             self.crop_alignment_combo.addItem(label, value.value)
         self.quality_combo = NoWheelComboBox()
-        self.quality_combo.addItems([*QUALITY_LONG_EDGE.keys(), "Custom"])
+        self.quality_combo.addItems(
+            [*QUALITY_LONG_EDGE.keys(), MAX_QUALITY_PRESET, "Custom"]
+        )
         self.quality_combo.setCurrentText("Balanced")
         self.paint_mode_combo = NoWheelComboBox()
         self.paint_mode_combo.addItem("Exact — raw pixels", PaintMode.EXACT.value)
@@ -3164,12 +3172,20 @@ class MainWindow(QMainWindow):
         model = self._brush_size_model()
         if model is None:
             return None
-        rows = int(model.sign_pixel_rows)
+        from app.brush_calibration import canonical_texture_rows
+
+        # Rust's sign textures come in power-of-two sizes, and the measured
+        # count carries a few percent of noise: 527 measured rows on a 512-row
+        # sign is normal.  Snapping to the canonical size is what lets a
+        # native-resolution plan line every cell up with its texel instead of
+        # scattering collisions wherever the noise said an extra row existed.
+        rows = canonical_texture_rows(model.sign_pixel_rows)
         if rows < 8:
             return None
         aspect = max(0.001, self._canvas_aspect_ratio())
         height = min(rows, 2048)
-        width = max(8, min(2048, round(height * aspect)))
+        width = canonical_texture_rows(height * aspect)
+        width = max(8, min(2048, width))
         return width, height
 
     def _cap_to_sign_resolution(self, width: int, height: int) -> tuple[int, int]:
@@ -3201,12 +3217,28 @@ class MainWindow(QMainWindow):
         self.logical_height_spin.setEnabled(custom)
         if not custom:
             aspect = self._canvas_aspect_ratio()
-            longest = QUALITY_LONG_EDGE[preset]
-            if aspect >= 1.0:
-                width, height = longest, max(8, round(longest / aspect))
+            if preset == MAX_QUALITY_PRESET:
+                # One logical cell per sign texel - the resolution ceiling
+                # itself, so there is nothing further to cap.  The fallback
+                # only covers a saved "Max" restored before its profile: the
+                # entry is disabled whenever the sign is unmeasured.
+                self._resolution_cap_note = ""
+                cap = self._sign_resolution_cap()
+                if cap is not None:
+                    width, height = cap
+                else:
+                    longest = QUALITY_LONG_EDGE["Very High"]
+                    if aspect >= 1.0:
+                        width, height = longest, max(8, round(longest / aspect))
+                    else:
+                        width, height = max(8, round(longest * aspect)), longest
             else:
-                width, height = max(8, round(longest * aspect)), longest
-            width, height = self._cap_to_sign_resolution(width, height)
+                longest = QUALITY_LONG_EDGE[preset]
+                if aspect >= 1.0:
+                    width, height = longest, max(8, round(longest / aspect))
+                else:
+                    width, height = max(8, round(longest * aspect)), longest
+                width, height = self._cap_to_sign_resolution(width, height)
             self.logical_width_spin.blockSignals(True)
             self.logical_height_spin.blockSignals(True)
             self.logical_width_spin.setValue(width)
@@ -4129,8 +4161,36 @@ class MainWindow(QMainWindow):
             )
         else:
             self.canvas_geometry_label.setText("Canvas: not calibrated  •  Aspect: —")
+        self._refresh_max_quality_availability()
         self._refresh_display_warning()
         self._update_start_availability()
+
+    def _refresh_max_quality_availability(self) -> None:
+        """Offer Max quality only while a measured sign gives it a meaning.
+
+        Max is defined as "one logical cell per sign texel", and the texel
+        count comes from the profile's measured brush model.  Without one the
+        entry is greyed out rather than silently meaning something else; if it
+        was selected when its measurement went away - profile switched, canvas
+        re-framed to a new shape - the quality falls back to Very High instead
+        of pinning the plan to a stale sign.
+        """
+
+        index = self.quality_combo.findText(MAX_QUALITY_PRESET)
+        if index < 0:
+            return
+        available = self._sign_resolution_cap() is not None
+        item = self.quality_combo.model().item(index)
+        if item is not None:
+            item.setEnabled(available)
+            item.setToolTip(
+                "One logical cell per sign texture pixel"
+                if available
+                else "Run one paint job with automatic brush sizing to "
+                "measure this sign's texture first"
+            )
+        if not available and self.quality_combo.currentText() == MAX_QUALITY_PRESET:
+            self.quality_combo.setCurrentText("Very High")
 
     @Slot()
     def _new_profile(self) -> None:
@@ -4797,9 +4857,12 @@ class MainWindow(QMainWindow):
                 "the measurement before painting"
             )
             return
+        from app.brush_calibration import canonical_texture_rows
+
+        rows = canonical_texture_rows(model.sign_pixel_rows)
         self.brush_model_status.setText(
             f"Last measured: size 1 covers {model.smallest_fraction * 100:.2f}% of "
-            f"the sign (about {model.sign_pixel_rows:.0f} rows tall). Every job "
+            f"the sign (a {rows}-row texture). Every job "
             "measures again before it paints."
         )
 
