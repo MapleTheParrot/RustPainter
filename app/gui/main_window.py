@@ -712,6 +712,9 @@ class MainWindow(QMainWindow):
         self._text_history_kind = ""
         self._text_history_stamp = 0.0
         self._restoring_text_history = False
+        # The decoded source at preview resolution, plus the size it is shown
+        # at, which Stretch pulls away from the decoded one.
+        self._source_pixmap = QPixmap()
         self._source_preview_size: tuple[int, int] | None = None
         # The Rust preview is only fronted once per imported image; afterwards
         # the user's tab choice is respected so text editing on the Source tab
@@ -2743,6 +2746,47 @@ class MainWindow(QMainWindow):
         self._record_text_history("move")
         QTimer.singleShot(0, self._refresh_text_editor_layers)
 
+    def _source_backdrop_size(self) -> tuple[int, int] | None:
+        """The size the source preview is shown at while text is placed.
+
+        Fit and Fill keep the source's own shape, so the decoded preview is
+        shown as it is.  Stretch does not: it squeezes the whole image onto a
+        canvas of another shape, and a caption dropped onto a face in a square
+        photo lands somewhere else entirely once that photo is pulled wide.
+        The backdrop is therefore pre-distorted to the canvas aspect, which is
+        both what the sign will show and what makes the editor's one uniform
+        text scale the true one.
+        """
+
+        if self._source_pixmap.isNull():
+            return None
+        preview = (self._source_pixmap.width(), self._source_pixmap.height())
+        if min(preview) <= 0:
+            return None
+        if self.scale_mode_combo.currentData() != ScaleMode.STRETCH.value:
+            return preview
+        return calculate_fit_size(
+            (max(1, self.logical_width_spin.value()), self._logical_height()),
+            preview,
+        )
+
+    def _refresh_source_backdrop(self) -> None:
+        """Re-display the source whenever the canvas would reshape it."""
+
+        size = self._source_backdrop_size()
+        if size is None or size == self._source_preview_size:
+            return
+        self._source_preview_size = size
+        pixmap = self._source_pixmap
+        if size != (pixmap.width(), pixmap.height()):
+            pixmap = pixmap.scaled(
+                size[0],
+                size[1],
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.original_preview.set_source(pixmap)
+
     def _source_canvas_geometry(self) -> tuple[QRectF, float] | None:
         """Where the sign canvas lies on the source preview pixmap.
 
@@ -2752,13 +2796,13 @@ class MainWindow(QMainWindow):
         - larger than the pixmap under Fit letterboxing, smaller under Fill
         cropping - and the float is how many preview pixels one logical canvas
         pixel spans, mirroring the mapping ``scale_image`` applies when the
-        text is baked.  Stretch distorts the source non-uniformly, so there
-        the text's on-screen aspect is approximated while its position and
-        painted size stay exact.
+        text is baked.  Stretch needs no rectangle of its own - the backdrop
+        is already displayed at the canvas's shape, so the whole pixmap is the
+        canvas and one scale serves both axes.
         """
 
         image = self._original_image
-        preview_size = self._source_preview_size
+        preview_size = self._source_backdrop_size()
         if image is None or preview_size is None:
             return None
         preview_width, preview_height = preview_size
@@ -2802,6 +2846,7 @@ class MainWindow(QMainWindow):
         return rect, rect.height() / logical_height
 
     def _refresh_text_editor_layers(self) -> None:
+        self._refresh_source_backdrop()
         geometry = self._source_canvas_geometry()
         if geometry is not None:
             self.original_preview.set_canvas_geometry(*geometry)
@@ -2940,6 +2985,7 @@ class MainWindow(QMainWindow):
         self._plan_metric_source = None
         self._plan_stroke_pixel_steps = 0
         self._plan_dot_count = 0
+        self._source_pixmap = QPixmap()
         self._source_preview_size = None
         self._show_preview_after_processing = True
         self.original_preview.clear_source("Decoding image…")
@@ -2969,8 +3015,8 @@ class MainWindow(QMainWindow):
         self.image_dimensions_label.setText(
             f"{result.image.width:,} × {result.image.height:,} px  •  {result.image.mode}"
         )
-        self._source_preview_size = result.preview.size
-        self.original_preview.set_source(self._pil_to_pixmap(result.preview))
+        self._source_pixmap = self._pil_to_pixmap(result.preview)
+        self._source_preview_size = None
         self._refresh_text_editor_layers()
         LOGGER.info(
             "Loaded image: %s (%dx%d)",
@@ -3004,6 +3050,9 @@ class MainWindow(QMainWindow):
         self.background_color_button.setEnabled(
             (fit or alpha_fill) and self.background_combo.currentData() == "custom"
         )
+        # Stretch reshapes the backdrop text is placed over, so the editor is
+        # brought up to date now rather than when the reprocess lands.
+        self._refresh_text_editor_layers()
         self._schedule_processing()
 
     @Slot()
@@ -3049,6 +3098,9 @@ class MainWindow(QMainWindow):
             self.quality_combo.blockSignals(False)
         self._sync_custom_resolution(axis)
         self._rescale_text_layers()
+        # A canvas of a new shape restretches the backdrop under it, which
+        # _rescale_text_layers only redraws when a layer's size moved too.
+        self._refresh_text_editor_layers()
         self._schedule_processing()
 
     def _sync_custom_resolution(self, source_axis: str = "width") -> None:

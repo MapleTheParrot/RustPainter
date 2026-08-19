@@ -222,6 +222,47 @@ def test_text_editor_maps_the_sign_canvas_onto_the_source_image(
     assert rect.top() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_stretch_edits_text_over_the_stretched_result(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Stretch pre-distorts the backdrop so placement matches the sign.
+
+    A square photo pulled onto a 2:1 canvas keeps none of its own proportions,
+    and text dropped over the undistorted original landed nowhere near the
+    spot it was aimed at.  The Source tab therefore shows the source already
+    stretched, which also makes one uniform text scale the true one.
+    """
+
+    source_path = tmp_path / "square.png"
+    Image.new("RGB", (30, 30), (80, 80, 80)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._source_preview_size is not None, timeout=5000)
+    decoded = window.original_preview._source.size()
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.STRETCH.value)
+    logical_width = window.logical_width_spin.value()
+    logical_height = window.logical_height_spin.value()
+    backdrop = window.original_preview._source.size()
+    assert backdrop != decoded
+    assert backdrop.width() / backdrop.height() == pytest.approx(
+        logical_width / logical_height, rel=0.05
+    )
+
+    geometry = window._source_canvas_geometry()
+    assert geometry is not None
+    rect, font_scale = geometry
+    # The whole backdrop is the canvas, and one logical pixel is the same
+    # length on both axes - which is what makes a placed caption land right.
+    assert rect.width() == pytest.approx(backdrop.width())
+    assert rect.height() == pytest.approx(backdrop.height())
+    assert font_scale == pytest.approx(rect.width() / logical_width, rel=0.05)
+    assert font_scale == pytest.approx(rect.height() / logical_height)
+
+    # Fit never distorts, so it gets the source back at its own shape.
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FIT.value)
+    assert window.original_preview._source.size() == decoded
+
+
 def test_delete_key_removes_the_selected_text_layer(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:

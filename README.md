@@ -201,6 +201,14 @@ Sizes are stored as a fraction of the canvas height rather than in pixels, so
 captions keep their proportions when a quality preset changes the painting
 resolution.
 
+Under **Stretch**, the Source tab shows the image already stretched to the
+shape of the sign rather than at its own proportions. Stretch is the one mode
+that reshapes the artwork, so laying text out over the undistorted original
+would put every caption somewhere the sign never had it; pre-distorting the
+backdrop makes the tab agree with what gets painted. Fit and Fill leave the
+source's shape alone and mark the sign's own area with a dashed outline
+instead.
+
 ### Optimization modes
 
 The **Optimization** picker in quick settings chooses how boldly planning may
