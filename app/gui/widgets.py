@@ -785,6 +785,8 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     layersDeleteRequested = Signal(object)
     layersDuplicateRequested = Signal(object)
     layerSelectionChanged = Signal()
+    undoRequested = Signal()
+    redoRequested = Signal()
     interactionFinished = Signal()
     browseRequested = Signal()
     imageDropped = Signal(str)
@@ -1024,15 +1026,24 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
 
         Delete or Backspace removes them, Ctrl+D or Ctrl+C copies them, Ctrl+A
         takes all of them, and the arrow keys nudge them a logical pixel at a
-        time - ten with Shift held.  While a layer is being edited every one of
-        those keys belongs to the text cursor instead, so the shortcuts only
-        apply to layers that are merely selected.
+        time - ten with Shift held.  Ctrl+Z and Ctrl+Y walk the text history.
+        While a layer is being edited every one of those keys belongs to the
+        text cursor instead, so the shortcuts only apply to layers that are
+        merely selected.
         """
 
         if not self.is_editing_text:
             selected = self.selected_indices()
             control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             key = event.key()
+            if control and key in {Qt.Key.Key_Z, Qt.Key.Key_Y}:
+                event.accept()
+                if key == Qt.Key.Key_Y or shift:
+                    self.redoRequested.emit()
+                else:
+                    self.undoRequested.emit()
+                return
             if control and key == Qt.Key.Key_A and self._items:
                 self.select_layers([item.index for item in self._items])
                 event.accept()

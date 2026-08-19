@@ -221,6 +221,18 @@ MAX_TEXT_SIZE = 256
 # says so instead of failing the next save.
 MAX_TEXT_LAYERS = 20
 
+# Text edits of the same kind arriving inside this window fold into one
+# undoable step, so holding an arrow key down leaves one thing to undo.
+TEXT_HISTORY_COALESCE_SECONDS = 0.8
+
+# How many steps back the text canvas can walk before the oldest are dropped.
+MAX_TEXT_HISTORY = 100
+
+
+# The layers, the layer the side panel names, and the canvas selection - one
+# point the text canvas can be walked back to.
+_TextSnapshot = tuple[tuple["_TextOverlayOptions", ...], int, tuple[int, ...]]
+
 
 @dataclass(slots=True)
 class _ProcessResult:
@@ -695,6 +707,11 @@ class MainWindow(QMainWindow):
         # in, and an empty list falls back to the layer the combo box names.
         self._selected_text_indices: list[int] = [0]
         self._syncing_text_controls = False
+        self._text_history: list[_TextSnapshot] = []
+        self._text_history_index = 0
+        self._text_history_kind = ""
+        self._text_history_stamp = 0.0
+        self._restoring_text_history = False
         self._source_preview_size: tuple[int, int] | None = None
         # The Rust preview is only fronted once per imported image; afterwards
         # the user's tab choice is respected so text editing on the Source tab
@@ -720,6 +737,7 @@ class MainWindow(QMainWindow):
         self._initialize_services()
         self._update_quality_dimensions()
         self._update_start_availability()
+        self._reset_text_history()
 
         LOGGER.info("RustPainter started")
 
@@ -1480,6 +1498,18 @@ class MainWindow(QMainWindow):
         text_title.setObjectName("sectionTitle")
         self.add_text_button = QPushButton("Add text")
         self.add_text_button.setObjectName("compactButton")
+        self.undo_text_button = QPushButton("Undo")
+        self.undo_text_button.setObjectName("compactButton")
+        self.undo_text_button.setToolTip(
+            "Step back through the text layers only, not the rest of the\n"
+            "settings. Ctrl+Z does the same from the Source tab."
+        )
+        self.redo_text_button = QPushButton("Redo")
+        self.redo_text_button.setObjectName("compactButton")
+        self.redo_text_button.setToolTip(
+            "Step forward again through the text layers. Ctrl+Y or\n"
+            "Ctrl+Shift+Z does the same from the Source tab."
+        )
         self.duplicate_text_button = QPushButton("Duplicate")
         self.duplicate_text_button.setObjectName("compactButton")
         self.duplicate_text_button.setToolTip(
@@ -1494,6 +1524,8 @@ class MainWindow(QMainWindow):
         )
         text_heading.addWidget(text_title)
         text_heading.addStretch(1)
+        text_heading.addWidget(self.undo_text_button)
+        text_heading.addWidget(self.redo_text_button)
         text_heading.addWidget(self.add_text_button)
         text_heading.addWidget(self.duplicate_text_button)
         text_heading.addWidget(self.remove_text_button)
@@ -2035,6 +2067,8 @@ class MainWindow(QMainWindow):
         self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
         self.paint_mode_combo.currentIndexChanged.connect(self._on_paint_mode_changed)
         self.add_text_button.clicked.connect(self._add_text_layer)
+        self.undo_text_button.clicked.connect(self._undo_text_edit)
+        self.redo_text_button.clicked.connect(self._redo_text_edit)
         self.duplicate_text_button.clicked.connect(self._duplicate_selected_text_layer)
         self.remove_text_button.clicked.connect(self._remove_text_layer)
         self.text_layer_combo.currentIndexChanged.connect(self._select_text_layer)
@@ -2082,6 +2116,8 @@ class MainWindow(QMainWindow):
         self.original_preview.interactionFinished.connect(
             self._on_text_interaction_finished
         )
+        self.original_preview.undoRequested.connect(self._undo_text_edit)
+        self.original_preview.redoRequested.connect(self._redo_text_edit)
         self.speed_preset_combo.currentIndexChanged.connect(self._apply_speed_preset)
         for timing in (
             self.stroke_speed_spin,
@@ -2300,6 +2336,7 @@ class MainWindow(QMainWindow):
         self._sync_text_controls()
         self._refresh_text_editor_layers()
         self.text_edit.setFocus()
+        self._record_text_history("add")
         self._schedule_settings_save()
 
     @Slot()
@@ -2347,6 +2384,7 @@ class MainWindow(QMainWindow):
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
+        self._record_text_history("duplicate")
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2378,6 +2416,7 @@ class MainWindow(QMainWindow):
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
+        self._record_text_history("delete")
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2435,6 +2474,9 @@ class MainWindow(QMainWindow):
             return
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
+        # Keyed by which controls moved, so a run of size changes folds into
+        # one step while a size change and then a color change do not.
+        self._record_text_history("style:" + ",".join(sorted(fields)))
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2450,6 +2492,7 @@ class MainWindow(QMainWindow):
         self._text_layers[index] = replace(self._text_layers[index], text=text)
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
+        self._record_text_history("text")
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2489,6 +2532,7 @@ class MainWindow(QMainWindow):
                 layer, **{axis: min(max(value, 0.0), 1.0)}
             )
         self._refresh_text_editor_layers()
+        self._record_text_history("align")
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2512,6 +2556,121 @@ class MainWindow(QMainWindow):
                 self._text_layers[index], **{field: first + step * position}
             )
         self._refresh_text_editor_layers()
+        self._record_text_history("spread")
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    # ------------------------------------------------------------ text history
+
+    def _text_snapshot(self) -> _TextSnapshot:
+        return (
+            tuple(self._text_layers),
+            self._selected_text_layer,
+            tuple(self._selected_text_indices),
+        )
+
+    def _reset_text_history(self) -> None:
+        """Start the history over from the layers as they now stand.
+
+        Loading a settings document replaces every layer at once, which is not
+        something an undo should be able to walk back into.
+        """
+
+        self._text_history = [self._text_snapshot()]
+        self._text_history_index = 0
+        self._text_history_kind = ""
+        self._text_history_stamp = 0.0
+        self._refresh_text_history_buttons()
+
+    def _record_text_history(self, kind: str) -> None:
+        """Remember the layers as they now stand, as one undoable step.
+
+        Successive edits of the same kind fold into one step while they keep
+        arriving, so holding an arrow key down or typing a word leaves a single
+        thing to undo rather than one per keystroke.
+        """
+
+        if self._restoring_text_history or not self._text_history:
+            return
+        snapshot = self._text_snapshot()
+        if snapshot[0] == self._text_history[self._text_history_index][0]:
+            # A change of selection alone is not worth a step of its own, but
+            # the step it belongs to should still remember it.
+            self._text_history[self._text_history_index] = snapshot
+            return
+        now = time.monotonic()
+        continues = (
+            kind == self._text_history_kind
+            and now - self._text_history_stamp < TEXT_HISTORY_COALESCE_SECONDS
+            # Never fold into the entry the history opened with; undoing back
+            # to the layers as they were loaded has to stay possible.
+            and self._text_history_index > 0
+        )
+        del self._text_history[self._text_history_index + 1 :]
+        if continues:
+            self._text_history[self._text_history_index] = snapshot
+        else:
+            self._text_history.append(snapshot)
+            self._text_history_index = len(self._text_history) - 1
+        dropped = len(self._text_history) - MAX_TEXT_HISTORY
+        if dropped > 0:
+            del self._text_history[:dropped]
+            self._text_history_index -= dropped
+        self._text_history_kind = kind
+        self._text_history_stamp = now
+        self._refresh_text_history_buttons()
+
+    def _refresh_text_history_buttons(self) -> None:
+        self.undo_text_button.setEnabled(self._text_history_index > 0)
+        self.redo_text_button.setEnabled(
+            self._text_history_index < len(self._text_history) - 1
+        )
+
+    @Slot()
+    def _undo_text_edit(self) -> None:
+        self._step_text_history(-1)
+
+    @Slot()
+    def _redo_text_edit(self) -> None:
+        self._step_text_history(1)
+
+    def _step_text_history(self, direction: int) -> None:
+        target = self._text_history_index + direction
+        if not 0 <= target < len(self._text_history):
+            self.statusBar().showMessage(
+                "No text edit left to undo" if direction < 0 else "Nothing to redo",
+                2500,
+            )
+            return
+        self._text_history_index = target
+        layers, primary, selected = self._text_history[target]
+        self._restoring_text_history = True
+        try:
+            # Pixel sizes are re-derived from the stored ratio, so a step taken
+            # under another quality preset still comes back the right size.
+            self._text_layers = [
+                replace(
+                    layer,
+                    font_size=self._text_font_size(
+                        layer.size_ratio or self._text_size_ratio(layer.font_size)
+                    ),
+                )
+                for layer in layers
+            ]
+            self._selected_text_layer = min(
+                max(primary, 0), len(self._text_layers) - 1
+            )
+            self._selected_text_indices = [
+                index for index in selected if 0 <= index < len(self._text_layers)
+            ]
+            self._rebuild_text_layer_combo()
+            self._sync_text_controls()
+            self._refresh_text_editor_layers()
+        finally:
+            self._restoring_text_history = False
+        # The step just landed on is finished; the next edit opens a new one.
+        self._text_history_kind = ""
+        self._refresh_text_history_buttons()
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2549,6 +2708,7 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing_text_controls = False
         self._rebuild_text_layer_combo()
+        self._record_text_history("text")
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2568,11 +2728,14 @@ class MainWindow(QMainWindow):
             self.text_size_spin.setValue(font_size)
         finally:
             self._syncing_text_controls = False
+        self._record_text_history("resize")
         self._schedule_processing()
         self._schedule_settings_save()
 
     @Slot()
     def _on_text_interaction_finished(self) -> None:
+        # A drag reports every step it takes; the whole drag is one step back.
+        self._record_text_history("move")
         QTimer.singleShot(0, self._refresh_text_editor_layers)
 
     def _source_canvas_geometry(self) -> tuple[QRectF, float] | None:
@@ -3583,6 +3746,9 @@ class MainWindow(QMainWindow):
             self._selected_text_indices = [0]
             self._rebuild_text_layer_combo()
             self._sync_text_controls()
+            # Loading a document replaces every layer at once, which is not
+            # something the undo history should be able to walk back into.
+            self._reset_text_history()
 
             self.pixel_spacing_spin.setValue(
                 float(painting.get("logical_pixel_spacing", 1.0))

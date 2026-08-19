@@ -600,6 +600,98 @@ def test_gradient_and_outline_round_trip_through_settings(
     assert not window.text_gradient_color_button.isEnabled()
 
 
+def test_the_text_canvas_keeps_its_own_undo_history(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 0)
+    window.text_size_spin.setValue(30)
+    window.text_align_buttons["center"].click()
+    assert [layer.font_size for layer in window._text_layers] == [30, 30]
+    assert [layer.x for layer in window._text_layers] == [0.5, 0.5]
+
+    window.undo_text_button.click()
+    assert [layer.x for layer in window._text_layers] != [0.5, 0.5]
+    # One step back is one step, so the size change is still standing.
+    assert [layer.font_size for layer in window._text_layers] == [30, 30]
+
+    window.undo_text_button.click()
+    assert [layer.font_size for layer in window._text_layers] == [24, 24]
+
+    window.redo_text_button.click()
+    window.redo_text_button.click()
+    assert [layer.font_size for layer in window._text_layers] == [30, 30]
+    assert [layer.x for layer in window._text_layers] == [0.5, 0.5]
+    assert not window.redo_text_button.isEnabled()
+
+    # Undoing back past the start is a message, not an exception.
+    while window.undo_text_button.isEnabled():
+        window.undo_text_button.click()
+    window._undo_text_edit()
+    assert [layer.text for layer in window._text_layers] == [""]
+
+
+def test_a_new_text_edit_drops_whatever_was_waiting_to_be_redone(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.text_align_buttons["top"].click()
+    window.undo_text_button.click()
+    assert window.redo_text_button.isEnabled()
+
+    window.text_align_buttons["bottom"].click()
+    assert not window.redo_text_button.isEnabled()
+    assert window._text_layers[window._selected_text_layer].y > 0.5
+
+
+def test_a_whole_drag_takes_a_single_step_back(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Dragging reports every step it takes, and undoes as one move."""
+
+    _two_layer_window(window, tmp_path, qtbot)
+    preview = window.original_preview
+    preview.select_layers([1], 1)
+    before = (window._text_layers[1].x, window._text_layers[1].y)
+
+    item = preview._items[1]
+    start = item.mapToScene(item.text_rect().center())
+    _drag_item(item, start, start + QPointF(-40.0, 60.0))
+    assert (window._text_layers[1].x, window._text_layers[1].y) != before
+
+    preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert window._text_layers[1].x == pytest.approx(before[0])
+    assert window._text_layers[1].y == pytest.approx(before[1])
+
+
+def test_undoing_a_text_edit_keeps_the_size_the_current_canvas_asks_for(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A step taken under one quality preset comes back sized for another.
+
+    Layers hold their size as a fraction of the canvas, so the history has to
+    hold the fraction too rather than the pixels it happened to mean.
+    """
+
+    _two_layer_window(window, tmp_path, qtbot)
+    window.quality_combo.setCurrentText("High")
+    window.original_preview.select_layers([0], 0)
+    window.text_size_spin.setValue(40)
+    ratio = window._text_layers[0].size_ratio
+
+    window.quality_combo.setCurrentText("Very Fast")
+    assert window._text_layers[0].font_size < 40
+    window.undo_text_button.click()
+
+    restored = window._text_layers[0]
+    assert restored.size_ratio != ratio
+    assert restored.font_size == window._text_font_size(restored.size_ratio)
+
+
 def test_background_removal_toggles_its_options_and_shrinks_the_plan(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
