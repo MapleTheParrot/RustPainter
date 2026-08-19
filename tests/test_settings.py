@@ -71,6 +71,11 @@ def test_default_settings_returns_independent_documents() -> None:
                 "y": 0.5,
                 "bold": False,
                 "italic": False,
+                "gradient": False,
+                "gradient_direction": "vertical",
+                "gradient_color": "#FF9336",
+                "outline_width": 0,
+                "outline_color": "#000000",
             }
         ]
     }

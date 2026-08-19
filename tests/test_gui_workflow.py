@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,7 +16,11 @@ from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeyEvent
 from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
-from app.gui.main_window import MainWindow, _PendingPaint
+from app.gui.main_window import (
+    MainWindow,
+    _PendingPaint,
+    _TextOverlayOptions,
+)
 from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
 from app.input_controller import MockInputController
@@ -292,6 +297,307 @@ def test_control_c_copies_characters_while_a_layer_is_being_edited(
         )
     )
     assert len(window._text_layers) == 1
+
+
+def _two_layer_window(window: MainWindow, tmp_path: Path, qtbot) -> None:
+    """Open a plain backdrop carrying two captions, ready to be edited."""
+
+    source_path = tmp_path / "two-captions.png"
+    Image.new("RGB", (128, 64), (10, 10, 10)).save(source_path)
+    window.text_edit.setText("FIRST")
+    window.add_text_button.click()
+    window.text_edit.setText("SECOND")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 2, timeout=5000)
+
+
+def _drag_item(item, start: QPointF, end: QPointF, modifiers=None) -> None:
+    """Press, move and release one text item, in scene coordinates."""
+
+    modifiers = modifiers or Qt.KeyboardModifier.NoModifier
+    for event_type, position in (
+        (QEvent.Type.GraphicsSceneMousePress, start),
+        (QEvent.Type.GraphicsSceneMouseMove, end),
+        (QEvent.Type.GraphicsSceneMouseRelease, end),
+    ):
+        event = QGraphicsSceneMouseEvent(event_type)
+        event.setButton(Qt.MouseButton.LeftButton)
+        event.setButtons(Qt.MouseButton.LeftButton)
+        event.setScenePos(position)
+        event.setPos(item.mapFromScene(position))
+        event.setModifiers(modifiers)
+        if event_type == QEvent.Type.GraphicsSceneMousePress:
+            item.mousePressEvent(event)
+        elif event_type == QEvent.Type.GraphicsSceneMouseMove:
+            item.mouseMoveEvent(event)
+        else:
+            item.mouseReleaseEvent(event)
+
+
+def test_selecting_several_layers_edits_them_together(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Styling reaches every selected layer; the typed text reaches one.
+
+    Two captions that should match are the whole point of a multiple
+    selection, but they are still two captions - giving them a shared font
+    must not give them a shared string.
+    """
+
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 1)
+    assert window._edit_target_indices() == [0, 1]
+    assert "2 layers selected" in window.text_selection_label.text()
+
+    window.text_size_spin.setValue(18)
+    window.text_color_button.set_color("#22CCFF", emit=True)
+    window.text_bold_check.setChecked(True)
+
+    assert [layer.font_size for layer in window._text_layers] == [18, 18]
+    assert [layer.color for layer in window._text_layers] == [(34, 204, 255)] * 2
+    assert all(layer.bold for layer in window._text_layers)
+    assert [layer.text for layer in window._text_layers] == ["FIRST", "SECOND"]
+
+    window.text_edit.setText("ONLY THIS ONE")
+    assert [layer.text for layer in window._text_layers] == ["FIRST", "ONLY THIS ONE"]
+
+
+def test_dragging_one_of_several_selected_layers_moves_them_all(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 1)
+    before = [(layer.x, layer.y) for layer in window._text_layers]
+
+    item = window.original_preview._items[1]
+    start = item.mapToScene(item.text_rect().center())
+    _drag_item(item, start, start + QPointF(0.0, 12.0))
+
+    after = [(layer.x, layer.y) for layer in window._text_layers]
+    assert after != before
+    # One step for the group, so the layers keep the spacing they had.
+    assert after[0][1] - before[0][1] == pytest.approx(after[1][1] - before[1][1])
+    assert after[0][0] == pytest.approx(before[0][0])
+
+
+def test_dragging_text_snaps_onto_the_middle_of_the_sign(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A near miss lands on the middle, and Alt hands the pixels back."""
+
+    _two_layer_window(window, tmp_path, qtbot)
+    preview = window.original_preview
+    canvas = preview.canvas_rect()
+    near_middle = QPointF(canvas.center().x() + 1.5, canvas.center().y() + 1.5)
+
+    preview.select_layers([0], 0)
+    item = preview._items[0]
+    _drag_item(item, item.mapToScene(item.text_rect().center()), near_middle)
+    assert (window._text_layers[0].x, window._text_layers[0].y) == (0.5, 0.5)
+
+    preview.select_layers([0], 0)
+    item = preview._items[0]
+    _drag_item(
+        item,
+        item.mapToScene(item.text_rect().center()),
+        near_middle,
+        Qt.KeyboardModifier.AltModifier,
+    )
+    assert window._text_layers[0].x != 0.5
+    assert window._text_layers[0].y != 0.5
+
+
+def test_align_and_spread_place_layers_without_dragging(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0], 0)
+
+    window.text_align_buttons["center"].click()
+    window.text_align_buttons["top"].click()
+    layer = window._text_layers[0]
+    assert layer.x == pytest.approx(0.5)
+    # Parked against the edge means touching it, not straddling it.
+    assert layer.y == pytest.approx(window._text_layer_extent(layer)[1] / 2)
+
+    window.text_align_buttons["right"].click()
+    assert window._text_layers[0].x == pytest.approx(
+        1.0 - window._text_layer_extent(window._text_layers[0])[0] / 2
+    )
+
+    # Spreading needs a layer in the middle to move, so two is not enough.
+    assert not window.text_spread_buttons["down"].isEnabled()
+    window.add_text_button.click()
+    window.text_edit.setText("THIRD")
+    for index, y in ((0, 0.1), (1, 0.9), (2, 0.7)):
+        window._text_layers[index] = replace(window._text_layers[index], y=y)
+    window.original_preview.select_layers([0, 1, 2], 0)
+    assert window.text_spread_buttons["down"].isEnabled()
+
+    window.text_spread_buttons["down"].click()
+    assert window._text_layers[2].y == pytest.approx(0.5)
+
+
+def test_arrow_keys_nudge_every_selected_layer(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 0)
+    before = [layer.x for layer in window._text_layers]
+
+    for _ in range(2):
+        window.original_preview.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Right,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    # Two logical pixels of a 128-wide canvas, for both layers.
+    step = 2.0 / window.logical_width_spin.value()
+    assert [layer.x for layer in window._text_layers] == [
+        pytest.approx(value + step) for value in before
+    ]
+
+    window.original_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.ShiftModifier
+        )
+    )
+    assert window._text_layers[0].y == pytest.approx(
+        0.5 - 10.0 / window.logical_height_spin.value()
+    )
+
+
+def test_control_a_takes_every_layer_and_escape_lets_them_go(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([], 0)
+
+    window.original_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert window.original_preview.selected_indices() == [0, 1]
+    assert window._edit_target_indices() == [0, 1]
+
+    window.original_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier
+        )
+    )
+    assert window.original_preview.selected_indices() == []
+    # With nothing selected the panel still has the named layer to edit.
+    assert window._edit_target_indices() == [window._selected_text_layer]
+
+
+def test_delete_and_copy_apply_to_the_whole_selection(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 0)
+
+    window.original_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_D, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert [layer.text for layer in window._text_layers] == [
+        "FIRST",
+        "FIRST",
+        "SECOND",
+        "SECOND",
+    ]
+
+    qtbot.waitUntil(lambda: len(window.original_preview._items) == 4, timeout=5000)
+    window.original_preview.select_layers([1, 3], 1)
+    window.original_preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier
+        )
+    )
+    assert [layer.text for layer in window._text_layers] == ["FIRST", "SECOND"]
+
+
+def test_a_gradient_and_an_outline_survive_into_the_painted_image() -> None:
+    """Both decorations are baked, not just drawn on the editing canvas."""
+
+    backdrop = ProcessedImage(
+        Image.new("RGB", (160, 80), (0, 0, 0)),
+        np.zeros((80, 160), dtype=bool),
+        64,
+    )
+    gradient = _TextOverlayOptions(
+        "RUST",
+        "",
+        44,
+        (255, 0, 0),
+        gradient=True,
+        gradient_color=(0, 0, 255),
+        gradient_direction="vertical",
+    )
+    baked = main_window_module._apply_text_overlays(backdrop, (gradient,))
+    pixels = np.asarray(baked.image.convert("RGB"), dtype=np.int16)
+    mask = np.asarray(baked.paint_mask, dtype=bool)
+    rows = np.flatnonzero(mask.any(axis=1))
+    top = mask.copy()
+    top[rows[len(rows) // 2] :] = False
+    bottom = mask & ~top
+    # Red at the start of the ramp, blue at its end.
+    assert pixels[top][:, 0].mean() > pixels[bottom][:, 0].mean()
+    assert pixels[bottom][:, 2].mean() > pixels[top][:, 2].mean()
+
+    outlined = _TextOverlayOptions(
+        "RUST", "", 44, (255, 255, 255), outline_width=3, outline_color=(0, 255, 0)
+    )
+    baked = main_window_module._apply_text_overlays(backdrop, (outlined,))
+    painted = np.asarray(baked.image.convert("RGB"), dtype=np.int16)[
+        np.asarray(baked.paint_mask, dtype=bool)
+    ]
+    green = painted[:, 1] > 150
+    assert np.any(green & (painted[:, 0] < 100) & (painted[:, 2] < 100))
+    # An outline reaches past the letters, so it paints more of the sign.
+    assert baked.paint_mask.sum() > _apply_plain_text_mask(backdrop)
+
+
+def _apply_plain_text_mask(backdrop: ProcessedImage) -> int:
+    plain = _TextOverlayOptions("RUST", "", 44, (255, 255, 255))
+    return int(main_window_module._apply_text_overlays(backdrop, (plain,)).paint_mask.sum())
+
+
+def test_gradient_and_outline_round_trip_through_settings(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _two_layer_window(window, tmp_path, qtbot)
+    window.original_preview.select_layers([0, 1], 0)
+    window.text_gradient_check.setChecked(True)
+    window._set_combo_data(window.text_gradient_direction_combo, "diagonal")
+    window.text_gradient_color_button.set_color("#FF0000", emit=True)
+    window.text_outline_spin.setValue(2)
+    window.text_outline_color_button.set_color("#00FF00", emit=True)
+
+    document = window._settings_document()
+    saved = document["image"]["text_overlay"]["layers"]
+    assert [layer["gradient"] for layer in saved] == [True, True]
+    assert saved[0]["gradient_direction"] == "diagonal"
+    assert saved[0]["gradient_color"] == "#FF0000"
+    assert saved[0]["outline_width"] == 2
+    assert saved[0]["outline_color"] == "#00FF00"
+
+    window._apply_settings(document)
+    restored = window._text_layers[0]
+    assert restored.gradient is True
+    assert restored.gradient_direction == "diagonal"
+    assert restored.gradient_color == (255, 0, 0)
+    assert restored.outline_width == 2
+    assert restored.outline_color == (0, 255, 0)
+    # The gradient's own controls follow the checkbox rather than sitting live
+    # next to a switched-off gradient.
+    window.text_gradient_check.setChecked(False)
+    assert not window.text_gradient_color_button.isEnabled()
 
 
 def test_background_removal_toggles_its_options_and_shrinks_the_plan(

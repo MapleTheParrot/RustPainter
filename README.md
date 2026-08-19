@@ -115,7 +115,9 @@ painting unattended. Everything below is detail you only need when tuning.
 - Fit, fill/crop, and stretch composition with a live paint simulation
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
 - One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
-- Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy the selected layer, Delete to remove it, live font/color styling, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
+- Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
+- Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
+- Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and - for automatic brush sizing - the numeric Size field and Rust's clear button, with an on-screen overlay to verify them
@@ -163,6 +165,36 @@ subject and the plan gets shorter by exactly those pixels.
 Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
+
+### Laying out text
+
+Every text layer lives on the Source tab, where it is dragged, resized by its
+handles, and edited by double-clicking it. The layer picked in the side panel
+owns the **Text** field; everything else - font, size, color, style, gradient,
+outline - is written to the whole selection at once.
+
+- **Selecting several layers** - drag a box across bare canvas to sweep up the
+  layers it touches, Ctrl+click to add or drop one, or Ctrl+A to take them all.
+  Escape lets go. A group drags as one, so the layers keep their spacing.
+- **Snapping** - a dragged layer jumps onto the middle of the sign, its edges,
+  and the centre lines and edges of the other layers when it comes within a few
+  pixels of them; a line marks whatever it caught. Hold **Alt** while dragging
+  to place it by hand instead.
+- **Align and Spread** - *Left / Center / Right / Top / Middle / Bottom* park
+  the selection against an edge or midline of the sign. *Across* and *Down*
+  leave an equal gap between three or more selected layers.
+- **Arrow keys** nudge the selection one logical canvas pixel at a time, ten
+  with Shift held.
+- **Gradient** fades the letters from the text color into a second one, down,
+  across, or diagonally. The fade is quantized with the rest of the artwork, so
+  a narrow palette shows it as bands rather than as a smooth ramp.
+- **Outline** rings every letter with that many logical pixels of a chosen
+  color, which is what keeps a caption readable over artwork it shares a color
+  with. It paints extra cells, so it costs a little time.
+
+Sizes are stored as a fraction of the canvas height rather than in pixels, so
+captions keep their proportions when a quality preset changes the painting
+resolution.
 
 ### Optimization modes
 
@@ -397,6 +429,7 @@ Profiles, settings, calibration reference captures, and logs are stored under `%
 main.py
 app/
   gui/                 PySide6 interface
+    text_render.py     one text renderer for the editor and the baked plan
   calibration.py       full-screen rectangle selector
   profiles.py          profile JSON persistence
   settings.py          defaults and local settings

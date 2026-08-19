@@ -119,6 +119,14 @@ from app.timelapse_export import (
 
 from .assets import icon as art_icon, pixmap as art_pixmap, tinted_pixmap
 from .styles import ON_ACCENT, TEXT, badge_foreground, state_badge_style
+from .text_render import (
+    GRADIENT_DIRECTIONS,
+    MAX_OUTLINE_WIDTH,
+    TextStyle,
+    draw_text,
+    layer_font,
+    text_size,
+)
 from .widgets import (
     CalibrationStatus,
     ColorButton,
@@ -252,6 +260,9 @@ class _TextOverlayOptions:
     fraction of the canvas. The ratio is what survives a change of painting
     resolution, so text keeps the same size on the finished sign whether it was
     placed under the Very Fast or the Very High preset.
+
+    ``outline_width`` is in the same logical pixels, and a gradient runs from
+    ``color`` to ``gradient_color`` across the text's own line box.
     """
 
     text: str
@@ -263,11 +274,22 @@ class _TextOverlayOptions:
     bold: bool = False
     italic: bool = False
     size_ratio: float = 0.0
+    gradient: bool = False
+    gradient_color: tuple[int, int, int] = (255, 255, 255)
+    gradient_direction: str = "vertical"
+    outline_width: int = 0
+    outline_color: tuple[int, int, int] = (0, 0, 0)
 
 
 class _WorkerSignals(QObject):
     completed = Signal(object)
     failed = Signal(int, str)
+
+
+def _rgb(color: QColor) -> tuple[int, int, int]:
+    """The plain channel triple the layer model and the renderer both use."""
+
+    return (color.red(), color.green(), color.blue())
 
 
 def _predicted_sign_colors(
@@ -351,21 +373,13 @@ def _apply_text_overlays(
     try:
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         for layer in visible_layers:
-            font = QFont(layer.font_family)
-            font.setPixelSize(max(1, layer.font_size))
-            font.setBold(layer.bold)
-            font.setItalic(layer.italic)
-            painter.setFont(font)
-            painter.setPen(QColor(*layer.color))
-            text_bounds = painter.fontMetrics().boundingRect(layer.text)
-            bounds = QRectF(
-                0.0,
-                0.0,
-                max(1.0, float(text_bounds.width() + 4)),
-                max(1.0, float(text_bounds.height() + 4)),
+            draw_text(
+                painter,
+                layer.text,
+                layer_font(layer),
+                QPointF(layer.x * width, layer.y * height),
+                TextStyle.from_layer(layer),
             )
-            bounds.moveCenter(QPointF(layer.x * width, layer.y * height))
-            painter.drawText(bounds, int(Qt.AlignmentFlag.AlignCenter), layer.text)
     finally:
         painter.end()
 
@@ -677,6 +691,9 @@ class MainWindow(QMainWindow):
             _TextOverlayOptions("", "", 24, (255, 255, 255), size_ratio=24 / 128)
         ]
         self._selected_text_layer = 0
+        # Which layers the side panel writes to; a canvas selection fills it
+        # in, and an empty list falls back to the layer the combo box names.
+        self._selected_text_indices: list[int] = [0]
         self._syncing_text_controls = False
         self._source_preview_size: tuple[int, int] | None = None
         # The Rust preview is only fronted once per imported image; afterwards
@@ -1131,10 +1148,13 @@ class MainWindow(QMainWindow):
             "Browse an image to begin", smooth=True, hint=browse_hint
         )
         self.original_preview.setToolTip(
-            "Drag text to move it, drag its handles to resize it, double-click "
-            "to edit it, press Ctrl+D or Ctrl+C to copy it, or press Delete to "
-            "remove it. The dashed border is the part of the image the sign "
-            "will show."
+            "Drag text to move it, drag its handles to resize it, and "
+            "double-click to edit it. Drag a box across bare canvas, "
+            "Ctrl+click or Ctrl+A to take several layers at once; the arrow "
+            "keys nudge them, Ctrl+D or Ctrl+C copies them, and Delete "
+            "removes them. Dragging snaps to the sign and to the other "
+            "layers unless Alt is held. The dashed border is the part of "
+            "the image the sign will show."
         )
         self.paint_preview = PreviewLabel(
             "Paint simulation will appear here", smooth=False, hint=browse_hint
@@ -1463,11 +1483,15 @@ class MainWindow(QMainWindow):
         self.duplicate_text_button = QPushButton("Duplicate")
         self.duplicate_text_button.setObjectName("compactButton")
         self.duplicate_text_button.setToolTip(
-            "Copy the selected text layer. Ctrl+D or Ctrl+C does the same to\n"
-            "the layer selected in the Source tab."
+            "Copy every selected text layer. Ctrl+D or Ctrl+C does the\n"
+            "same from the Source tab."
         )
         self.remove_text_button = QPushButton("Remove")
         self.remove_text_button.setObjectName("compactButton")
+        self.remove_text_button.setToolTip(
+            "Delete every selected text layer. The last one is emptied\n"
+            "rather than removed, so there is always one to type into."
+        )
         text_heading.addWidget(text_title)
         text_heading.addStretch(1)
         text_heading.addWidget(self.add_text_button)
@@ -1507,6 +1531,81 @@ class MainWindow(QMainWindow):
         text_style_layout.addWidget(self.text_italic_check)
         text_style_layout.addStretch(1)
 
+        self.text_gradient_check = QCheckBox("Gradient")
+        self.text_gradient_check.setToolTip(
+            "Fade the letters from the text color into a second one. The fade\n"
+            "is quantized with the rest of the artwork, so a narrow palette\n"
+            "will show it as bands rather than as a smooth ramp."
+        )
+        self.text_gradient_direction_combo = NoWheelComboBox()
+        for label, value in (
+            ("Top to bottom", "vertical"),
+            ("Left to right", "horizontal"),
+            ("Diagonal", "diagonal"),
+        ):
+            self.text_gradient_direction_combo.addItem(label, value)
+        self.text_gradient_color_button = ColorButton(
+            "#ff9336", dialog_title="Choose the color the text fades into"
+        )
+        self.text_outline_spin = NoWheelSpinBox()
+        self.text_outline_spin.setRange(0, MAX_OUTLINE_WIDTH)
+        self.text_outline_spin.setValue(0)
+        self.text_outline_spin.setSuffix(" px")
+        self.text_outline_spin.setSpecialValueText("None")
+        self.text_outline_spin.setToolTip(
+            "Ring every letter, in logical canvas pixels, so a caption stays\n"
+            "readable over artwork it happens to share a color with."
+        )
+        self.text_outline_color_button = ColorButton(
+            "#000000", dialog_title="Choose the outline color"
+        )
+
+        self.text_align_buttons: dict[str, QPushButton] = {}
+        align_layout = QHBoxLayout()
+        align_layout.setContentsMargins(0, 0, 0, 0)
+        align_layout.setSpacing(4)
+        for name, label, tip in (
+            ("left", "Left", "the left edge of the sign"),
+            ("center", "Center", "the middle of the sign, side to side"),
+            ("right", "Right", "the right edge of the sign"),
+            ("top", "Top", "the top edge of the sign"),
+            ("middle", "Middle", "the middle of the sign, top to bottom"),
+            ("bottom", "Bottom", "the bottom edge of the sign"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("compactButton")
+            button.setToolTip(f"Move the selected text to {tip}")
+            button.clicked.connect(
+                lambda _checked=False, key=name: self._align_text_layers(key)
+            )
+            align_layout.addWidget(button)
+            self.text_align_buttons[name] = button
+        align_layout.addStretch(1)
+
+        self.text_spread_buttons: dict[str, QPushButton] = {}
+        spread_layout = QHBoxLayout()
+        spread_layout.setContentsMargins(0, 0, 0, 0)
+        spread_layout.setSpacing(4)
+        for name, label, tip in (
+            ("across", "Across", "side to side"),
+            ("down", "Down", "top to bottom"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("compactButton")
+            button.setToolTip(
+                f"Leave an equal gap between three or more selected layers, {tip}"
+            )
+            button.clicked.connect(
+                lambda _checked=False, key=name: self._distribute_text_layers(key)
+            )
+            spread_layout.addWidget(button)
+            self.text_spread_buttons[name] = button
+        spread_layout.addStretch(1)
+
+        self.text_selection_label = QLabel("")
+        self.text_selection_label.setObjectName("muted")
+        self.text_selection_label.setWordWrap(True)
+
         text_grid.addWidget(QLabel("Layer"), 0, 0)
         text_grid.addWidget(self.text_layer_combo, 0, 1, 1, 3)
         text_grid.addWidget(QLabel("Text"), 1, 0)
@@ -1519,6 +1618,19 @@ class MainWindow(QMainWindow):
         text_grid.addWidget(self.text_color_button, 3, 3)
         text_grid.addWidget(QLabel("Style"), 4, 0)
         text_grid.addLayout(text_style_layout, 4, 1, 1, 3)
+        text_grid.addWidget(self.text_gradient_check, 5, 0)
+        text_grid.addWidget(self.text_gradient_direction_combo, 5, 1)
+        text_grid.addWidget(QLabel("Into"), 5, 2)
+        text_grid.addWidget(self.text_gradient_color_button, 5, 3)
+        text_grid.addWidget(QLabel("Outline"), 6, 0)
+        text_grid.addWidget(self.text_outline_spin, 6, 1)
+        text_grid.addWidget(QLabel("Color"), 6, 2)
+        text_grid.addWidget(self.text_outline_color_button, 6, 3)
+        text_grid.addWidget(QLabel("Align"), 7, 0)
+        text_grid.addLayout(align_layout, 7, 1, 1, 3)
+        text_grid.addWidget(QLabel("Spread"), 8, 0)
+        text_grid.addLayout(spread_layout, 8, 1, 1, 3)
+        text_grid.addWidget(self.text_selection_label, 9, 0, 1, 4)
         text_grid.setColumnStretch(1, 1)
         text_grid.setColumnStretch(3, 1)
         image_layout.addWidget(self.text_options_panel)
@@ -1926,18 +2038,47 @@ class MainWindow(QMainWindow):
         self.duplicate_text_button.clicked.connect(self._duplicate_selected_text_layer)
         self.remove_text_button.clicked.connect(self._remove_text_layer)
         self.text_layer_combo.currentIndexChanged.connect(self._select_text_layer)
-        self.text_edit.textChanged.connect(self._on_text_control_changed)
-        self.text_font_combo.currentFontChanged.connect(self._on_text_control_changed)
-        self.text_size_spin.valueChanged.connect(self._on_text_control_changed)
-        self.text_color_button.colorChanged.connect(self._on_text_control_changed)
-        self.text_bold_check.toggled.connect(self._on_text_control_changed)
-        self.text_italic_check.toggled.connect(self._on_text_control_changed)
+        # Only the text itself belongs to one layer; every other control
+        # rewrites the whole selection, so each reports what it changed.
+        self.text_edit.textChanged.connect(self._on_text_edited)
+        self.text_font_combo.currentFontChanged.connect(
+            lambda font: self._apply_to_selected_text(font_family=font.family())
+        )
+        self.text_size_spin.valueChanged.connect(self._on_text_size_changed)
+        self.text_color_button.colorChanged.connect(
+            lambda color: self._apply_to_selected_text(color=_rgb(color))
+        )
+        self.text_bold_check.toggled.connect(
+            lambda checked: self._apply_to_selected_text(bold=checked)
+        )
+        self.text_italic_check.toggled.connect(
+            lambda checked: self._apply_to_selected_text(italic=checked)
+        )
+        self.text_gradient_check.toggled.connect(self._on_text_gradient_toggled)
+        self.text_gradient_direction_combo.currentIndexChanged.connect(
+            lambda _index: self._apply_to_selected_text(
+                gradient_direction=self.text_gradient_direction_combo.currentData()
+            )
+        )
+        self.text_gradient_color_button.colorChanged.connect(
+            lambda color: self._apply_to_selected_text(gradient_color=_rgb(color))
+        )
+        self.text_outline_spin.valueChanged.connect(
+            lambda value: self._apply_to_selected_text(outline_width=int(value))
+        )
+        self.text_outline_color_button.colorChanged.connect(
+            lambda color: self._apply_to_selected_text(outline_color=_rgb(color))
+        )
         self.original_preview.layerMoved.connect(self._on_text_layer_moved)
-        self.original_preview.layerSelected.connect(self._select_text_layer)
+        self.original_preview.layerSelectionChanged.connect(
+            self._on_canvas_selection_changed
+        )
         self.original_preview.layerTextEdited.connect(self._on_canvas_text_edited)
         self.original_preview.layerResized.connect(self._on_canvas_text_resized)
-        self.original_preview.layerDeleteRequested.connect(self._delete_text_layer)
-        self.original_preview.layerDuplicateRequested.connect(self._duplicate_text_layer)
+        self.original_preview.layersDeleteRequested.connect(self._delete_text_layers)
+        self.original_preview.layersDuplicateRequested.connect(
+            self._duplicate_text_layers
+        )
         self.original_preview.interactionFinished.connect(
             self._on_text_interaction_finished
         )
@@ -2059,10 +2200,33 @@ class MainWindow(QMainWindow):
         self.text_layer_combo.blockSignals(False)
         self.remove_text_button.setEnabled(bool(self._text_layers))
 
+    def _primary_text_index(self) -> int:
+        """The layer the combo box names, which owns the text field."""
+
+        return min(max(self._selected_text_layer, 0), len(self._text_layers) - 1)
+
+    def _edit_target_indices(self) -> list[int]:
+        """Which layers the side panel writes to.
+
+        A canvas selection wins when there is one, so a font or a color change
+        reaches every layer the user swept up.  Otherwise only the layer the
+        combo box names is edited, which is the case before an image is opened
+        and after a click on bare canvas has cleared the selection.
+        """
+
+        if not self._text_layers:
+            return []
+        selected = [
+            index
+            for index in self._selected_text_indices
+            if 0 <= index < len(self._text_layers)
+        ]
+        return selected or [self._primary_text_index()]
+
     def _sync_text_controls(self) -> None:
         if not self._text_layers:
             return
-        layer = self._text_layers[self._selected_text_layer]
+        layer = self._text_layers[self._primary_text_index()]
         self._syncing_text_controls = True
         try:
             self.text_edit.setText(layer.text)
@@ -2072,8 +2236,36 @@ class MainWindow(QMainWindow):
             self.text_color_button.set_color(QColor(*layer.color))
             self.text_bold_check.setChecked(layer.bold)
             self.text_italic_check.setChecked(layer.italic)
+            self.text_gradient_check.setChecked(layer.gradient)
+            self._set_combo_data(
+                self.text_gradient_direction_combo, layer.gradient_direction
+            )
+            self.text_gradient_color_button.set_color(QColor(*layer.gradient_color))
+            self.text_outline_spin.setValue(layer.outline_width)
+            self.text_outline_color_button.set_color(QColor(*layer.outline_color))
         finally:
             self._syncing_text_controls = False
+        self._refresh_text_selection_state()
+
+    def _refresh_text_selection_state(self) -> None:
+        """Show what the panel is about to edit, and gate what needs a group."""
+
+        gradient = self.text_gradient_check.isChecked()
+        self.text_gradient_direction_combo.setEnabled(gradient)
+        self.text_gradient_color_button.setEnabled(gradient)
+        self.text_outline_color_button.setEnabled(self.text_outline_spin.value() > 0)
+        selected = len(self._edit_target_indices())
+        # Spreading layers out only means something once there is a layer in
+        # the middle to move.
+        for button in self.text_spread_buttons.values():
+            button.setEnabled(selected >= 3)
+        self.text_selection_label.setText(
+            f"{selected} layers selected — everything but the text itself "
+            "applies to all of them."
+            if selected > 1
+            else "Drag a box across the Source tab, or Ctrl+click, to edit "
+            "several layers at once."
+        )
 
     @Slot()
     def _add_text_layer(self) -> None:
@@ -2082,7 +2274,6 @@ class MainWindow(QMainWindow):
                 f"A sign can hold at most {MAX_TEXT_LAYERS} text layers", 4000
             )
             return
-        color = self.text_color_button.color()
         offset = min(0.24, len(self._text_layers) * 0.06)
         font_size = self.text_size_spin.value()
         self._text_layers.append(
@@ -2090,15 +2281,21 @@ class MainWindow(QMainWindow):
                 "",
                 self.text_font_combo.currentFont().family(),
                 font_size,
-                (color.red(), color.green(), color.blue()),
+                _rgb(self.text_color_button.color()),
                 x=min(0.85, 0.5 + offset),
                 y=min(0.85, 0.5 + offset),
                 bold=self.text_bold_check.isChecked(),
                 italic=self.text_italic_check.isChecked(),
                 size_ratio=self._text_size_ratio(font_size),
+                gradient=self.text_gradient_check.isChecked(),
+                gradient_color=_rgb(self.text_gradient_color_button.color()),
+                gradient_direction=self.text_gradient_direction_combo.currentData(),
+                outline_width=self.text_outline_spin.value(),
+                outline_color=_rgb(self.text_outline_color_button.color()),
             )
         )
         self._selected_text_layer = len(self._text_layers) - 1
+        self._selected_text_indices = [self._selected_text_layer]
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
@@ -2107,28 +2304,46 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _duplicate_selected_text_layer(self) -> None:
-        self._duplicate_text_layer(self._selected_text_layer)
+        self._duplicate_text_layers(self._edit_target_indices())
 
-    @Slot(int)
-    def _duplicate_text_layer(self, index: int) -> None:
-        """Insert a copy of one text layer, nudged clear of the original."""
+    @Slot(object)
+    def _duplicate_text_layers(self, indices: Any) -> None:
+        """Insert a copy of each named layer, nudged clear of its original."""
 
-        if not 0 <= index < len(self._text_layers):
+        wanted = self._valid_text_indices(indices)
+        if not wanted:
             return
-        if len(self._text_layers) >= MAX_TEXT_LAYERS:
+        room = MAX_TEXT_LAYERS - len(self._text_layers)
+        if room <= 0:
             self.statusBar().showMessage(
                 f"A sign can hold at most {MAX_TEXT_LAYERS} text layers", 4000
             )
             return
-        source = self._text_layers[index]
-        offset = self._text_size_ratio(source.font_size) * 0.5
-        copy = replace(
-            source,
-            x=min(max(source.x + offset * 0.5, 0.0), 1.0),
-            y=min(max(source.y + offset, 0.0), 1.0),
-        )
-        self._text_layers.insert(index + 1, copy)
-        self._selected_text_layer = index + 1
+        if len(wanted) > room:
+            wanted = wanted[:room]
+            self.statusBar().showMessage(
+                f"Room for {room} more layer{'s' if room != 1 else ''}, "
+                "so only that many were copied",
+                4000,
+            )
+        layers: list[_TextOverlayOptions] = []
+        copies: list[int] = []
+        for index, layer in enumerate(self._text_layers):
+            layers.append(layer)
+            if index not in wanted:
+                continue
+            nudge = self._text_size_ratio(layer.font_size) * 0.5
+            copies.append(len(layers))
+            layers.append(
+                replace(
+                    layer,
+                    x=min(max(layer.x + nudge * 0.5, 0.0), 1.0),
+                    y=min(max(layer.y + nudge, 0.0), 1.0),
+                )
+            )
+        self._text_layers = layers
+        self._selected_text_indices = copies
+        self._selected_text_layer = copies[-1]
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
@@ -2137,34 +2352,50 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _remove_text_layer(self) -> None:
-        self._delete_text_layer(self._selected_text_layer)
+        self._delete_text_layers(self._edit_target_indices())
 
-    @Slot(int)
-    def _delete_text_layer(self, index: int) -> None:
-        """Drop one text layer, keeping a single empty layer to type into."""
+    @Slot(object)
+    def _delete_text_layers(self, indices: Any) -> None:
+        """Drop layers, keeping a single empty one to type into."""
 
-        if not 0 <= index < len(self._text_layers):
+        wanted = self._valid_text_indices(indices)
+        if not wanted:
             return
-        if len(self._text_layers) > 1:
-            self._text_layers.pop(index)
-            selected = self._selected_text_layer
-            if index < selected:
-                selected -= 1
-            self._selected_text_layer = min(max(selected, 0), len(self._text_layers) - 1)
+        kept = [
+            layer
+            for index, layer in enumerate(self._text_layers)
+            if index not in set(wanted)
+        ]
+        if kept:
+            self._text_layers = kept
+            # Land on the layer before the first gap, which is where the eye
+            # already is however many were removed.
+            self._selected_text_layer = min(max(wanted[0] - 1, 0), len(kept) - 1)
         else:
-            self._text_layers[0] = replace(self._text_layers[0], text="")
+            self._text_layers = [replace(self._text_layers[0], text="")]
             self._selected_text_layer = 0
+        self._selected_text_indices = []
         self._rebuild_text_layer_combo()
         self._sync_text_controls()
         self._refresh_text_editor_layers()
         self._schedule_processing()
         self._schedule_settings_save()
 
+    def _valid_text_indices(self, indices: Any) -> list[int]:
+        return sorted(
+            {
+                int(index)
+                for index in indices
+                if 0 <= int(index) < len(self._text_layers)
+            }
+        )
+
     @Slot(int)
     def _select_text_layer(self, index: int) -> None:
         if not 0 <= index < len(self._text_layers):
             return
         self._selected_text_layer = index
+        self._selected_text_indices = [index]
         if self.text_layer_combo.currentIndex() != index:
             self.text_layer_combo.blockSignals(True)
             self.text_layer_combo.setCurrentIndex(index)
@@ -2172,26 +2403,127 @@ class MainWindow(QMainWindow):
         self._sync_text_controls()
         self.original_preview.select_layer(index)
 
-    def _on_text_control_changed(self, *_args: Any) -> None:
-        if self._syncing_text_controls or not self._text_layers:
-            return
-        current = self._text_layers[self._selected_text_layer]
-        color = self.text_color_button.color()
-        font_size = self.text_size_spin.value()
-        self._text_layers[self._selected_text_layer] = replace(
-            current,
-            text=self.text_edit.text(),
-            font_family=self.text_font_combo.currentFont().family(),
-            font_size=font_size,
-            color=(color.red(), color.green(), color.blue()),
-            bold=self.text_bold_check.isChecked(),
-            italic=self.text_italic_check.isChecked(),
-            size_ratio=self._text_size_ratio(font_size),
+    @Slot()
+    def _on_canvas_selection_changed(self) -> None:
+        """Let the canvas decide what the side panel is pointed at."""
+
+        self._selected_text_indices = self._valid_text_indices(
+            self.original_preview.selected_indices()
         )
+        primary = self.original_preview.primary_index()
+        if primary is not None and 0 <= primary < len(self._text_layers):
+            self._selected_text_layer = primary
+            if self.text_layer_combo.currentIndex() != primary:
+                self.text_layer_combo.blockSignals(True)
+                self.text_layer_combo.setCurrentIndex(primary)
+                self.text_layer_combo.blockSignals(False)
+        self._sync_text_controls()
+
+    def _apply_to_selected_text(self, **fields: Any) -> None:
+        """Write one styling change to every layer the panel is pointed at."""
+
+        if self._syncing_text_controls:
+            return
+        changed = False
+        for index in self._edit_target_indices():
+            updated = replace(self._text_layers[index], **fields)
+            if updated != self._text_layers[index]:
+                self._text_layers[index] = updated
+                changed = True
+        self._refresh_text_selection_state()
+        if not changed:
+            return
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
         self._schedule_processing()
         self._schedule_settings_save()
+
+    @Slot(str)
+    def _on_text_edited(self, text: str) -> None:
+        """Only the named layer takes the typed text, however many are picked."""
+
+        if self._syncing_text_controls or not self._text_layers:
+            return
+        index = self._primary_text_index()
+        if self._text_layers[index].text == text:
+            return
+        self._text_layers[index] = replace(self._text_layers[index], text=text)
+        self._rebuild_text_layer_combo()
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot(int)
+    def _on_text_size_changed(self, font_size: int) -> None:
+        self._apply_to_selected_text(
+            font_size=int(font_size), size_ratio=self._text_size_ratio(int(font_size))
+        )
+
+    @Slot(bool)
+    def _on_text_gradient_toggled(self, enabled: bool) -> None:
+        self._apply_to_selected_text(gradient=bool(enabled))
+        self._refresh_text_selection_state()
+
+    @Slot(str)
+    def _align_text_layers(self, edge: str) -> None:
+        """Park the selected layers against one edge or midline of the sign."""
+
+        targets = self._edit_target_indices()
+        if not targets:
+            return
+        for index in targets:
+            layer = self._text_layers[index]
+            width, height = self._text_layer_extent(layer)
+            position = {
+                "left": {"x": width / 2.0},
+                "center": {"x": 0.5},
+                "right": {"x": 1.0 - width / 2.0},
+                "top": {"y": height / 2.0},
+                "middle": {"y": 0.5},
+                "bottom": {"y": 1.0 - height / 2.0},
+            }.get(edge)
+            if position is None:
+                return
+            axis, value = next(iter(position.items()))
+            self._text_layers[index] = replace(
+                layer, **{axis: min(max(value, 0.0), 1.0)}
+            )
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    @Slot(str)
+    def _distribute_text_layers(self, axis: str) -> None:
+        """Even out the gaps between three or more selected layers."""
+
+        targets = self._edit_target_indices()
+        if len(targets) < 3:
+            self.statusBar().showMessage(
+                "Select three or more text layers to spread them out", 4000
+            )
+            return
+        field = "x" if axis == "across" else "y"
+        ordered = sorted(targets, key=lambda index: getattr(self._text_layers[index], field))
+        first = getattr(self._text_layers[ordered[0]], field)
+        last = getattr(self._text_layers[ordered[-1]], field)
+        step = (last - first) / (len(ordered) - 1)
+        for position, index in enumerate(ordered[1:-1], start=1):
+            self._text_layers[index] = replace(
+                self._text_layers[index], **{field: first + step * position}
+            )
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
+    def _text_layer_extent(self, layer: _TextOverlayOptions) -> tuple[float, float]:
+        """How much of the canvas a layer covers, as width and height fractions."""
+
+        width, height = text_size(layer.text, layer_font(layer))
+        outline = 2 * TextStyle.from_layer(layer).outline
+        return (
+            (width + outline) / max(1, self.logical_width_spin.value()),
+            (height + outline) / self._logical_height(),
+        )
 
     @Slot(int, float, float)
     def _on_text_layer_moved(self, index: int, x: float, y: float) -> None:
@@ -2202,7 +2534,6 @@ class MainWindow(QMainWindow):
             x=min(max(x, 0.0), 1.0),
             y=min(max(y, 0.0), 1.0),
         )
-        self._selected_text_layer = index
         self._schedule_processing()
         self._schedule_settings_save()
 
@@ -2308,6 +2639,7 @@ class MainWindow(QMainWindow):
             self.original_preview.set_canvas_geometry(*geometry)
         self.original_preview.set_layers(
             self._text_layers,
+            self._edit_target_indices(),
             self._selected_text_layer,
         )
 
@@ -3208,18 +3540,33 @@ class MainWindow(QMainWindow):
                 font_size = int(layer_value.get("font_size", 24))
                 # Documents written before sizes were stored as a ratio only
                 # have pixels, which belong to the resolution saved with them.
+                gradient_color = QColor(
+                    str(layer_value.get("gradient_color", "#FFFFFF"))
+                )
+                outline_color = QColor(str(layer_value.get("outline_color", "#000000")))
+                direction = str(layer_value.get("gradient_direction", "vertical"))
                 self._text_layers.append(
                     _TextOverlayOptions(
                         text=str(layer_value.get("text", "")),
                         font_family=str(layer_value.get("font_family", "")),
                         font_size=font_size,
-                        color=(color.red(), color.green(), color.blue()),
+                        color=_rgb(color),
                         x=float(layer_value.get("x", 0.5)),
                         y=float(layer_value.get("y", 0.5)),
                         bold=bool(layer_value.get("bold", False)),
                         italic=bool(layer_value.get("italic", False)),
                         size_ratio=float(layer_value.get("size_ratio", 0.0))
                         or self._text_size_ratio(font_size),
+                        gradient=bool(layer_value.get("gradient", False)),
+                        gradient_color=_rgb(gradient_color),
+                        gradient_direction=direction
+                        if direction in GRADIENT_DIRECTIONS
+                        else "vertical",
+                        outline_width=min(
+                            max(int(layer_value.get("outline_width", 0)), 0),
+                            MAX_OUTLINE_WIDTH,
+                        ),
+                        outline_color=_rgb(outline_color),
                     )
                 )
             if not self._text_layers:
@@ -3233,6 +3580,7 @@ class MainWindow(QMainWindow):
                     )
                 ]
             self._selected_text_layer = 0
+            self._selected_text_indices = [0]
             self._rebuild_text_layer_combo()
             self._sync_text_controls()
 
@@ -3358,6 +3706,15 @@ class MainWindow(QMainWindow):
                         "y": layer.y,
                         "bold": layer.bold,
                         "italic": layer.italic,
+                        "gradient": layer.gradient,
+                        "gradient_color": "#{:02X}{:02X}{:02X}".format(
+                            *layer.gradient_color
+                        ),
+                        "gradient_direction": layer.gradient_direction,
+                        "outline_width": layer.outline_width,
+                        "outline_color": "#{:02X}{:02X}{:02X}".format(
+                            *layer.outline_color
+                        ),
                     }
                     for layer in self._text_layers
                 ]

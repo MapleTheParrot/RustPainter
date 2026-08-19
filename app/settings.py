@@ -96,6 +96,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                     "y": 0.5,
                     "bold": False,
                     "italic": False,
+                    # A gradient runs from "color" into "gradient_color" over
+                    # the text's own box; an outline rings every letter with
+                    # that many logical pixels of "outline_color".
+                    "gradient": False,
+                    "gradient_direction": "vertical",
+                    "gradient_color": "#FF9336",
+                    "outline_width": 0,
+                    "outline_color": "#000000",
                 }
             ],
         },
@@ -311,9 +319,36 @@ def _validate(settings: Mapping[str, Any]) -> None:
             or not 0.0 < float(size_ratio) <= 32.0
         ):
             raise SettingsError(f"{label}.size_ratio must be between 0 and 32")
-        text_color = layer.get("color")
-        if not isinstance(text_color, str) or _HEX_COLOR.fullmatch(text_color) is None:
-            raise SettingsError(f"{label}.color must use #RRGGBB format")
+        # Colors written before gradients and outlines existed are absent
+        # rather than wrong, so only the keys a document does carry are read.
+        for key in ("color", "gradient_color", "outline_color"):
+            text_color = layer.get(key, "#FFFFFF" if key == "color" else None)
+            if text_color is None:
+                continue
+            if (
+                not isinstance(text_color, str)
+                or _HEX_COLOR.fullmatch(text_color) is None
+            ):
+                raise SettingsError(f"{label}.{key} must use #RRGGBB format")
+        direction = layer.get("gradient_direction")
+        if direction is not None and direction not in {
+            "vertical",
+            "horizontal",
+            "diagonal",
+        }:
+            raise SettingsError(
+                f"{label}.gradient_direction must be vertical, horizontal, "
+                "or diagonal"
+            )
+        outline_width = layer.get("outline_width")
+        if outline_width is not None and (
+            isinstance(outline_width, bool)
+            or not isinstance(outline_width, int)
+            or not 0 <= outline_width <= 16
+        ):
+            raise SettingsError(
+                f"{label}.outline_width must be an integer from 0 to 16"
+            )
         for coordinate in ("x", "y"):
             value = layer.get(coordinate)
             if (
@@ -326,6 +361,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         for key in ("bold", "italic"):
             if not isinstance(layer.get(key), bool):
                 raise SettingsError(f"{label}.{key} must be true or false")
+        if not isinstance(layer.get("gradient", False), bool):
+            raise SettingsError(f"{label}.gradient must be true or false")
 
     assert isinstance(painting, Mapping)
     nonnegative = {

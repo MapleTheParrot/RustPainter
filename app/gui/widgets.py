@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from .assets import pixmap as art_pixmap, tinted_pixmap
 from .styles import ACCENT, ACCENT_SOFT, MUTED, SUCCESS, WARNING
+from .text_render import TextStyle, draw_text
 
 
 class NoWheelComboBox(QComboBox):
@@ -143,6 +144,19 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
 _HOVER_EVENTS = {QEvent.Type.Enter, QEvent.Type.Leave}
+
+# How near a dragged text layer has to come, in screen pixels, before it jumps
+# onto an alignment.  Small enough that ordinary dragging never feels magnetic,
+# and Alt turns it off outright.
+SNAP_DISTANCE_PIXELS = 7.0
+
+# Arrow keys nudge a selection in whole logical canvas pixels.
+_ARROW_STEPS: dict[Any, tuple[float, float]] = {
+    Qt.Key.Key_Left: (-1.0, 0.0),
+    Qt.Key.Key_Right: (1.0, 0.0),
+    Qt.Key.Key_Up: (0.0, -1.0),
+    Qt.Key.Key_Down: (0.0, 1.0),
+}
 
 
 def dropped_image_path(event: Any) -> Path | None:
@@ -369,30 +383,22 @@ class _MovableTextItem(QGraphicsTextItem):
 
     The item's own coordinates and font stay in logical canvas pixels; the
     view scales the whole item so the same text covers the same fraction of
-    the sign however large the backdrop pixmap is.  ``canvas_rect`` reports
+    the sign however large the backdrop pixmap is.  The owning view reports
     where that sign canvas sits in scene coordinates, which is what movement
     is clamped to and what the emitted position fractions are relative to.
     """
 
-    def __init__(
-        self,
-        index: int,
-        moved: Callable[[int, float, float], None],
-        text_edited: Callable[[int, str], None],
-        resized: Callable[[int, int], None],
-        interaction_finished: Callable[[], None],
-        canvas_rect: Callable[[], QRectF] | None = None,
-    ) -> None:
+    def __init__(self, index: int, owner: "TextEditorPreview") -> None:
         super().__init__()
         self.index = index
-        self._moved = moved
-        self._text_edited = text_edited
-        self._resized = resized
-        self._interaction_finished = interaction_finished
-        self._canvas_rect_getter = canvas_rect
+        self._owner = owner
+        self._style = TextStyle()
         self._syncing = True
         self._editing = False
         self._dragging = False
+        self._drag_origin = QPointF()
+        self._drag_start_rect = QRectF()
+        self._drag_start: list[tuple["_MovableTextItem", QPointF]] = []
         self._resize_handle: str | None = None
         self._resize_start = QPointF()
         self._resize_start_size = 24
@@ -417,6 +423,16 @@ class _MovableTextItem(QGraphicsTextItem):
     def is_editing(self) -> bool:
         return self._editing
 
+    def set_style(self, style: TextStyle) -> None:
+        """Adopt the layer's fill and outline, which the item draws itself."""
+
+        if style == self._style:
+            return
+        # An outline reaches past the text box, so the painted area grows.
+        self.prepareGeometryChange()
+        self._style = style
+        self.update()
+
     def set_center(self, x: float, y: float) -> None:
         scale = max(self.scale(), 1e-6)
         center = self.boundingRect().center()
@@ -427,18 +443,28 @@ class _MovableTextItem(QGraphicsTextItem):
     def finish_setup(self) -> None:
         self._syncing = False
 
+    def text_rect(self) -> QRectF:
+        """The text's own box, without the margin handles and outlines need."""
+
+        return QGraphicsTextItem.boundingRect(self)
+
+    def text_scene_rect(self) -> QRectF:
+        return self.mapRectToScene(self.text_rect())
+
     def _canvas_bounds(self) -> QRectF:
-        if self._canvas_rect_getter is not None:
-            rect = self._canvas_rect_getter()
-            if rect.width() > 0 and rect.height() > 0:
-                return rect
+        rect = self._owner.canvas_rect()
+        if rect.width() > 0 and rect.height() > 0:
+            return rect
         if self.scene() is not None:
             return self.scene().sceneRect()
         return QRectF(0.0, 0.0, 1.0, 1.0)
 
+    def _handle_size(self) -> float:
+        return max(4.0, min(9.0, max(1, self.font().pixelSize()) * 0.24))
+
     def _handle_rects(self) -> dict[str, QRectF]:
-        bounds = super().boundingRect()
-        size = max(4.0, min(9.0, max(1, self.font().pixelSize()) * 0.24))
+        bounds = self.text_rect()
+        size = self._handle_size()
         half = size / 2.0
         left, center_x, right = bounds.left(), bounds.center().x(), bounds.right()
         top, center_y, bottom = bounds.top(), bounds.center().y(), bounds.bottom()
@@ -454,19 +480,33 @@ class _MovableTextItem(QGraphicsTextItem):
         }
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt API
-        bounds = super().boundingRect()
-        size = max(4.0, min(9.0, max(1, self.font().pixelSize()) * 0.24))
-        return bounds.adjusted(-size / 2.0, -size / 2.0, size / 2.0, size / 2.0)
+        margin = self._handle_size() / 2.0 + self._style.outline
+        return self.text_rect().adjusted(-margin, -margin, margin, margin)
 
     def shape(self) -> QPainterPath:
         path = super().shape()
-        if self.isSelected() and not self._editing:
+        if self._handles_visible:
             for rectangle in self._handle_rects().values():
                 path.addRect(rectangle)
         return path
 
+    @property
+    def _handles_visible(self) -> bool:
+        """Resize handles belong to a lone selection.
+
+        With several layers selected a handle would be ambiguous - the size
+        box in the side panel is what applies to all of them - so each member
+        of the group just outlines itself instead.
+        """
+
+        return (
+            self.isSelected()
+            and not self._editing
+            and len(self._owner.selected_items()) <= 1
+        )
+
     def _handle_at(self, position: QPointF) -> str | None:
-        if not self.isSelected() or self._editing:
+        if not self._handles_visible:
             return None
         for name, rectangle in self._handle_rects().items():
             if rectangle.contains(position):
@@ -486,14 +526,32 @@ class _MovableTextItem(QGraphicsTextItem):
         return Qt.CursorShape.OpenHandCursor
 
     def paint(self, painter, option, widget=None) -> None:
-        super().paint(painter, option, widget)
+        if self._editing:
+            # The document draws the caret and the selection highlight, which
+            # the glyph renderer knows nothing about.
+            super().paint(painter, option, widget)
+        else:
+            draw_text(
+                painter,
+                self.toPlainText(),
+                self.font(),
+                self.text_rect().center(),
+                self._style,
+            )
         if not self.isSelected() or self._editing:
             return
         painter.save()
-        painter.setPen(QColor("#fff1e2"))
-        painter.setBrush(QColor(ACCENT))
-        for rectangle in self._handle_rects().values():
-            painter.drawRect(rectangle)
+        if self._handles_visible:
+            painter.setPen(QColor("#fff1e2"))
+            painter.setBrush(QColor(ACCENT))
+            for rectangle in self._handle_rects().values():
+                painter.drawRect(rectangle)
+        else:
+            marker = QPen(QColor(ACCENT))
+            marker.setCosmetic(True)
+            painter.setPen(marker)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.text_rect())
         painter.restore()
 
     def hoverMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -510,24 +568,54 @@ class _MovableTextItem(QGraphicsTextItem):
             self._resize_handle = handle
             self._resize_start = event.scenePos()
             self._resize_start_size = max(1, self.font().pixelSize())
-            text_bounds = super().boundingRect()
+            text_bounds = self.text_rect()
             self._resize_start_width = max(1.0, text_bounds.width())
             self._resize_start_height = max(1.0, text_bounds.height())
             self._resize_center = self.mapToScene(text_bounds.center())
             event.accept()
             return
+        self._owner.note_primary(self.index)
+        # Qt settles the selection here, so which layers a drag carries is
+        # only known once the base class has had the press.
+        super().mousePressEvent(event)
         self._dragging = not self._editing
+        if self._dragging:
+            self._drag_origin = event.scenePos()
+            self._drag_start_rect = self.text_scene_rect()
+            moving = self._owner.selected_items()
+            if self not in moving:
+                moving = [self]
+            self._drag_start = [(item, item.pos()) for item in moving]
         self.setCursor(
             Qt.CursorShape.IBeamCursor
             if self._editing
             else Qt.CursorShape.ClosedHandCursor
         )
-        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if self._resize_handle is None:
+        if self._resize_handle is not None:
+            self._resize_to(event)
+            return
+        if not self._dragging or not self._drag_start:
             super().mouseMoveEvent(event)
             return
+        delta = event.scenePos() - self._drag_origin
+        guides: list[tuple[str, float]] = []
+        # Alt is the usual way out when the wanted spot is next to a guide.
+        if not event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            offset, guides = self._owner.snap_offset(
+                self._drag_start_rect.translated(delta),
+                {item for item, _ in self._drag_start},
+            )
+            delta += offset
+        self._owner.set_snap_guides(guides)
+        # Every selected layer takes the same step, so a group keeps its shape
+        # even where one member is held back by the canvas edge.
+        for item, start in self._drag_start:
+            item.setPos(start + delta)
+        event.accept()
+
+    def _resize_to(self, event) -> None:
         delta = event.scenePos() - self._resize_start
         horizontal = (
             -1
@@ -568,13 +656,15 @@ class _MovableTextItem(QGraphicsTextItem):
         else:
             super().mouseReleaseEvent(event)
         self._dragging = False
+        self._drag_start = []
+        self._owner.set_snap_guides([])
         self.setCursor(
             Qt.CursorShape.IBeamCursor
             if self._editing
             else Qt.CursorShape.OpenHandCursor
         )
         if was_interacting:
-            self._interaction_finished()
+            self._owner.interactionFinished.emit()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API
         self._editing = True
@@ -601,7 +691,7 @@ class _MovableTextItem(QGraphicsTextItem):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self._interaction_finished()
+        self._owner.interactionFinished.emit()
         self.update()
 
     def _apply_font_size(self, font_size: int) -> None:
@@ -613,12 +703,12 @@ class _MovableTextItem(QGraphicsTextItem):
         self.setFont(font)
         self.set_center(self._resize_center.x(), self._resize_center.y())
         self._syncing = False
-        self._resized(self.index, font_size)
+        self._owner.layerResized.emit(self.index, font_size)
         self.update()
 
     def _on_document_changed(self) -> None:
         if not self._syncing:
-            self._text_edited(self.index, self.toPlainText())
+            self._owner.layerTextEdited.emit(self.index, self.toPlainText())
 
     def itemChange(self, change, value):  # noqa: N802 - Qt API
         if (
@@ -627,7 +717,7 @@ class _MovableTextItem(QGraphicsTextItem):
         ):
             position = value
             scale = max(self.scale(), 1e-6)
-            bounds = self.boundingRect()
+            bounds = self.text_rect()
             canvas = self._canvas_bounds()
             left, top = bounds.left() * scale, bounds.top() * scale
             width, height = bounds.width() * scale, bounds.height() * scale
@@ -657,9 +747,9 @@ class _MovableTextItem(QGraphicsTextItem):
             and self.scene() is not None
         ):
             canvas = self._canvas_bounds()
-            center = self.mapToScene(self.boundingRect().center())
+            center = self.mapToScene(self.text_rect().center())
             if canvas.width() > 0 and canvas.height() > 0:
-                self._moved(
+                self._owner.layerMoved.emit(
                     self.index,
                     (center.x() - canvas.left()) / canvas.width(),
                     (center.y() - canvas.top()) / canvas.height(),
@@ -667,15 +757,34 @@ class _MovableTextItem(QGraphicsTextItem):
         return result
 
 
+def _closest_offset(
+    anchors: tuple[float, ...], targets: list[float], threshold: float
+) -> tuple[float, float | None]:
+    """The smallest move that lands one of ``anchors`` on one of ``targets``.
+
+    Anchors are offered centre first and ties are kept, so a layer that could
+    align equally well by its centre or by an edge prefers its centre.
+    """
+
+    offset, distance, guide = 0.0, threshold, None
+    for anchor in anchors:
+        for target in targets:
+            if abs(target - anchor) < distance:
+                distance = abs(target - anchor)
+                offset = target - anchor
+                guide = target
+    return offset, guide
+
+
 class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     """Image preview with selectable, editable, resizable text layers."""
 
     layerMoved = Signal(int, float, float)
-    layerSelected = Signal(int)
     layerTextEdited = Signal(int, str)
     layerResized = Signal(int, int)
-    layerDeleteRequested = Signal(int)
-    layerDuplicateRequested = Signal(int)
+    layersDeleteRequested = Signal(object)
+    layersDuplicateRequested = Signal(object)
+    layerSelectionChanged = Signal()
     interactionFinished = Signal()
     browseRequested = Signal()
     imageDropped = Signal(str)
@@ -697,7 +806,12 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        # A drag that starts on bare canvas sweeps up every layer it touches;
+        # one that starts on a layer still moves that layer.
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setRubberBandSelectionMode(
+            Qt.ItemSelectionMode.IntersectsItemBoundingRect
+        )
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._background = QGraphicsPixmapItem()
@@ -708,6 +822,9 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._items: list[_MovableTextItem] = []
         self._canvas_rect: QRectF | None = None
         self._font_scale = 1.0
+        self._primary: int | None = None
+        self._syncing_selection = False
+        self._guides: list[tuple[str, float]] = []
         self._placeholder = placeholder
         self._hint = hint
         self._placeholder_art = art_pixmap("preview-placeholder", 96)
@@ -771,12 +888,36 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._canvas_rect = None
         self._font_scale = 1.0
         self.set_source(None)
-        self.set_layers([], -1)
+        self.set_layers([], ())
 
-    def set_layers(self, layers: list[object], selected_index: int) -> None:
+    def set_layers(
+        self,
+        layers: list[object],
+        selected: object = (),
+        primary: int | None = None,
+    ) -> None:
+        """Rebuild the layer items, restoring which of them were selected."""
+
+        wanted = (
+            {int(selected)} if isinstance(selected, int) else {int(i) for i in selected}
+        )
+        # Tearing the old items down drops their selection, and putting the new
+        # ones up retakes it; neither is a choice the user just made.
+        self._syncing_selection = True
+        try:
+            self._rebuild_items(layers, wanted, primary)
+        finally:
+            self._syncing_selection = False
+
+    def _rebuild_items(
+        self, layers: list[object], wanted: set[int], primary: int | None
+    ) -> None:
         for item in self._items:
             self._scene.removeItem(item)
         self._items.clear()
+        self._guides = []
+        if primary is not None:
+            self._primary = primary
         if self._source.isNull():
             return
         canvas = self.canvas_rect()
@@ -784,14 +925,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             text = str(getattr(layer, "text", ""))
             if not text.strip():
                 continue
-            item = _MovableTextItem(
-                index,
-                self.layerMoved.emit,
-                self.layerTextEdited.emit,
-                self.layerResized.emit,
-                self.interactionFinished.emit,
-                self.canvas_rect,
-            )
+            item = _MovableTextItem(index, self)
             item.setPlainText(text)
             font = QFont(str(getattr(layer, "font_family", "")))
             font.setPixelSize(max(1, int(getattr(layer, "font_size", 24))))
@@ -800,6 +934,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             item.setFont(font)
             color = getattr(layer, "color", (255, 255, 255))
             item.setDefaultTextColor(QColor(*color))
+            item.set_style(TextStyle.from_layer(layer))
             item.setZValue(float(index))
             item.setScale(self._font_scale)
             self._scene.addItem(item)
@@ -807,13 +942,77 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
                 canvas.left() + float(getattr(layer, "x", 0.5)) * canvas.width(),
                 canvas.top() + float(getattr(layer, "y", 0.5)) * canvas.height(),
             )
-            item.setSelected(index == selected_index)
+            item.setSelected(index in wanted)
             item.finish_setup()
             self._items.append(item)
 
-    def select_layer(self, index: int) -> None:
+    def selected_items(self) -> list[_MovableTextItem]:
+        return [item for item in self._items if item.isSelected()]
+
+    def selected_indices(self) -> list[int]:
+        return [item.index for item in self.selected_items()]
+
+    def select_layers(self, indices: object, primary: int | None = None) -> None:
+        wanted = {int(index) for index in indices}
+        if primary is not None:
+            self._primary = primary
         for item in self._items:
-            item.setSelected(item.index == index)
+            item.setSelected(item.index in wanted)
+
+    def select_layer(self, index: int) -> None:
+        self.select_layers([index], index)
+
+    def note_primary(self, index: int) -> None:
+        """Remember the layer touched last; it is the one the panel edits."""
+
+        self._primary = index
+
+    def primary_index(self) -> int | None:
+        selected = self.selected_indices()
+        if self._primary in selected:
+            return self._primary
+        return selected[0] if selected else None
+
+    def selected_index(self) -> int | None:
+        return self.primary_index()
+
+    def snap_offset(
+        self, rect: QRectF, moving: set
+    ) -> tuple[QPointF, list[tuple[str, float]]]:
+        """Nudge a dragged box onto the nearest canvas or layer alignment.
+
+        The threshold is a distance on screen rather than one in the scene, so
+        how sticky a guide feels does not change with the size of the artwork.
+        """
+
+        threshold = SNAP_DISTANCE_PIXELS / max(abs(self.transform().m11()), 1e-6)
+        canvas = self.canvas_rect()
+        xs = [canvas.center().x(), canvas.left(), canvas.right()]
+        ys = [canvas.center().y(), canvas.top(), canvas.bottom()]
+        for item in self._items:
+            if item in moving:
+                continue
+            other = item.text_scene_rect()
+            xs += [other.center().x(), other.left(), other.right()]
+            ys += [other.center().y(), other.top(), other.bottom()]
+        offset_x, guide_x = _closest_offset(
+            (rect.center().x(), rect.left(), rect.right()), xs, threshold
+        )
+        offset_y, guide_y = _closest_offset(
+            (rect.center().y(), rect.top(), rect.bottom()), ys, threshold
+        )
+        guides: list[tuple[str, float]] = []
+        if guide_x is not None:
+            guides.append(("vertical", guide_x))
+        if guide_y is not None:
+            guides.append(("horizontal", guide_y))
+        return QPointF(offset_x, offset_y), guides
+
+    def set_snap_guides(self, guides: list[tuple[str, float]]) -> None:
+        if guides == self._guides:
+            return
+        self._guides = list(guides)
+        self.viewport().update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().resizeEvent(event)
@@ -821,35 +1020,54 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
-        """Edit the selected layer with the keyboard.
+        """Edit the selected layers with the keyboard.
 
-        Delete or Backspace removes it; Ctrl+D or Ctrl+C copies it. While a
-        layer is being edited every one of those keys belongs to the text
-        cursor instead, so the shortcuts only apply to a layer that is merely
-        selected.
+        Delete or Backspace removes them, Ctrl+D or Ctrl+C copies them, Ctrl+A
+        takes all of them, and the arrow keys nudge them a logical pixel at a
+        time - ten with Shift held.  While a layer is being edited every one of
+        those keys belongs to the text cursor instead, so the shortcuts only
+        apply to layers that are merely selected.
         """
 
         if not self.is_editing_text:
-            selected = self.selected_index()
-            control = bool(
-                event.modifiers() & Qt.KeyboardModifier.ControlModifier
-            )
-            deletes = event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
-            duplicates = control and event.key() in {Qt.Key.Key_D, Qt.Key.Key_C}
-            if selected is not None and (deletes or duplicates):
+            selected = self.selected_indices()
+            control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            key = event.key()
+            if control and key == Qt.Key.Key_A and self._items:
+                self.select_layers([item.index for item in self._items])
                 event.accept()
-                if deletes:
-                    self.layerDeleteRequested.emit(selected)
-                else:
-                    self.layerDuplicateRequested.emit(selected)
+                return
+            if key == Qt.Key.Key_Escape and selected:
+                self.select_layers([])
+                event.accept()
+                return
+            if selected and key in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
+                event.accept()
+                self.layersDeleteRequested.emit(selected)
+                return
+            if selected and control and key in {Qt.Key.Key_D, Qt.Key.Key_C}:
+                event.accept()
+                self.layersDuplicateRequested.emit(selected)
+                return
+            if selected and key in _ARROW_STEPS:
+                event.accept()
+                self._nudge(
+                    _ARROW_STEPS[key],
+                    10.0
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                    else 1.0,
+                )
                 return
         super().keyPressEvent(event)
 
-    def selected_index(self) -> int | None:
-        for item in self._items:
-            if item.isSelected():
-                return item.index
-        return None
+    def _nudge(self, direction: tuple[float, float], steps: float) -> None:
+        step = self._font_scale * steps
+        for item in self.selected_items():
+            item.setPos(
+                item.pos().x() + direction[0] * step,
+                item.pos().y() + direction[1] * step,
+            )
+        self.interactionFinished.emit()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().paintEvent(event)
@@ -864,36 +1082,56 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             )
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
-        """Mark the sign canvas when it is not simply the whole pixmap.
+        """Mark the sign canvas, and whatever a drag is lined up on right now.
 
         Fill mode dims the cropped-away margins so text cannot be parked on
         pixels the sign never receives; the dashed border also outlines the
-        letterbox area Fit adds beyond the source.
+        letterbox area Fit adds beyond the source.  Snap guides are solid, and
+        last only as long as the drag holding that alignment.
         """
 
         super().drawForeground(painter, rect)
-        if self._source.isNull() or self._canvas_rect is None:
+        if self._source.isNull():
             return
         canvas = self.canvas_rect()
         pixmap_rect = QRectF(0.0, 0.0, self._source.width(), self._source.height())
-        if canvas.contains(pixmap_rect) and pixmap_rect.contains(canvas):
+        if self._canvas_rect is not None and not (
+            canvas.contains(pixmap_rect) and pixmap_rect.contains(canvas)
+        ):
+            cropped = QPainterPath()
+            cropped.addRect(pixmap_rect)
+            kept = QPainterPath()
+            kept.addRect(canvas.intersected(pixmap_rect))
+            painter.fillPath(cropped.subtracted(kept), QColor(0, 0, 0, 110))
+            border = QPen(QColor(ACCENT))
+            border.setCosmetic(True)
+            border.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(border)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(canvas)
+        if not self._guides:
             return
-        cropped = QPainterPath()
-        cropped.addRect(pixmap_rect)
-        kept = QPainterPath()
-        kept.addRect(canvas.intersected(pixmap_rect))
-        painter.fillPath(cropped.subtracted(kept), QColor(0, 0, 0, 110))
-        border = QPen(QColor(ACCENT))
-        border.setCosmetic(True)
-        border.setStyle(Qt.PenStyle.DashLine)
-        painter.setPen(border)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(canvas)
+        guide = QPen(QColor(ACCENT))
+        guide.setCosmetic(True)
+        painter.setPen(guide)
+        span = canvas.united(self._scene.sceneRect())
+        for orientation, position in self._guides:
+            if orientation == "vertical":
+                painter.drawLine(
+                    QPointF(position, span.top()), QPointF(position, span.bottom())
+                )
+            else:
+                painter.drawLine(
+                    QPointF(span.left(), position), QPointF(span.right(), position)
+                )
 
     def _on_selection_changed(self) -> None:
-        selected = self._scene.selectedItems()
-        if selected and isinstance(selected[0], _MovableTextItem):
-            self.layerSelected.emit(selected[0].index)
+        if self._syncing_selection:
+            return
+        # Membership decides whether an item draws handles or a plain marker.
+        for item in self._items:
+            item.update()
+        self.layerSelectionChanged.emit()
 
 
 class ColorButton(QPushButton):
