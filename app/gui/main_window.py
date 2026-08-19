@@ -4307,8 +4307,13 @@ class MainWindow(QMainWindow):
             and not paused
         ):
             can_start = False
-        self.start_button.setEnabled(
-            can_start and not countdown_active and (not active or paused)
+        enabled = can_start and not countdown_active and (not active or paused)
+        self.start_button.setEnabled(enabled)
+        # A disabled button with no explanation reads as a broken app.  Name the
+        # blocker instead, because the two common ones -- unfinished calibration
+        # and a hotkey another program already owns -- are both user-fixable.
+        self.start_button.setToolTip(
+            "" if enabled else self._start_blocked_reason(profile_ready, paused)
         )
         self.start_button.setText(
             f"RESUME PAINTING  •  {self.start_hotkey_combo.currentText()}"
@@ -4325,6 +4330,34 @@ class MainWindow(QMainWindow):
         )
         self._set_job_controls_locked(job_locked)
         self._update_calibration_overlay()
+
+    def _start_blocked_reason(self, profile_ready: bool, paused: bool) -> str:
+        if self._painter_is_active() and not paused:
+            return "A paint job is already running."
+        if self._countdown and self._countdown.isVisible():
+            return "Waiting for the countdown to finish."
+        if self._plan is None:
+            return "Load an image and wait for its paint plan to finish."
+        if not profile_ready and not self.dry_run_check.isChecked():
+            missing = [
+                label
+                for label, done in (
+                    ("canvas", self._current_profile.canvas is not None),
+                    ("color box", self._current_profile.color_box is not None),
+                    ("hue bar", self._current_profile.hue_bar is not None),
+                )
+                if self._current_profile is not None and not done
+            ]
+            if missing:
+                return "Calibrate the " + ", ".join(missing) + " before painting."
+            return "Finish calibrating this profile before painting."
+        if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
+            return (
+                "The global abort hotkey is not active, so real painting is blocked. "
+                "Another program may already own "
+                f"{self.abort_hotkey_combo.currentText()}; pick different hotkeys above."
+            )
+        return "Painting is unavailable right now."
 
     def _set_job_controls_locked(self, locked: bool) -> None:
         controls = (

@@ -30,7 +30,7 @@ from app.models import (
 )
 from app.painter import Painter, PainterState
 from app.brush_calibration import fit_brush_size_model
-from app.profiles import DisplayMetadata, Profile
+from app.profiles import DisplayMetadata, Profile, Rect
 from app.screen import VirtualScreen
 
 
@@ -1622,3 +1622,21 @@ def test_timelapse_page_reports_recording_status(
 
     window._finish_timelapse(final=False)
     assert window.timelapse_status_badge.text() == "Not recording"
+
+
+def test_disabled_start_button_names_the_blocker(window: MainWindow) -> None:
+    # A greyed-out START with no explanation reads as a broken app.  Both common
+    # blockers are user-fixable, so each has to say so.
+    window.dry_run_check.setChecked(False)
+
+    assert not window.start_button.isEnabled()
+    assert "Load an image" in window.start_button.toolTip()
+
+    window._plan = object()
+    window._current_profile = Profile(id="p", name="Sign", canvas=Rect(0, 0, 100, 100))
+    window._update_start_availability()
+
+    tooltip = window.start_button.toolTip()
+    assert not window.start_button.isEnabled()
+    assert "color box" in tooltip and "hue bar" in tooltip
+    assert "canvas" not in tooltip

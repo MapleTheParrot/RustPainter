@@ -159,3 +159,15 @@ def test_every_offered_hotkey_choice_resolves_on_both_platforms() -> None:
         assert spec.virtual_key > 0
         assert spec.modifier_mask >= MOD_NOREPEAT
         assert mac_virtual_key_code(spec.key) >= 0
+
+
+def test_registration_failure_explains_an_already_owned_hotkey() -> None:
+    # RegisterHotKey's 1409 means some other program claimed the key first.
+    # The bare code told users nothing about what to do next.
+    from app.hotkeys import _registration_failure_detail
+
+    detail = _registration_failure_detail(1409)
+
+    assert "another running program already owns it" in detail
+    assert "1409" in detail
+    assert "Windows error 4242" == _registration_failure_detail(4242)

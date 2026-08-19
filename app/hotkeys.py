@@ -34,6 +34,22 @@ class HotkeyRegistrationError(RuntimeError):
     pass
 
 
+# RegisterHotKey reports a bare code that tells the user nothing.  1409 is by
+# far the common one: some other running program already owns the combination
+# system-wide, and Windows gives it to whoever asked first.
+_WINDOWS_HOTKEY_ERRORS = {
+    1409: "another running program already owns it",
+    87: "Windows rejected the key combination",
+}
+
+
+def _registration_failure_detail(error_code: int) -> str:
+    reason = _WINDOWS_HOTKEY_ERRORS.get(error_code)
+    if reason is None:
+        return f"Windows error {error_code or 'unknown'}"
+    return f"{reason} (Windows error {error_code})"
+
+
 @dataclass(frozen=True, slots=True)
 class HotkeySpec:
     key: int | str
@@ -302,8 +318,9 @@ class GlobalHotkeyManager:
                 if not register(None, identifier, spec.modifier_mask, spec.virtual_key):
                     error_code = ctypes.get_last_error()
                     raise HotkeyRegistrationError(
-                        f"Could not register {name} hotkey {spec} "
-                        f"(Windows error {error_code or 'unknown'})"
+                        f"Could not register {name} hotkey {spec}: "
+                        f"{_registration_failure_detail(error_code)}. "
+                        "Choose a different hotkey in Settings."
                     )
                 registered_ids.append(identifier)
             with self._lock:
