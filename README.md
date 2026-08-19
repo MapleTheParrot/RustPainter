@@ -118,7 +118,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
 - Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
 - Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
-- Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y on the Source tab), so a whole drag or a run of keystrokes steps back as one edit
+- Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y anywhere in the window, mid-typing included), so a whole drag or a run of keystrokes steps back as one edit
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign/UI layout, each inheriting the current calibration
 - Drag calibration for the canvas, color box, hue bar, and - for automatic brush sizing - the numeric Size field and Rust's clear button, with an on-screen overlay to verify them
@@ -187,9 +187,10 @@ outline - is written to the whole selection at once.
 - **Arrow keys** nudge the selection one logical canvas pixel at a time, ten
   with Shift held.
 - **Undo and Redo** cover the text layers only, not the rest of the settings.
-  Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z) do the same from the Source tab. A whole
-  drag, or a run of keystrokes, steps back as one edit, and opening a saved
-  settings document starts the history over.
+  Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z) do the same from anywhere in the window -
+  over the canvas, in the side panel's fields, and while a layer is being typed
+  into. A whole drag, or a run of keystrokes, steps back as one edit, and
+  opening a saved settings document starts the history over.
 - **Gradient** fades the letters from the text color into a second one, down,
   across, or diagonally. The fade is quantized with the rest of the artwork, so
   a narrow palette shows it as bands rather than as a smooth ramp.

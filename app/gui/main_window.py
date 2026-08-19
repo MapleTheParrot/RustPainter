@@ -40,6 +40,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -736,6 +737,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_processing_controls()
+        self._install_text_history_shortcuts()
         self._install_logging_handler()
         self._initialize_services()
         self._update_quality_dimensions()
@@ -2627,6 +2629,24 @@ class MainWindow(QMainWindow):
         self._text_history_kind = kind
         self._text_history_stamp = now
         self._refresh_text_history_buttons()
+
+    def _install_text_history_shortcuts(self) -> None:
+        """Give the text history the window's own undo and redo keys.
+
+        The canvas answers Ctrl+Z itself, but text is just as often typed into
+        the side panel, where those keys used to reach no further than one
+        line edit's private stack.  Binding them window-wide means the same
+        keys walk the same history wherever the focus happens to sit.
+        """
+
+        for sequences, handler in (
+            (("Ctrl+Z",), self._undo_text_edit),
+            (("Ctrl+Y", "Ctrl+Shift+Z"), self._redo_text_edit),
+        ):
+            for sequence in sequences:
+                shortcut = QShortcut(QKeySequence(sequence), self)
+                shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+                shortcut.activated.connect(handler)
 
     def _refresh_text_history_buttons(self) -> None:
         self.undo_text_button.setEnabled(self._text_history_index > 0)

@@ -12,7 +12,7 @@ import pytest
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeyEvent
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeyEvent, QShortcut
 from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
@@ -261,6 +261,78 @@ def test_stretch_edits_text_over_the_stretched_result(
     # Fit never distorts, so it gets the source back at its own shape.
     window._set_combo_data(window.scale_mode_combo, ScaleMode.FIT.value)
     assert window.original_preview._source.size() == decoded
+
+
+def test_control_z_walks_the_history_while_a_layer_is_being_edited(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Typing into a layer is exactly when an undo is wanted."""
+
+    _two_layer_window(window, tmp_path, qtbot)
+    preview = window.original_preview
+    item = preview._items[1]
+    double_click = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseDoubleClick)
+    double_click.setButton(Qt.MouseButton.LeftButton)
+    double_click.setPos(item.boundingRect().center())
+    item.mouseDoubleClickEvent(double_click)
+    assert preview.is_editing_text
+
+    # A step of another kind so the typing below cannot fold into the one
+    # that named this layer in the first place.
+    window.text_align_buttons["top"].click()
+    item.setPlainText("TYPO")
+    assert window._text_layers[1].text == "TYPO"
+
+    preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert window._text_layers[1].text == "SECOND"
+
+    preview.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier
+        )
+    )
+    assert window._text_layers[1].text == "TYPO"
+
+
+def test_the_window_answers_undo_keys_from_the_side_panel(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """The same keys walk the same history wherever the focus sits.
+
+    Text is as often typed into the side panel as onto the canvas, so the undo
+    keys are bound to the window rather than to the one widget that used to
+    answer them.
+    """
+
+    _two_layer_window(window, tmp_path, qtbot)
+    window.text_align_buttons["top"].click()
+    window.text_edit.setFocus()
+    window.text_edit.setText("RENAMED")
+    assert window._text_layers[1].text == "RENAMED"
+
+    shortcuts = {
+        shortcut.key().toString(): shortcut
+        for shortcut in window.findChildren(QShortcut)
+    }
+    assert {"Ctrl+Z", "Ctrl+Y", "Ctrl+Shift+Z"} <= set(shortcuts)
+    assert all(
+        shortcuts[keys].context() == Qt.ShortcutContext.WindowShortcut
+        for keys in ("Ctrl+Z", "Ctrl+Y", "Ctrl+Shift+Z")
+    )
+
+    shortcuts["Ctrl+Z"].activated.emit()
+    assert window._text_layers[1].text == "SECOND"
+    assert window.text_edit.text() == "SECOND"
+
+    shortcuts["Ctrl+Y"].activated.emit()
+    assert window._text_layers[1].text == "RENAMED"
+    shortcuts["Ctrl+Z"].activated.emit()
+    shortcuts["Ctrl+Shift+Z"].activated.emit()
+    assert window._text_layers[1].text == "RENAMED"
 
 
 def test_delete_key_removes_the_selected_text_layer(
