@@ -2504,32 +2504,37 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_text_gradient_toggled(self, enabled: bool) -> None:
+        # The second color and the direction only mean something while the
+        # gradient is on, and _apply_to_selected_text gates them on the way out.
         self._apply_to_selected_text(gradient=bool(enabled))
-        self._refresh_text_selection_state()
 
     @Slot(str)
     def _align_text_layers(self, edge: str) -> None:
         """Park the selected layers against one edge or midline of the sign."""
 
+        across = {"left", "center", "right"}
+        if edge not in across | {"top", "middle", "bottom"}:
+            return
         targets = self._edit_target_indices()
         if not targets:
             return
+        axis = "x" if edge in across else "y"
         for index in targets:
             layer = self._text_layers[index]
-            width, height = self._text_layer_extent(layer)
+            extent = self._text_layer_extent(layer)
+            # Parked against an edge means touching it, so half the layer's
+            # own width or height stands between its centre and that edge.
+            half = extent[0 if axis == "x" else 1] / 2.0
             position = {
-                "left": {"x": width / 2.0},
-                "center": {"x": 0.5},
-                "right": {"x": 1.0 - width / 2.0},
-                "top": {"y": height / 2.0},
-                "middle": {"y": 0.5},
-                "bottom": {"y": 1.0 - height / 2.0},
-            }.get(edge)
-            if position is None:
-                return
-            axis, value = next(iter(position.items()))
+                "left": half,
+                "center": 0.5,
+                "right": 1.0 - half,
+                "top": half,
+                "middle": 0.5,
+                "bottom": 1.0 - half,
+            }[edge]
             self._text_layers[index] = replace(
-                layer, **{axis: min(max(value, 0.0), 1.0)}
+                layer, **{axis: min(max(position, 0.0), 1.0)}
             )
         self._refresh_text_editor_layers()
         self._record_text_history("align")
