@@ -116,7 +116,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
 - One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
 - Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
-- Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
+- Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Shift+click, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
 - Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
 - Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y anywhere in the window, mid-typing included), so a whole drag or a run of keystrokes steps back as one edit
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
@@ -175,8 +175,10 @@ owns the **Text** field; everything else - font, size, color, style, gradient,
 outline - is written to the whole selection at once.
 
 - **Selecting several layers** - drag a box across bare canvas to sweep up the
-  layers it touches, Ctrl+click to add or drop one, or Ctrl+A to take them all.
-  Escape lets go. A group drags as one, so the layers keep their spacing.
+  layers it touches, Shift+click or Ctrl+click to add or drop one, or Ctrl+A to
+  take them all. Holding either modifier while dragging a box widens the
+  selection rather than starting a new one. Escape lets go. A group drags as
+  one, so the layers keep their spacing.
 - **Snapping** - a dragged layer jumps onto the middle of the sign, its edges,
   and the centre lines and edges of the other layers when it comes within a few
   pixels of them; a line marks whatever it caught. Hold **Alt** while dragging

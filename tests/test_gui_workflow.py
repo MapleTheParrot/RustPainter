@@ -335,6 +335,28 @@ def test_the_window_answers_undo_keys_from_the_side_panel(
     assert window._text_layers[1].text == "RENAMED"
 
 
+def test_shift_click_adds_a_layer_to_the_selection_and_takes_it_back_out(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Shift is the multi-select modifier every other editor uses."""
+
+    _two_layer_window(window, tmp_path, qtbot)
+    preview = window.original_preview
+    preview.select_layers([0], 0)
+
+    second = preview._items[1]
+    _click_item(second, Qt.KeyboardModifier.ShiftModifier)
+    assert preview.selected_indices() == [0, 1]
+    assert window._edit_target_indices() == [0, 1]
+
+    _click_item(second, Qt.KeyboardModifier.ShiftModifier)
+    assert preview.selected_indices() == [0]
+
+    # A plain click still means "just this one".
+    _click_item(second)
+    assert preview.selected_indices() == [1]
+
+
 def test_delete_key_removes_the_selected_text_layer(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
@@ -424,15 +446,23 @@ def _two_layer_window(window: MainWindow, tmp_path: Path, qtbot) -> None:
     qtbot.waitUntil(lambda: len(window.original_preview._items) == 2, timeout=5000)
 
 
-def _drag_item(item, start: QPointF, end: QPointF, modifiers=None) -> None:
-    """Press, move and release one text item, in scene coordinates."""
+def _drag_item(item, start: QPointF, end: QPointF | None, modifiers=None) -> None:
+    """Press, move and release one text item, in scene coordinates.
+
+    ``end`` of ``None`` is a click: the item is pressed and let go without
+    ever moving, which is a case Qt settles the selection differently for.
+    """
 
     modifiers = modifiers or Qt.KeyboardModifier.NoModifier
-    for event_type, position in (
-        (QEvent.Type.GraphicsSceneMousePress, start),
-        (QEvent.Type.GraphicsSceneMouseMove, end),
-        (QEvent.Type.GraphicsSceneMouseRelease, end),
-    ):
+    steps = (
+        ((QEvent.Type.GraphicsSceneMousePress, start),)
+        if end is None
+        else (
+            (QEvent.Type.GraphicsSceneMousePress, start),
+            (QEvent.Type.GraphicsSceneMouseMove, end),
+        )
+    ) + ((QEvent.Type.GraphicsSceneMouseRelease, end or start),)
+    for event_type, position in steps:
         event = QGraphicsSceneMouseEvent(event_type)
         event.setButton(Qt.MouseButton.LeftButton)
         event.setButtons(Qt.MouseButton.LeftButton)
@@ -445,6 +475,12 @@ def _drag_item(item, start: QPointF, end: QPointF, modifiers=None) -> None:
             item.mouseMoveEvent(event)
         else:
             item.mouseReleaseEvent(event)
+
+
+def _click_item(item, modifiers=None) -> None:
+    """Press and release one text item without moving it."""
+
+    _drag_item(item, item.mapToScene(item.text_rect().center()), None, modifiers)
 
 
 def test_selecting_several_layers_edits_them_together(

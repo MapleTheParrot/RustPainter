@@ -575,10 +575,18 @@ class _MovableTextItem(QGraphicsTextItem):
             event.accept()
             return
         self._owner.note_primary(self.index)
-        # Qt settles the selection here, so which layers a drag carries is
-        # only known once the base class has had the press.
-        super().mousePressEvent(event)
-        self._dragging = not self._editing
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and not self._editing:
+            # Ctrl is the only multi-select modifier the base class knows, so
+            # Shift - the one every other editor uses - is answered here: it
+            # adds this layer to the selection, or drops it back out of one.
+            self.setSelected(not self.isSelected())
+            event.accept()
+        else:
+            # Qt settles the selection here, so which layers a drag carries is
+            # only known once the base class has had the press.
+            super().mousePressEvent(event)
+        # A click that just deselected has nothing left under it to drag.
+        self._dragging = not self._editing and self.isSelected()
         if self._dragging:
             self._drag_origin = event.scenePos()
             self._drag_start_rect = self.text_scene_rect()
@@ -652,6 +660,11 @@ class _MovableTextItem(QGraphicsTextItem):
         was_interacting = self._dragging or self._resize_handle is not None
         if self._resize_handle is not None:
             self._resize_handle = None
+            event.accept()
+        elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier and not self._editing:
+            # The base class settles the selection a second time on release,
+            # collapsing it onto whatever was clicked; Shift asked for the
+            # group the press just widened, so it is left standing.
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -826,6 +839,8 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._font_scale = 1.0
         self._primary: int | None = None
         self._syncing_selection = False
+        # What a modifier-held rubber band has to give back; see mousePressEvent.
+        self._carried_selection: set[int] = set()
         self._guides: list[tuple[str, float]] = []
         self._placeholder = placeholder
         self._hint = hint
@@ -1020,6 +1035,36 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         super().resizeEvent(event)
         if not self._source.isNull():
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        """Remember a selection a modifier-held rubber band should keep.
+
+        Qt clears the selection the moment a band starts, so a Shift-drag
+        meant to gather a second group would otherwise throw the first one
+        away.  What was selected is carried across the drag and handed back as
+        the band makes its own picks.
+        """
+
+        extend = event.modifiers() & (
+            Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
+        )
+        self._carried_selection = set(self.selected_indices()) if extend else set()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().mouseMoveEvent(event)
+        if self._carried_selection and not self.rubberBandRect().isNull():
+            for item in self._items:
+                if item.index in self._carried_selection:
+                    item.setSelected(True)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        carried = self._carried_selection
+        banding = not self.rubberBandRect().isNull()
+        self._carried_selection = set()
+        super().mouseReleaseEvent(event)
+        if carried and banding:
+            self.select_layers(carried | set(self.selected_indices()))
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Edit the selected layers with the keyboard.
