@@ -373,8 +373,9 @@ def test_profile_color_correction_changes_picker_command() -> None:
     ]
     assert color_box_moves
     # The measured material halves brightness, so desired mid-gray requires a
-    # full-value white picker command at the top of the S/V box.
-    assert color_box_moves[0].y == 100
+    # full-value white picker command at the top of the S/V box - pulled 2%
+    # inside the widget, because Rust ignores clicks on its outermost pixels.
+    assert color_box_moves[0].y == 102
 
 
 def test_pause_holds_progress_then_resume_completes() -> None:

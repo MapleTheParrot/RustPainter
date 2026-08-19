@@ -1058,7 +1058,11 @@ class Painter:
             if self.input.emits_real_input
             else 0.0
         )
-        self._safe_click(normalized_point(box, 0.5, 0.5), epoch)
+        self._safe_click(
+            normalized_point(box, 0.5, 0.5),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
         self._interruptible_sleep(settle, epoch=epoch, check_focus=True)
         # The field holds at most six characters, and clearing from both sides
         # of the caret empties it wherever the click happened to place it.
@@ -1491,11 +1495,19 @@ class Painter:
             saturation_direction=directions.saturation,
             value_direction=directions.value,
         )
-        self._safe_click(coordinates.hue, epoch)
+        self._safe_click(
+            self._inset_into(coordinates.hue, target.hue_bar),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
         self._interruptible_sleep(
             settings.delay_after_hue_seconds, epoch=epoch, check_focus=True
         )
-        self._safe_click(coordinates.saturation_value, epoch)
+        self._safe_click(
+            self._inset_into(coordinates.saturation_value, target.color_box),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
         self._interruptible_sleep(
             settings.delay_after_saturation_value_seconds,
             epoch=epoch,
@@ -1569,7 +1581,40 @@ class Painter:
             )
         return clamp_to_rect(point[0], point[1], canvas)
 
-    def _safe_click(self, point: tuple[float, float], epoch: int) -> None:
+    # Picker widgets ignore clicks at their outermost pixels - photographed in
+    # game: a click on the color box's exact corner leaves the cursor where it
+    # was, while the same click 2% inside lands.  Every picker click is pulled
+    # this fraction inward; the color cost is at most 2% of one axis, far under
+    # the sign material's own response, while a dropped click paints entire
+    # color groups with the previous group's color.
+    _PICKER_EDGE_INSET = 0.02
+
+    # Rust has been observed running its paint UI at 15 FPS, where a click held
+    # shorter than one 67 ms frame can be sampled as nothing.  Picker clicks are
+    # rare (a handful per color change), so holding them across a frame costs
+    # nothing next to a silently unchanged color.
+    _PICKER_CLICK_HOLD_SECONDS = 0.09
+
+    @classmethod
+    def _inset_into(
+        cls, point: tuple[float, float], rect: RectangleLike
+    ) -> tuple[float, float]:
+        """Clamp a click target into ``rect`` shrunk by the edge inset."""
+
+        margin_x = rect.width * cls._PICKER_EDGE_INSET
+        margin_y = rect.height * cls._PICKER_EDGE_INSET
+        return (
+            min(max(point[0], rect.left + margin_x), rect.left + rect.width - 1 - margin_x),
+            min(max(point[1], rect.top + margin_y), rect.top + rect.height - 1 - margin_y),
+        )
+
+    def _safe_click(
+        self,
+        point: tuple[float, float],
+        epoch: int,
+        *,
+        hold_floor: float = 0.0,
+    ) -> None:
         self._checkpoint(epoch=epoch, check_focus=True)
         # Picker normalization already targets inclusive physical endpoints, for
         # which conventional rounding is appropriate.
@@ -1579,11 +1624,8 @@ class Painter:
         self._mouse_down(epoch)
         try:
             settings = self._job.settings if self._job is not None else PainterSettings()
-            self._interruptible_sleep(
-                settings.mouse_down_duration_seconds,
-                epoch=epoch,
-                check_focus=True,
-            )
+            hold = max(settings.mouse_down_duration_seconds, hold_floor)
+            self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
         finally:
             self.input.mouse_up(MouseButton.LEFT)
 
