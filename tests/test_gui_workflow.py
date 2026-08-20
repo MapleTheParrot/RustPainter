@@ -12,7 +12,14 @@ import pytest
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeyEvent, QShortcut
+from PySide6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QKeyEvent,
+    QMouseEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
@@ -1146,11 +1153,16 @@ def test_max_quality_plans_one_cell_per_measured_texel(
     assert window.logical_height_spin.value() == 128
 
 
-def test_max_quality_needs_a_measured_sign(window: MainWindow) -> None:
-    """Without a measurement Max would mean nothing, so it is not on offer.
+def test_max_quality_without_a_measurement_plans_the_screen_grid(
+    window: MainWindow,
+) -> None:
+    """Max works from the first paint, before any job has measured the sign.
 
-    And a profile whose measurement goes away takes Max with it: the selection
-    falls back to Very High instead of silently planning against a stale sign.
+    Unmeasured, it plans one logical cell per screen pixel of the calibrated
+    canvas - the finest grid the mouse can address, which brush size 1 paints
+    without losing detail.  A measurement snaps the same selection onto the
+    sign's true texel grid, and losing the measurement drops it back to the
+    screen grid instead of abandoning the preset.
     """
 
     assert window._current_profile is not None
@@ -1160,19 +1172,31 @@ def test_max_quality_needs_a_measured_sign(window: MainWindow) -> None:
 
     index = window.quality_combo.findText("Max")
     assert index >= 0
-    assert not window.quality_combo.model().item(index).isEnabled()
+    assert window.quality_combo.model().item(index).isEnabled()
 
+    window.quality_combo.setCurrentText("Max")
+    assert window.logical_width_spin.value() == 200
+    assert window.logical_height_spin.value() == 100
+
+    # Every real path that changes the model or canvas - profile switch,
+    # canvas recalibration, a finished job storing its measurement - refreshes
+    # the profile UI and re-derives the quality dimensions, so the test walks
+    # the same pair.
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 128.0) for size in (60, 30, 12)]
     ).to_dict()
     window._refresh_profile_ui()
-    assert window.quality_combo.model().item(index).isEnabled()
+    window._update_quality_dimensions()
+    assert window.quality_combo.currentText() == "Max"
+    assert window.logical_width_spin.value() == 256
+    assert window.logical_height_spin.value() == 128
 
-    window.quality_combo.setCurrentText("Max")
     window._current_profile.metadata.pop("brush_size_model", None)
     window._refresh_profile_ui()
-    assert window.quality_combo.currentText() == "Very High"
-    assert not window.quality_combo.model().item(index).isEnabled()
+    window._update_quality_dimensions()
+    assert window.quality_combo.currentText() == "Max"
+    assert window.logical_width_spin.value() == 200
+    assert window.logical_height_spin.value() == 100
 
 
 def test_plan_summary_announces_a_capped_resolution(
@@ -2161,6 +2185,346 @@ def test_plan_recalculation_shows_pending_feedback(
     assert window.analysis_time.value_label.text() != "…"
 
 
+def _drag_view(view, start: QPointF, end: QPointF) -> None:
+    """Press, move and release on a view's viewport, in scene coordinates."""
+
+    for event_type, position in (
+        (QEvent.Type.MouseButtonPress, start),
+        (QEvent.Type.MouseMove, end),
+        (QEvent.Type.MouseButtonRelease, end),
+    ):
+        local = QPointF(view.mapFromScene(position))
+        event = QMouseEvent(
+            event_type,
+            local,
+            local,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        if event_type == QEvent.Type.MouseButtonPress:
+            view.mousePressEvent(event)
+        elif event_type == QEvent.Type.MouseMove:
+            view.mouseMoveEvent(event)
+        else:
+            view.mouseReleaseEvent(event)
+
+
+def test_dragging_the_source_image_reframes_the_fill_crop(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Fill keeps a band of the image, and the drag says which band.
+
+    The five named anchors cannot express "a little above centre", which is
+    almost always where the subject of a photo is, so a drag writes its own
+    centring, marks the alignment Custom, and moves the dashed frame with the
+    pointer rather than waiting for the plan to catch up.
+    """
+
+    source_path = tmp_path / "tall.png"
+    Image.new("RGB", (60, 60), (90, 60, 140)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FILL.value)
+    preview = window.original_preview
+    assert preview.can_pan_crop()
+    centred = preview.canvas_rect().top()
+
+    start = preview.canvas_rect().center()
+    _drag_view(preview, start, start - QPointF(0.0, 1000.0))
+
+    assert window.crop_alignment_combo.currentData() == "custom"
+    assert window._crop_focus == (0.5, 0.0)
+    assert preview.canvas_rect().top() == pytest.approx(0.0, abs=1e-6)
+    assert centred > 0.0
+    assert window._processing_options().crop_focus == (0.5, 0.0)
+    assert window._settings_document()["image"]["crop_focus"] == [0.5, 0.0]
+
+    # Picking a named anchor again is how the hand-framed crop is given back.
+    window._set_combo_data(window.crop_alignment_combo, "center")
+    assert window._crop_focus is None
+    assert preview.canvas_rect().top() == pytest.approx(centred)
+    assert window._settings_document()["image"]["crop_focus"] is None
+
+
+def test_only_a_fill_crop_with_room_to_move_takes_the_drag(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Fit has nothing to reframe, so the drag stays a rubber band there."""
+
+    source_path = tmp_path / "square.png"
+    Image.new("RGB", (40, 40), (30, 120, 90)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FIT.value)
+    assert not window.original_preview.can_pan_crop()
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.STRETCH.value)
+    assert not window.original_preview.can_pan_crop()
+
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FILL.value)
+    assert window.original_preview.can_pan_crop()
+
+
+def test_a_hand_framed_crop_survives_a_restart(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    window._set_combo_data(window.scale_mode_combo, ScaleMode.FILL.value)
+    window._on_crop_focus_dragged(0.25, 0.75)
+    saved = window._settings_document()
+    assert saved["image"]["crop_focus"] == [0.25, 0.75]
+
+    window._apply_settings(saved)
+    assert window._crop_focus == (0.25, 0.75)
+    assert window.crop_alignment_combo.currentData() == "custom"
+
+
+def test_editing_the_rust_preview_points_at_the_source_tab(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A click on the read-only preview is answered, not swallowed.
+
+    Both tabs show the same artwork, so trying to drag text on the wrong one
+    is a reasonable mistake; it earns a sentence and a one-click way over to
+    the tab that does take the edit, rather than a dialog or silence.
+    """
+
+    source_path = tmp_path / "flat.png"
+    Image.new("RGB", (32, 16), (200, 120, 40)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    window.preview_tabs.setCurrentIndex(1)
+    # isHidden rather than isVisible: the window itself is never shown here,
+    # and a child of a hidden parent is never visible however it was asked.
+    assert window.preview_notice.isHidden()
+
+    window.paint_preview.mousePressEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(40.0, 40.0),
+            QPointF(40.0, 40.0),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    assert not window.preview_notice.isHidden()
+    assert "Source tab" in window.preview_notice._message.text()
+
+    window.preview_notice._trigger()
+    assert window.preview_tabs.currentIndex() == 0
+    assert window.preview_notice.isHidden()
+
+    # Insisting with a double-click needs no notice to read: it just goes.
+    window.preview_tabs.setCurrentIndex(1)
+    window.paint_preview.mouseDoubleClickEvent(
+        QMouseEvent(
+            QEvent.Type.MouseButtonDblClick,
+            QPointF(40.0, 40.0),
+            QPointF(40.0, 40.0),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+    assert window.preview_tabs.currentIndex() == 0
+
+
+def test_a_plan_already_computed_comes_straight_back(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Returning to a preset already planned costs nothing to show again.
+
+    A Max-quality plan can take a minute, and stepping away to compare and
+    back again used to pay that minute twice.  The finished plan is kept, so
+    the second visit is the same object, immediately, with no spinner.
+    """
+
+    source_path = tmp_path / "cached.png"
+    Image.new("RGB", (48, 24), (40, 160, 210)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    balanced = window._plan
+
+    window.quality_combo.setCurrentText("Very Fast")
+    qtbot.waitUntil(lambda: window._plan not in (None, balanced), timeout=5000)
+    fast = window._plan
+
+    window.quality_combo.setCurrentText("Balanced")
+    # No wait: a cached plan is applied inside the settings change itself.
+    assert window._plan is balanced
+    assert not window.processing_spinner.is_spinning
+    assert not window.plan_busy.is_pending
+
+    window.quality_combo.setCurrentText("Very Fast")
+    assert window._plan is fast
+
+
+def test_a_plan_overtaken_before_it_landed_is_still_filed_right(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A result that arrived too late to show is still a result worth keeping.
+
+    It also must not be filed under whatever was asked for last: switching
+    away mid-recalculation and back again has to bring back the plan for the
+    settings on screen, not the one the abandoned worker was computing.
+    """
+
+    source_path = tmp_path / "overtaken.png"
+    image = Image.new("RGB", (64, 32), (250, 250, 250))
+    for x in range(20):
+        image.putpixel((x, 0), (251, 249, 250))
+    image.save(source_path)
+    window._set_combo_data(window.paint_mode_combo, "exact")
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    exact = window._plan
+
+    # Ask for another mode and start planning it, then go back before it can
+    # land, so its result arrives with the cached exact plan already on screen.
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    window._start_processing()
+    window._set_combo_data(window.paint_mode_combo, "exact")
+    assert window._plan is exact
+
+    qtbot.waitUntil(lambda: len(window._plan_cache) == 2, timeout=5000)
+    assert window._plan is exact
+
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    assert not window.processing_spinner.is_spinning
+    assert window._plan is not None
+    assert window._plan is not exact
+
+
+def test_the_plan_cache_belongs_to_one_image_and_one_budget(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    first = tmp_path / "first.png"
+    Image.new("RGB", (32, 16), (10, 90, 40)).save(first)
+    window.load_image(first)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert len(window._plan_cache) == 1
+
+    second = tmp_path / "second.png"
+    Image.new("RGB", (32, 16), (200, 30, 30)).save(second)
+    window.load_image(second)
+    # The plans held belonged to the image that was replaced.
+    assert not window._plan_cache
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    # Nothing accumulates without bound: the oldest plans are let go first.
+    only = window._plan_cache[next(iter(window._plan_cache))]
+    for index in range(main_window_module.PLAN_CACHE_ENTRIES + 3):
+        window._remember_plan((index,), only)
+    assert len(window._plan_cache) == main_window_module.PLAN_CACHE_ENTRIES
+
+    # And a single plan too large for the whole budget is still kept, because
+    # the plan on screen is the one in the cache.
+    huge = replace(only, plan=replace(only.plan, width=4096, height=4096))
+    window._remember_plan(("huge",), huge)
+    assert window._plan_cache_cost(huge) > main_window_module.PLAN_CACHE_BYTES
+    assert list(window._plan_cache) == [("huge",)]
+
+
+def test_recalculating_covers_the_preview_it_is_recalculating(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """The small spinner is easy to miss; the overlay is not.
+
+    It also names the settings being planned for, because the question a slow
+    recalculation raises is "what is it doing?", not just "is it busy?".
+    """
+
+    source_path = tmp_path / "busy.png"
+    Image.new("RGB", (32, 16), (120, 60, 200)).save(source_path)
+    window.load_image(source_path)
+    assert window.plan_busy.is_pending
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert not window.plan_busy.is_pending
+
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    assert window.plan_busy.is_pending
+    summary = window._plan_summary()
+    assert "Balanced quality" in summary
+    assert "Fast optimization" in summary
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert not window.plan_busy.is_pending
+
+
+def test_paused_jobs_still_show_the_calibration_outlines(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pause is exactly when the boxes are worth looking at.
+
+    Nothing is being clicked while a job is held, the outlines take no input,
+    and what the user is usually checking is whether Rust still lines up with
+    the calibration before letting the job carry on.
+    """
+
+    from types import SimpleNamespace
+
+    class _FakeOverlay:
+        def __init__(self) -> None:
+            self.visible = False
+            self.entries: list = []
+
+        def set_rectangles(self, entries) -> None:
+            self.entries = list(entries)
+
+        def show_overlay(self) -> None:
+            self.visible = True
+
+        def hide(self) -> None:
+            self.visible = False
+
+        def isVisible(self) -> bool:  # noqa: N802 - mirrors the QWidget API
+            return self.visible
+
+    monkeypatch.setattr(main_window_module, "CalibrationPreviewOverlay", _FakeOverlay)
+    window.show_calibration_check.setChecked(True)
+    window._current_profile.canvas = ScreenRect(0, 0, 200, 100)
+    window._update_calibration_overlay()
+    assert window._calibration_preview.isVisible()
+
+    window._painter = SimpleNamespace(
+        state=PainterState.RUNNING, is_active=True, is_alive=True
+    )
+    window._update_calibration_overlay()
+    assert not window._calibration_preview.isVisible()
+
+    window._painter.state = PainterState.PAUSED
+    window._update_calibration_overlay()
+    assert window._calibration_preview.isVisible()
+
+    window._painter.state = PainterState.RUNNING
+    window._update_calibration_overlay()
+    assert not window._calibration_preview.isVisible()
+
+
+def test_the_timelapse_speed_slider_says_what_it_costs(
+    window: MainWindow,
+) -> None:
+    """A slider asks "how fast", not "how many frames per second".
+
+    The readout keeps the frame rate, because that is what the saved file is
+    written at, and adds the thing the number actually buys: how much of the
+    paint job one second of video covers.
+    """
+
+    window.timelapse_interval_spin.setValue(10)
+    window.timelapse_speed_slider.setValue(15)
+    assert window.timelapse_speed_label.text() == "15 fps  •  2m 30s per second"
+
+    window.timelapse_speed_slider.setValue(30)
+    assert window.timelapse_speed_label.text() == "30 fps  •  5m 00s per second"
+
+    window.timelapse_interval_spin.setValue(5)
+    assert window.timelapse_speed_label.text() == "30 fps  •  2m 30s per second"
+
+
 def test_rust_on_another_monitor_offers_and_applies_a_move(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2533,7 +2897,7 @@ def test_saving_a_recording_writes_a_video_the_user_chose(
     )
 
     _select_session(window, directory)
-    window.timelapse_fps_spin.setValue(12)
+    window.timelapse_speed_slider.setValue(12)
     window._set_combo_data(window.timelapse_format_combo, "avi")
     window._export_selected_session()
 
@@ -2577,7 +2941,7 @@ def test_a_failed_export_says_so_and_leaves_the_button_usable(
 
 
 def test_the_playback_speed_and_format_survive_a_restart(window: MainWindow) -> None:
-    window.timelapse_fps_spin.setValue(24)
+    window.timelapse_speed_slider.setValue(24)
     window._set_combo_data(window.timelapse_format_combo, "gif")
 
     saved = window._settings_document()

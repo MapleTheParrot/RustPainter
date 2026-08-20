@@ -37,6 +37,26 @@ CROP_CENTERING: dict[CropAlignment, tuple[float, float]] = {
     CropAlignment.RIGHT: (1.0, 0.5),
 }
 
+
+def crop_centering(
+    alignment: CropAlignment | str = CropAlignment.CENTER,
+    focus: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """The centering fractions Fill should keep, named or dragged.
+
+    A crop dragged on the source image lands between the five named
+    alignments, so it carries its own pair and simply outranks the name.  Both
+    the resampler and the GUI's canvas overlay ask this one function, which is
+    what stops the dashed rectangle from drifting off the region that is
+    actually kept.
+    """
+
+    if focus is not None:
+        x, y = focus
+        return (min(max(float(x), 0.0), 1.0), min(max(float(y), 0.0), 1.0))
+    return CROP_CENTERING[_alignment(alignment)]
+
+
 try:
     _LANCZOS = Image.Resampling.LANCZOS
     _DITHER_NONE = Image.Dither.NONE
@@ -249,7 +269,7 @@ def _scale_layer(
     source: Image.Image,
     target_size: tuple[int, int],
     mode: ScaleMode,
-    alignment: CropAlignment,
+    centering: tuple[float, float],
 ) -> tuple[Image.Image, np.ndarray]:
     """Return an RGBA layer plus a mask for the source's rectangular footprint."""
 
@@ -261,7 +281,6 @@ def _scale_layer(
         )
 
     if mode is ScaleMode.FILL:
-        centering = CROP_CENTERING[alignment]
         return (
             _resample(
                 source,
@@ -293,6 +312,7 @@ def scale_image(
     mode: ScaleMode | str = ScaleMode.FIT,
     *,
     alignment: CropAlignment | str = CropAlignment.CENTER,
+    focus: tuple[float, float] | None = None,
     background_color: RGBColor | None = None,
     transparency_mode: TransparencyMode | str = TransparencyMode.LEAVE_UNPAINTED,
     transparent_fill_color: RGBColor | None = None,
@@ -303,7 +323,8 @@ def scale_image(
     ``background_color=None`` makes Fit letterbox pixels unpainted.  Fully
     transparent source pixels are independently controlled by
     ``transparency_mode``.  If they should use a background but neither color is
-    supplied, white is used as a safe visible default.
+    supplied, white is used as a safe visible default.  ``focus`` overrides
+    ``alignment`` with the exact centering a dragged crop was left at.
     """
 
     _validate_size(target_size, "Target")
@@ -313,11 +334,11 @@ def scale_image(
         raise ValueError("Alpha threshold must be between 0 and 255")
 
     resolved_mode = _scale_mode(mode)
-    resolved_alignment = _alignment(alignment)
+    resolved_centering = crop_centering(alignment, focus)
     resolved_transparency = _transparency_mode(transparency_mode)
     rgba_source = load_image(source)
     layer, footprint = _scale_layer(
-        rgba_source, target_size, resolved_mode, resolved_alignment
+        rgba_source, target_size, resolved_mode, resolved_centering
     )
 
     layer_array = np.asarray(layer, dtype=np.uint8)
@@ -650,6 +671,7 @@ def process_image(
         (options.logical_width, options.logical_height),
         options.scale_mode,
         alignment=options.crop_alignment,
+        focus=options.crop_focus,
         background_color=options.background_color,
         transparency_mode=options.transparency_mode,
         transparent_fill_color=options.transparent_fill_color,
@@ -685,6 +707,7 @@ __all__ = [
     "calculate_fill_size",
     "calculate_fit_size",
     "calculate_scaled_size",
+    "crop_centering",
     "detect_background_color",
     "fill_crop_box",
     "fill_size",

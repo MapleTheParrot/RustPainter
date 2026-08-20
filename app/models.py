@@ -185,6 +185,11 @@ class ImageProcessOptions:
     logical_height: int
     scale_mode: ScaleMode | str = ScaleMode.FIT
     crop_alignment: CropAlignment | str = CropAlignment.CENTER
+    # Where Fill anchors the region it keeps, as (x, y) fractions of the
+    # margin it has to give away.  ``None`` follows ``crop_alignment``; a crop
+    # dragged on the source image stores the exact pair it was left at, which
+    # the five named alignments cannot express.
+    crop_focus: tuple[float, float] | None = None
     color_count: int = 32
     dither: bool = False
     background_color: RGBColor | None = None
@@ -208,6 +213,11 @@ class ImageProcessOptions:
             raise ValueError("Alpha threshold must be between 0 and 255")
         if not 0.0 <= float(self.background_removal_tolerance) <= 100.0:
             raise ValueError("Background removal tolerance must be between 0 and 100")
+        if self.crop_focus is not None:
+            if len(self.crop_focus) != 2 or any(
+                not 0.0 <= float(value) <= 1.0 for value in self.crop_focus
+            ):
+                raise ValueError("Crop focus must be two fractions from 0 to 1")
 
 
 @dataclass(slots=True)

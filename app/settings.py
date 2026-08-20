@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "image": {
         "scale_mode": "fit",
         "crop_alignment": "center",
+        # Where Fill anchors the region it keeps, as [x, y] fractions of the
+        # margin it gives away.  ``null`` follows crop_alignment; dragging the
+        # crop on the Source tab stores the exact pair it was left at.
+        "crop_focus": None,
         "quality_preset": "balanced",
         # How boldly planning may simplify the image to paint faster; "exact"
         # reproduces the raw quantized image with the classic pipeline.
@@ -223,6 +227,18 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "crop_alignment"
     ) not in {"center", "top", "bottom", "left", "right"}:
         raise SettingsError("image.crop_alignment is invalid")
+    focus = image.get("crop_focus")
+    if focus is not None:
+        if not isinstance(focus, Sequence) or isinstance(focus, (str, bytes)):
+            raise SettingsError("image.crop_focus must be null or [x, y]")
+        if len(focus) != 2 or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not 0.0 <= float(value) <= 1.0
+            for value in focus
+        ):
+            raise SettingsError("image.crop_focus must be two fractions from 0 to 1")
     if not isinstance(image.get("quality_preset"), str) or image.get(
         "quality_preset"
     ) not in {*QUALITY_PRESETS, "custom"}:

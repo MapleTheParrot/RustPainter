@@ -15,7 +15,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Sequence
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -33,7 +33,8 @@ from app.timelapse_export import (
     MIN_FRAME_RATE,
 )
 
-from .widgets import NoWheelSpinBox
+from .assets import icon
+from .styles import ON_ACCENT
 
 
 LOGGER = logging.getLogger("rust_painter.timelapse")
@@ -92,27 +93,37 @@ class TimelapsePlayer(QDialog):
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("accent")
         self.play_button.setMinimumWidth(96)
+        self.play_button.setIcon(icon("play", 64, ON_ACCENT))
+        self.play_button.setIconSize(QSize(15, 15))
         self.play_button.clicked.connect(self.toggle_playback)
         self.restart_button = QPushButton("Restart")
         self.restart_button.clicked.connect(self.restart)
-        self.speed_spin = NoWheelSpinBox()
-        self.speed_spin.setRange(MIN_FRAME_RATE, MAX_FRAME_RATE)
-        self.speed_spin.setValue(
+        # Dragging to a speed beats typing a frame rate: the number is the
+        # unit the file is written in, not the thing anyone actually wants.
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(MIN_FRAME_RATE, MAX_FRAME_RATE)
+        self.speed_slider.setValue(
             max(MIN_FRAME_RATE, min(MAX_FRAME_RATE, int(frame_rate)))
         )
-        self.speed_spin.setSuffix(" fps")
-        self.speed_spin.setToolTip(
+        self.speed_slider.setPageStep(5)
+        self.speed_slider.setMinimumWidth(140)
+        self.speed_slider.setToolTip(
             "Playback speed. This is also the frame rate the video export "
             "suggests, so a comfortable speed here is a comfortable video."
         )
-        self.speed_spin.valueChanged.connect(self._apply_speed)
+        self.speed_slider.valueChanged.connect(self._apply_speed)
+        self.speed_label = QLabel()
+        self.speed_label.setObjectName("muted")
+        self.speed_label.setMinimumWidth(52)
         self.counter_label = QLabel()
         self.counter_label.setObjectName("muted")
         controls.addWidget(self.play_button)
         controls.addWidget(self.restart_button)
         controls.addStretch(1)
-        controls.addWidget(QLabel("Speed"))
-        controls.addWidget(self.speed_spin)
+        controls.addWidget(QLabel("Slow"))
+        controls.addWidget(self.speed_slider)
+        controls.addWidget(QLabel("Fast"))
+        controls.addWidget(self.speed_label)
         controls.addStretch(1)
         controls.addWidget(self.counter_label)
         layout.addLayout(controls)
@@ -130,7 +141,7 @@ class TimelapsePlayer(QDialog):
 
     @property
     def frame_rate(self) -> int:
-        return int(self.speed_spin.value())
+        return int(self.speed_slider.value())
 
     @property
     def is_playing(self) -> bool:
@@ -153,11 +164,13 @@ class TimelapsePlayer(QDialog):
             self._show_frame(0)
         self._timer.start()
         self.play_button.setText("Pause")
+        self.play_button.setIcon(icon("pause", 64, ON_ACCENT))
 
     @Slot()
     def pause(self) -> None:
         self._timer.stop()
         self.play_button.setText("Play")
+        self.play_button.setIcon(icon("play", 64, ON_ACCENT))
 
     @Slot()
     def restart(self) -> None:
@@ -170,6 +183,7 @@ class TimelapsePlayer(QDialog):
     @Slot()
     def _apply_speed(self) -> None:
         self._timer.setInterval(max(16, round(1000 / self.frame_rate)))
+        self.speed_label.setText(f"{self.frame_rate} fps")
 
     @Slot(int)
     def _seek(self, index: int) -> None:

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFontComboBox,
+    QFrame,
     QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -145,6 +147,9 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".ti
 
 _HOVER_EVENTS = {QEvent.Type.Enter, QEvent.Type.Leave}
 
+# What makes a floating overlay recompute where it sits.
+_RESIZE_EVENTS = {QEvent.Type.Resize, QEvent.Type.Show}
+
 # How near a dragged text layer has to come, in screen pixels, before it jumps
 # onto an alignment.  Small enough that ordinary dragging never feels magnetic,
 # and Alt turns it off outright.
@@ -214,6 +219,234 @@ def _paint_placeholder(
     painter.end()
 
 
+def _paint_corner_chip(device: QWidget, area: QRect, text: str) -> None:
+    """Draw a quiet pill in the bottom-right corner of a preview.
+
+    It is the standing answer to "can I edit this?", shown before the user
+    tries rather than after, and is deliberately dim enough to read as a label
+    on the panel instead of as content in the image.  It sits at the bottom so
+    a notice arriving along the top edge never lands on top of it.
+    """
+
+    painter = QPainter(device)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    font = painter.font()
+    font.setPointSizeF(max(6.5, font.pointSizeF() - 1.0))
+    font.setBold(True)
+    painter.setFont(font)
+    metrics = painter.fontMetrics()
+    width = metrics.horizontalAdvance(text) + 16
+    height = metrics.height() + 6
+    pill = QRectF(
+        area.right() - width - 8, area.bottom() - height - 8, width, height
+    )
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(18, 14, 11, 205))
+    painter.drawRoundedRect(pill, height / 2, height / 2)
+    painter.setPen(QColor(MUTED))
+    painter.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
+    painter.end()
+
+
+class InlineNotice(QFrame):
+    """A self-dismissing message that floats over the widget it explains.
+
+    Used where a modal dialog would be out of proportion to the mistake: the
+    user did something reasonable in the wrong place, and what they need is a
+    sentence saying so plus the one button that puts them where they meant to
+    be.  It never blocks input, it hides itself again, and it follows whatever
+    it covers when that is resized.
+    """
+
+    actionTriggered = Signal()
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        icon_name: str = "status",
+        seconds: float = 6.0,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("inlineNotice")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 10, 8)
+        layout.setSpacing(9)
+        self._glyph = QLabel()
+        self._glyph.setFixedSize(18, 18)
+        self._glyph.setScaledContents(True)
+        self._glyph.setPixmap(tinted_pixmap(icon_name, ACCENT, 36))
+        self._message = QLabel("")
+        self._message.setObjectName("inlineNoticeText")
+        self._action = QPushButton("")
+        self._action.setObjectName("compactButton")
+        self._action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._action.clicked.connect(self._trigger)
+        layout.addWidget(self._glyph)
+        layout.addWidget(self._message)
+        layout.addWidget(self._action)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(max(1, int(seconds * 1000)))
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+        parent.installEventFilter(self)
+
+    def show_message(self, message: str, action: str = "") -> None:
+        self._message.setText(message)
+        self._action.setText(action)
+        self._action.setVisible(bool(action))
+        self._reposition()
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def _trigger(self) -> None:
+        self.hide()
+        self.actionTriggered.emit()
+
+    def hide(self) -> None:  # noqa: D102 - QWidget API
+        self._timer.stop()
+        super().hide()
+
+    def _reposition(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.adjustSize()
+        width = min(self.width(), max(120, parent.width() - 24))
+        self.resize(width, self.height())
+        self.move(max(12, (parent.width() - width) // 2), 14)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
+        if (
+            watched is self.parentWidget()
+            and event.type() in _RESIZE_EVENTS
+            and self.isVisible()
+        ):
+            self._reposition()
+        return super().eventFilter(watched, event)
+
+
+class BusyOverlay(QWidget):
+    """A scrim and a card saying what the application is working on.
+
+    A 16-pixel spinner beside a heading is easy to miss when the control that
+    started the work is somewhere else entirely, and a job that takes a minute
+    then reads as an application that has stopped responding.  This covers the
+    content being recalculated instead, so the answer to "is anything
+    happening?" is wherever the user is already looking.  It never takes the
+    mouse, so editing continues underneath while the plan catches up, and it
+    waits out a short delay first so a fast recalculation never flashes.
+    """
+
+    def __init__(self, parent: QWidget, *, delay_ms: int = 220) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._top_inset = 0
+        self._card = QFrame(self)
+        self._card.setObjectName("busyCard")
+        self._card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(22, 16, 22, 16)
+        card_layout.setSpacing(8)
+        heading = QHBoxLayout()
+        heading.setSpacing(10)
+        self._spinner = Spinner(20, 3)
+        self._title = QLabel("Working...")
+        self._title.setObjectName("busyTitle")
+        heading.addWidget(self._spinner)
+        heading.addWidget(self._title)
+        heading.addStretch(1)
+        card_layout.addLayout(heading)
+        self._detail = QLabel("")
+        self._detail.setObjectName("muted")
+        card_layout.addWidget(self._detail)
+        self._bar = QProgressBar()
+        # A job of unknown length gets the sweeping bar, which says "running"
+        # far more plainly than a bar frozen at zero would.
+        self._bar.setRange(0, 0)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        card_layout.addWidget(self._bar)
+        self._delay = QTimer(self)
+        self._delay.setSingleShot(True)
+        self._delay.setInterval(max(0, delay_ms))
+        self._delay.timeout.connect(self._reveal)
+        self.hide()
+        parent.installEventFilter(self)
+
+    def begin(self, title: str, detail: str = "") -> None:
+        """Arm the overlay; it appears only if the work outlasts the delay."""
+
+        self._title.setText(title)
+        self._detail.setText(detail)
+        self._detail.setVisible(bool(detail))
+        if self.isVisible():
+            self._layout_card()
+        elif not self._delay.isActive():
+            self._delay.start()
+
+    def end(self) -> None:
+        self._delay.stop()
+        self._spinner.stop()
+        self.hide()
+
+    @property
+    def is_pending(self) -> bool:
+        """Whether the overlay is showing or still waiting out its delay."""
+
+        return self._delay.isActive() or self.isVisible()
+
+    def set_top_inset(self, pixels: int) -> None:
+        """Leave the top of the parent uncovered - a tab bar stays reachable."""
+
+        self._top_inset = max(0, int(pixels))
+        if self.isVisible():
+            self._layout_card()
+
+    def _reveal(self) -> None:
+        parent = self.parentWidget()
+        if parent is None or not parent.isVisible():
+            return
+        self._spinner.start()
+        self._layout_card()
+        self.show()
+        self.raise_()
+
+    def _layout_card(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        area = parent.rect().adjusted(0, self._top_inset, 0, 0)
+        self.setGeometry(area)
+        size = self._card.sizeHint()
+        width = min(max(size.width(), 260), max(160, area.width() - 40))
+        self._card.setFixedWidth(width)
+        self._card.adjustSize()
+        self._card.move(
+            max(0, (self.width() - self._card.width()) // 2),
+            max(0, (self.height() - self._card.height()) // 2),
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(8, 6, 5, 150))
+        painter.end()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
+        if (
+            watched is self.parentWidget()
+            and event.type() in _RESIZE_EVENTS
+            and self.isVisible()
+        ):
+            self._layout_card()
+        return super().eventFilter(watched, event)
+
+
 class _ImageDropTarget:
     """Click-to-browse and drag-and-drop behaviour shared by both previews.
 
@@ -254,12 +487,15 @@ class _ImageDropTarget:
     def _refresh_empty_state(self) -> None:
         """Only the empty state is clickable, so the cursor follows it."""
 
-        self.setCursor(
+        self.setCursor(self._idle_cursor())
+        self.update()
+
+    def _idle_cursor(self) -> Qt.CursorShape:
+        return (
             Qt.CursorShape.PointingHandCursor
             if self._is_empty
             else Qt.CursorShape.ArrowCursor
         )
-        self.update()
 
     @property
     def _placeholder_active(self) -> bool:
@@ -306,10 +542,19 @@ class _ImageDropTarget:
 
 
 class PreviewLabel(_ImageDropTarget, QLabel):
-    """A pixmap label that keeps the source aspect ratio while resizing."""
+    """A pixmap label that keeps the source aspect ratio while resizing.
+
+    ``read_only_chip`` marks the label as something to look at rather than
+    something to edit: the chip says so up front, a press emits
+    :attr:`editAttempted` so the window can offer the place where that edit
+    does work, and a double-click emits :attr:`editElsewhereRequested` to be
+    taken there outright.
+    """
 
     browseRequested = Signal()
     imageDropped = Signal(str)
+    editAttempted = Signal()
+    editElsewhereRequested = Signal()
 
     def __init__(
         self,
@@ -318,6 +563,7 @@ class PreviewLabel(_ImageDropTarget, QLabel):
         *,
         smooth: bool = True,
         hint: str = "",
+        read_only_chip: str = "",
     ) -> None:
         super().__init__("", parent)
         self.setObjectName("preview")
@@ -327,9 +573,32 @@ class PreviewLabel(_ImageDropTarget, QLabel):
         self._smooth = smooth
         self._placeholder = placeholder
         self._hint = hint
+        self._read_only_chip = read_only_chip
         self._placeholder_art = art_pixmap("preview-placeholder", 96)
         self._init_drop_target()
         self._refresh_empty_state()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # A press on a filled read-only preview is almost always someone
+        # trying to edit here; say so instead of silently doing nothing.
+        if (
+            self._read_only_chip
+            and not self._is_empty
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.editAttempted.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # Clicking once asks what is going on and gets an answer; insisting is
+        # unambiguous enough to just be taken where the edit works.
+        if self._read_only_chip and not self._is_empty:
+            self.editElsewhereRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def set_source(self, pixmap: QPixmap | None) -> None:
         self._source = pixmap or QPixmap()
@@ -357,6 +626,8 @@ class PreviewLabel(_ImageDropTarget, QLabel):
                 self._hint,
                 self._placeholder_active,
             )
+        elif self._read_only_chip:
+            _paint_corner_chip(self, self.contentsRect(), self._read_only_chip)
 
     def _update_scaled(self) -> None:
         if self._source.isNull():
@@ -803,6 +1074,8 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     interactionFinished = Signal()
     browseRequested = Signal()
     imageDropped = Signal(str)
+    cropFocusChanged = Signal(float, float)
+    cropDragFinished = Signal()
 
     def __init__(
         self,
@@ -842,6 +1115,12 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         # What a modifier-held rubber band has to give back; see mousePressEvent.
         self._carried_selection: set[int] = set()
         self._guides: list[tuple[str, float]] = []
+        # Fill crops the sign out of the middle of the source; dragging picks
+        # which part of it that is.  Held from the press so a rebuilt scene
+        # mid-drag cannot make the image jump.
+        self._crop_pannable = False
+        self._crop_origin: QPointF | None = None
+        self._crop_press_rect = QRectF()
         self._placeholder = placeholder
         self._hint = hint
         self._placeholder_art = art_pixmap("preview-placeholder", 96)
@@ -877,7 +1156,45 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._canvas_rect = QRectF(rect) if rect is not None else None
         self._font_scale = max(float(font_scale), 1e-6)
         self._update_scene_rect()
+        if self._crop_origin is None:
+            self._refresh_empty_state()
         self.viewport().update()
+
+    def set_crop_pannable(self, pannable: bool) -> None:
+        """Allow or forbid dragging the sign's window over the source image."""
+
+        if pannable == self._crop_pannable:
+            return
+        self._crop_pannable = pannable
+        self._crop_origin = None
+        self._refresh_empty_state()
+
+    @property
+    def is_panning_crop(self) -> bool:
+        return self._crop_origin is not None
+
+    def crop_margin(self) -> tuple[float, float]:
+        """How far the kept region can still travel on each axis, in pixels."""
+
+        if not self._crop_pannable or self._canvas_rect is None or self._source.isNull():
+            return (0.0, 0.0)
+        return (
+            max(0.0, self._source.width() - self._canvas_rect.width()),
+            max(0.0, self._source.height() - self._canvas_rect.height()),
+        )
+
+    def can_pan_crop(self) -> bool:
+        """Whether there is any margin at all to drag the crop across."""
+
+        margin_x, margin_y = self.crop_margin()
+        return margin_x > 0.5 or margin_y > 0.5
+
+    def _crop_focus_at(self, left: float, top: float) -> tuple[float, float]:
+        margin_x, margin_y = self.crop_margin()
+        return (
+            min(max(left / margin_x, 0.0), 1.0) if margin_x > 0.0 else 0.5,
+            min(max(top / margin_y, 0.0), 1.0) if margin_y > 0.0 else 0.5,
+        )
 
     def canvas_rect(self) -> QRectF:
         if (
@@ -904,8 +1221,16 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._placeholder = placeholder
         self._canvas_rect = None
         self._font_scale = 1.0
+        self._crop_origin = None
         self.set_source(None)
         self.set_layers([], ())
+
+    def _idle_cursor(self) -> Qt.CursorShape:
+        # An open hand over bare canvas is what tells the user the sign's
+        # window can be dragged onto the part of the image they want.
+        if not self._is_empty and self.can_pan_crop():
+            return Qt.CursorShape.OpenHandCursor
+        return super()._idle_cursor()
 
     def set_layers(
         self,
@@ -1048,10 +1373,42 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         extend = event.modifiers() & (
             Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
         )
+        if (
+            not extend
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._starts_crop_pan(event)
+        ):
+            self._crop_origin = self.mapToScene(event.position().toPoint())
+            self._crop_press_rect = QRectF(self._canvas_rect or QRectF())
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         self._carried_selection = set(self.selected_indices()) if extend else set()
         super().mousePressEvent(event)
 
+    def _starts_crop_pan(self, event) -> bool:
+        """A plain drag on bare canvas moves the crop, not a rubber band.
+
+        A text layer under the pointer still wins - dragging a caption is what
+        that gesture already means - and the band is reachable with Shift or
+        Ctrl held, which is how several layers were always gathered anyway.
+        """
+
+        if self._source.isNull() or not self.can_pan_crop():
+            return False
+        return self.itemAt(event.position().toPoint()) in (None, self._background)
+
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._crop_origin is not None:
+            moved = self.mapToScene(event.position().toPoint()) - self._crop_origin
+            self.cropFocusChanged.emit(
+                *self._crop_focus_at(
+                    self._crop_press_rect.left() + moved.x(),
+                    self._crop_press_rect.top() + moved.y(),
+                )
+            )
+            event.accept()
+            return
         super().mouseMoveEvent(event)
         if self._carried_selection and not self.rubberBandRect().isNull():
             for item in self._items:
@@ -1059,6 +1416,13 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
                     item.setSelected(True)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._crop_origin is not None:
+            self._crop_origin = None
+            self.viewport().unsetCursor()
+            self._refresh_empty_state()
+            self.cropDragFinished.emit()
+            event.accept()
+            return
         carried = self._carried_selection
         banding = not self.rubberBandRect().isNull()
         self._carried_selection = set()
@@ -1168,6 +1532,8 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             painter.setPen(border)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(canvas)
+            if self.can_pan_crop():
+                self._draw_crop_grips(painter, canvas)
         if not self._guides:
             return
         guide = QPen(QColor(ACCENT))
@@ -1182,6 +1548,23 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
             else:
                 painter.drawLine(
                     QPointF(span.left(), position), QPointF(span.right(), position)
+                )
+
+    def _draw_crop_grips(self, painter: QPainter, canvas: QRectF) -> None:
+        """Bracket the crop frame's corners so it reads as something to grab."""
+
+        grip = QPen(QColor(ACCENT))
+        grip.setCosmetic(True)
+        grip.setWidth(3)
+        painter.setPen(grip)
+        arm = min(canvas.width(), canvas.height()) * 0.09
+        for x, step_x in ((canvas.left(), 1.0), (canvas.right(), -1.0)):
+            for y, step_y in ((canvas.top(), 1.0), (canvas.bottom(), -1.0)):
+                painter.drawLine(
+                    QPointF(x, y), QPointF(x + arm * step_x, y)
+                )
+                painter.drawLine(
+                    QPointF(x, y), QPointF(x, y + arm * step_y)
                 )
 
     def _on_selection_changed(self) -> None:

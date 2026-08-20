@@ -112,10 +112,10 @@ painting unattended. Everything below is detail you only need when tuning.
 
 - Dark, rust-textured workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by clicking either preview, browsing, or dropping a file anywhere in the window
-- Fit, fill/crop, and stretch composition with a live paint simulation
+- Fit, fill/crop, and stretch composition with a live paint simulation, with the Fill crop draggable directly on the source image so the sign keeps the part of the picture you meant
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
 - One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
-- Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a dashed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint
+- Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a bracketed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint, marks itself read-only, and offers a way back to the Source tab if you try to edit there
 - Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Shift+click, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
 - Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
 - Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y anywhere in the window, mid-typing included), so a whole drag or a run of keystrokes steps back as one edit
@@ -127,8 +127,9 @@ painting unattended. Everything below is detail you only need when tuning.
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
 - Per-profile color correction measured from a painted 32-swatch chart
-- A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required
+- A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required, and playback speed is a slider that says how much of the paint job one second of video covers
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
+- Plans already computed are kept, so stepping back to a preset you already tried comes back instantly instead of being recalculated, and any recalculation that does run covers the preview with what it is working on
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
 ## Detailed setup and first paint
@@ -136,7 +137,7 @@ painting unattended. Everything below is detail you only need when tuning.
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
 2. Open the target sign's painting interface and leave it stationary.
 3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
-4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through and hide automatically while painting).
+4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI (they are click-through, hide themselves while a job is actually painting, and come back while it is paused so the boxes can be checked against Rust before letting it carry on).
 5. If automatic brush sizing is wanted, calibrate the numeric **Size value box** beside Rust's size slider and the **Clear button** (Rust's trash icon, which wipes the sign). There is nothing to run by hand: every paint job measures the brush itself, then clears the sign before it paints. Measuring paints a scout stroke to find the scale, then a few probe strokes bracketing the brush your resolution needs, and reads back how much of the sign each one actually covered. Only solid coverage counts - Rust's brush fades out over its last texture pixel, and a cell left under that fade still looks unpainted. Measuring every run rather than once is what removes the step that used to be missed: a stored measurement describes a sign you may since have re-framed, walked away from, or replaced, and a stale one paints the whole image at the wrong width.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
@@ -209,8 +210,21 @@ shape of the sign rather than at its own proportions. Stretch is the one mode
 that reshapes the artwork, so laying text out over the undistorted original
 would put every caption somewhere the sign never had it; pre-distorting the
 backdrop makes the tab agree with what gets painted. Fit and Fill leave the
-source's shape alone and mark the sign's own area with a dashed outline
+source's shape alone and mark the sign's own area with a bracketed outline
 instead.
+
+### Framing a Fill crop
+
+Under **Fill / Crop** the sign keeps only the part of the image that fits its
+shape, and the Source tab shows which part: the kept region is bracketed and
+everything it drops is dimmed. Drag anywhere on bare canvas to move that frame
+onto what you want the sign to hold - the pointer becomes an open hand wherever
+there is room to move - and **Crop alignment** switches to *Custom - dragged*.
+Picking a named anchor again puts the crop back on it. Text layers are anchored
+to the sign rather than to the image, so they travel with the frame.
+
+While a Fill crop can move, gathering several text layers with a rubber band
+takes Shift+drag or Ctrl+drag; a plain drag is the crop.
 
 ### Optimization modes
 
@@ -345,9 +359,16 @@ shows what the current job is recording. Select one and:
 - **Watch** plays it back in a window inside RustPainter. Space plays and
   pauses, the arrow keys step one frame, and the slider scrubs. Double-clicking
   a recording in the list opens it too.
-- **Save as video** writes the whole recording to one file. **Speed** sets both
-  the playback rate and the exported frame rate, so what you watched is what
-  you save.
+- **Save video** writes the whole recording to one file, in the container
+  picked beside it.
+- **Speed** is one slider for both playback and the exported frame rate, so
+  what you watched is what you save. It reads out the frame rate and how much
+  of the paint job one second of video covers at it, which is the number worth
+  choosing by.
+
+The buttons at the right of that row open the timelapse folder, open the
+selected recording's folder, look for recordings again, and delete the
+selected recording; each names itself on hover.
 
 AVI (Motion JPEG) and animated GIF are written by RustPainter itself and need
 nothing installed. MP4 is offered as well when `ffmpeg` is on `PATH` (or named

@@ -99,6 +99,20 @@ QFrame#inlinePanel {{
     border: 1px solid {BORDER};
     border-radius: 8px;
 }}
+/* Floating over a preview rather than sitting in the layout, so both of
+   these carry their own plate and a rust edge that reads as "on top". */
+QFrame#inlineNotice {{
+    {_POPUP}
+    border: 1px solid {ACCENT_SOFT};
+    border-radius: 9px;
+}}
+QLabel#inlineNoticeText {{ color: {TEXT}; font-weight: 600; }}
+QFrame#busyCard {{
+    {_POPUP}
+    border: 1px solid {ACCENT_SOFT};
+    border-radius: 11px;
+}}
+QLabel#busyTitle {{ color: {TEXT}; font-size: 11pt; font-weight: 700; }}
 QGroupBox {{
     margin-top: 12px;
     padding: 15px 12px 12px 12px;

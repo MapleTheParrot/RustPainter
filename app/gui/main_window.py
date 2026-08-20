@@ -8,8 +8,10 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -65,6 +67,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -75,8 +78,8 @@ from PySide6.QtWidgets import (
 
 from app.color_calibration import ColorCorrectionModel
 from app.image_processing import (
-    CROP_CENTERING,
     calculate_fit_size,
+    crop_centering,
     fill_crop_box,
     process_image,
     quantize_image,
@@ -119,7 +122,7 @@ from app.timelapse_export import (
 )
 
 from .assets import icon as art_icon, pixmap as art_pixmap, tinted_pixmap
-from .styles import ON_ACCENT, TEXT, badge_foreground, state_badge_style
+from .styles import DANGER, ON_ACCENT, TEXT, badge_foreground, state_badge_style
 from .text_render import (
     GRADIENT_DIRECTIONS,
     MAX_OUTLINE_WIDTH,
@@ -129,9 +132,11 @@ from .text_render import (
     text_size,
 )
 from .widgets import (
+    BusyOverlay,
     CalibrationStatus,
     ColorButton,
     CountdownDialog,
+    InlineNotice,
     NoWheelComboBox,
     NoWheelDoubleSpinBox,
     NoWheelFontComboBox,
@@ -171,9 +176,42 @@ QUALITY_LONG_EDGE: dict[str, int] = {
 
 # The quality entry with no fixed long edge: it asks the measured brush model
 # how many texture rows this sign actually holds and plans one logical cell
-# per texel.  Only selectable once a job has measured the sign, because until
-# then there is nothing to ask.
+# per texel.  Before any job has measured the sign it plans one cell per
+# screen pixel of the calibrated canvas instead - the finest grid the mouse
+# can address - so the preset works from the first paint, with brush size 1
+# merely repeating itself wherever screen pixels outnumber texels.
 MAX_QUALITY_PRESET = "Max"
+
+# How many finished plans are kept so that going back to a combination of
+# settings already computed is instant.  A count alone is the wrong bound:
+# six thumbnail-sized plans cost nothing, while six plans of a sign painted at
+# native texel resolution are hundreds of megabytes, so the cache is held to a
+# rough memory budget as well and gives up its oldest entries to stay inside
+# it.  One entry is always kept, however large, because the plan on screen is
+# in the cache too.
+PLAN_CACHE_ENTRIES = 6
+PLAN_CACHE_BYTES = 96 * 1024 * 1024
+
+# Roughly what one entry costs: a Stroke plus its slot in the group's tuple,
+# and per logical cell an RGBA quantized image, a boolean paint mask, and the
+# RGBA simulation the Rust preview shows.
+_STROKE_BYTES = 72
+_CELL_BYTES = 4 + 1 + 4
+
+
+# The crop-alignment entry a dragged crop selects.  Its centering is stored
+# per image rather than as one of the five named anchors, which cannot express
+# a crop the user framed by hand.
+CUSTOM_CROP_VALUE = "custom"
+CUSTOM_CROP_LABEL = "Custom - dragged"
+
+# What the preview heading offers to teach, chosen by the tab in front and by
+# whether the sign's window can actually be dragged over the source right now.
+PREVIEW_HINTS: dict[str, str] = {
+    "source": "Click the preview or drop an image anywhere to open it",
+    "crop": "Drag the image to choose what the sign shows",
+    "rust": "Read-only - edit the artwork on the Source tab",
+}
 
 # All timing values one speed preset controls, in the spinbox units used below.
 SPEED_PRESETS: dict[str, dict[str, float]] = {
@@ -303,6 +341,39 @@ class _TextOverlayOptions:
 class _WorkerSignals(QObject):
     completed = Signal(object)
     failed = Signal(int, str)
+
+
+def _hashable(value: Any) -> Any:
+    """A stable, hashable stand-in for anything a plan was computed from.
+
+    Dataclasses are walked field by field rather than listed by name, so an
+    option added later is part of the cache key without anyone remembering to
+    put it there - the failure mode of the alternative is a stale plan shown
+    for settings that never produced it.
+    """
+
+    if hasattr(value, "__dataclass_fields__"):
+        return tuple(
+            (field.name, _hashable(getattr(value, field.name)))
+            for field in fields(value)
+        )
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _hashable(item)) for key, item in value.items()))
+    return value
+
+
+def _glyph_label(icon_name: str, edge: int) -> QLabel:
+    """A baked icon as a plain label, for headings and inline captions."""
+
+    glyph = QLabel()
+    glyph.setFixedSize(edge, edge)
+    glyph.setScaledContents(True)
+    glyph.setPixmap(art_pixmap(icon_name, edge * 2))
+    return glyph
 
 
 def _rgb(color: QColor) -> tuple[int, int, int]:
@@ -650,6 +721,15 @@ class MainWindow(QMainWindow):
         self._plan_metric_source: PaintPlan | None = None
         self._plan_stroke_pixel_steps = 0
         self._plan_dot_count = 0
+        # Finished plans, newest last, keyed by everything that shaped them.
+        # Stepping back to a preset already tried is then instant instead of
+        # another full recalculation of a plan that has not changed.
+        self._plan_cache: OrderedDict[tuple, _ProcessResult] = OrderedDict()
+        # The key each dispatched worker is planning for, by serial.  Keeping
+        # it per worker rather than as one pending slot is what lets a result
+        # that arrived too late to be shown still be filed correctly, instead
+        # of being filed under whatever the newest request happened to be.
+        self._plan_keys: dict[int, tuple] = {}
         self._load_serial = 0
         self._load_pool = QThreadPool(self)
         self._load_pool.setMaxThreadCount(1)
@@ -723,6 +803,10 @@ class MainWindow(QMainWindow):
         # at, which Stretch pulls away from the decoded one.
         self._source_pixmap = QPixmap()
         self._source_preview_size: tuple[int, int] | None = None
+        # Where Fill anchors the region it keeps when the user has framed it
+        # by hand; None follows the named crop alignment instead.
+        self._crop_focus: tuple[float, float] | None = None
+        self._last_named_crop = CropAlignment.CENTER.value
         # The Rust preview is only fronted once per imported image; afterwards
         # the user's tab choice is respected so text editing on the Source tab
         # is not interrupted by every reprocess.
@@ -1035,78 +1119,84 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         heading = QHBoxLayout()
+        heading.setSpacing(10)
         title = QLabel("Timelapse")
         title.setObjectName("pageTitle")
         self.timelapse_status_badge = QLabel("Not recording")
         self.timelapse_status_badge.setObjectName("muted")
+        heading.addWidget(_glyph_label("clock", 22))
         heading.addWidget(title)
         heading.addStretch(1)
         heading.addWidget(self.timelapse_status_badge)
         layout.addLayout(heading)
-        note = QLabel(
-            "Capture the sign at a regular interval while it is painted, then "
-            "assemble the frames into a video."
-        )
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        layout.addWidget(note)
 
+        # One compact row of controls beats three rows of form labels: what
+        # each one does is short enough to be the control's own label, and the
+        # detail that used to sit in paragraphs is a tooltip away.
         capture_group = QGroupBox("Capture")
-        capture_form = QFormLayout(capture_group)
-        self.timelapse_check = QCheckBox("Capture frames while painting")
+        capture_layout = QVBoxLayout(capture_group)
+        capture_layout.setSpacing(9)
+        capture_row = QHBoxLayout()
+        capture_row.setSpacing(10)
+        self.timelapse_check = QCheckBox("Record while painting")
         self.timelapse_check.setToolTip(
             "Saves a screenshot of the calibrated canvas at a regular interval\n"
             "while a job paints, so the finished frames can be assembled into\n"
-            "a timelapse video."
+            "a timelapse video.  Recording follows the job: it starts when\n"
+            "painting starts, skips paused time, and stops when the job ends."
         )
         self.timelapse_interval_spin = self._int_spin(1, 600, 10, " s")
         self.timelapse_interval_spin.setToolTip(
             "How often a frame is captured. Painting a large sign can take an\n"
             "hour, so a frame every 10 seconds is usually plenty."
         )
-        self.timelapse_final_check = QCheckBox("Capture a final frame when a job finishes")
+        self.timelapse_final_check = QCheckBox("Frame at the finish")
         self.timelapse_final_check.setChecked(True)
         self.timelapse_final_check.setToolTip(
             "The interval rarely lands on the last stroke, so the finished sign\n"
             "gets one extra frame of its own."
         )
-        capture_form.addRow("Recording", self.timelapse_check)
-        capture_form.addRow("Frame every", self.timelapse_interval_spin)
-        capture_form.addRow("Finish", self.timelapse_final_check)
+        capture_row.addWidget(self.timelapse_check)
+        capture_row.addStretch(1)
+        capture_row.addWidget(_glyph_label("clock", 16))
+        capture_row.addWidget(QLabel("Every"))
+        capture_row.addWidget(self.timelapse_interval_spin)
+        capture_row.addWidget(self.timelapse_final_check)
+        capture_layout.addLayout(capture_row)
         capture_note = QLabel(
             "Frames cover the calibrated canvas, so the sign must be calibrated "
-            "in Rust setup. Recording follows the paint job: it starts when "
-            "painting starts, skips paused time, and stops when the job ends."
+            "in Rust setup."
         )
         capture_note.setWordWrap(True)
         capture_note.setObjectName("muted")
-        capture_form.addRow("", capture_note)
+        capture_layout.addWidget(capture_note)
         layout.addWidget(capture_group)
 
         sessions_group = QGroupBox("Recordings")
         sessions_layout = QVBoxLayout(sessions_group)
+        sessions_layout.setSpacing(9)
         self.timelapse_sessions = QListWidget()
         self.timelapse_sessions.setAlternatingRowColors(True)
         self.timelapse_sessions.setMinimumHeight(180)
+        self.timelapse_sessions.setToolTip(
+            "Every job keeps its own folder of numbered PNG frames.  Saving a "
+            "video leaves that folder untouched."
+        )
         sessions_layout.addWidget(self.timelapse_sessions)
+
         playback_row = QHBoxLayout()
+        playback_row.setSpacing(8)
         self.play_session_button = QPushButton("Watch")
         self.play_session_button.setObjectName("accent")
         self._set_icon(self.play_session_button, "play", ON_ACCENT, size=16)
         self.play_session_button.setToolTip(
             "Play the selected recording back inside RustPainter."
         )
-        self.export_session_button = QPushButton("Save as video")
+        self.export_session_button = QPushButton("Save video")
+        self._set_icon(self.export_session_button, "drag-drop", size=16)
         self.export_session_button.setToolTip(
             "Write the selected recording to a single video file you can keep, "
             "upload, or share."
-        )
-        self.timelapse_fps_spin = self._int_spin(
-            MIN_FRAME_RATE, MAX_FRAME_RATE, DEFAULT_FRAME_RATE, " fps"
-        )
-        self.timelapse_fps_spin.setToolTip(
-            "Frames per second for playback and for the exported video. A slow "
-            "sign painted over an hour is worth watching faster than it happened."
         )
         self.timelapse_format_combo = NoWheelComboBox()
         for video_format in available_formats():
@@ -1117,43 +1207,94 @@ class MainWindow(QMainWindow):
         )
         playback_row.addWidget(self.play_session_button)
         playback_row.addWidget(self.export_session_button)
-        playback_row.addStretch(1)
-        playback_row.addWidget(QLabel("Speed"))
-        playback_row.addWidget(self.timelapse_fps_spin)
-        playback_row.addWidget(QLabel("Format"))
         playback_row.addWidget(self.timelapse_format_combo)
-        sessions_layout.addLayout(playback_row)
-
-        session_buttons = QHBoxLayout()
-        self.open_timelapse_button = QPushButton("Open timelapse folder")
-        self.open_session_button = QPushButton("Open selected")
-        self.delete_session_button = QPushButton("Delete selected")
-        self.delete_session_button.setObjectName("danger")
-        self.refresh_sessions_button = QPushButton("Refresh")
+        playback_row.addStretch(1)
+        # Icon-only buttons for the housekeeping actions: they are used rarely,
+        # and their labels were most of the text on the page.
+        self.open_timelapse_button = self._icon_button(
+            "drag-drop", "Open the timelapse folder"
+        )
+        self.open_session_button = self._icon_button(
+            "workspace", "Open the selected recording's folder"
+        )
+        self.refresh_sessions_button = self._icon_button(
+            "status", "Look for recordings again"
+        )
+        self.delete_session_button = self._icon_button(
+            "trash",
+            "Delete the selected recording and every frame in it",
+            color=DANGER,
+        )
         for button in (
             self.open_timelapse_button,
             self.open_session_button,
-            self.delete_session_button,
             self.refresh_sessions_button,
+            self.delete_session_button,
         ):
-            session_buttons.addWidget(button)
-        sessions_layout.addLayout(session_buttons)
+            playback_row.addWidget(button)
+        sessions_layout.addLayout(playback_row)
+
+        # A slider says "how fast" without asking anyone to think in frames
+        # per second first; the readout still names the number, because that
+        # is what the exported file is written at.
+        speed_row = QHBoxLayout()
+        speed_row.setSpacing(9)
+        speed_row.addWidget(_glyph_label("sliders", 16))
+        speed_row.addWidget(QLabel("Speed"))
+        self.timelapse_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timelapse_speed_slider.setRange(MIN_FRAME_RATE, MAX_FRAME_RATE)
+        self.timelapse_speed_slider.setValue(DEFAULT_FRAME_RATE)
+        self.timelapse_speed_slider.setPageStep(5)
+        self.timelapse_speed_slider.setToolTip(
+            "How fast the recording plays, and the frame rate the saved video "
+            "is written at.  A sign painted over an hour is worth watching "
+            "faster than it happened."
+        )
+        self.timelapse_speed_label = QLabel("")
+        self.timelapse_speed_label.setObjectName("muted")
+        self.timelapse_speed_label.setMinimumWidth(150)
+        self.timelapse_speed_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        speed_row.addWidget(QLabel("Slow"))
+        speed_row.addWidget(self.timelapse_speed_slider, 1)
+        speed_row.addWidget(QLabel("Fast"))
+        speed_row.addWidget(self.timelapse_speed_label)
+        sessions_layout.addLayout(speed_row)
 
         self.timelapse_export_progress = QProgressBar()
         self.timelapse_export_progress.setVisible(False)
         self.timelapse_export_progress.setTextVisible(True)
         sessions_layout.addWidget(self.timelapse_export_progress)
-
-        assemble_note = QLabel(
-            "Each job keeps its own folder of numbered PNG frames, so the "
-            "original capture is never re-encoded. Saving as video leaves that "
-            "folder untouched."
-        )
-        assemble_note.setWordWrap(True)
-        assemble_note.setObjectName("muted")
-        sessions_layout.addWidget(assemble_note)
         layout.addWidget(sessions_group, 1)
+        self._refresh_timelapse_speed_label()
         return content
+
+    def _icon_button(
+        self, icon_name: str, tooltip: str, color: str | None = None
+    ) -> QPushButton:
+        """A square, label-free button; its tooltip carries the whole meaning.
+
+        The accessible name repeats the tooltip because it is the only text
+        the button has, and a screen reader has nothing else to announce.
+        """
+
+        button = QPushButton()
+        button.setObjectName("iconButton")
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(30, 30)
+        self._set_icon(button, icon_name, color, size=16)
+        return button
+
+    def _refresh_timelapse_speed_label(self, *_args: Any) -> None:
+        """Say what the slider means in both of the units that matter."""
+
+        rate = self.timelapse_speed_slider.value()
+        interval = max(1, self.timelapse_interval_spin.value())
+        # One second of video covers this much of the paint job.
+        covered = self._format_duration(rate * interval)
+        self.timelapse_speed_label.setText(f"{rate} fps  •  {covered} per second")
 
     def _build_preview_area(self) -> QWidget:
         content = QWidget()
@@ -1164,11 +1305,13 @@ class MainWindow(QMainWindow):
         heading = QHBoxLayout()
         title = QLabel("PREVIEW")
         title.setObjectName("pageTitle")
-        hint = QLabel("Click the preview or drop an image anywhere to open it")
-        hint.setObjectName("muted")
+        # The hint follows the tab and the scaling mode, because the one
+        # gesture worth advertising is different on each of them.
+        self.preview_hint_label = QLabel(PREVIEW_HINTS["source"])
+        self.preview_hint_label.setObjectName("muted")
         heading.addWidget(title)
         heading.addStretch(1)
-        heading.addWidget(hint)
+        heading.addWidget(self.preview_hint_label)
         layout.addLayout(heading)
 
         tabs = QTabWidget()
@@ -1178,20 +1321,32 @@ class MainWindow(QMainWindow):
         )
         self.original_preview.setToolTip(
             "Drag text to move it, drag its handles to resize it, and "
-            "double-click to edit it. Drag a box across bare canvas, "
+            "double-click to edit it. Shift+drag a box across bare canvas, "
             "Ctrl+click or Ctrl+A to take several layers at once; the arrow "
             "keys nudge them, Ctrl+D or Ctrl+C copies them, and Delete "
             "removes them. Dragging snaps to the sign and to the other "
-            "layers unless Alt is held. The dashed border is the part of "
-            "the image the sign will show."
+            "layers unless Alt is held. The bracketed border is the part of "
+            "the image the sign will show - under Fill, drag bare canvas to "
+            "move it onto what you want the sign to keep."
         )
         self.paint_preview = PreviewLabel(
-            "Paint simulation will appear here", smooth=False, hint=browse_hint
+            "Paint simulation will appear here",
+            smooth=False,
+            hint=browse_hint,
+            read_only_chip="Preview only",
         )
         self.paint_preview.setToolTip(
             "Exactly what the painter will put on the sign - text is baked in "
-            "and every color is palette-limited."
+            "and every color is palette-limited.  Editing happens on the "
+            "Source tab; this one only shows the result."
         )
+        # Trying to edit here is a reasonable mistake - the two tabs show the
+        # same artwork - so it is answered in place, with the tab that does
+        # take the edit one click away rather than a dialog to dismiss.
+        self.preview_notice = InlineNotice(self.paint_preview, icon_name="pencil")
+        self.preview_notice.actionTriggered.connect(self._show_source_tab)
+        self.paint_preview.editAttempted.connect(self._on_read_only_edit_attempt)
+        self.paint_preview.editElsewhereRequested.connect(self._show_source_tab)
         for preview in (self.original_preview, self.paint_preview):
             preview.browseRequested.connect(self._browse_image)
             preview.imageDropped.connect(
@@ -1199,7 +1354,14 @@ class MainWindow(QMainWindow):
             )
         tabs.addTab(self.original_preview, "Source")
         tabs.addTab(self.paint_preview, "Rust preview")
+        tabs.setTabToolTip(0, "The image as imported - move and edit text here")
+        tabs.setTabToolTip(1, "The finished sign, read-only")
+        tabs.currentChanged.connect(self._on_preview_tab_changed)
         self.preview_tabs = tabs
+        # Recalculating covers the artwork it is recalculating, so the answer
+        # to "is anything happening?" is where the user is already looking.
+        # The tab bar stays uncovered so either tab is still reachable.
+        self.plan_busy = BusyOverlay(tabs)
         layout.addWidget(tabs, 1)
 
         analysis = QFrame()
@@ -1291,11 +1453,7 @@ class MainWindow(QMainWindow):
         progress_layout.setContentsMargins(13, 11, 13, 12)
         progress_head = QHBoxLayout()
         progress_head.setSpacing(8)
-        status_glyph = QLabel()
-        status_glyph.setFixedSize(20, 20)
-        status_glyph.setScaledContents(True)
-        status_glyph.setPixmap(art_pixmap("status", 40))
-        progress_head.addWidget(status_glyph)
+        progress_head.addWidget(_glyph_label("status", 20))
         self.progress_state_label = QLabel("Idle")
         self.progress_detail_label = QLabel("No active paint job")
         self.progress_detail_label.setObjectName("muted")
@@ -1311,6 +1469,41 @@ class MainWindow(QMainWindow):
         layout.addWidget(progress_frame)
 
         return content
+
+    @Slot()
+    def _show_source_tab(self) -> None:
+        self.preview_tabs.setCurrentIndex(0)
+        self.original_preview.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    @Slot()
+    def _on_read_only_edit_attempt(self) -> None:
+        """Answer an edit aimed at the Rust preview without stopping the user."""
+
+        self.preview_notice.show_message(
+            "Read-only preview - the artwork is edited on the Source tab.",
+            "Go to Source",
+        )
+        self.statusBar().showMessage(
+            "The Rust preview is read-only; text and crop are edited on the "
+            "Source tab",
+            5000,
+        )
+
+    @Slot()
+    def _on_preview_tab_changed(self, *_args: Any) -> None:
+        self.preview_notice.hide()
+        self._refresh_preview_hint()
+
+    def _refresh_preview_hint(self) -> None:
+        """Name the one gesture that matters on whichever tab is in front."""
+
+        if self.preview_tabs.currentIndex() == 1:
+            key = "rust"
+        elif self.original_preview.can_pan_crop():
+            key = "crop"
+        else:
+            key = "source"
+        self.preview_hint_label.setText(PREVIEW_HINTS[key])
 
     def _set_active_progress_visible(self, active: bool) -> None:
         """Swap the plan panel for the enlarged progress readout while painting."""
@@ -1360,6 +1553,14 @@ class MainWindow(QMainWindow):
             ("Right", CropAlignment.RIGHT),
         ):
             self.crop_alignment_combo.addItem(label, value.value)
+        # A dragged crop lands between the five named anchors, so it gets an
+        # entry of its own rather than being rounded to the nearest one.
+        self.crop_alignment_combo.addItem(CUSTOM_CROP_LABEL, CUSTOM_CROP_VALUE)
+        self.crop_alignment_combo.setToolTip(
+            "Which part of the image Fill keeps.  Dragging the image on the "
+            "Source tab reframes it freely and switches this to Custom; "
+            "picking a named anchor again puts the crop back on it."
+        )
         self.quality_combo = NoWheelComboBox()
         self.quality_combo.addItems(
             [*QUALITY_LONG_EDGE.keys(), MAX_QUALITY_PRESET, "Custom"]
@@ -1997,10 +2198,7 @@ class MainWindow(QMainWindow):
 
         heading = QHBoxLayout()
         heading.setSpacing(8)
-        glyph = QLabel()
-        glyph.setFixedSize(22, 22)
-        glyph.setScaledContents(True)
-        glyph.setPixmap(art_pixmap(icon_name, 44))
+        glyph = _glyph_label(icon_name, 22)
         name = QLabel(label.upper())
         name.setObjectName("muted")
         heading.addWidget(glyph)
@@ -2057,7 +2255,11 @@ class MainWindow(QMainWindow):
 
     def _connect_processing_controls(self) -> None:
         self.scale_mode_combo.currentIndexChanged.connect(self._on_scale_mode_changed)
-        self.crop_alignment_combo.currentIndexChanged.connect(self._schedule_processing)
+        self.crop_alignment_combo.currentIndexChanged.connect(
+            self._on_crop_alignment_changed
+        )
+        self.original_preview.cropFocusChanged.connect(self._on_crop_focus_dragged)
+        self.original_preview.cropDragFinished.connect(self._schedule_settings_save)
         self.background_combo.currentIndexChanged.connect(self._on_background_changed)
         self.background_color_button.colorChanged.connect(self._schedule_processing)
         self.remove_background_check.toggled.connect(self._on_background_removal_changed)
@@ -2840,9 +3042,7 @@ class MainWindow(QMainWindow):
         logical_height = max(1, self.logical_height_spin.value())
         mode = self.scale_mode_combo.currentData()
         if mode == ScaleMode.FILL.value:
-            centering = CROP_CENTERING[
-                CropAlignment(self.crop_alignment_combo.currentData())
-            ]
+            centering = self._crop_centering()
             left, top, right, bottom = fill_crop_box(
                 (image.width, image.height),
                 (logical_width, logical_height),
@@ -2875,6 +3075,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_text_editor_layers(self) -> None:
         self._refresh_source_backdrop()
+        self.original_preview.set_crop_pannable(
+            self.scale_mode_combo.currentData() == ScaleMode.FILL.value
+        )
         geometry = self._source_canvas_geometry()
         if geometry is not None:
             self.original_preview.set_canvas_geometry(*geometry)
@@ -2883,6 +3086,7 @@ class MainWindow(QMainWindow):
             self._edit_target_indices(),
             self._selected_text_layer,
         )
+        self._refresh_preview_hint()
 
     def _logical_height(self) -> int:
         return max(1, self.logical_height_spin.value())
@@ -3006,6 +3210,9 @@ class MainWindow(QMainWindow):
         self._process_serial += 1
         self._process_timer.stop()
         self._thread_pool.clear()
+        # Every cached plan belongs to the image it was made from.
+        self._plan_cache.clear()
+        self._plan_keys.clear()
         self._original_image = None
         self._image_path = None
         self._processed = None
@@ -3021,7 +3228,7 @@ class MainWindow(QMainWindow):
         self.image_name_label.setText(path.name)
         self.image_dimensions_label.setText("Loading…")
         self.processing_label.setText("Decoding image…")
-        self._set_plan_processing(True)
+        self._set_plan_processing(True, "Opening the image")
         self._refresh_statistics()
         self._update_start_availability()
 
@@ -3064,6 +3271,52 @@ class MainWindow(QMainWindow):
         self._refresh_statistics()
         self._update_start_availability()
         QMessageBox.critical(self, "Could not load image", message)
+
+    def _crop_centering(self) -> tuple[float, float]:
+        """The centering Fill keeps right now, dragged or named."""
+
+        return crop_centering(self._named_crop_alignment(), self._crop_focus)
+
+    def _named_crop_alignment(self) -> str:
+        """The last named anchor, which "Custom" leaves standing behind it."""
+
+        value = str(self.crop_alignment_combo.currentData() or "")
+        if value and value != CUSTOM_CROP_VALUE:
+            return value
+        return self._last_named_crop
+
+    @Slot()
+    def _on_crop_alignment_changed(self, *_args: Any) -> None:
+        """Follow a named anchor, or keep the crop the user dragged."""
+
+        value = str(self.crop_alignment_combo.currentData() or "")
+        if value == CUSTOM_CROP_VALUE:
+            # Selecting Custom without ever having dragged means "leave it
+            # where it is", so it starts from the anchor being left behind.
+            if self._crop_focus is None:
+                self._crop_focus = crop_centering(self._last_named_crop)
+        else:
+            self._last_named_crop = value or self._last_named_crop
+            self._crop_focus = None
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+
+    @Slot(float, float)
+    def _on_crop_focus_dragged(self, x: float, y: float) -> None:
+        """Reframe the sign onto the part of the source the drag picked."""
+
+        focus = (min(max(float(x), 0.0), 1.0), min(max(float(y), 0.0), 1.0))
+        if focus == self._crop_focus:
+            return
+        self._crop_focus = focus
+        if self.crop_alignment_combo.currentData() != CUSTOM_CROP_VALUE:
+            self.crop_alignment_combo.blockSignals(True)
+            self._set_combo_data(self.crop_alignment_combo, CUSTOM_CROP_VALUE)
+            self.crop_alignment_combo.blockSignals(False)
+        # The dashed frame and every text layer anchored to it follow the drag
+        # immediately; the plan itself catches up on the usual debounce.
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
 
     @Slot()
     def _on_scale_mode_changed(self) -> None:
@@ -3188,6 +3441,25 @@ class MainWindow(QMainWindow):
         width = max(8, min(2048, width))
         return width, height
 
+    def _screen_resolution_cap(self) -> tuple[int, int] | None:
+        """The finest grid an unmeasured sign can usefully be painted on.
+
+        Strokes land on whole screen pixels, so the calibrated canvas's own
+        pixel grid already holds every cell a plan could address.  Where the
+        screen is finer than the sign's texture, brush size 1 paints some
+        texels more than once - the cost is repeated strokes, never lost
+        detail - and a measured job later snaps the grid to the true texel
+        count.  ``None`` until the canvas is calibrated.
+        """
+
+        rect = self._profile_rect("canvas")
+        if rect is None:
+            return None
+        scale = min(1.0, 2048 / max(rect.width, rect.height))
+        width = max(8, round(rect.width * scale))
+        height = max(8, round(rect.height * scale))
+        return width, height
+
     def _cap_to_sign_resolution(self, width: int, height: int) -> tuple[int, int]:
         """Hold a requested logical size at what the sign can actually show.
 
@@ -3219,14 +3491,18 @@ class MainWindow(QMainWindow):
             aspect = self._canvas_aspect_ratio()
             if preset == MAX_QUALITY_PRESET:
                 # One logical cell per sign texel - the resolution ceiling
-                # itself, so there is nothing further to cap.  The fallback
-                # only covers a saved "Max" restored before its profile: the
-                # entry is disabled whenever the sign is unmeasured.
+                # itself, so there is nothing further to cap.  An unmeasured
+                # sign uses its screen-pixel grid instead: strokes land on
+                # whole screen pixels, so that grid already holds every cell
+                # a plan could express, and a later measurement only trims
+                # the strokes that would repeat inside one texel.
                 self._resolution_cap_note = ""
-                cap = self._sign_resolution_cap()
+                cap = self._sign_resolution_cap() or self._screen_resolution_cap()
                 if cap is not None:
                     width, height = cap
                 else:
+                    # Neither a measurement nor a calibrated canvas: nothing
+                    # to derive a grid from until the sign is framed.
                     longest = QUALITY_LONG_EDGE["Very High"]
                     if aspect >= 1.0:
                         width, height = longest, max(8, round(longest / aspect))
@@ -3250,11 +3526,63 @@ class MainWindow(QMainWindow):
         self._rescale_text_layers()
         self._schedule_processing()
 
+    def _plan_cache_key(self) -> tuple:
+        """Everything a finished plan depends on, as one hashable value.
+
+        Built by walking the option dataclasses rather than by listing fields
+        here, so a new option joins the key the day it is added instead of
+        silently letting a stale plan be reused.
+        """
+
+        return (
+            _hashable(self._processing_options()),
+            self._current_overpaint_gap(),
+            self._text_overlay_options(),
+            _hashable(self._color_correction_model()),
+            self._current_paint_mode(),
+            _hashable(self._brush_capabilities()),
+        )
+
+    @staticmethod
+    def _plan_cache_cost(result: _ProcessResult) -> int:
+        """Roughly how much memory one cached plan is holding on to."""
+
+        plan = result.plan
+        return (
+            plan.stroke_count * _STROKE_BYTES
+            + plan.width * plan.height * _CELL_BYTES
+        )
+
+    def _remember_plan(self, key: tuple, result: _ProcessResult) -> None:
+        """Keep a finished plan, dropping the oldest ones to stay in budget."""
+
+        self._plan_cache.pop(key, None)
+        self._plan_cache[key] = result
+        held = sum(
+            self._plan_cache_cost(entry) for entry in self._plan_cache.values()
+        )
+        while len(self._plan_cache) > 1 and (
+            len(self._plan_cache) > PLAN_CACHE_ENTRIES or held > PLAN_CACHE_BYTES
+        ):
+            _, dropped = self._plan_cache.popitem(last=False)
+            held -= self._plan_cache_cost(dropped)
+
     @Slot()
     def _schedule_processing(self, *_args: Any) -> None:
         if self._original_image is None:
             return
         self._process_serial += 1
+        key = self._plan_cache_key()
+        cached = self._plan_cache.get(key)
+        if cached is not None:
+            # Nothing about this combination has changed since it was planned,
+            # so there is nothing to recompute and nothing to wait for.
+            self._plan_cache.move_to_end(key)
+            self._process_timer.stop()
+            self._thread_pool.clear()
+            self._set_plan_processing(False)
+            self._on_processing_complete(replace(cached, serial=self._process_serial))
+            return
         self._plan = None
         self._processed = None
         self._plan_metric_source = None
@@ -3266,14 +3594,35 @@ class MainWindow(QMainWindow):
         self._refresh_statistics()
         self._update_start_availability()
 
-    def _set_plan_processing(self, processing: bool) -> None:
-        """Show or hide the visible signs that the plan is being recalculated."""
+    def _set_plan_processing(
+        self, processing: bool, title: str = "Recalculating the paint plan"
+    ) -> None:
+        """Show or hide the visible signs that the plan is being recalculated.
+
+        The small spinner beside the PAINT PLAN heading is easy to miss when
+        the control that started the work is in another panel, so the busy
+        overlay covers the preview as well and names the settings being
+        planned for - which is the question a slow recalculation raises.
+        """
 
         self._plan_processing = processing
         if processing:
             self.processing_spinner.start()
+            self.plan_busy.set_top_inset(self.preview_tabs.tabBar().height())
+            self.plan_busy.begin(title, self._plan_summary())
         else:
             self.processing_spinner.stop()
+            self.plan_busy.end()
+
+    def _plan_summary(self) -> str:
+        """The settings a running recalculation is planning against."""
+
+        mode = self.paint_mode_combo.currentText().split("—")[0].strip()
+        return (
+            f"{self.quality_combo.currentText()} quality  •  {mode} "
+            f"optimization  •  {self.logical_width_spin.value()} × "
+            f"{self._logical_height()}"
+        )
 
     def _background_color(self) -> tuple[int, int, int] | None:
         mode = self.background_combo.currentData()
@@ -3295,7 +3644,8 @@ class MainWindow(QMainWindow):
             logical_width=self.logical_width_spin.value(),
             logical_height=self.logical_height_spin.value(),
             scale_mode=ScaleMode(self.scale_mode_combo.currentData()),
-            crop_alignment=CropAlignment(self.crop_alignment_combo.currentData()),
+            crop_alignment=CropAlignment(self._named_crop_alignment()),
+            crop_focus=self._crop_focus,
             color_count=int(self.color_count_combo.currentData()),
             dither=self.dither_check.isChecked(),
             background_color=background,
@@ -3369,10 +3719,24 @@ class MainWindow(QMainWindow):
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
+        # Recorded rather than recomputed on arrival, so the result is always
+        # filed under the settings it was actually planned from.  A worker
+        # dropped from the queue above never reports back, so the oldest
+        # entries are let go rather than waiting for a result that will not
+        # come; only one worker runs at a time.
+        self._plan_keys[serial] = self._plan_cache_key()
+        for stale in sorted(self._plan_keys)[:-2]:
+            del self._plan_keys[stale]
         self._thread_pool.start(worker)
 
     @Slot(object)
     def _on_processing_complete(self, result: _ProcessResult) -> None:
+        # Filed before the staleness check: a plan whose settings have already
+        # been left behind is still a correct plan for those settings, and
+        # keeping it is exactly what makes flicking back to them instant.
+        key = self._plan_keys.pop(result.serial, None)
+        if key is not None and not self._closing:
+            self._remember_plan(key, result)
         if result.serial != self._process_serial or self._closing:
             return
         self._set_plan_processing(False)
@@ -3382,7 +3746,10 @@ class MainWindow(QMainWindow):
         self._plan_stroke_pixel_steps = result.stroke_pixel_steps
         self._plan_dot_count = result.dot_count
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
-        if not self.original_preview.is_interacting:
+        if not (
+            self.original_preview.is_interacting
+            or self.original_preview.is_panning_crop
+        ):
             # Scale-mode or resolution changes land here, so the editor's
             # canvas mapping is refreshed alongside the simulation.
             self._refresh_text_editor_layers()
@@ -3439,6 +3806,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, str)
     def _on_processing_failed(self, serial: int, message: str) -> None:
+        self._plan_keys.pop(serial, None)
         if serial != self._process_serial or self._closing:
             return
         self._set_plan_processing(False)
@@ -3647,6 +4015,12 @@ class MainWindow(QMainWindow):
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
         self.move_to_rust_button.clicked.connect(self._move_calibration_to_rust_monitor)
+        self.timelapse_speed_slider.valueChanged.connect(
+            self._refresh_timelapse_speed_label
+        )
+        self.timelapse_interval_spin.valueChanged.connect(
+            self._refresh_timelapse_speed_label
+        )
         self.open_timelapse_button.clicked.connect(self._open_timelapse_folder)
         self.open_session_button.clicked.connect(self._open_selected_session)
         self.delete_session_button.clicked.connect(self._delete_selected_session)
@@ -3692,7 +4066,7 @@ class MainWindow(QMainWindow):
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,
-            self.timelapse_fps_spin,
+            self.timelapse_speed_slider,
             self.timelapse_format_combo,
             self.countdown_spin,
             self.dry_run_check,
@@ -3709,7 +4083,7 @@ class MainWindow(QMainWindow):
         for control in settings_controls:
             if isinstance(control, QComboBox):
                 control.currentIndexChanged.connect(self._schedule_settings_save)
-            elif isinstance(control, (QSpinBox, QDoubleSpinBox)):
+            elif isinstance(control, (QSpinBox, QDoubleSpinBox, QSlider)):
                 control.valueChanged.connect(self._schedule_settings_save)
             elif isinstance(control, QCheckBox):
                 control.toggled.connect(self._schedule_settings_save)
@@ -3740,8 +4114,16 @@ class MainWindow(QMainWindow):
             control.blockSignals(True)
         try:
             self._set_combo_data(self.scale_mode_combo, image.get("scale_mode", "fit"))
+            stored_focus = image.get("crop_focus")
+            self._crop_focus = (
+                (float(stored_focus[0]), float(stored_focus[1]))
+                if isinstance(stored_focus, (list, tuple)) and len(stored_focus) == 2
+                else None
+            )
+            self._last_named_crop = str(image.get("crop_alignment", "center"))
             self._set_combo_data(
-                self.crop_alignment_combo, image.get("crop_alignment", "center")
+                self.crop_alignment_combo,
+                CUSTOM_CROP_VALUE if self._crop_focus else self._last_named_crop,
             )
             preset = str(image.get("quality_preset", "balanced")).replace("_", " ").title()
             if self.quality_combo.findText(preset) >= 0:
@@ -3898,7 +4280,7 @@ class MainWindow(QMainWindow):
             self.timelapse_final_check.setChecked(
                 bool(timelapse.get("capture_final_frame", True))
             )
-            self.timelapse_fps_spin.setValue(
+            self.timelapse_speed_slider.setValue(
                 int(timelapse.get("playback_frame_rate", DEFAULT_FRAME_RATE))
             )
             self._set_combo_data(
@@ -3944,6 +4326,7 @@ class MainWindow(QMainWindow):
         self._on_transparency_changed()
         self._on_background_removal_changed()
         self._sync_paint_mode_dependent_controls()
+        self._refresh_timelapse_speed_label()
         self._refresh_text_editor_layers()
 
     def _settings_document(self) -> dict[str, Any]:
@@ -3951,7 +4334,8 @@ class MainWindow(QMainWindow):
         current["image"] = {
             **current.get("image", {}),
             "scale_mode": self.scale_mode_combo.currentData(),
-            "crop_alignment": self.crop_alignment_combo.currentData(),
+            "crop_alignment": self._named_crop_alignment(),
+            "crop_focus": list(self._crop_focus) if self._crop_focus else None,
             "quality_preset": self.quality_combo.currentText().lower().replace(" ", "_"),
             "paint_mode": str(self.paint_mode_combo.currentData() or "balanced"),
             "logical_width": self.logical_width_spin.value(),
@@ -4018,7 +4402,7 @@ class MainWindow(QMainWindow):
             "enabled": self.timelapse_check.isChecked(),
             "interval_seconds": self.timelapse_interval_spin.value(),
             "capture_final_frame": self.timelapse_final_check.isChecked(),
-            "playback_frame_rate": self.timelapse_fps_spin.value(),
+            "playback_frame_rate": self.timelapse_speed_slider.value(),
             "export_format": str(self.timelapse_format_combo.currentData() or "avi"),
         }
         current["hotkeys"] = {
@@ -4161,36 +4545,33 @@ class MainWindow(QMainWindow):
             )
         else:
             self.canvas_geometry_label.setText("Canvas: not calibrated  •  Aspect: —")
-        self._refresh_max_quality_availability()
+        self._refresh_max_quality_hint()
         self._refresh_display_warning()
         self._update_start_availability()
 
-    def _refresh_max_quality_availability(self) -> None:
-        """Offer Max quality only while a measured sign gives it a meaning.
+    def _refresh_max_quality_hint(self) -> None:
+        """Say what grid Max quality will plan against right now.
 
-        Max is defined as "one logical cell per sign texel", and the texel
-        count comes from the profile's measured brush model.  Without one the
-        entry is greyed out rather than silently meaning something else; if it
-        was selected when its measurement went away - profile switched, canvas
-        re-framed to a new shape - the quality falls back to Very High instead
-        of pinning the plan to a stale sign.
+        Max means "one logical cell per sign texel" once a job has measured
+        the sign; before that it plans on the calibrated canvas's screen-pixel
+        grid, which brush size 1 paints without losing detail.  The tooltip
+        carries the distinction, so the entry never has to be greyed out and
+        the selection survives a measurement coming or going - the grid it
+        resolves to is re-derived wherever the model or canvas changes.
         """
 
         index = self.quality_combo.findText(MAX_QUALITY_PRESET)
         if index < 0:
             return
-        available = self._sign_resolution_cap() is not None
         item = self.quality_combo.model().item(index)
-        if item is not None:
-            item.setEnabled(available)
-            item.setToolTip(
-                "One logical cell per sign texture pixel"
-                if available
-                else "Run one paint job with automatic brush sizing to "
-                "measure this sign's texture first"
-            )
-        if not available and self.quality_combo.currentText() == MAX_QUALITY_PRESET:
-            self.quality_combo.setCurrentText("Very High")
+        if item is None:
+            return
+        item.setToolTip(
+            "One logical cell per sign texture pixel"
+            if self._sign_resolution_cap() is not None
+            else "One logical cell per screen pixel until a paint job with "
+            "automatic brush sizing measures this sign's texture"
+        )
 
     @Slot()
     def _new_profile(self) -> None:
@@ -4521,8 +4902,13 @@ class MainWindow(QMainWindow):
                 )
                 if rect is not None
             ]
+        # A paused job is the moment the outlines are most wanted: nothing is
+        # being clicked, and what the user is checking is whether the boxes
+        # still line up with Rust before letting the job carry on.  The
+        # overlay takes no input, and a recording skips paused frames, so
+        # nothing downstream sees it either.
         busy = (
-            self._painter_is_active()
+            (self._painter_is_active() and not self._painter_is_paused())
             or self._debug_running
             or self._countdown_callback_running
             or bool(self._countdown and self._countdown.isVisible())
@@ -5069,6 +5455,17 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- execution
 
+    def _painter_state_value(self) -> str | None:
+        """The painter's state as its plain string, or None when there is none."""
+
+        painter = self._painter
+        if painter is None:
+            return None
+        return getattr(getattr(painter, "state", None), "value", None)
+
+    def _painter_is_paused(self) -> bool:
+        return self._painter_state_value() == "paused"
+
     def _painter_is_active(self) -> bool:
         if self._painter is None:
             return False
@@ -5094,14 +5491,7 @@ class MainWindow(QMainWindow):
             or self._countdown_callback_running
             or self._debug_running
         )
-        paused = False
-        if self._painter is not None:
-            try:
-                from app.painter import PainterState
-
-                paused = self._painter.state == PainterState.PAUSED
-            except Exception:
-                paused = False
+        paused = self._painter_is_paused()
         profile_ready = bool(
             self._current_profile
             and self._current_profile.is_ready
@@ -5968,7 +6358,7 @@ class MainWindow(QMainWindow):
                 session.name,
                 frames,
                 self,
-                frame_rate=self.timelapse_fps_spin.value(),
+                frame_rate=self.timelapse_speed_slider.value(),
             )
         except Exception as exc:
             LOGGER.exception("Could not open the timelapse player")
@@ -6031,7 +6421,7 @@ class MainWindow(QMainWindow):
         worker = _TimelapseExportWorker(
             frames,
             destination,
-            self.timelapse_fps_spin.value(),
+            self.timelapse_speed_slider.value(),
             video_format.key,
         )
         worker.signals.progress.connect(self._on_export_progress)
@@ -6051,7 +6441,7 @@ class MainWindow(QMainWindow):
             len(frames),
             session.name,
             destination,
-            self.timelapse_fps_spin.value(),
+            self.timelapse_speed_slider.value(),
         )
         self._timelapse_export_pool.start(worker)
 
