@@ -182,6 +182,17 @@ QUALITY_LONG_EDGE: dict[str, int] = {
 # merely repeating itself wherever screen pixels outnumber texels.
 MAX_QUALITY_PRESET = "Max"
 
+# How long a change waits before the plan is recalculated for it.  A control
+# that moves once - a combo box, a checkbox - has said everything it is going
+# to say, so it only needs long enough to coalesce with whatever moves with
+# it.  Typing is different: every character is a change, and recalculating
+# between keystrokes throws work away and keeps the busy overlay on screen for
+# as long as the sentence takes to write.  So text waits for an actual pause
+# instead - long enough that ordinary typing never starts a plan, short enough
+# that stopping to look at the preview does not feel like waiting for it.
+PLAN_SETTLE_MS = 180
+TYPING_SETTLE_MS = 600
+
 # How many finished plans are kept so that going back to a combination of
 # settings already computed is instant.  A count alone is the wrong bound:
 # six thumbnail-sized plans cost nothing, while six plans of a sign painted at
@@ -738,8 +749,13 @@ class MainWindow(QMainWindow):
         self._thread_pool.setMaxThreadCount(1)
         self._process_timer = QTimer(self)
         self._process_timer.setSingleShot(True)
-        self._process_timer.setInterval(180)
+        self._process_timer.setInterval(PLAN_SETTLE_MS)
         self._process_timer.timeout.connect(self._start_processing)
+        # A control that moves once wants its plan promptly; a keyboard wants
+        # to be left alone until the sentence is finished.  The flag says a
+        # recalculation is owed but has not been handed to a worker yet, which
+        # is what keeps the statistics reading as pending rather than absent.
+        self._plan_pending = False
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(350)
@@ -2710,7 +2726,10 @@ class MainWindow(QMainWindow):
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
         self._record_text_history("text")
-        self._schedule_processing()
+        # The editor draws the new characters over the source immediately; the
+        # plan waits for the typing to stop, because a plan for half a word is
+        # thrown away by the next keystroke anyway.
+        self._schedule_processing(typing=True)
         self._schedule_settings_save()
 
     @Slot(int)
@@ -3211,6 +3230,7 @@ class MainWindow(QMainWindow):
         serial = self._load_serial
         self._process_serial += 1
         self._process_timer.stop()
+        self._plan_pending = False
         self._thread_pool.clear()
         # Every cached plan belongs to the image it was made from.
         self._plan_cache.clear()
@@ -3269,6 +3289,7 @@ class MainWindow(QMainWindow):
             return
         self.image_dimensions_label.setText("Could not load image")
         self.processing_label.setText(f"Could not load image: {message}")
+        self._plan_pending = False
         self._set_plan_processing(False)
         self._refresh_statistics()
         self._update_start_availability()
@@ -3570,7 +3591,17 @@ class MainWindow(QMainWindow):
             held -= self._plan_cache_cost(dropped)
 
     @Slot()
-    def _schedule_processing(self, *_args: Any) -> None:
+    def _schedule_processing(self, *_args: Any, typing: bool = False) -> None:
+        """Queue a recalculation, waiting out the settle delay it deserves.
+
+        Nothing about the recalculation is announced here.  Saying "working"
+        the instant a control moves means saying it again on the next
+        keystroke, and the announcement outlives every one of them: the busy
+        overlay goes up on the first character and only comes down once typing
+        stops.  The waiting is instead announced by whichever recalculation
+        actually survives the settle delay, in :meth:`_start_processing`.
+        """
+
         if self._original_image is None:
             return
         self._process_serial += 1
@@ -3581,6 +3612,7 @@ class MainWindow(QMainWindow):
             # so there is nothing to recompute and nothing to wait for.
             self._plan_cache.move_to_end(key)
             self._process_timer.stop()
+            self._plan_pending = False
             self._thread_pool.clear()
             self._set_plan_processing(False)
             self._on_processing_complete(replace(cached, serial=self._process_serial))
@@ -3590,9 +3622,8 @@ class MainWindow(QMainWindow):
         self._plan_metric_source = None
         self._plan_stroke_pixel_steps = 0
         self._plan_dot_count = 0
-        self._process_timer.start()
-        self.processing_label.setText("Updating paint simulation…")
-        self._set_plan_processing(True)
+        self._plan_pending = True
+        self._process_timer.start(TYPING_SETTLE_MS if typing else PLAN_SETTLE_MS)
         self._refresh_statistics()
         self._update_start_availability()
 
@@ -3609,6 +3640,7 @@ class MainWindow(QMainWindow):
 
         self._plan_processing = processing
         if processing:
+            self._plan_pending = False
             self.processing_spinner.start()
             self.plan_busy.set_top_inset(self.preview_tabs.tabBar().height())
             self.plan_busy.begin(title, self._plan_summary())
@@ -3704,6 +3736,13 @@ class MainWindow(QMainWindow):
         if self._original_image is None:
             return
         serial = self._process_serial
+        # The settle delay has passed, so this recalculation is the one that
+        # is really going to run and is the one worth announcing.  The overlay
+        # waits out a delay of its own on top, so short work still never
+        # flashes anything on screen.
+        self._plan_pending = False
+        self.processing_label.setText("Updating paint simulation…")
+        self._set_plan_processing(True)
         # Drop queued stale previews; an already running worker is allowed to
         # finish, but its serial prevents it from replacing newer settings.
         self._thread_pool.clear()
@@ -3824,7 +3863,9 @@ class MainWindow(QMainWindow):
         if plan is None:
             # While a recalculation is in flight the metrics read as pending
             # rather than absent, so the numbers do not just vanish.
-            placeholder = "…" if self._plan_processing else "—"
+            placeholder = (
+                "…" if self._plan_processing or self._plan_pending else "—"
+            )
             for widget in (
                 self.analysis_resolution,
                 self.analysis_colors,

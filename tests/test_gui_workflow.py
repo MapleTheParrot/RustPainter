@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 import app.gui.main_window as main_window_module
 from app.gui.main_window import (
     MainWindow,
+    PLAN_SETTLE_MS,
     _PendingPaint,
     _TextOverlayOptions,
 )
@@ -2177,13 +2178,48 @@ def test_plan_recalculation_shows_pending_feedback(
     assert not window.processing_spinner.is_spinning
     assert window.analysis_time.value_label.text() != "…"
 
-    # Changing a setting that invalidates the plan restarts the feedback.
+    # Changing a setting that invalidates the plan restarts the feedback.  The
+    # numbers read as pending at once; the spinner waits for the settle delay
+    # to hand the work to a worker, so a run of quick changes spins nothing.
     window._set_combo_data(window.paint_mode_combo, "fast")
-    assert window.processing_spinner.is_spinning
+    assert window._plan_pending
+    assert not window.processing_spinner.is_spinning
     assert window.analysis_time.value_label.text() == "…"
+    window._process_timer.stop()
+    window._start_processing()
+    assert window.processing_spinner.is_spinning
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
     assert not window.processing_spinner.is_spinning
     assert window.analysis_time.value_label.text() != "…"
+
+
+def test_typing_a_caption_waits_for_a_pause_before_replanning(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Every keystroke invalidates the plan, so none of them may announce one.
+
+    Recalculating between characters throws the work away on the next one and
+    leaves the busy overlay standing for as long as the sentence takes to
+    write, which is what made typing feel like the application was struggling.
+    """
+
+    source_path = tmp_path / "typed.png"
+    Image.new("RGB", (32, 16), (30, 30, 30)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    for index in range(1, len("HELLO") + 1):
+        window.text_edit.setText("HELLO"[:index])
+        assert window._plan_pending
+        # Nothing on screen claims to be working, and the settle delay is
+        # pushed back out to its full length by every further character.
+        assert not window.plan_busy.is_pending
+        assert not window.processing_spinner.is_spinning
+        assert window._process_timer.remainingTime() > PLAN_SETTLE_MS
+
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert not window._plan_pending
+    assert window._text_layers[0].text == "HELLO"
 
 
 def _drag_view(view, start: QPointF, end: QPointF) -> None:
@@ -2446,7 +2482,12 @@ def test_recalculating_covers_the_preview_it_is_recalculating(
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
     assert not window.plan_busy.is_pending
 
+    # The overlay belongs to work that is really running, so it goes up when
+    # the settle delay expires rather than the moment a control moves.
     window._set_combo_data(window.paint_mode_combo, "fast")
+    assert not window.plan_busy.is_pending
+    window._process_timer.stop()
+    window._start_processing()
     assert window.plan_busy.is_pending
     summary = window._plan_summary()
     assert "Balanced quality" in summary
