@@ -168,6 +168,18 @@ Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
 
+### Saving the Rust preview
+
+The button beside the **PREVIEW** heading writes the Rust preview to an image
+file. It is saved at one pixel per logical cell - the grid the plan is
+expressed in - so a screenshot of the finished sign scaled down to the same
+size lines up cell for cell and the difference between what was promised and
+what Rust produced is a straight subtraction. Formats that carry alpha (PNG,
+WebP) leave the unpainted cells empty instead of drawing the checkerboard the
+preview shows them over; JPEG and BMP get the checker, having nowhere else to
+put it. When the profile carries a measured color correction, the file shows
+the colors the sign is predicted to return, exactly as the preview does.
+
 ### Transparency and soft edges
 
 Painting has no alpha channel, so every pixel of the source has to become one

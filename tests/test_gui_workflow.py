@@ -2242,6 +2242,77 @@ def test_typing_a_caption_waits_for_a_pause_before_replanning(
     assert window._text_layers[0].text == "HELLO"
 
 
+def test_the_rust_preview_can_be_saved_as_an_image(
+    window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The promise has to leave the app to be held against the result.
+
+    It is written at one pixel per logical cell - the grid the plan is
+    expressed in - and unpainted cells stay empty rather than picking up the
+    checkerboard the preview draws them over, so a capture scaled to match can
+    simply be subtracted from it.
+    """
+
+    source_path = tmp_path / "exported.png"
+    image = Image.new("RGBA", (32, 16), (0, 0, 0, 0))
+    for x in range(16):
+        for y in range(16):
+            image.putpixel((x, y), (220, 40, 60, 255))
+    image.save(source_path)
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(32)
+    window.logical_height_spin.setValue(16)
+
+    assert not window.export_preview_button.isEnabled()
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
+    assert window.export_preview_button.isEnabled()
+
+    destination = tmp_path / "out" / "sign.png"
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getSaveFileName",
+        lambda *_a, **_k: (str(destination), ""),
+    )
+    window.export_preview_button.click()
+
+    assert destination.exists()
+    with Image.open(destination) as saved:
+        saved.load()
+        assert saved.size == window._processed.image.size
+        assert saved.mode == "RGBA"
+        # Painted where the artwork was, and nothing at all where it was not.
+        assert saved.getpixel((0, 0))[3] == 255
+        assert saved.getpixel((31, 0))[3] == 0
+    assert window._settings["ui"]["last_preview_export_directory"] == str(
+        destination.parent
+    )
+
+
+def test_saving_the_preview_to_a_flat_format_keeps_the_checker(
+    window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A format with no alpha has to put something under the bare cells."""
+
+    source_path = tmp_path / "flat.png"
+    Image.new("RGB", (32, 16), (60, 160, 90)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._processed is not None, timeout=5000)
+
+    destination = tmp_path / "sign.bmp"
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getSaveFileName",
+        lambda *_a, **_k: (str(destination), ""),
+    )
+    window.export_preview_button.click()
+
+    with Image.open(destination) as saved:
+        saved.load()
+        assert saved.mode == "RGB"
+        assert saved.size == window._processed.image.size
+
+
 def _drag_view(view, start: QPointF, end: QPointF) -> None:
     """Press, move and release on a view's viewport, in scene coordinates."""
 

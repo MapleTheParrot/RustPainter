@@ -1351,6 +1351,13 @@ class MainWindow(QMainWindow):
         heading.addWidget(title)
         heading.addStretch(1)
         heading.addWidget(self.preview_hint_label)
+        # What the painter promises to put on the sign, as a file: the only
+        # way to hold it next to a screenshot of what it actually put there.
+        self.export_preview_button = self._icon_button(
+            "drag-drop", "Save the Rust preview as an image file"
+        )
+        self.export_preview_button.setEnabled(False)
+        heading.addWidget(self.export_preview_button)
         layout.addLayout(heading)
 
         tabs = QTabWidget()
@@ -3721,6 +3728,98 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    # ------------------------------------------------- exporting the preview
+
+    def _preview_export_image(self, transparent: bool) -> Image.Image | None:
+        """The Rust preview as a file, which is not quite what is on screen.
+
+        On screen, unpainted cells are drawn over a checkerboard so they read
+        as bare sign rather than as black paint.  A file is going to be
+        measured against a capture instead of looked at, so where the format
+        can say "nothing here" it says it, and only where it cannot does the
+        checker stand in.
+        """
+
+        processed = self._processed
+        if processed is None:
+            return None
+        correction = self._color_correction_model()
+        if not transparent:
+            return _build_simulation_image(processed, correction)
+        mask = np.asarray(processed.paint_mask, dtype=np.bool_)
+        rgb = np.asarray(processed.image.convert("RGB"), dtype=np.uint8)
+        if correction is not None:
+            rgb = _predicted_sign_colors(rgb, mask, correction)
+        alpha = np.where(mask, 255, 0).astype(np.uint8)
+        return Image.fromarray(np.dstack((rgb, alpha)), mode="RGBA")
+
+    def _last_preview_directory(self) -> Path:
+        stored = self._settings.get("ui", {}).get("last_preview_export_directory")
+        if isinstance(stored, str) and stored:
+            candidate = Path(stored)
+            if candidate.is_dir():
+                return candidate
+        return self._image_path.parent if self._image_path else Path.home()
+
+    @Slot()
+    def _export_rust_preview(self) -> None:
+        """Write the Rust preview out at one pixel per logical cell.
+
+        That is the grid the plan is expressed in, so a capture of the finished
+        sign scaled down to the same size lines up cell for cell and the
+        difference between promise and result is a straight subtraction.
+        """
+
+        processed = self._processed
+        if processed is None:
+            QMessageBox.information(
+                self,
+                "Nothing to save",
+                "Load an image and let the paint plan finish first.",
+            )
+            return
+        width, height = processed.image.size
+        stem = self._image_path.stem if self._image_path else "sign"
+        suggested = self._last_preview_directory() / f"{stem}-rust-{width}x{height}.png"
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save the Rust preview",
+            str(suggested),
+            "PNG image (*.png);;WebP image (*.webp);;"
+            "JPEG image (*.jpg *.jpeg);;Bitmap image (*.bmp);;All files (*)",
+        )
+        if not chosen:
+            return
+        destination = Path(chosen)
+        if not destination.suffix:
+            destination = destination.with_suffix(".png")
+        transparent = destination.suffix.lower() in {
+            ".png",
+            ".webp",
+            ".tif",
+            ".tiff",
+        }
+        image = self._preview_export_image(transparent)
+        if image is None:
+            return
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            image.save(destination)
+        except (OSError, ValueError) as exc:
+            LOGGER.exception("Could not save the Rust preview")
+            QMessageBox.warning(self, "Could not save the preview", str(exc))
+            return
+        self._settings.setdefault("ui", {})["last_preview_export_directory"] = str(
+            destination.parent
+        )
+        self._schedule_settings_save()
+        LOGGER.info("Saved the Rust preview to %s (%dx%d)", destination, width, height)
+        self.statusBar().showMessage(
+            f"Saved the Rust preview to {destination}"
+            f"  •  {width} × {height}, one pixel per logical cell",
+            10000,
+        )
+
     def _text_overlay_options(self) -> tuple[_TextOverlayOptions, ...]:
         return tuple(self._text_layers)
 
@@ -3883,6 +3982,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_statistics(self, *_args: Any) -> None:
         plan = self._plan
+        # The preview can be saved exactly when there is one to save.
+        self.export_preview_button.setEnabled(self._processed is not None)
         if plan is None:
             # While a recalculation is in flight the metrics read as pending
             # rather than absent, so the numbers do not just vanish.
@@ -4097,6 +4198,7 @@ class MainWindow(QMainWindow):
         self.timelapse_interval_spin.valueChanged.connect(
             self._refresh_timelapse_speed_label
         )
+        self.export_preview_button.clicked.connect(self._export_rust_preview)
         self.open_timelapse_button.clicked.connect(self._open_timelapse_folder)
         self.open_session_button.clicked.connect(self._open_selected_session)
         self.delete_session_button.clicked.connect(self._delete_selected_sessions)
