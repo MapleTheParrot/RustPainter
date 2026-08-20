@@ -1596,6 +1596,7 @@ class Painter:
                 self._update_progress_state(
                     PainterState.RUNNING,
                     f"Verifying the painted sign (pass {pass_number})",
+                    phase="verify",
                 )
                 self._move(park, epoch)
                 self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
@@ -1639,6 +1640,7 @@ class Painter:
                 self._update_progress_state(
                     PainterState.RUNNING,
                     f"Touching up {wrong} cells (pass {pass_number})",
+                    phase="verify",
                 )
                 self._execute_plan(job, plan=touch_up_plan(mismatch, indices, palette))
                 pass_number += 1

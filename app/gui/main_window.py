@@ -3844,7 +3844,17 @@ class MainWindow(QMainWindow):
             f"{plan.stroke_count:,}"
         )
         seconds = self._estimate_seconds(plan)
-        self.analysis_time.value_label.setText(self._format_duration(seconds))  # type: ignore[attr-defined]
+        # Verification repaints however many cells the capture disputes, which
+        # cannot be known before the sign exists - so the estimate names the
+        # extra pass instead of quietly overrunning it.
+        verify_note = (
+            " + touch-up"
+            if int(self._settings.get("painting", {}).get("verify_passes", 1)) > 0
+            else ""
+        )
+        self.analysis_time.value_label.setText(  # type: ignore[attr-defined]
+            f"{self._format_duration(seconds)}{verify_note}"
+        )
 
     def _estimate_seconds(self, plan: PaintPlan) -> float:
         canvas = self._profile_rect("canvas")
@@ -6091,6 +6101,10 @@ class MainWindow(QMainWindow):
             f"Stroke {progress.completed_strokes:,} / {progress.total_strokes:,}"
         )
         self.progress_detail_label.setText(f"{detail}  •  {percent:.1f}%{remaining}")
+        if getattr(progress, "phase", "paint") == "verify":
+            # The touch-up pass restarts the bar for its own, smaller plan;
+            # titled anything less specific, it reads as the job starting over.
+            self.active_progress_title.setText("TOUCHING UP")
         if (
             getattr(progress, "phase", "paint") == "paint"
             and getattr(progress.state, "value", "") == "running"
