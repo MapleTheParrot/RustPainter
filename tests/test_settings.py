@@ -124,6 +124,7 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
         ({"image": {"background_mode": "purple"}}, "background_mode"),
         ({"image": {"background_color": "white"}}, "background_color"),
         ({"image": {"transparent_pixels": "discard"}}, "transparent_pixels"),
+        ({"image": {"alpha_fill": "yes"}}, "alpha_fill"),
         ({"image": {"remove_background": "yes"}}, "remove_background"),
         ({"image": {"background_removal_source": "guess"}}, "background_removal_source"),
         ({"image": {"background_removal_color": "white"}}, "background_removal_color"),

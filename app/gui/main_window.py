@@ -1044,9 +1044,19 @@ class MainWindow(QMainWindow):
         self.transparency_combo = NoWheelComboBox()
         self.transparency_combo.addItem("Leave unpainted", TransparencyMode.LEAVE_UNPAINTED.value)
         self.transparency_combo.addItem("Use background color", TransparencyMode.USE_BACKGROUND.value)
-        form.addRow("Background / alpha fill", self.background_combo)
+        self.alpha_fill_check = QCheckBox("Blend soft edges into the background")
+        self.alpha_fill_check.setToolTip(
+            "Painting has no transparency, so a half-transparent pixel has\n"
+            "to become one solid color or none at all.  On, it is mixed\n"
+            "into the background color, which suits artwork the sign really\n"
+            "will carry that background behind.  Off, only the mostly\n"
+            "opaque pixels are painted, in their own colors, so a cut-out\n"
+            "subject is not ringed with a halo of background it never had."
+        )
+        form.addRow("Background fill", self.background_combo)
         form.addRow("Custom", self.background_color_button)
         form.addRow("Transparent pixels", self.transparency_combo)
+        form.addRow("Alpha fill", self.alpha_fill_check)
         layout.addWidget(composition)
 
         quality = QGroupBox("Palette and strokes")
@@ -2280,6 +2290,7 @@ class MainWindow(QMainWindow):
         self.original_preview.cropDragFinished.connect(self._schedule_settings_save)
         self.background_combo.currentIndexChanged.connect(self._on_background_changed)
         self.background_color_button.colorChanged.connect(self._schedule_processing)
+        self.alpha_fill_check.toggled.connect(self._schedule_processing)
         self.remove_background_check.toggled.connect(self._on_background_removal_changed)
         self.removal_source_combo.currentIndexChanged.connect(
             self._on_background_removal_changed
@@ -3686,6 +3697,7 @@ class MainWindow(QMainWindow):
             transparency_mode=transparency,
             transparent_fill_color=transparent_fill,
             alpha_threshold=0,
+            alpha_fill=self.alpha_fill_check.isChecked(),
             remove_background=self.remove_background_check.isChecked(),
             background_removal_color=(
                 (removal_color.red(), removal_color.green(), removal_color.blue())
@@ -4092,6 +4104,7 @@ class MainWindow(QMainWindow):
             self.crop_alignment_combo,
             self.background_combo,
             self.transparency_combo,
+            self.alpha_fill_check,
             self.quality_combo,
             self.paint_mode_combo,
             self.logical_width_spin,
@@ -4199,6 +4212,7 @@ class MainWindow(QMainWindow):
                 self.transparency_combo,
                 image.get("transparent_pixels", "leave_unpainted"),
             )
+            self.alpha_fill_check.setChecked(bool(image.get("alpha_fill", False)))
             self.remove_background_check.setChecked(
                 bool(image.get("remove_background", False))
             )
@@ -4398,6 +4412,7 @@ class MainWindow(QMainWindow):
             "background_mode": self.background_combo.currentData(),
             "background_color": self.background_color_button.color().name().upper(),
             "transparent_pixels": self.transparency_combo.currentData(),
+            "alpha_fill": self.alpha_fill_check.isChecked(),
             "remove_background": self.remove_background_check.isChecked(),
             "background_removal_source": self.removal_source_combo.currentData(),
             "background_removal_color": self.removal_color_button.color()
@@ -5645,6 +5660,7 @@ class MainWindow(QMainWindow):
             self.background_combo,
             self.background_color_button,
             self.transparency_combo,
+            self.alpha_fill_check,
             self.remove_background_check,
             self.removal_source_combo,
             self.removal_color_button,

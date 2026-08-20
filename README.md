@@ -168,6 +168,22 @@ Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
 
+### Transparency and soft edges
+
+Painting has no alpha channel, so every pixel of the source has to become one
+solid color or none at all. **Settings → Artwork** decides both halves of that:
+**Transparent pixels** covers the fully transparent ones, and **Alpha fill**
+covers the ones in between - the anti-aliased rim of a logo, the feathered
+outline of a cut-out subject.
+
+Alpha fill is off by default. Off, a pixel is painted only once it is more
+opaque than not, and it is painted in its own color, so nothing appears on the
+sign that the artwork did not contain. On, partial alpha is mixed into the
+background color the way a compositor would, which is right when the sign
+really will carry that background behind the artwork - and wrong otherwise,
+because a feathered edge then paints a halo of half-background around the
+subject.
+
 ### Laying out text
 
 Every text layer lives on the Source tab, where it is dragged, resized by its

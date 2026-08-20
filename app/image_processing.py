@@ -26,6 +26,10 @@ ImageSource: TypeAlias = str | Path | Image.Image
 # background tolerance percentage into a concrete color distance.
 _MAX_RGB_DISTANCE = sqrt(3.0) * 255.0
 
+# Alpha above this counts as opaque when alpha fill is off, so a pixel that is
+# more there than not gets painted and the rest of the soft edge is dropped.
+OPAQUE_ALPHA_CUTOFF = 127
+
 # Where each Fill alignment anchors the kept region, as ``ImageOps.fit``
 # centering fractions.  Shared with the GUI so its canvas overlay and the
 # resampler can never disagree about which part of the source survives.
@@ -317,6 +321,7 @@ def scale_image(
     transparency_mode: TransparencyMode | str = TransparencyMode.LEAVE_UNPAINTED,
     transparent_fill_color: RGBColor | None = None,
     alpha_threshold: int = 0,
+    alpha_fill: bool = False,
 ) -> tuple[Image.Image, np.ndarray]:
     """Scale to a logical canvas and return opaque simulation plus paint mask.
 
@@ -325,6 +330,11 @@ def scale_image(
     ``transparency_mode``.  If they should use a background but neither color is
     supplied, white is used as a safe visible default.  ``focus`` overrides
     ``alignment`` with the exact centering a dragged crop was left at.
+
+    ``alpha_fill`` decides what happens to the pixels in between - the soft
+    edge of a cut-out subject, an anti-aliased logo.  On, they are mixed into
+    the background color the way a compositor would; off, only the mostly
+    opaque ones are painted, in their own colors.
     """
 
     _validate_size(target_size, "Target")
@@ -352,17 +362,27 @@ def scale_image(
     result_rgb[:] = background or (0, 0, 0)
     paint_mask = (~footprint) & (background is not None)
 
-    visible_source = footprint & (source_alpha > alpha_threshold)
+    # Painting has no alpha control, so every partly transparent pixel has to
+    # become one opaque color or nothing at all.  Mixing it into the
+    # background is right when the sign really will carry that background, and
+    # wrong otherwise: the soft edge of a cut-out subject then paints a ring of
+    # half-background the artwork never had, which is the halo people see
+    # around something they asked to be left unpainted.  So alpha fill is a
+    # choice, and with it off a pixel is painted only once it is mostly opaque
+    # and is painted in its own color.
+    cutoff = alpha_threshold if alpha_fill else max(alpha_threshold, OPAQUE_ALPHA_CUTOFF)
+    visible_source = footprint & (source_alpha > cutoff)
     hidden_source = footprint & ~visible_source
 
-    # Painting has no alpha control.  Resolve partial source alpha now against
-    # the selected background (or white when the underlying sign is unknown).
     if np.any(visible_source):
-        opacity = source_alpha[visible_source].astype(np.float32)[:, None] / 255.0
-        foreground = source_rgb[visible_source].astype(np.float32)
-        base = np.asarray(alpha_base, dtype=np.float32)[None, :]
-        blended = np.rint(foreground * opacity + base * (1.0 - opacity))
-        result_rgb[visible_source] = blended.astype(np.uint8)
+        if alpha_fill:
+            opacity = source_alpha[visible_source].astype(np.float32)[:, None] / 255.0
+            foreground = source_rgb[visible_source].astype(np.float32)
+            base = np.asarray(alpha_base, dtype=np.float32)[None, :]
+            blended = np.rint(foreground * opacity + base * (1.0 - opacity))
+            result_rgb[visible_source] = blended.astype(np.uint8)
+        else:
+            result_rgb[visible_source] = source_rgb[visible_source]
         paint_mask[visible_source] = True
 
     if resolved_transparency is TransparencyMode.USE_BACKGROUND:
@@ -676,6 +696,7 @@ def process_image(
         transparency_mode=options.transparency_mode,
         transparent_fill_color=options.transparent_fill_color,
         alpha_threshold=options.alpha_threshold,
+        alpha_fill=options.alpha_fill,
     )
     if options.remove_background:
         scaled, paint_mask = remove_background(
@@ -703,6 +724,7 @@ resize_image = scale_image
 __all__ = [
     "CROP_CENTERING",
     "ImageSource",
+    "OPAQUE_ALPHA_CUTOFF",
     "background_mask",
     "calculate_fill_size",
     "calculate_fit_size",

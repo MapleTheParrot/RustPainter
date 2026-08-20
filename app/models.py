@@ -196,6 +196,10 @@ class ImageProcessOptions:
     transparency_mode: TransparencyMode | str = TransparencyMode.LEAVE_UNPAINTED
     transparent_fill_color: RGBColor | None = None
     alpha_threshold: int = 0
+    # Whether partly transparent pixels are mixed into the background color.
+    # Off, only the mostly opaque ones are painted, and in their own colors -
+    # a soft edge is dropped rather than turned into a ring of background.
+    alpha_fill: bool = False
     remove_background: bool = False
     # ``None`` asks the processor to read the key color off the artwork edges.
     background_removal_color: RGBColor | None = None

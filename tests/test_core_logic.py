@@ -112,6 +112,43 @@ class TransparencyAndQuantizationTests(unittest.TestCase):
         self.assertTrue(mask.all())
         self.assertEqual(result.getpixel((1, 0)), (7, 8, 9, 255))
 
+    def test_a_soft_edge_is_dropped_rather_than_painted_as_background(self) -> None:
+        """Half-transparent pixels are what an unwanted halo is made of.
+
+        Blending them into the background paints a ring of near-background
+        around a cut-out subject, which is the opposite of what "leave
+        transparent pixels unpainted" was asked for.
+        """
+
+        source = Image.new("RGBA", (3, 1))
+        source.putdata([(200, 20, 30, 255), (200, 20, 30, 90), (10, 200, 30, 0)])
+        result, mask = scale_image(
+            source, (3, 1), "stretch", transparent_fill_color=(255, 255, 255)
+        )
+        np.testing.assert_array_equal(mask, [[True, False, False]])
+        # The opaque pixel keeps its own color rather than a blended one.
+        self.assertEqual(result.getpixel((0, 0)), (200, 20, 30, 255))
+        self.assertEqual(result.getpixel((1, 0))[3], 0)
+
+    def test_alpha_fill_blends_a_soft_edge_into_the_background(self) -> None:
+        source = Image.new("RGBA", (2, 1))
+        source.putdata([(200, 20, 30, 255), (0, 0, 0, 128)])
+        result, mask = scale_image(
+            source,
+            (2, 1),
+            "stretch",
+            alpha_fill=True,
+            transparent_fill_color=(255, 255, 255),
+        )
+        self.assertTrue(mask.all())
+        red, green, blue, alpha = result.getpixel((1, 0))
+        self.assertEqual(alpha, 255)
+        # 128/255 of black over white, so every channel lands mid-grey.
+        self.assertEqual((red, green, blue), (127, 127, 127))
+
+    def test_alpha_fill_is_off_by_default(self) -> None:
+        self.assertFalse(ImageProcessOptions(logical_width=8, logical_height=8).alpha_fill)
+
     def test_quantization_limits_painted_colors_and_preserves_mask(self) -> None:
         image = Image.new("RGBA", (5, 1))
         image.putdata(

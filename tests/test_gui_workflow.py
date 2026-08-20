@@ -1877,6 +1877,25 @@ def test_transparent_background_choice_is_visible_and_persisted(
     assert document["image"]["background_mode"] == "white"
 
 
+def test_alpha_fill_is_off_by_default_and_reaches_the_rust_preview(
+    window: MainWindow,
+) -> None:
+    """The Rust preview must not show a fill the settings say is off.
+
+    Painting has no transparency, so a soft edge either becomes solid
+    background or is left alone; the checkbox is what decides, and it starts
+    out leaving it alone.
+    """
+
+    assert not window.alpha_fill_check.isChecked()
+    assert window._processing_options().alpha_fill is False
+    assert window._settings_document()["image"]["alpha_fill"] is False
+
+    window.alpha_fill_check.setChecked(True)
+    assert window._processing_options().alpha_fill is True
+    assert window._settings_document()["image"]["alpha_fill"] is True
+
+
 def test_gui_persists_complete_brush_settings_and_future_keys(
     window: MainWindow,
 ) -> None:

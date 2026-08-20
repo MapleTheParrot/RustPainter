@@ -78,6 +78,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "background_mode": "unpainted",
         "background_color": "#FFFFFF",
         "transparent_pixels": "leave_unpainted",
+        # Whether a partly transparent pixel is mixed into the background
+        # color.  Off by default: painting has no alpha, and blending a soft
+        # edge into the backdrop rings a cut-out subject with a halo of
+        # background the artwork never had.
+        "alpha_fill": False,
         "remove_background": False,
         # "auto" reads the key color off the artwork edges; "custom" uses
         # background_removal_color as typed.
@@ -277,6 +282,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "transparent_pixels"
     ) not in {"leave_unpainted", "use_background"}:
         raise SettingsError("image.transparent_pixels is invalid")
+    if not isinstance(image.get("alpha_fill"), bool):
+        raise SettingsError("image.alpha_fill must be true or false")
     if not isinstance(image.get("remove_background"), bool):
         raise SettingsError("image.remove_background must be true or false")
     if not isinstance(image.get("background_removal_source"), str) or image.get(
