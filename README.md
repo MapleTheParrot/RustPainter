@@ -114,7 +114,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by clicking either preview, browsing, or dropping a file anywhere in the window
 - Fit, fill/crop, and stretch composition with a live paint simulation, with the Fill crop draggable directly on the source image so the sign keeps the part of the picture you meant
 - Adjustable painting resolution, palette size, dithering, transparency, and fit background
-- One-click background removal that leaves a plain backdrop unpainted, by detected or picked color, with an adjustable tolerance
+- One-click background removal that leaves the backdrop unpainted, by detected or picked color, with a smart matcher for gradients, vignettes and photographic backdrops that also clears the halo off a cut-out subject
 - Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a bracketed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint, marks itself read-only, and offers a way back to the Source tab if you try to edit there
 - Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Shift+click, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
 - Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
@@ -159,10 +159,35 @@ subject and the plan gets shorter by exactly those pixels.
 - **Tolerance** - how far a pixel may drift from that color and still be
   skipped. Raise it for photographs and JPEG artifacts; lower it when part of
   the subject starts disappearing.
-- **Touching the edges / Anywhere in the image** - edge matching only removes
-  background reachable from outside the artwork, so enclosed areas (the hole in
-  an O, a white eye) keep their paint. *Anywhere* also removes every matching
-  pocket inside the subject.
+- **Smart / Touching the edges / Anywhere in the image** - how the match is
+  made, described below.
+
+*Touching the edges* and *Anywhere in the image* both match one flat color.
+Edge matching only removes background reachable from outside the artwork, so
+enclosed areas (the hole in an O, a white eye) keep their paint; *Anywhere*
+also removes every matching pocket inside the subject.
+
+**Smart** is the default, and is for backdrops that are not one flat color -
+which is most of them. A studio sweep is a gradient, a photograph has a
+vignette, and a JPEG has ringing along every edge, so one key color matches the
+middle of the range and neither end. Smart works differently in three ways:
+
+- It reads **several** background colors off a band around the artwork instead
+  of one off a single-pixel ring, and measures each pixel against the nearest.
+- The tolerance decides only where the background *certainly* is. From those
+  seeds the region spreads outwards through anything merely plausible, and only
+  through pixels reachable from outside the artwork - so a gradient comes away
+  end to end without the tolerance ever having to be wide enough to reach the
+  subject, and enclosed pockets still keep their paint.
+- The last pixel or two before the background is a blend of the two and matches
+  neither, which is what leaves an outline around a cut-out subject. Those get a
+  much looser match, but only where they are genuinely nearer the backdrop than
+  the artwork behind them is - so a blend goes and the edge of a merely pale
+  subject stays.
+
+Because Smart grows past the tolerance rather than stopping at it, it reaches
+further than the same number would elsewhere. If it starts taking the subject,
+lower the tolerance rather than raising it.
 
 Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed

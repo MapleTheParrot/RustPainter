@@ -881,7 +881,13 @@ def test_background_removal_toggles_its_options_and_shrinks_the_plan(
     document = window._settings_document()
     assert document["image"]["remove_background"] is True
     assert document["image"]["background_removal_source"] == "custom"
-    assert document["image"]["background_removal_scope"] == "connected"
+    # The smart matcher is what removal reaches for unless told otherwise.
+    assert document["image"]["background_removal_scope"] == "subject"
+
+    window._set_combo_data(window.removal_scope_combo, "connected")
+    assert (
+        window._settings_document()["image"]["background_removal_scope"] == "connected"
+    )
 
 
 def test_delete_key_edits_text_while_a_layer_is_being_edited(

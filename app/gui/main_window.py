@@ -1724,14 +1724,24 @@ class MainWindow(QMainWindow):
         )
         self.removal_scope_combo = NoWheelComboBox()
         self.removal_scope_combo.addItem(
+            "Smart - find the subject", BackgroundRemovalScope.SUBJECT.value
+        )
+        self.removal_scope_combo.addItem(
             "Touching the edges", BackgroundRemovalScope.CONNECTED.value
         )
         self.removal_scope_combo.addItem(
             "Anywhere in the image", BackgroundRemovalScope.EVERYWHERE.value
         )
         self.removal_scope_combo.setToolTip(
-            "Edge matching keeps enclosed areas — the hole in an O, a white\n"
-            "eye — painted. Anywhere also skips every matching inner pocket."
+            "Smart reads several colors off a band around the artwork and\n"
+            "grows a strict match outwards through a looser one, so a\n"
+            "gradient, a vignette or a photographic backdrop comes away in\n"
+            "one piece and no halo is left around the subject.  It reaches\n"
+            "further than the tolerance alone says, so lower the tolerance\n"
+            "rather than raising it if the subject starts going too.\n\n"
+            "Touching the edges matches one flat color and keeps enclosed\n"
+            "areas - the hole in an O, a white eye - painted.  Anywhere\n"
+            "also skips every matching inner pocket."
         )
         for control in (self.removal_source_combo, self.removal_scope_combo):
             control.setSizeAdjustPolicy(
@@ -4351,7 +4361,7 @@ class MainWindow(QMainWindow):
             )
             self._set_combo_data(
                 self.removal_scope_combo,
-                image.get("background_removal_scope", "connected"),
+                image.get("background_removal_scope", "subject"),
             )
             text_overlay = image.get("text_overlay", {})
             layer_values = text_overlay.get("layers", [])

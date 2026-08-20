@@ -30,6 +30,35 @@ _MAX_RGB_DISTANCE = sqrt(3.0) * 255.0
 # more there than not gets painted and the rest of the soft edge is dropped.
 OPAQUE_ALPHA_CUTOFF = 127
 
+# How the smart scope differs from matching one flat color, in three numbers.
+#
+# A real backdrop is rarely one color: a studio sweep is a gradient, a photo
+# has a vignette, and a JPEG has ringing along every edge.  Averaging all of
+# that into a single key matches the middle of the range and neither end, so
+# several keys are read off instead and every pixel is measured against the
+# nearest of them.
+_SUBJECT_KEY_COLORS = 4
+
+# The keys are voted for from a band rather than the one-pixel ring, because a
+# single ring of a noisy backdrop is a small and unrepresentative sample.
+_SUBJECT_BORDER_DEPTH = 3
+
+# Seeds have to match a key strictly; what a seed then spreads into only has
+# to be plausible.  That is what carries a fill from one end of a gradient to
+# the other without the tolerance having to be wide enough to reach the
+# subject from the start - but it is also how a fill leaks, so the growth band
+# stays narrow enough that an ordinary subject sits outside it.  There is a
+# cliff rather than a slope here: widen it far enough to reach the subject and
+# the fill does not take a little more of the picture, it takes all of it.
+_SUBJECT_GROWTH = 1.5
+
+# The last pixel or two before the background is a blend of the two, so it
+# matches neither and gets painted as a halo around the subject.  Those pixels
+# are allowed a much looser match, precisely because being within two pixels
+# of removed background is itself most of the evidence.
+_FRINGE_GROWTH = 3.0
+_FRINGE_PASSES = 2
+
 # Where each Fill alignment anchors the kept region, as ``ImageOps.fit``
 # centering fractions.  Shared with the GUI so its canvas overlay and the
 # resampler can never disagree about which part of the source survives.
@@ -402,6 +431,8 @@ def scale_image(
 
 def _removal_scope(value: BackgroundRemovalScope | str) -> BackgroundRemovalScope:
     aliases = {
+        "subject": BackgroundRemovalScope.SUBJECT,
+        "smart": BackgroundRemovalScope.SUBJECT,
         "connected": BackgroundRemovalScope.CONNECTED,
         "edges": BackgroundRemovalScope.CONNECTED,
         "touching": BackgroundRemovalScope.CONNECTED,
@@ -424,12 +455,16 @@ def _resolved_mask(image: Image.Image, paint_mask: np.ndarray | None) -> np.ndar
     return mask
 
 
-def _painted_border(paint_mask: np.ndarray) -> np.ndarray:
-    """A one-pixel ring around the painted area's bounding box.
+def _painted_border(paint_mask: np.ndarray, depth: int = 1) -> np.ndarray:
+    """A ring ``depth`` pixels deep around the painted area's bounding box.
 
     Fit leaves unpainted bars around the artwork, so the canvas edge is not
     always where the background starts.  Working from the painted bounding box
     means one ring serves letterboxed, cropped, and stretched layouts alike.
+
+    A deeper band is a larger and steadier sample of a noisy backdrop, so it
+    is what the smart scope votes on; it is held to a quarter of the artwork
+    on each side so that it can never swallow what it is meant to ring.
     """
 
     border = np.zeros(paint_mask.shape, dtype=np.bool_)
@@ -439,28 +474,44 @@ def _painted_border(paint_mask: np.ndarray) -> np.ndarray:
         return border
     top, bottom = int(rows[0]), int(rows[-1])
     left, right = int(columns[0]), int(columns[-1])
-    border[top, left : right + 1] = True
-    border[bottom, left : right + 1] = True
-    border[top : bottom + 1, left] = True
-    border[top : bottom + 1, right] = True
+    depth = max(
+        1,
+        min(int(depth), (bottom - top) // 4 + 1, (right - left) // 4 + 1),
+    )
+    border[top : top + depth, left : right + 1] = True
+    border[bottom - depth + 1 : bottom + 1, left : right + 1] = True
+    border[top : bottom + 1, left : left + depth] = True
+    border[top : bottom + 1, right - depth + 1 : right + 1] = True
     return border & paint_mask
 
 
-def detect_background_color(
-    image: Image.Image, paint_mask: np.ndarray | None = None
-) -> RGBColor | None:
+def detect_background_colors(
+    image: Image.Image,
+    paint_mask: np.ndarray | None = None,
+    *,
+    limit: int = 1,
+    depth: int = 1,
+    share: float = 0.05,
+) -> list[RGBColor]:
     """Guess the background from the colors ringing the painted artwork.
 
     Edge pixels are bucketed coarsely before voting so a noisy or JPEG-blurred
-    backdrop still lands in one bucket; the winning bucket then reports the
+    backdrop still lands in one bucket; each winning bucket then reports the
     average of its real colors rather than a quantized stand-in.
+
+    ``limit`` is how many colors may be returned, most popular first.  One is
+    right for a flat backdrop, but a gradient or a vignette is genuinely
+    several colors and averaging them produces one that matches the middle of
+    the range and neither end.  A runner-up has to hold ``share`` of the
+    sampled band to count, so a subject clipping the edge does not become a
+    background color in its own right.
     """
 
     mask = _resolved_mask(image, paint_mask)
-    border = _painted_border(mask)
+    border = _painted_border(mask, depth)
     samples = np.asarray(image.convert("RGB"), dtype=np.uint8)[border]
     if samples.size == 0:
-        return None
+        return []
     buckets = samples >> 4
     packed = (
         (buckets[:, 0].astype(np.int32) << 8)
@@ -468,10 +519,25 @@ def detect_background_color(
         | buckets[:, 2].astype(np.int32)
     )
     values, counts = np.unique(packed, return_counts=True)
-    winner = values[int(np.argmax(counts))]
-    average = samples[packed == winner].mean(axis=0)
-    red, green, blue = (int(round(float(channel))) for channel in average)
-    return (red, green, blue)
+    ranked = np.argsort(counts)[::-1][: max(1, int(limit))]
+    floor = max(1, int(float(share) * samples.shape[0]))
+    colors: list[RGBColor] = []
+    for index in ranked:
+        if colors and int(counts[index]) < floor:
+            break
+        average = samples[packed == values[index]].mean(axis=0)
+        red, green, blue = (int(round(float(channel))) for channel in average)
+        colors.append((red, green, blue))
+    return colors
+
+
+def detect_background_color(
+    image: Image.Image, paint_mask: np.ndarray | None = None
+) -> RGBColor | None:
+    """The single most popular color ringing the painted artwork."""
+
+    colors = detect_background_colors(image, paint_mask)
+    return colors[0] if colors else None
 
 
 def _fill_runs(similar: np.ndarray, seeded: np.ndarray) -> np.ndarray:
@@ -521,19 +587,103 @@ def _connected_region(similar: np.ndarray, seeds: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(filled)
 
 
+def _grown(mask: np.ndarray) -> np.ndarray:
+    """The mask plus every pixel sharing an edge with it."""
+
+    grown = mask.copy()
+    grown[1:, :] |= mask[:-1, :]
+    grown[:-1, :] |= mask[1:, :]
+    grown[:, 1:] |= mask[:, :-1]
+    grown[:, :-1] |= mask[:, 1:]
+    return grown
+
+
+def _neighbour_min(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """The smallest value among each pixel's four neighbours, ``valid`` only.
+
+    A pixel with no valid neighbour at all reports infinity, which is the
+    honest answer and happens to be the one that lets an isolated speck go.
+    """
+
+    filled = np.where(valid, values, np.inf).astype(np.float32)
+    best = np.full(values.shape, np.inf, dtype=np.float32)
+    best[1:, :] = np.minimum(best[1:, :], filled[:-1, :])
+    best[:-1, :] = np.minimum(best[:-1, :], filled[1:, :])
+    best[:, 1:] = np.minimum(best[:, 1:], filled[:, :-1])
+    best[:, :-1] = np.minimum(best[:, :-1], filled[:, 1:])
+    return best
+
+
+def _key_distance(rgb: np.ndarray, keys: list[RGBColor]) -> np.ndarray:
+    """How far every pixel is from the nearest of the background colors."""
+
+    nearest: np.ndarray | None = None
+    for key in keys:
+        difference = (rgb - np.asarray(key, dtype=np.int16)).astype(np.float32)
+        distance = np.sqrt(np.einsum("ijk,ijk->ij", difference, difference))
+        nearest = distance if nearest is None else np.minimum(nearest, distance)
+    assert nearest is not None  # keys is never empty here
+    return nearest
+
+
+def _subject_background(
+    mask: np.ndarray, distance: np.ndarray, limit: float
+) -> np.ndarray:
+    """Separate backdrop from subject by growing a strict match into a loose one.
+
+    One tolerance has to be two different things at once: tight enough not to
+    reach the subject, and wide enough to cover a backdrop that is a gradient,
+    a vignette, or a field of JPEG ringing.  It cannot be both, which is why a
+    flat match either leaves a mottled backdrop half painted or eats into the
+    artwork.
+
+    So the tolerance is only used to decide where the background certainly is.
+    From those seeds the region spreads through anything merely plausible, and
+    only through pixels it can actually reach from outside the artwork - which
+    is what keeps an enclosed pocket of the same color, the hole in an O or a
+    white eye, painted.  A last two pixels of much looser growth follow the
+    boundary itself, where the halo lives: a pixel that is a blend of subject
+    and backdrop matches neither, so it is judged against what it is attached
+    to instead of against the tolerance.  A blend sits partway along a ramp
+    into the background, so it is closer to the background than the artwork
+    behind it is; the outer pixels of a genuinely pale subject are no closer
+    than the rest of that subject, and stay.
+    """
+
+    strong = mask & (distance <= limit)
+    weak = mask & (distance <= min(limit * _SUBJECT_GROWTH, _MAX_RGB_DISTANCE))
+    seeds = strong & _painted_border(mask, _SUBJECT_BORDER_DEPTH)
+    removed = _connected_region(weak, seeds)
+    if not removed.any():
+        return removed
+    fringe = (
+        mask
+        & ~removed
+        & (distance <= min(limit * _FRINGE_GROWTH, _MAX_RGB_DISTANCE))
+    )
+    for _ in range(_FRINGE_PASSES):
+        inward = _neighbour_min(distance, mask & ~removed)
+        touching = fringe & ~removed & _grown(removed) & (distance < inward)
+        if not touching.any():
+            break
+        removed = removed | touching
+    return removed
+
+
 def background_mask(
     image: Image.Image,
     paint_mask: np.ndarray | None = None,
     *,
     color: RGBColor | None = None,
     tolerance: float = 12.0,
-    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.CONNECTED,
+    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.SUBJECT,
 ) -> np.ndarray:
     """Return the painted pixels that count as background for ``color``.
 
     ``tolerance`` is a percentage of the longest possible RGB distance, so 0
     matches a single exact color and 100 matches everything.  ``color=None``
-    reads the key color off the artwork edges.
+    reads the key color off the artwork edges - several of them under the
+    smart scope, which measures each pixel against whichever is nearest.
     """
 
     _validate_color(color, "Background removal color")
@@ -541,16 +691,30 @@ def background_mask(
         raise ValueError("Background removal tolerance must be between 0 and 100")
     resolved_scope = _removal_scope(scope)
     mask = _resolved_mask(image, paint_mask)
+    empty = np.zeros(mask.shape, dtype=np.bool_)
     if not mask.any():
-        return np.zeros(mask.shape, dtype=np.bool_)
-    key = color if color is not None else detect_background_color(image, mask)
-    if key is None:
-        return np.zeros(mask.shape, dtype=np.bool_)
+        return empty
+    smart = resolved_scope is BackgroundRemovalScope.SUBJECT
+    if color is not None:
+        keys = [color]
+    elif smart:
+        keys = detect_background_colors(
+            image,
+            mask,
+            limit=_SUBJECT_KEY_COLORS,
+            depth=_SUBJECT_BORDER_DEPTH,
+        )
+    else:
+        detected = detect_background_color(image, mask)
+        keys = [] if detected is None else [detected]
+    if not keys:
+        return empty
 
     rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
-    difference = (rgb - np.asarray(key, dtype=np.int16)).astype(np.float32)
-    distance = np.sqrt(np.einsum("ijk,ijk->ij", difference, difference))
+    distance = _key_distance(rgb, keys)
     limit = float(tolerance) / 100.0 * _MAX_RGB_DISTANCE
+    if smart:
+        return _subject_background(mask, distance, limit)
     similar = mask & (distance <= limit)
     if resolved_scope is BackgroundRemovalScope.EVERYWHERE:
         return similar
@@ -563,7 +727,7 @@ def remove_background(
     *,
     color: RGBColor | None = None,
     tolerance: float = 12.0,
-    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.CONNECTED,
+    scope: BackgroundRemovalScope | str = BackgroundRemovalScope.SUBJECT,
 ) -> tuple[Image.Image, np.ndarray]:
     """Drop background pixels from the paint mask so Rust never paints them."""
 
@@ -731,6 +895,7 @@ __all__ = [
     "calculate_scaled_size",
     "crop_centering",
     "detect_background_color",
+    "detect_background_colors",
     "fill_crop_box",
     "fill_size",
     "fit_size",

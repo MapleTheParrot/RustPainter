@@ -89,7 +89,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "background_removal_source": "auto",
         "background_removal_color": "#FFFFFF",
         "background_removal_tolerance": 12,
-        "background_removal_scope": "connected",
+        # "subject" is the smart matcher: several key colors read off a band
+        # around the artwork, grown from a strict match through a looser one.
+        "background_removal_scope": "subject",
         "text_overlay": {
             "layers": [
                 {
@@ -307,9 +309,9 @@ def _validate(settings: Mapping[str, Any]) -> None:
         )
     if not isinstance(image.get("background_removal_scope"), str) or image.get(
         "background_removal_scope"
-    ) not in {"connected", "everywhere"}:
+    ) not in {"subject", "connected", "everywhere"}:
         raise SettingsError(
-            "image.background_removal_scope must be connected or everywhere"
+            "image.background_removal_scope must be subject, connected, or everywhere"
         )
     text_overlay = image.get("text_overlay")
     if not isinstance(text_overlay, Mapping):

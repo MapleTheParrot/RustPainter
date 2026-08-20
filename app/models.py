@@ -56,6 +56,10 @@ class TransparencyMode(str, Enum):
 class BackgroundRemovalScope(str, Enum):
     """How far a background match is allowed to reach into the image."""
 
+    # Reads several background colors off a band around the artwork and grows
+    # a strict match outwards through a looser one, so a gradient, a vignette
+    # or a noisy photographic backdrop comes away in one piece.
+    SUBJECT = "subject"
     CONNECTED = "connected"
     EVERYWHERE = "everywhere"
 
@@ -205,7 +209,7 @@ class ImageProcessOptions:
     background_removal_color: RGBColor | None = None
     background_removal_tolerance: float = 12.0
     background_removal_scope: BackgroundRemovalScope | str = (
-        BackgroundRemovalScope.CONNECTED
+        BackgroundRemovalScope.SUBJECT
     )
 
     def __post_init__(self) -> None:

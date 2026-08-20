@@ -14,6 +14,7 @@ from app.color_mapping import (
 from app.coordinates import logical_pixel_center, screen_to_logical_pixel
 from app.image_processing import (
     background_mask,
+    detect_background_colors,
     calculate_fill_size,
     calculate_fit_size,
     detect_background_color,
@@ -22,7 +23,7 @@ from app.image_processing import (
     remove_background,
     scale_image,
 )
-from app.models import ImageProcessOptions, ScreenRect
+from app.models import BackgroundRemovalScope, ImageProcessOptions, ScreenRect
 from app.paint_plan import generate_paint_plan, group_horizontal_runs
 
 
@@ -365,7 +366,7 @@ class BackgroundRemovalTests(unittest.TestCase):
         self.assertEqual(detect_background_color(self.image), (255, 255, 255))
 
     def test_connected_removal_keeps_an_enclosed_pocket_painted(self) -> None:
-        removed = background_mask(self.image, tolerance=5)
+        removed = background_mask(self.image, tolerance=5, scope="connected")
         self.assertFalse(bool(removed[16, 16]))
         self.assertFalse(bool(removed[16, 8]))
         self.assertTrue(bool(removed[0, 0]))
@@ -424,6 +425,104 @@ class BackgroundRemovalTests(unittest.TestCase):
         _, remaining = remove_background(scaled, mask, tolerance=6)
         self.assertLess(int(remaining.sum()), int(mask.sum()))
         self.assertGreater(int(remaining.sum()), 0)
+
+
+class SmartBackgroundRemovalTests(unittest.TestCase):
+    """Backdrops that are not one flat color, which is most of them."""
+
+    @staticmethod
+    def _gradient(subject: tuple[int, int, int] = (30, 90, 200)) -> Image.Image:
+        """A studio sweep: the backdrop ramps from one end to the other."""
+
+        height, width = 64, 96
+        pixels = np.full((height, width, 4), 255, dtype=np.uint8)
+        ramp = np.linspace(205, 255, width).astype(np.uint8)
+        for channel in range(3):
+            pixels[:, :, channel] = ramp[None, :]
+        pixels[20:44, 30:66, :3] = subject
+        return Image.fromarray(pixels, mode="RGBA")
+
+    def test_several_key_colors_are_read_off_a_gradient(self) -> None:
+        image = self._gradient()
+        colors = detect_background_colors(image, limit=4, depth=3)
+        self.assertGreater(len(colors), 1)
+        # One average of the whole ramp would match its middle and neither
+        # end; the keys spread across it instead.
+        greys = sorted(color[0] for color in colors)
+        self.assertGreater(greys[-1] - greys[0], 20)
+
+    def test_a_gradient_backdrop_comes_away_whole(self) -> None:
+        image = self._gradient()
+        _, mask = scale_image(image, image.size, "stretch")
+        backdrop = int(mask.sum()) - 24 * 36
+
+        flat = background_mask(image, tolerance=12, scope="connected")
+        smart = background_mask(image, tolerance=12, scope="subject")
+
+        # One flat key cannot span the ramp, so it leaves part of it painted.
+        self.assertLess(int(flat.sum()), backdrop)
+        self.assertEqual(int(smart.sum()), backdrop)
+
+    def test_a_pale_subject_is_not_shaved_as_if_it_were_a_halo(self) -> None:
+        """A pale subject is close to a white backdrop without blending into it.
+
+        The halo pass is deliberately loose, so what stops it eating two
+        pixels off every pale subject is not the tolerance: it is that those
+        pixels are no nearer the backdrop than the subject behind them, which
+        a genuine blend always is.
+        """
+
+        height, width = 64, 96
+        pixels = np.full((height, width, 4), 255, dtype=np.uint8)
+        pixels[20:44, 30:66, :3] = (200, 200, 200)
+        image = Image.fromarray(pixels, mode="RGBA")
+
+        removed = background_mask(image, tolerance=12, scope="subject")
+        self.assertEqual(int(removed.sum()), height * width - 24 * 36)
+
+    def test_a_soft_edge_does_not_survive_as_a_halo(self) -> None:
+        """A blend of subject and backdrop matches neither, and rings the subject."""
+
+        height, width = 64, 64
+        rows, columns = np.mgrid[0:height, 0:width]
+        radius = np.sqrt((rows - 32.0) ** 2 + (columns - 32.0) ** 2)
+        coverage = np.clip((20.0 - radius) / 3.0, 0.0, 1.0)
+        pixels = np.full((height, width, 4), 255, dtype=np.uint8)
+        for channel, value in enumerate((20, 40, 60)):
+            pixels[:, :, channel] = (
+                value * coverage + 255 * (1.0 - coverage)
+            ).astype(np.uint8)
+        image = Image.fromarray(pixels, mode="RGBA")
+
+        flat = background_mask(image, tolerance=6, scope="connected")
+        smart = background_mask(image, tolerance=6, scope="subject")
+
+        # The ring of half-blended pixels the flat match leaves behind is
+        # exactly what shows up on a sign as an outline around the subject.
+        halo = ~flat & smart
+        self.assertGreater(int(halo.sum()), 0)
+        # It goes without the solid middle of the disc going with it.
+        self.assertFalse(bool(smart[32, 32]))
+        self.assertTrue(bool(smart[0, 0]))
+
+    def test_the_smart_scope_still_keeps_enclosed_pockets_painted(self) -> None:
+        size = 48
+        rows, columns = np.mgrid[0:size, 0:size]
+        radius = (rows - 24) ** 2 + (columns - 24) ** 2
+        pixels = np.full((size, size, 4), 255, dtype=np.uint8)
+        pixels[radius < 225] = (200, 30, 40, 255)
+        pixels[radius < 25] = (255, 255, 255, 255)
+        image = Image.fromarray(pixels, mode="RGBA")
+
+        removed = background_mask(image, tolerance=5, scope="subject")
+        self.assertFalse(bool(removed[24, 24]))
+        self.assertTrue(bool(removed[0, 0]))
+
+    def test_the_smart_scope_is_what_removal_reaches_for_by_default(self) -> None:
+        options = ImageProcessOptions(logical_width=8, logical_height=8)
+        self.assertEqual(
+            options.background_removal_scope, BackgroundRemovalScope.SUBJECT
+        )
 
 
 if __name__ == "__main__":
