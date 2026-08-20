@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QShortcut,
 )
@@ -2782,7 +2783,7 @@ def test_timelapse_page_lists_recordings_and_deletes_a_selected_one(
     monkeypatch.setattr(
         QMessageBox, "question", lambda *_a, **_k: QMessageBox.StandardButton.Yes
     )
-    window._delete_selected_session()
+    window._delete_selected_sessions()
 
     assert not (root / "20260818-090000").exists()
     assert (root / "20260818-100000").exists()
@@ -2877,14 +2878,23 @@ def _recorded_session(window: MainWindow, name: str, frames: int) -> Path:
     return directory
 
 
-def _select_session(window: MainWindow, directory: Path) -> None:
-    window._refresh_timelapse_sessions()
+def _session_row(window: MainWindow, directory: Path) -> int:
     for row in range(window.timelapse_sessions.count()):
         item = window.timelapse_sessions.item(row)
         if item.data(Qt.ItemDataRole.UserRole) == str(directory):
-            window.timelapse_sessions.setCurrentItem(item)
-            return
+            return row
     raise AssertionError(f"{directory} was not listed")
+
+
+def _select_session(window: MainWindow, *directories: Path) -> None:
+    """Pick exactly these recordings, the way clicking them would."""
+
+    window._refresh_timelapse_sessions()
+    window.timelapse_sessions.clearSelection()
+    for directory in directories:
+        item = window.timelapse_sessions.item(_session_row(window, directory))
+        window.timelapse_sessions.setCurrentItem(item)
+        item.setSelected(True)
 
 
 def test_watching_and_saving_need_a_recording_with_frames(window: MainWindow) -> None:
@@ -2902,6 +2912,91 @@ def test_watching_and_saving_need_a_recording_with_frames(window: MainWindow) ->
     _select_session(window, recorded)
     assert window.play_session_button.isEnabled()
     assert window.export_session_button.isEnabled()
+
+
+def test_a_run_of_recordings_is_selected_and_deleted_together(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing out old recordings is a batch job, so it asks once.
+
+    Shift-clicking down a list is how a run of them gets picked everywhere
+    else, and Delete is the key that removes what is picked.
+    """
+
+    sessions = [
+        _recorded_session(window, f"2026010{index}-000000", index)
+        for index in range(1, 5)
+    ]
+    window._refresh_timelapse_sessions()
+    # Newest first, so the run from the top down covers the three newest.
+    window.timelapse_sessions.setCurrentRow(0)
+    window.timelapse_sessions.item(2).setSelected(True)
+    window.timelapse_sessions.item(1).setSelected(True)
+
+    assert len(window._selected_session_paths()) == 3
+    # Three recordings cannot be watched or encoded at once, but they can
+    # certainly be deleted at once.
+    assert not window.play_session_button.isEnabled()
+    assert not window.export_session_button.isEnabled()
+    assert not window.open_session_button.isEnabled()
+    assert window.delete_session_button.isEnabled()
+    assert "3 recordings selected" in window.timelapse_selection_label.text()
+    assert window._selected_session_path() is None
+
+    asked: list[str] = []
+
+    def _confirm(_parent, _title, text, *_args, **_kwargs):
+        asked.append(text)
+        return main_window_module.QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(main_window_module.QMessageBox, "question", _confirm)
+    window._delete_selected_sessions()
+
+    assert len(asked) == 1
+    assert "3 recordings" in asked[0]
+    assert [session.exists() for session in sessions] == [True, False, False, False]
+    assert window.timelapse_sessions.count() == 1
+    assert window.timelapse_selection_label.text() == ""
+
+
+def test_the_delete_key_removes_the_selected_recordings(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _recorded_session(window, "20260101-000000", 2)
+    _select_session(window, session)
+
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *_a, **_k: main_window_module.QMessageBox.StandardButton.Yes,
+    )
+    assert window.delete_session_shortcut.key() == QKeySequence.StandardKey.Delete
+    window.delete_session_shortcut.activated.emit()
+
+    assert not session.exists()
+
+
+def test_a_recording_still_being_written_survives_a_batch_delete(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live session is dropped from the batch, not allowed to fail it."""
+
+    from types import SimpleNamespace
+
+    finished = _recorded_session(window, "20260101-000000", 2)
+    live = _recorded_session(window, "20260101-000100", 1)
+    window._timelapse_recorder = SimpleNamespace(directory=live)
+    _select_session(window, live, finished)
+
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *_a, **_k: main_window_module.QMessageBox.StandardButton.Yes,
+    )
+    window._delete_selected_sessions()
+
+    assert live.exists()
+    assert not finished.exists()
 
 
 def test_the_player_steps_scrubs_and_stops_at_the_last_frame(

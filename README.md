@@ -384,7 +384,16 @@ shows what the current job is recording. Select one and:
 
 The buttons at the right of that row open the timelapse folder, open the
 selected recording's folder, look for recordings again, and delete the
-selected recording; each names itself on hover.
+selected recordings; each names itself on hover.
+
+Recordings are selected the way files are anywhere else: click one, shift-click
+another for the whole run between them, ctrl-click to add or drop one, and
+Ctrl+A for all of them. Watching, saving, and opening a folder work on one
+recording at a time and stay disabled while several are picked; deleting does
+not, so a run of old recordings is cleared out with one confirmation and one
+press of Delete. The line under the list totals up what a multiple selection
+holds before it goes. A recording the current paint job is still writing to is
+left out of the batch rather than failing it.
 
 AVI (Motion JPEG) and animated GIF are written by RustPainter itself and need
 nothing installed. MP4 is offered as well when `ffmpeg` is on `PATH` (or named

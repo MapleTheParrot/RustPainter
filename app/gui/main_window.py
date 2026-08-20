@@ -45,6 +45,7 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -1206,11 +1207,21 @@ class MainWindow(QMainWindow):
         self.timelapse_sessions = QListWidget()
         self.timelapse_sessions.setAlternatingRowColors(True)
         self.timelapse_sessions.setMinimumHeight(180)
+        # Housekeeping is the common reason to come here, and housekeeping is
+        # done in batches: shift-click takes a run of old recordings,
+        # ctrl-click picks them out one by one, and Delete clears the lot.
+        self.timelapse_sessions.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.timelapse_sessions.setToolTip(
             "Every job keeps its own folder of numbered PNG frames.  Saving a "
-            "video leaves that folder untouched."
+            "video leaves that folder untouched.\n"
+            "Shift-click for a run, ctrl-click to pick, Delete to remove them."
         )
         sessions_layout.addWidget(self.timelapse_sessions)
+        self.timelapse_selection_label = QLabel("")
+        self.timelapse_selection_label.setObjectName("muted")
+        sessions_layout.addWidget(self.timelapse_selection_label)
 
         playback_row = QHBoxLayout()
         playback_row.setSpacing(8)
@@ -4088,16 +4099,26 @@ class MainWindow(QMainWindow):
         )
         self.open_timelapse_button.clicked.connect(self._open_timelapse_folder)
         self.open_session_button.clicked.connect(self._open_selected_session)
-        self.delete_session_button.clicked.connect(self._delete_selected_session)
+        self.delete_session_button.clicked.connect(self._delete_selected_sessions)
         self.refresh_sessions_button.clicked.connect(self._refresh_timelapse_sessions)
         self.play_session_button.clicked.connect(self._play_selected_session)
         self.export_session_button.clicked.connect(self._export_selected_session)
-        self.timelapse_sessions.currentRowChanged.connect(
-            lambda _row: self._sync_session_buttons()
+        self.timelapse_sessions.itemSelectionChanged.connect(
+            self._sync_session_buttons
         )
         self.timelapse_sessions.itemDoubleClicked.connect(
             lambda _item: self._play_selected_session()
         )
+        # Delete is what the key is for everywhere else a list of files is
+        # shown, and it is scoped to the list so it cannot fire from elsewhere
+        # on the page.
+        self.delete_session_shortcut = QShortcut(
+            QKeySequence.StandardKey.Delete, self.timelapse_sessions
+        )
+        self.delete_session_shortcut.setContext(
+            Qt.ShortcutContext.WidgetShortcut
+        )
+        self.delete_session_shortcut.activated.connect(self._delete_selected_sessions)
 
         settings_controls = (
             self.scale_mode_combo,
@@ -6478,7 +6499,7 @@ class MainWindow(QMainWindow):
     def _refresh_timelapse_sessions(self) -> None:
         """List every recorded session, newest first, with its frame count."""
 
-        selected = self._selected_session_path()
+        selected = {path.name for path in self._selected_session_paths()}
         self.timelapse_sessions.clear()
         root = self._timelapse_root()
         try:
@@ -6498,31 +6519,95 @@ class MainWindow(QMainWindow):
             )
             item.setData(Qt.ItemDataRole.UserRole, str(session))
             self.timelapse_sessions.addItem(item)
-            if selected is not None and session == selected:
-                self.timelapse_sessions.setCurrentItem(item)
+            if session.name in selected:
+                # setCurrentItem would clear the rest of the selection, so the
+                # first survivor sets the current row and the others only join
+                # the selection.
+                if self.timelapse_sessions.currentItem() is None:
+                    self.timelapse_sessions.setCurrentItem(item)
+                item.setSelected(True)
         if not sessions:
             placeholder = QListWidgetItem("No recordings yet")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             self.timelapse_sessions.addItem(placeholder)
         self._sync_session_buttons()
 
+    def _selected_session_paths(self) -> list[Path]:
+        """Every picked recording, in the order the list shows them."""
+
+        paths = []
+        for item in self.timelapse_sessions.selectedItems():
+            value = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(value, str):
+                paths.append(Path(value))
+        return paths
+
     def _selected_session_path(self) -> Path | None:
-        item = self.timelapse_sessions.currentItem()
-        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
-        return Path(value) if isinstance(value, str) else None
+        """The picked recording, when exactly one is picked.
+
+        The actions that show a recording work on one at a time, and a
+        multiple selection is not a vague version of a single one: it is a
+        different request, so those actions decline it rather than guessing
+        which member of it was meant.
+        """
+
+        paths = self._selected_session_paths()
+        return paths[0] if len(paths) == 1 else None
 
     def _sync_session_buttons(self) -> None:
-        session = self._selected_session_path()
-        has_selection = session is not None
+        """Offer exactly the actions that make sense for what is picked.
+
+        Several recordings cannot be watched or encoded at once, but they can
+        certainly be deleted at once, so the buttons part company here rather
+        than all following the same "something is selected" flag.
+        """
+
+        sessions = self._selected_session_paths()
+        count = len(sessions)
         exporting = self._timelapse_export is not None
-        self.open_session_button.setEnabled(has_selection)
-        self.delete_session_button.setEnabled(has_selection and not exporting)
+        single = sessions[0] if count == 1 else None
         # An empty session folder can be opened and deleted but has nothing to
         # watch, so the two buttons that need frames check for them.
-        has_frames = has_selection and bool(session_frames(session))
+        has_frames = single is not None and bool(session_frames(single))
+        self.open_session_button.setEnabled(single is not None)
         self.play_session_button.setEnabled(has_frames)
         self.export_session_button.setEnabled(has_frames and not exporting)
+        self.delete_session_button.setEnabled(count > 0 and not exporting)
         self.timelapse_format_combo.setEnabled(not exporting)
+        several = "Pick a single recording to do that with it."
+        self.play_session_button.setToolTip(
+            several if count > 1 else "Play the selected recording back inside RustPainter."
+        )
+        self.export_session_button.setToolTip(
+            several
+            if count > 1
+            else (
+                "Write the selected recording to a single video file you can "
+                "keep, upload, or share."
+            )
+        )
+        self.open_session_button.setToolTip(
+            several if count > 1 else "Open the selected recording's folder"
+        )
+        self.delete_session_button.setToolTip(
+            f"Delete the {count} selected recordings and every frame in them"
+            if count > 1
+            else "Delete the selected recording and every frame in it"
+        )
+        self._refresh_session_selection_label(sessions)
+
+    def _refresh_session_selection_label(self, sessions: list[Path]) -> None:
+        """Say what a multiple selection adds up to before it is deleted."""
+
+        if len(sessions) < 2:
+            self.timelapse_selection_label.setText("")
+            return
+        frames = [frame for session in sessions for frame in session_frames(session)]
+        megabytes = sum(frame.stat().st_size for frame in frames) / (1024 * 1024)
+        self.timelapse_selection_label.setText(
+            f"{len(sessions)} recordings selected  •  {len(frames):,} frame"
+            f"{'s' if len(frames) != 1 else ''}  •  {megabytes:.1f} MB"
+        )
 
     @Slot()
     def _play_selected_session(self) -> None:
@@ -6706,14 +6791,24 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     @Slot()
-    def _delete_selected_session(self) -> None:
-        session = self._selected_session_path()
-        if session is None or not session.is_dir():
+    def _delete_selected_sessions(self) -> None:
+        """Delete every picked recording, live ones excepted, after one prompt.
+
+        Clearing out old recordings is a batch job, so it asks once for the
+        whole batch and reports once for it.  A recording the current paint
+        job is still writing to is dropped from the batch rather than taking
+        the rest of it down with an error.
+        """
+
+        sessions = [
+            session for session in self._selected_session_paths() if session.is_dir()
+        ]
+        if not sessions:
             return
-        if (
-            self._timelapse_recorder is not None
-            and self._timelapse_recorder.directory == session
-        ):
+        live = getattr(self._timelapse_recorder, "directory", None)
+        held = [session for session in sessions if session == live]
+        sessions = [session for session in sessions if session != live]
+        if not sessions:
             QMessageBox.information(
                 self,
                 "Recording in progress",
@@ -6721,30 +6816,59 @@ class MainWindow(QMainWindow):
                 "before deleting it.",
             )
             return
-        frames = len(list(session.glob("frame_*.png")))
+        frames = sum(len(session_frames(session)) for session in sessions)
+        plural = "s" if frames != 1 else ""
+        subject = (
+            f"“{sessions[0].name}” and its {frames} frame{plural}"
+            if len(sessions) == 1
+            else f"{len(sessions)} recordings and their {frames:,} frame{plural}"
+        )
+        held_note = (
+            "\n\nThe recording still being written by the current paint job is "
+            "left alone."
+            if held
+            else ""
+        )
         if (
             QMessageBox.question(
                 self,
-                "Delete recording",
-                f"Delete “{session.name}” and its {frames} frame"
-                f"{'s' if frames != 1 else ''}? This cannot be undone.",
+                "Delete recording" if len(sessions) == 1 else "Delete recordings",
+                f"Delete {subject}? This cannot be undone.{held_note}",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             != QMessageBox.StandardButton.Yes
         ):
             return
-        try:
-            import shutil
+        import shutil
 
-            shutil.rmtree(session)
-        except OSError as exc:
-            LOGGER.exception("Could not delete a timelapse session")
-            QMessageBox.warning(self, "Could not delete the recording", str(exc))
-            return
-        LOGGER.info("Deleted timelapse session %s", session.name)
-        self.statusBar().showMessage(f"Deleted {session.name}", 5000)
+        deleted: list[Path] = []
+        failure: str | None = None
+        for session in sessions:
+            try:
+                shutil.rmtree(session)
+            except OSError as exc:
+                LOGGER.exception("Could not delete a timelapse session")
+                failure = failure or f"{session.name}: {exc}"
+                continue
+            LOGGER.info("Deleted timelapse session %s", session.name)
+            deleted.append(session)
         self._refresh_timelapse_sessions()
+        if deleted:
+            self.statusBar().showMessage(
+                f"Deleted {deleted[0].name}"
+                if len(deleted) == 1
+                else f"Deleted {len(deleted)} recordings",
+                5000,
+            )
+        if failure is not None:
+            QMessageBox.warning(
+                self,
+                "Could not delete every recording"
+                if deleted
+                else "Could not delete the recording",
+                failure,
+            )
 
     def _set_idle_ui(self, detail: str = "No active paint job") -> None:
         self.progress_state_label.setText("Idle")
