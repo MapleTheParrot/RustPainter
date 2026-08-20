@@ -751,6 +751,8 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer.setInterval(5000)
         self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
         self._timelapse_recorder: Any = None
+        self._run_report: Any = None
+        self._paint_job_snapshot: Any = None
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
         self._timelapse_export_pool = QThreadPool(self)
@@ -5867,6 +5869,11 @@ class MainWindow(QMainWindow):
         if pending is None or self._pending_start_cancelled:
             return
         self._pending_paint = None
+        # The pending job is cleared before painting starts, but the run
+        # report needs the settings and profile exactly as they were at the
+        # countdown - reading them back later describes some edit made
+        # afterwards and blames this run for it.
+        self._paint_job_snapshot = pending
         dry_run = pending.dry_run
         if not dry_run and not self._emergency_hotkey_available():
             QMessageBox.critical(
@@ -6095,6 +6102,7 @@ class MainWindow(QMainWindow):
             # painting one, and without it a finished job would open a new
             # recording the moment it closed the old one.
             self._maybe_start_timelapse()
+            self._maybe_start_run_report()
         self.active_paint_progress.setValue(round(percent * 10))
         self.active_progress_state.setText(
             str(progress.message or progress.state.value)
@@ -6107,6 +6115,17 @@ class MainWindow(QMainWindow):
         )
         elapsed = self._format_duration(progress.elapsed_seconds)
         self.active_detail_label.setText(f"{detail}  •  {elapsed} elapsed")
+        # Traced last, so the update that opens the report is itself the
+        # trace's first row - which is what dates the start of the artwork.
+        # Pauses are traced too: an unexplained gap in the timeline is the
+        # first thing looked for when a run took longer than it should have.
+        report = self._run_report
+        if report is not None:
+            recorder = self._timelapse_recorder
+            report.sample_progress(
+                progress,
+                timelapse_frame=int(getattr(recorder, "frame_count", 0) or 0),
+            )
 
     @Slot(int, object, str)
     def _on_paint_state(self, generation: int, state: Any, reason: str) -> None:
@@ -6136,6 +6155,12 @@ class MainWindow(QMainWindow):
             )
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
+            self._finish_run_report(value, reason)
+            # The run measured this sign whatever its outcome, and that
+            # measurement is what stops the next plan from asking for a
+            # resolution the brush cannot paint.  Losing it because the
+            # user stopped the job is how the same mistake gets repeated.
+            self._store_measured_brush_model()
         if reason:
             self.statusBar().showMessage(f"{value.title()}: {reason}", 5000)
         LOGGER.info("Painter state: %s (%s)", value, reason)
@@ -6171,6 +6196,98 @@ class MainWindow(QMainWindow):
         self._update_start_availability()
 
     # -------------------------------------------------------------- timelapse
+
+    def _maybe_start_run_report(self) -> None:
+        """Open this run's diagnostic folder as the artwork starts.
+
+        Started from the same painting-phase progress update as the timelapse,
+        so the report describes the picture rather than the probe strokes the
+        job wipes off first - and so the brush the job measured for itself is
+        already known and can be written down beside the plan that assumed it.
+        """
+
+        if self._run_report is not None or self._closing:
+            return
+        painter = self._painter
+        plan = self._plan
+        if painter is None or plan is None:
+            return
+        try:
+            from app.run_report import RunReport
+
+            report = RunReport(self._local_data_directory() / "runs")
+        except Exception:
+            LOGGER.exception("Could not open a run report")
+            return
+        self._run_report = report
+        snapshot = self._paint_job_snapshot
+        recorder = self._timelapse_recorder
+        # The countdown snapshot is the truthful record; reading the live
+        # controls is only a fallback for a job that reached painting without
+        # one, and is still far better than a report with no settings at all.
+        settings = getattr(snapshot, "settings", None) or self._settings_document()
+        report.record_context(
+            settings=settings,
+            profile=getattr(snapshot, "profile", None) or self._current_profile,
+            timelapse_directory=(
+                recorder.directory if recorder is not None else None
+            ),
+            image_path=self._image_path,
+            dry_run=bool(getattr(snapshot, "dry_run", False)),
+        )
+        report.record_plan(plan, self._processed)
+        canvas = self._profile_rect("canvas")
+        if canvas is not None:
+            report.record_brush(
+                painter.measured_brush_size_model,
+                canvas_height=float(canvas.height),
+                canvas_width=float(canvas.width),
+                plan_width=plan.width,
+                plan_height=plan.height,
+            )
+        # A full-screen PNG takes long enough to encode that capturing it on
+        # the GUI thread would visibly stall the first strokes' progress.
+        threading.Thread(
+            target=report.record_screen,
+            name="RustPainterRunReportScreen",
+            daemon=True,
+        ).start()
+        LOGGER.info("Run report recording to %s", report.directory)
+
+    def _finish_run_report(self, outcome: str, reason: str) -> None:
+        """Close the report out, capturing the sign as the run left it.
+
+        An aborted or failed run is the one worth keeping: nobody needs a
+        finished sign explained.
+        """
+
+        report = self._run_report
+        if report is None:
+            return
+        self._run_report = None
+        canvas = self._profile_rect("canvas")
+        painter = self._painter
+        plan = self._plan
+        if canvas is not None and plan is not None and painter is not None:
+            try:
+                report.record_brush(
+                    painter.measured_brush_size_model,
+                    canvas_height=float(canvas.height),
+                    canvas_width=float(canvas.width),
+                    plan_width=plan.width,
+                    plan_height=plan.height,
+                )
+            except Exception:
+                LOGGER.exception("Could not record the brush in the run report")
+
+        def wrap_up() -> None:
+            if canvas is not None:
+                report.record_canvas(canvas, "canvas_final")
+            report.finish(outcome, reason)
+
+        threading.Thread(
+            target=wrap_up, name="RustPainterRunReportFinish", daemon=True
+        ).start()
 
     def _maybe_start_timelapse(self) -> None:
         """Begin recording frames once a real paint job starts on the artwork."""

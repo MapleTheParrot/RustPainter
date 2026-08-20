@@ -447,9 +447,42 @@ git push origin v1.0.0
 You can also run the workflow by hand from the Actions tab to get a test build
 as a downloadable artifact without tagging anything.
 
+## Run reports
+
+Every paint job writes a diagnostic folder under `runs/` in the app's data
+directory, whether it finishes, is aborted, or fails. A sign that came out
+wrong is usually explained hours later, and a folder of canvas frames alone
+cannot answer the questions that decide the diagnosis - so the job records
+them while it runs:
+
+- **`plan.png`** - the exact image the plan reproduces. Replanning it from the
+  source afterwards repeats the pipeline but not the fonts, the palette, or
+  the settings of that day, and a reference that is off by a few rows is worse
+  than none.
+- **`run.json`** - the plan's structure (size, stroke count, how many of those
+  are single cells, and every color group **in painting order**), the settings
+  and profile exactly as they were at the countdown, and the brush the job
+  measured for itself stated against the cells it had to fit:
+  `smallestBrushCells` above 1 means every stroke repainted its neighbours,
+  and `planRowsOverSignRows` above 1 means the plan asked for more rows than
+  the sign's texture can store.
+- **`screen_start.png`** - one full-desktop capture as the artwork begins. It
+  is the only record of what the game was set to: brush shape and opacity, the
+  Size field, the selected color, and how the sign was framed.
+- **`progress.csv`** - a trace sampled every couple of seconds carrying the
+  timelapse frame count, so any frame showing something wrong maps back to the
+  color and stroke being painted when it was taken. Pauses are traced too,
+  since an unexplained gap is the first thing to look for when a run took
+  longer than it should have.
+- **`canvas_final.png`** - the sign as the run left it.
+
+The screen capture and the final canvas are written on background threads, so
+recording never stalls a stroke. A report that cannot be written is logged and
+skipped: a missing diagnostic is a nuisance and a lost paint job is hours.
+
 ## Local data and logs
 
-Profiles, settings, calibration reference captures, and logs are stored under `%LOCALAPPDATA%\RustPainter` when available. Deleting that folder resets the application; exporting or copying its JSON files is enough to back up calibration data.
+Profiles, settings, calibration reference captures, timelapse frames, run reports, and logs are stored under `%LOCALAPPDATA%\RustPainter` when available. Deleting that folder resets the application; exporting or copying its JSON files is enough to back up calibration data.
 
 ## Known limitations
 
@@ -481,6 +514,7 @@ app/
   hotkeys.py           Windows global hotkeys
   painter.py           resumable, abortable execution
   screen.py            DPI/display/focus/capture helpers
+  run_report.py        per-run diagnostic bundle for after the fact
 tests/
 ```
 

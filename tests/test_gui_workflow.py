@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -2948,3 +2949,68 @@ def test_the_playback_speed_and_format_survive_a_restart(window: MainWindow) -> 
 
     assert saved["timelapse"]["playback_frame_rate"] == 24
     assert saved["timelapse"]["export_format"] == "gif"
+
+
+def test_a_run_report_records_the_plan_and_survives_an_abort(
+    window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    """An aborted run is the one that needs explaining, so it still reports."""
+
+    source_path = tmp_path / "report-source.png"
+    Image.new("RGBA", (32, 16), (210, 30, 40, 255)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+    from types import SimpleNamespace
+
+    from app import run_report as run_report_module
+
+    # The real ones photograph the desktop; the wiring under test is which
+    # files appear and when, not Pillow's ability to grab a screen.
+    monkeypatch.setattr(
+        run_report_module.RunReport, "record_screen", lambda self: None
+    )
+    monkeypatch.setattr(
+        run_report_module.RunReport,
+        "record_canvas",
+        lambda self, canvas, name: None,
+    )
+    window._current_profile.canvas = ScreenRect(0, 0, 64, 32)
+    window._painter = SimpleNamespace(
+        input=SimpleNamespace(emits_real_input=True),
+        state=PainterState.RUNNING,
+        measured_brush_size_model=None,
+    )
+
+    def progress(phase: str, strokes: int) -> PaintProgress:
+        return PaintProgress(
+            PainterState.RUNNING, 1, 1, strokes, 4, strokes, 4,
+            25.0 * strokes, 0.0, None, "", phase,
+        )
+
+    # Calibration strokes are not the artwork, so nothing opens yet.
+    window._on_paint_progress(window._paint_generation, progress("calibrate", 0))
+    assert window._run_report is None
+
+    window._on_paint_progress(window._paint_generation, progress("paint", 1))
+    report = window._run_report
+    assert report is not None
+    directory = report.directory
+
+    window._painter.state = PainterState.ABORTED
+    window._on_paint_state(
+        window._paint_generation, SimpleNamespace(value="aborted"), "user"
+    )
+    assert window._run_report is None
+    qtbot.waitUntil(lambda: (directory / "run.json").exists(), timeout=5000)
+
+    document = json.loads((directory / "run.json").read_text())
+    assert document["outcome"] == "aborted"
+    assert document["outcomeReason"] == "user"
+    assert document["plan"]["width"] == window._plan.width
+    assert document["plan"]["strokes"] == window._plan.stroke_count
+    # The settings and profile of the day, not whatever is on disk later.
+    assert document["settings"]["image"]["paint_mode"]
+    assert (directory / "plan.png").exists()
+    assert (directory / "progress.csv").exists()
+    window._painter = None
