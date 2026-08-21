@@ -467,6 +467,76 @@ def test_a_paused_job_takes_new_timing_and_keeps_its_shape() -> None:
     assert time.monotonic() - resumed >= remaining * 0.05
 
 
+def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
+    """Every interval the job leaves the sign, jumps, and comes back.
+
+    The break is Save, Space, a click where the game has the cursor, and then
+    the color selected again before the next stroke, since the painting UI
+    was closed and reopened in between.
+    """
+
+    input_controller = MockInputController()
+    painter = Painter(input_controller)
+    profile = _profile()
+    profile.save_button = ScreenRect(600, 300, 100, 30)
+    # Four strokes 0.3 s apart with a 0.5 s interval: the break falls once,
+    # before the third stroke, and the interval counts afresh from its end.
+    painter.start(
+        _dot_plan(4),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.3,
+            anti_afk_enabled=True,
+            anti_afk_interval_seconds=0.5,
+        ),
+    )
+    assert painter.wait(_t(15.0))
+    assert painter.state is PainterState.COMPLETED
+    assert painter.progress.completed_strokes == 4
+
+    events = input_controller.events
+    kinds = [(event.kind, event.x, event.y, event.value) for event in events]
+    jumps = [index for index, event in enumerate(events) if event.kind == "key_down"]
+    assert len(jumps) == 1, kinds
+    assert all(events[index].value == "SPACE" for index in jumps)
+    for index in jumps:
+        # Save was clicked, at its centre, before the jump ...
+        before = events[:index]
+        save_moves = [
+            event
+            for event in before
+            if event.kind == "move" and (event.x, event.y) == (650, 314)
+        ]
+        assert save_moves, kinds
+        # ... and after it the sign was reopened with a click that did not
+        # move the mouse, then the color was picked again (a move into the
+        # hue bar) before the next stroke.
+        after = events[index + 1 :]
+        assert after[1].kind == "mouse_down", kinds
+        assert after[2].kind == "mouse_up", kinds
+        reselect = next(event for event in after[3:] if event.kind == "move")
+        assert 720 <= reselect.x < 732, kinds
+    assert not input_controller.held_buttons
+
+
+def test_anti_afk_needs_the_save_button_only_for_real_input() -> None:
+    class RealInput(MockInputController):
+        emits_real_input = True
+
+    settings = _settings(anti_afk_enabled=True)
+    with pytest.raises(ValueError, match="Save button"):
+        Painter(RealInput()).configure(_dot_plan(1), _profile(), settings)
+
+    # Mock input runs the plan without a Save button and without a break.
+    input_controller = MockInputController()
+    painter = Painter(input_controller)
+    painter.start(_dot_plan(3), _profile(), _settings(anti_afk_enabled=True, anti_afk_interval_seconds=0.01))
+    assert painter.wait(_t(2.0))
+    assert painter.state is PainterState.COMPLETED
+    assert not any(event.kind == "key_down" for event in input_controller.events)
+
+
 def test_abort_stops_queued_strokes_and_releases_mouse() -> None:
     input_controller = MockInputController()
     painter = Painter(input_controller)

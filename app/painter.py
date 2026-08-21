@@ -169,6 +169,7 @@ class PaintingTarget:
     hue_bar: RectangleLike
     brush_size_box: RectangleLike | None = None
     clear_button: RectangleLike | None = None
+    save_button: RectangleLike | None = None
     picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
     brush_size_model: BrushSizeModel | None = None
@@ -204,6 +205,7 @@ class PaintingTarget:
             hue_bar=hue_bar,
             brush_size_box=getattr(profile, "brush_size_box", None),
             clear_button=getattr(profile, "clear_button", None),
+            save_button=getattr(profile, "save_button", None),
             picker_directions=PickerDirections(
                 hue="bottom_to_top",
                 saturation="left_low",
@@ -251,6 +253,10 @@ class PainterSettings:
     mouse_move_tolerance_pixels: float = 3.0
     safety_poll_interval_seconds: float = 0.01
     progress_callback_interval_seconds: float = 0.04
+    # Every interval, save the sign, jump, and reopen the sign, so a server
+    # that kicks idle players sees one moving.  Needs the Save button.
+    anti_afk_enabled: bool = False
+    anti_afk_interval_seconds: float = 1800.0
 
     # The fields a paused job may take new values for.  Everything else
     # shaped the job - which brush it measured, how its strokes were laid
@@ -278,6 +284,8 @@ class PainterSettings:
         "mouse_move_tolerance_pixels",
         "safety_poll_interval_seconds",
         "progress_callback_interval_seconds",
+        "anti_afk_enabled",
+        "anti_afk_interval_seconds",
     )
 
     def retuned(self, other: "PainterSettings") -> "PainterSettings":
@@ -295,6 +303,7 @@ class PainterSettings:
             "focus_check_interval_seconds": self.focus_check_interval_seconds,
             "safety_poll_interval_seconds": self.safety_poll_interval_seconds,
             "mouse_move_pause_threshold_pixels": self.mouse_move_pause_threshold_pixels,
+            "anti_afk_interval_seconds": self.anti_afk_interval_seconds,
         }
         for name, value in positive.items():
             if value <= 0 or not math.isfinite(value):
@@ -406,6 +415,11 @@ class PainterSettings:
             ),
             progress_callback_interval_seconds=float(
                 pick(values, "progress_callback_interval_seconds", 0.04)
+            ),
+            anti_afk_enabled=bool(pick(safety, "anti_afk_enabled", False)),
+            anti_afk_interval_seconds=(
+                float(pick(safety, "anti_afk_interval_seconds", 0.0))
+                or float(pick(safety, "anti_afk_interval_minutes", 30.0)) * 60.0
             ),
         )
 
@@ -552,6 +566,9 @@ class Painter:
         # seconds were priced on the timing it started with, so its measured
         # pace then says nothing about the machine's per-stroke overhead.
         self._timing_retuned = False
+        # When the job last proved to the server it was not idle: the start
+        # of the job, and then every anti-AFK break.
+        self._last_anti_afk_at = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -771,6 +788,7 @@ class Painter:
             self._last_progress_emit = 0.0
             self._paint_phase_timing = None
             self._timing_retuned = False
+            self._last_anti_afk_at = self._started_at
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -970,6 +988,14 @@ class Painter:
                 # measure, but checking it here turns an unpaintable resolution
                 # into an error before the countdown instead of after it.
                 self._validate_brush_reach(plan, target, settings, target.brush_size_model)
+        if settings.anti_afk_enabled and getattr(self.input, "emits_real_input", True):
+            if target.save_button is None:
+                raise ValueError(
+                    "The anti-AFK break is enabled, but Rust's Save button is not "
+                    "calibrated, so the painting UI could not be closed to jump"
+                )
+            if target.save_button.width <= 0 or target.save_button.height <= 0:
+                raise ValueError("Save button calibration must have positive dimensions")
         # A dry run only visualizes the plan, so it may carry brush metadata
         # that real input could not honor with the current calibration.
         if getattr(self.input, "emits_real_input", True):
@@ -2268,7 +2294,6 @@ class Painter:
             for index_in_group, stroke in enumerate(group.strokes, start=1):
                 while True:
                     self._checkpoint(check_focus=True)
-                    current_epoch = self._pause_generation_value()
                     # A pause may have retuned the job, so every stroke is
                     # held and paced by the settings the job has now, not the
                     # ones it started with.  The schedule keeps its original
@@ -2276,6 +2301,11 @@ class Painter:
                     # time left is corrected by the measured pace anyway.
                     settings = job.settings
                     try:
+                        # Leaving the sign and coming back starts a new
+                        # epoch, so the color and brush are set again before
+                        # the stroke; a pause during the break retries it.
+                        self._anti_afk_break_if_due(job)
+                        current_epoch = self._pause_generation_value()
                         if applied_epoch != current_epoch:
                             applied_diameter = None
                             applied_epoch = current_epoch
@@ -2331,6 +2361,83 @@ class Painter:
                 self._settle(job.settings.delay_between_colors_seconds),
                 check_focus=True,
             )
+
+    # The break's own waits: for the painting UI to close after Save, for the
+    # jump to land (and the server to have seen it), and for the UI to be
+    # open again after the click that reopens the sign.
+    _AFK_SAVE_SETTLE_SECONDS = 0.5
+    _AFK_JUMP_SETTLE_SECONDS = 1.0
+    _AFK_REOPEN_SETTLE_SECONDS = 1.0
+    _AFK_JUMP_HOLD_SECONDS = 0.1
+
+    def _anti_afk_due(self, job: _Job) -> bool:
+        settings = job.settings
+        return bool(
+            settings.anti_afk_enabled
+            and job.target.save_button is not None
+            and time.monotonic() - self._last_anti_afk_at
+            >= settings.anti_afk_interval_seconds
+        )
+
+    def _anti_afk_break_if_due(self, job: _Job) -> None:
+        """Every interval: save the sign, jump, and open the sign again.
+
+        A server that kicks idle players watches for movement, and a player
+        stood at a sign for an hour has made none.  The break leaves the
+        painting UI through its Save button (the server keeps the work so
+        far), jumps, and clicks to reopen the sign - which works because the
+        player is still looking at it: they were when the job started, and
+        an idle camera does not turn.  The painter then carries on from the
+        stroke it was about to make.
+
+        The cursor is the game's, not the painter's, from the moment the UI
+        closes, so the mouse guard's baseline is dropped until the next
+        stroke lays a new one.
+        """
+
+        if not self._anti_afk_due(job):
+            return
+        button = job.target.save_button
+        assert button is not None
+        epoch = self._pause_generation_value()
+        LOGGER.info("Anti-AFK break: saving the sign, jumping, and reopening it")
+        self._update_progress_state(
+            PainterState.RUNNING, "Keeping the player awake: saving and jumping"
+        )
+        self._safe_click(
+            normalized_point(button, 0.5, 0.5),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
+        with self._condition:
+            self._reset_mouse_movement_baseline()
+        self._interruptible_sleep(
+            self._AFK_SAVE_SETTLE_SECONDS, epoch=epoch, check_focus=True
+        )
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self.input.press_key("SPACE", hold_seconds=self._AFK_JUMP_HOLD_SECONDS)
+        self._interruptible_sleep(
+            self._AFK_JUMP_SETTLE_SECONDS, epoch=epoch, check_focus=True
+        )
+        # The click goes wherever the game has the cursor - in first person
+        # that is the crosshair, on the sign - so the mouse is not moved.
+        self._mouse_down(epoch)
+        try:
+            self._interruptible_sleep(
+                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+            )
+        finally:
+            self.input.mouse_up(MouseButton.LEFT)
+        self._interruptible_sleep(
+            self._AFK_REOPEN_SETTLE_SECONDS, epoch=epoch, check_focus=True
+        )
+        with self._condition:
+            self._reset_mouse_movement_baseline()
+            self._last_anti_afk_at = time.monotonic()
+            # A new epoch: the sign was left and re-entered, so the next
+            # stroke re-selects its color and re-applies its brush size.
+            self._pause_generation += 1
+        self._update_progress_state(PainterState.RUNNING, "Painting")
 
     def _verify_and_touch_up(self, job: _Job) -> None:
         """Read the sign back and repaint the cells that missed their color.

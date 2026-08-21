@@ -3593,3 +3593,66 @@ def test_a_paused_job_leaves_the_timing_controls_live_and_retunes_on_resume(
     window._update_start_availability()
     assert window.quality_combo.isEnabled()
     assert window.stroke_delay_spin.isEnabled()
+
+
+def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """The break leaves the painting UI through Save, so Save must be known.
+
+    With the switch on, the Save button turns from optional to needed and an
+    uncalibrated one blocks Start with a reason; the switch and its interval
+    are saved, and reach the painter in seconds.
+    """
+
+    assert not window.anti_afk_check.isChecked()
+    window._current_profile.save_button = None
+    window._refresh_profile_ui()
+    assert window.save_button_status._value.text() == "Optional"
+
+    window.anti_afk_check.setChecked(True)
+    window.anti_afk_interval_spin.setValue(12)
+    assert window.save_button_status._value.text() == "Needed"
+
+    source_path = tmp_path / "flat.png"
+    Image.new("RGB", (32, 16), (200, 120, 40)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    profile = window._current_profile
+    profile.canvas = ScreenRect(10, 10, 200, 100)
+    profile.color_box = ScreenRect(300, 10, 100, 100)
+    profile.hue_bar = ScreenRect(420, 10, 12, 100)
+    window.apply_brush_check.setChecked(False)
+    window.dry_run_check.setChecked(True)
+    window._update_start_availability()
+    # A dry run never opens the painting UI, so it does not need Save.
+    assert window.start_button.isEnabled()
+
+    window.dry_run_check.setChecked(False)
+    window._hotkeys_ready = True
+    window._hotkeys = type("LiveHotkeys", (), {"running": True})()
+    window._update_start_availability()
+    assert not window.start_button.isEnabled()
+    assert "Save button" in window.start_button.toolTip()
+    with pytest.raises(ValueError, match="Save button"):
+        window._validate_profile_on_virtual_screen(anti_afk=True)
+
+    profile.save_button = ScreenRect(300, 130, 90, 30)
+    window._refresh_profile_ui()
+    assert window.save_button_status._value.text() == "Ready"
+    assert window.start_button.isEnabled()
+
+    document = window._settings_document()
+    assert document["safety"]["anti_afk_enabled"] is True
+    assert document["safety"]["anti_afk_interval_minutes"] == 12
+    settings = window._painter_settings(document, dry_run=False)
+    assert settings.anti_afk_enabled is True
+    assert settings.anti_afk_interval_seconds == 12 * 60
+    assert window._painter_settings(document, dry_run=True).anti_afk_enabled is False
+
+    # Off again, the button is optional and Start no longer asks for it.
+    window.anti_afk_check.setChecked(False)
+    profile.save_button = None
+    window._refresh_profile_ui()
+    assert window.save_button_status._value.text() == "Optional"
+    assert window.start_button.isEnabled()

@@ -2145,11 +2145,13 @@ class MainWindow(QMainWindow):
         self.hue_bar_status = CalibrationStatus("Hue bar")
         self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
         self.clear_button_status = CalibrationStatus("Clear button", optional=True)
+        self.save_button_status = CalibrationStatus("Save button", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
         self.calibrate_clear_button = QPushButton("Set")
+        self.calibrate_save_button = QPushButton("Set")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -2164,6 +2166,12 @@ class MainWindow(QMainWindow):
                 self.calibrate_clear_button,
                 "Calibrate Rust's trash/clear icon, which wipes the sign between "
                 "the brush measurement and the painting",
+            ),
+            (
+                self.save_button_status,
+                self.calibrate_save_button,
+                "Calibrate Rust's Save changes button, which the anti-AFK break "
+                "clicks to leave the painting UI before it jumps",
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -2307,6 +2315,36 @@ class MainWindow(QMainWindow):
         safety_form.addRow("Pause", self.pause_hotkey_combo)
         safety_form.addRow("Stop", self.abort_hotkey_combo)
         layout.addWidget(safety_group)
+
+        # A server that kicks idle players watches for movement, and a player
+        # stood at a sign for an hour has made none.  Every interval the job
+        # saves the sign, jumps, clicks to reopen the sign, and carries on.
+        afk_group = QGroupBox("Anti-AFK")
+        afk_form = QFormLayout(afk_group)
+        self.anti_afk_check = QCheckBox("Jump every so often so the server does not kick an idle player")
+        self.anti_afk_check.setToolTip(
+            "Every interval the painter clicks Rust's Save button to leave the\n"
+            "painting UI, presses Space to jump, waits a second, clicks to open\n"
+            "the sign again, and carries on from the same stroke.  You have to\n"
+            "still be looking at the sign - you were when the job started, and\n"
+            "an idle camera does not turn.  Needs the Save button calibrated."
+        )
+        self.anti_afk_interval_spin = self._int_spin(1, 180, 30, " min")
+        self.anti_afk_interval_spin.setToolTip(
+            "How long the job paints between jumps.  Set it under the server's\n"
+            "idle kick time."
+        )
+        afk_form.addRow("Anti-AFK", self.anti_afk_check)
+        afk_form.addRow("Every", self.anti_afk_interval_spin)
+        afk_note = QLabel(
+            "Closing the painting UI with Save keeps what has been painted so "
+            "far; the click that reopens the sign lands wherever the game has "
+            "the crosshair, which is the sign as long as nobody has turned."
+        )
+        afk_note.setWordWrap(True)
+        afk_note.setObjectName("muted")
+        afk_form.addRow("", afk_note)
+        layout.addWidget(afk_group)
         layout.addStretch(1)
         return content
 
@@ -4585,6 +4623,15 @@ class MainWindow(QMainWindow):
                 "clear_button", "trash / clear icon that wipes the sign"
             )
         )
+        self.calibrate_save_button.clicked.connect(
+            lambda: self._begin_calibration(
+                "save_button", "Save changes button that closes the painting UI"
+            )
+        )
+        # Whether the Save button is needed follows the switch.
+        self.anti_afk_check.toggled.connect(
+            lambda _checked: self._refresh_profile_ui()
+        )
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
@@ -4672,6 +4719,8 @@ class MainWindow(QMainWindow):
             self.corner_abort_check,
             self.mouse_pause_check,
             self.verify_ui_check,
+            self.anti_afk_check,
+            self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.pause_hotkey_combo,
             self.abort_hotkey_combo,
@@ -4917,6 +4966,10 @@ class MainWindow(QMainWindow):
                 str(safety.get("expected_process_name", "") or "")
             )
             self.verify_ui_check.setChecked(bool(safety.get("verify_calibrated_ui", False)))
+            self.anti_afk_check.setChecked(bool(safety.get("anti_afk_enabled", False)))
+            self.anti_afk_interval_spin.setValue(
+                int(safety.get("anti_afk_interval_minutes", 30))
+            )
             self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
             self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
             self.pause_hotkey_combo.setCurrentText(str(hotkeys.get("pause", "F9")))
@@ -5029,6 +5082,8 @@ class MainWindow(QMainWindow):
             "expected_window_title_contains": self.expected_window_edit.text().strip(),
             "expected_process_name": self.expected_process_edit.text().strip(),
             "verify_calibrated_ui": self.verify_ui_check.isChecked(),
+            "anti_afk_enabled": self.anti_afk_check.isChecked(),
+            "anti_afk_interval_minutes": self.anti_afk_interval_spin.value(),
         }
         current["execution"] = {
             **current.get("execution", {}),
@@ -5116,6 +5171,11 @@ class MainWindow(QMainWindow):
         )
         self.clear_button_status.set_calibrated(
             bool(status.get("clear_button")), brush_optional
+        )
+        # The anti-AFK break leaves the painting UI through Save; with the
+        # break off, the button is never clicked.
+        self.save_button_status.set_calibrated(
+            bool(status.get("save_button")), not self.anti_afk_check.isChecked()
         )
         self._refresh_brush_model_status()
         if self._refresh_quality_preset_availability():
@@ -5205,6 +5265,7 @@ class MainWindow(QMainWindow):
                     "hue_bar",
                     "brush_size_box",
                     "clear_button",
+                    "save_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
@@ -5318,6 +5379,7 @@ class MainWindow(QMainWindow):
                 "hue_bar",
                 "brush_size_box",
                 "clear_button",
+                "save_button",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -5463,7 +5525,14 @@ class MainWindow(QMainWindow):
         source, target = mismatch
         candidate = Profile.from_dict(profile.to_dict())
         moved: list[str] = []
-        for name in ("canvas", "color_box", "hue_bar", "brush_size_box", "clear_button"):
+        for name in (
+            "canvas",
+            "color_box",
+            "hue_bar",
+            "brush_size_box",
+            "clear_button",
+            "save_button",
+        ):
             rect = getattr(candidate, name, None)
             if rect is None:
                 continue
@@ -5514,6 +5583,7 @@ class MainWindow(QMainWindow):
                     ("Hue bar", getattr(profile, "hue_bar", None)),
                     ("Size value box", getattr(profile, "brush_size_box", None)),
                     ("Clear button", getattr(profile, "clear_button", None)),
+                    ("Save button", getattr(profile, "save_button", None)),
                 )
                 if rect is not None
             ]
@@ -6132,6 +6202,7 @@ class MainWindow(QMainWindow):
             self._current_profile
             and self._current_profile.is_ready
             and not self._missing_sizing_rectangles()
+            and not self._missing_anti_afk_rectangles()
         )
         can_dry_run = self.dry_run_check.isChecked() and self._plan is not None
         can_start = (self._plan is not None and profile_ready) or can_dry_run or paused
@@ -6184,6 +6255,17 @@ class MainWindow(QMainWindow):
             if self._profile_rect(name) is None
         ]
 
+    def _missing_anti_afk_rectangles(self) -> list[str]:
+        """The rectangle the anti-AFK break needs but this profile lacks.
+
+        The break leaves the painting UI through Rust's Save button, so with
+        the break on, the button has to be calibrated.
+        """
+
+        if not self.anti_afk_check.isChecked():
+            return []
+        return ["Save button"] if self._profile_rect("save_button") is None else []
+
     def _start_blocked_reason(self, profile_ready: bool, paused: bool) -> str:
         if self._painter_is_active() and not paused:
             return "A paint job is already running."
@@ -6210,6 +6292,12 @@ class MainWindow(QMainWindow):
                     "every job and wipes the measurement off again, so it needs "
                     "the " + " and ".join(sizing) + " calibrated. Turn automatic "
                     "brush sizing off to paint with whatever brush Rust has set."
+                )
+            if self._missing_anti_afk_rectangles():
+                return (
+                    "The anti-AFK break leaves the painting UI through Rust's "
+                    "Save button, so it needs the Save button calibrated. Turn "
+                    "Anti-AFK off under Settings to paint without it."
                 )
             return "Finish calibrating this profile before painting."
         if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
@@ -6241,6 +6329,8 @@ class MainWindow(QMainWindow):
             self.expected_process_edit,
             self.corner_abort_check,
             self.mouse_pause_check,
+            self.anti_afk_check,
+            self.anti_afk_interval_spin,
         )
 
     def _set_job_controls_locked(self, locked: bool, *, retunable: bool = False) -> None:
@@ -6289,6 +6379,7 @@ class MainWindow(QMainWindow):
             self.calibrate_hue_bar_button,
             self.calibrate_brush_button,
             self.calibrate_clear_button,
+            self.calibrate_save_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -6297,6 +6388,8 @@ class MainWindow(QMainWindow):
             self.corner_abort_check,
             self.mouse_pause_check,
             self.verify_ui_check,
+            self.anti_afk_check,
+            self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.pause_hotkey_combo,
             self.abort_hotkey_combo,
@@ -6428,7 +6521,8 @@ class MainWindow(QMainWindow):
             self._refresh_display_warning()
             try:
                 self._validate_profile_on_virtual_screen(
-                    apply_brush_size=self.apply_brush_check.isChecked()
+                    apply_brush_size=self.apply_brush_check.isChecked(),
+                    anti_afk=self.anti_afk_check.isChecked(),
                 )
             except ValueError as exc:
                 QMessageBox.critical(self, "Calibration is outside the desktop", str(exc))
@@ -6487,6 +6581,7 @@ class MainWindow(QMainWindow):
         profile: Any | None = None,
         *,
         apply_brush_size: bool = False,
+        anti_afk: bool = False,
     ) -> None:
         profile = profile or self._current_profile
         if profile is None:
@@ -6497,7 +6592,13 @@ class MainWindow(QMainWindow):
         names = ["canvas", "color_box", "hue_bar"]
         if apply_brush_size:
             names.extend(("brush_size_box", "clear_button"))
+        if anti_afk:
+            names.append("save_button")
         required = {
+            "save_button": (
+                "The anti-AFK break leaves the painting UI through Rust's Save "
+                "button, so it requires the Save button to be calibrated."
+            ),
             "brush_size_box": (
                 "Automatic brush sizing requires Rust's numeric Size field to be "
                 "calibrated."
@@ -6553,6 +6654,11 @@ class MainWindow(QMainWindow):
                     apply_brush_size=bool(
                         pending.settings.get("painting", {}).get(
                             "apply_brush_size", False
+                        )
+                    ),
+                    anti_afk=bool(
+                        pending.settings.get("safety", {}).get(
+                            "anti_afk_enabled", False
                         )
                     ),
                 )
@@ -6686,6 +6792,7 @@ class MainWindow(QMainWindow):
             )
             settings_document["safety"]["require_rust_foreground"] = False
             settings_document["safety"]["corner_abort_enabled"] = False
+            settings_document["safety"]["anti_afk_enabled"] = False
         return PainterSettings.from_mapping(settings_document)
 
     def _retune_paused_painter(self) -> None:

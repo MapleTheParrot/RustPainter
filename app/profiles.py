@@ -304,6 +304,9 @@ class CalibrationProfile:
     # Rust's "clear the sign" control.  Painting wipes the sign with it after
     # measuring the brush, so the probe strokes never end up under the artwork.
     clear_button: Rect | None = None
+    # Rust's "Save changes" control.  The anti-AFK break clicks it to leave
+    # the painting UI, jumps, and reopens the sign with a click.
+    save_button: Rect | None = None
     hue_direction: str = HueDirection.BOTTOM_TO_TOP.value
     saturation_direction: str = SaturationDirection.LEFT_LOW.value
     value_direction: str = ValueDirection.TOP_BRIGHT.value
@@ -357,6 +360,7 @@ class CalibrationProfile:
             "hue_bar": self.hue_bar is not None,
             "brush_size_box": self.brush_size_box is not None,
             "clear_button": self.clear_button is not None,
+            "save_button": self.save_button is not None,
         }
 
     @property
@@ -387,6 +391,7 @@ class CalibrationProfile:
             "hueBar": _rect_dict(self.hue_bar),
             "brushSizeBox": _rect_dict(self.brush_size_box),
             "clearButton": _rect_dict(self.clear_button),
+            "saveButton": _rect_dict(self.save_button),
             "pickerDirections": {
                 "hue": self.hue_direction,
                 "saturation": self.saturation_direction,
@@ -421,6 +426,11 @@ class CalibrationProfile:
             clear_button=_rect_from(
                 _first(value, "clearButton", "clear_button"),
                 "clear button",
+                optional=True,
+            ),
+            save_button=_rect_from(
+                _first(value, "saveButton", "save_button"),
+                "save button",
                 optional=True,
             ),
             hue_direction=_first(

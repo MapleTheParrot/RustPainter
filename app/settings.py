@@ -179,6 +179,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "expected_process_name": DEFAULT_EXPECTED_PROCESS_NAME,
         "expected_window_title_contains": "Rust",
         "verify_calibrated_ui": False,
+        # Every so often, save the sign, jump, and reopen it, so a server
+        # that kicks idle players sees one moving.
+        "anti_afk_enabled": False,
+        "anti_afk_interval_minutes": 30,
     },
     "execution": {
         "dry_run": False,
@@ -535,9 +539,13 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "pause_on_mouse_move",
         "require_rust_foreground",
         "verify_calibrated_ui",
+        "anti_afk_enabled",
     ):
         if not isinstance(safety.get(key), bool):
             raise SettingsError(f"safety.{key} must be true or false")
+    afk_interval = safety.get("anti_afk_interval_minutes")
+    if isinstance(afk_interval, bool) or not isinstance(afk_interval, int) or afk_interval < 1:
+        raise SettingsError("safety.anti_afk_interval_minutes must be a positive integer")
     for key in ("expected_process_name", "expected_window_title_contains"):
         if safety.get(key) is not None and not isinstance(safety.get(key), str):
             raise SettingsError(f"safety.{key} must be a string or null")
