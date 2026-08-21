@@ -304,8 +304,14 @@ costs a click and a typed number, so the planner only fetches a big brush when
 it pays for the trip. The measurement also tells the planner the widest brush
 Rust can actually reach on that sign, so it never plans a pass the Size field
 would have to clamp.
-Dithered images keep their deliberate speckle: region cleanup turns itself off
-when dithering is enabled.
+Region cleanup knows what an edge looks like. A downscaled line is nothing
+but tiny regions of in-between color along its sides, so a speck is only
+absorbed into a neighbor when its color is not the blend between that
+neighbor and a contrasting one, and it goes to the neighbor closest in color
+rather than the one it touches most - which lets a hair strand's short
+segments unify into one strand instead of dissolving into the fill around
+them. Dithered images keep their deliberate speckle: region cleanup turns
+itself off when dithering is enabled.
 
 Painting always keeps whatever brush shape is selected in Rust; the planner
 budgets every pass for the square brush's worst-case spill, so either solid

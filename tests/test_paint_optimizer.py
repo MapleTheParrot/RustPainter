@@ -96,6 +96,45 @@ def test_absorb_speck_but_keep_high_contrast_dot() -> None:
     assert (cleaned[8, 14] == (0, 0, 0)).all()
 
 
+def test_absorb_keeps_the_blend_step_of_an_edge() -> None:
+    # A dark line across a light field, downscaled: the cells beside the line
+    # are a mix of the two.  Each mix is a tiny region within the contrast
+    # limit of the field, yet absorbing it into the field would turn the
+    # anti-aliased line into a jagged one.
+    field, line, blend = (230, 200, 200), (30, 30, 30), (180, 158, 158)
+    image = _rgb(24, 12, field)
+    image[5, 2:22] = line
+    image[4, 2:22:4] = blend  # short runs, each far below the area limit
+    image[6, 3:22:4] = blend
+    cleaned = absorb_insignificant_regions(
+        image, _full_mask(image), min_area=14, contrast_limit=18.0
+    )
+    assert (cleaned[4, 2:22:4] == blend).all()
+    assert (cleaned[6, 3:22:4] == blend).all()
+    # A speck of nearly the field's color sitting away from any edge is still
+    # cleaned up.
+    image[1, 10] = (226, 200, 200)
+    cleaned = absorb_insignificant_regions(
+        image, _full_mask(image), min_area=14, contrast_limit=18.0
+    )
+    assert (cleaned[1, 10] == field).all()
+
+
+def test_absorb_prefers_the_closest_color_over_the_longest_border() -> None:
+    # A strand arrives as short segments in two close shades, each touching
+    # the field along its whole length.  The shorter segment should join its
+    # neighbour on the strand, not dissolve into the field.
+    field, shade_a, shade_b = (230, 200, 200), (190, 150, 150), (186, 146, 146)
+    image = _rgb(30, 9, field)
+    image[4, 2:16] = shade_a  # 14 cells: established
+    image[4, 16:22] = shade_b  # 6 cells: too small on its own
+    cleaned = absorb_insignificant_regions(
+        image, _full_mask(image), min_area=14, contrast_limit=18.0
+    )
+    assert (cleaned[4, 16:22] == shade_a).all()
+    assert (cleaned[4, 2:16] == shade_a).all()
+
+
 def test_dither_preset_disables_region_cleanup() -> None:
     options = mode_options(PaintMode.FAST, preserve_dither=True)
     assert options.min_region_area == 0

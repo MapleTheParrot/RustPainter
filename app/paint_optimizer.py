@@ -49,6 +49,19 @@ _ASSUMED_MAX_BRUSH_PIXELS = 64.0
 # delay, the button press, and the hop to the stroke's start point.
 _STROKE_OVERHEAD_CELLS = 10
 
+# How far along the way from a similar neighbour to a contrasting one a tiny
+# region's color has to sit before it counts as the anti-aliased step between
+# the two rather than a speck in the first.  Measured as a fraction of the
+# distance between the two neighbours in Lab: a 90/10 mix is still a speck and
+# absorbing it merely crisps the edge by a hair, while a quarter mix is what a
+# downscaled line is made of, and absorbing that is what turns smooth hair
+# strands into a ragged staircase.
+_BLEND_FRACTION = 0.15
+
+# Neighbours this close in delta-E are the same color as far as absorption is
+# concerned, and the one with more shared border wins between them.
+_SIMILAR_NEIGHBOR_SLACK = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class BrushCapabilities:
@@ -283,6 +296,29 @@ def _label_regions(index_map: np.ndarray) -> tuple[np.ndarray, int]:
     return labels.reshape(index_map.shape), int(label_of_run.max()) + 1
 
 
+def _is_blend_toward(
+    own: np.ndarray, near: np.ndarray, far: np.ndarray, contrast_limit: float
+) -> np.ndarray:
+    """Whether absorbing ``own`` into each ``near`` color would erase a blend.
+
+    ``own`` is one Lab color, ``near`` the ``(k, 3)`` similar neighbours it
+    might be absorbed into and ``far`` the ``(m, 3)`` contrasting ones.  For
+    each near neighbour N the color is projected onto the line from N to every
+    far neighbour M; landing a real fraction of the way along it means the
+    region is the in-between shade of an N/M edge, not a speck in N.  Returns
+    a boolean per near neighbour.
+    """
+
+    span = far[None, :, :] - near[:, None, :]
+    span_length_sq = (span**2).sum(axis=2)
+    offset = own[None, None, :] - near[:, None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fraction = (offset * span).sum(axis=2) / span_length_sq
+    # Only an edge between genuinely different colors has a blend to protect.
+    is_edge = span_length_sq > contrast_limit**2
+    return (is_edge & (fraction >= _BLEND_FRACTION)).any(axis=1)
+
+
 def absorb_insignificant_regions(
     rgb: np.ndarray,
     mask: np.ndarray,
@@ -291,12 +327,26 @@ def absorb_insignificant_regions(
     *,
     max_rounds: int = 3,
 ) -> np.ndarray:
-    """Recolor tiny low-contrast regions to their dominant similar neighbor.
+    """Recolor tiny low-contrast regions to their most similar neighbor.
 
     Area alone never condemns a region: a tiny black pupil on a white face has
     huge contrast and survives, while a lone near-white speck inside white is
     absorbed.  Absorption only flows uphill in area, so two adjacent specks
     cannot trade colors forever.
+
+    Two rules keep this from eating the lines of a downscaled drawing, whose
+    anti-aliasing is nothing but tiny regions of in-between color:
+
+    * A region goes to the neighbor closest to it in color, not the one it
+      shares the most border with.  A hair strand arrives as a chain of short
+      segments in slightly different shades, each bordering the fill along
+      its whole length; judged by border it dissolves segment by segment into
+      the fill, judged by color the segments unify into one strand that is
+      then large enough to keep.
+    * A region whose color lies between a similar neighbor and a contrasting
+      one is the anti-aliased step between them and is left alone, however
+      small.  Pushing it onto the similar side would move the edge by a cell
+      and replace a smooth transition with a jagged one.
     """
 
     if min_area <= 1 or contrast_limit <= 0 or not mask.any():
@@ -346,22 +396,33 @@ def absorb_insignificant_regions(
                 continue
             neighbors = unique_pairs[begin:end, 1]
             neighbor_contacts = contacts[begin:end]
+            own_lab = lab[label_color[label]]
+            neighbor_lab = lab[label_color[neighbors]]
+            deltas = np.sqrt(((neighbor_lab - own_lab) ** 2).sum(axis=1))
             own_area = areas[label]
             # Only grow into something at least as established, so absorption
             # terminates instead of ping-ponging between two specks.
             eligible = (areas[neighbors] >= min_area) | (areas[neighbors] > own_area)
-            if not eligible.any():
+            candidates = np.flatnonzero(eligible & (deltas <= contrast_limit))
+            if candidates.size == 0:
                 continue
-            neighbors = neighbors[eligible]
-            neighbor_contacts = neighbor_contacts[eligible]
-            deltas = np.sqrt(
-                ((lab[label_color[neighbors]] - lab[label_color[label]]) ** 2).sum(axis=1)
-            )
-            within = deltas <= contrast_limit
-            if not within.any():
-                continue
-            candidates = np.flatnonzero(within)
-            best = candidates[int(np.argmax(neighbor_contacts[candidates]))]
+            # Every contrasting neighbour counts as a far side, whether or not
+            # it could absorb anything itself: the dark core of a line is
+            # often a thin region too.
+            far = np.flatnonzero(deltas > contrast_limit)
+            if far.size:
+                candidates = candidates[
+                    ~_is_blend_toward(
+                        own_lab, neighbor_lab[candidates], neighbor_lab[far], contrast_limit
+                    )
+                ]
+                if candidates.size == 0:
+                    continue
+            # The closest color does the least visible damage; border length
+            # only settles which of two equally close neighbours it is.
+            closest = deltas[candidates].min()
+            near = candidates[deltas[candidates] <= closest + _SIMILAR_NEIGHBOR_SLACK]
+            best = near[int(np.argmax(neighbor_contacts[near]))]
             absorbed_color[label] = label_color[neighbors[best]]
             changed = True
         if not changed:
