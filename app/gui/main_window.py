@@ -1384,6 +1384,19 @@ class MainWindow(QMainWindow):
         heading.addWidget(title)
         heading.addStretch(1)
         heading.addWidget(self.preview_hint_label)
+        # The plan has one color per cell, and the tab has to blow those cells
+        # up to fill itself.  Rust filters the sign's texture when it draws
+        # it, so filtered scaling is the honest guess at the finished sign;
+        # hard-edged cells exaggerate the grid but show exactly what each
+        # stroke will paint.  Both views have a use, so it is a switch.
+        self.smooth_preview_check = QCheckBox("Smooth")
+        self.smooth_preview_check.setChecked(True)
+        self.smooth_preview_check.setToolTip(
+            "Scale the Rust preview the way the game draws the sign's texture, "
+            "blending between cells.  Off shows every planned cell as a hard "
+            "square, closer to the painter's own view of the plan."
+        )
+        heading.addWidget(self.smooth_preview_check)
         # What the painter promises to put on the sign, as a file: the only
         # way to hold it next to a screenshot of what it actually put there.
         self.export_preview_button = self._icon_button(
@@ -1410,10 +1423,12 @@ class MainWindow(QMainWindow):
         )
         self.paint_preview = PreviewLabel(
             "Paint simulation will appear here",
-            smooth=False,
+            smooth=self.smooth_preview_check.isChecked(),
             hint=browse_hint,
             read_only_chip="Preview only",
         )
+        self.smooth_preview_check.toggled.connect(self.paint_preview.set_smooth)
+        self.smooth_preview_check.toggled.connect(self._schedule_settings_save)
         self.paint_preview.setToolTip(
             "Exactly what the painter will put on the sign - text is baked in "
             "and every color is palette-limited.  Editing happens on the "
@@ -4575,6 +4590,12 @@ class MainWindow(QMainWindow):
             self.show_calibration_check.setChecked(
                 bool(ui.get("show_calibration_overlay", False))
             )
+            self.smooth_preview_check.setChecked(
+                bool(ui.get("smooth_rust_preview", True))
+            )
+            # Signals are held while settings load, so the label is told
+            # directly rather than through the checkbox's toggle.
+            self.paint_preview.set_smooth(self.smooth_preview_check.isChecked())
 
             self.countdown_spin.setValue(int(safety.get("countdown_seconds", 3)))
             self.corner_abort_check.setChecked(bool(safety.get("corner_abort_enabled", True)))
@@ -4710,6 +4731,7 @@ class MainWindow(QMainWindow):
             "selected_profile_id": self._current_profile.id if self._current_profile else None,
             "last_image_path": str(self._image_path) if self._image_path else None,
             "show_calibration_overlay": self.show_calibration_check.isChecked(),
+            "smooth_rust_preview": self.smooth_preview_check.isChecked(),
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
         }
         return current

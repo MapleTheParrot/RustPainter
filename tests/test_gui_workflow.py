@@ -2643,6 +2643,30 @@ def test_paused_jobs_still_show_the_calibration_outlines(
     assert not window._calibration_preview.isVisible()
 
 
+def test_rust_preview_scaling_is_smooth_by_default_and_switchable(
+    window: MainWindow,
+) -> None:
+    """Filtered scaling is the honest guess at the sign; blocky is opt-in.
+
+    The switch has to reach the label itself, not just a setting, and has to
+    come back the same way the window was left.
+    """
+
+    assert window.smooth_preview_check.isChecked()
+    assert window.paint_preview.is_smooth()
+    assert window._settings_document()["ui"]["smooth_rust_preview"] is True
+
+    window.smooth_preview_check.setChecked(False)
+    assert not window.paint_preview.is_smooth()
+    assert window._settings_document()["ui"]["smooth_rust_preview"] is False
+
+    settings = window._settings_document()
+    settings["ui"]["smooth_rust_preview"] = True
+    window._apply_settings(settings)
+    assert window.smooth_preview_check.isChecked()
+    assert window.paint_preview.is_smooth()
+
+
 def test_the_timelapse_speed_slider_says_what_it_costs(
     window: MainWindow,
 ) -> None:

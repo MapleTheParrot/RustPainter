@@ -180,6 +180,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "last_image_path": None,
         "window_geometry": None,
         "show_calibration_overlay": False,
+        "smooth_rust_preview": True,
     },
 }
 

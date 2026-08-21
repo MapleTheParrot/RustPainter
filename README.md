@@ -193,6 +193,15 @@ Removal happens before the palette is chosen, so a skipped backdrop no longer
 consumes one of the requested colors. Text layers still paint over removed
 areas.
 
+### Viewing the Rust preview
+
+The plan has one color per logical cell, and the preview tab has to scale
+those cells up to fill itself. The **Smooth** switch beside the heading picks
+how: on, cells blend into each other the way Rust filters the sign's texture
+when it draws it, which is the closer guess at the finished sign; off, every
+cell is a hard square, which exaggerates the grid but shows exactly what each
+stroke will paint. The choice is remembered between sessions.
+
 ### Saving the Rust preview
 
 The button beside the **PREVIEW** heading writes the Rust preview to an image

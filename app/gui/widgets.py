@@ -629,6 +629,23 @@ class PreviewLabel(_ImageDropTarget, QLabel):
         elif self._read_only_chip:
             _paint_corner_chip(self, self.contentsRect(), self._read_only_chip)
 
+    def set_smooth(self, smooth: bool) -> None:
+        """Choose between filtered scaling and one hard block per source pixel.
+
+        Filtered is closer to how the game draws the sign's texture; blocky
+        shows each planned cell as its own square, which is what inspecting
+        the plan cell by cell needs.
+        """
+
+        smooth = bool(smooth)
+        if smooth == self._smooth:
+            return
+        self._smooth = smooth
+        self._update_scaled()
+
+    def is_smooth(self) -> bool:
+        return self._smooth
+
     def _update_scaled(self) -> None:
         if self._source.isNull():
             return
