@@ -1632,6 +1632,12 @@ class MainWindow(QMainWindow):
     def _on_preview_tab_changed(self, *_args: Any) -> None:
         self.preview_notice.hide()
         self._refresh_preview_hint()
+        self._refresh_text_section_visibility()
+
+    def _refresh_text_section_visibility(self) -> None:
+        """Show the text controls with the tab they edit, the Source tab."""
+
+        self.text_section.setVisible(self.preview_tabs.currentIndex() == 0)
 
     def _refresh_preview_hint(self) -> None:
         """Name the one gesture that matters on whichever tab is in front."""
@@ -1908,6 +1914,14 @@ class MainWindow(QMainWindow):
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)
 
+        # Text is edited on the Source tab and only there, so its controls
+        # come and go with that tab: on the Rust preview they would describe
+        # a layer the user cannot reach, and the space is better spent on
+        # the picture controls above.
+        self.text_section = QWidget()
+        text_section_layout = QVBoxLayout(self.text_section)
+        text_section_layout.setContentsMargins(0, 0, 0, 0)
+        text_section_layout.setSpacing(image_layout.spacing())
         text_heading = QHBoxLayout()
         text_title = QLabel("Text overlay")
         text_title.setObjectName("sectionTitle")
@@ -1944,7 +1958,7 @@ class MainWindow(QMainWindow):
         text_heading.addWidget(self.add_text_button)
         text_heading.addWidget(self.duplicate_text_button)
         text_heading.addWidget(self.remove_text_button)
-        image_layout.addLayout(text_heading)
+        text_section_layout.addLayout(text_heading)
 
         self.text_options_panel = QFrame()
         self.text_options_panel.setObjectName("inlinePanel")
@@ -2080,7 +2094,8 @@ class MainWindow(QMainWindow):
         text_grid.addWidget(self.text_selection_label, 9, 0, 1, 4)
         text_grid.setColumnStretch(1, 1)
         text_grid.setColumnStretch(3, 1)
-        image_layout.addWidget(self.text_options_panel)
+        text_section_layout.addWidget(self.text_options_panel)
+        image_layout.addWidget(self.text_section)
         layout.addWidget(image_group)
 
         profile_group, profile_layout = self._step_panel(2, "Rust setup")

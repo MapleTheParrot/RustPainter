@@ -3515,3 +3515,18 @@ def test_speed_presets_sit_on_the_frame_floors_and_old_profiles_still_match(
     window.speed_preset_combo.setCurrentText("Relaxed")
     assert window.dot_duration_spin.value() == SPEED_PRESETS["Relaxed"]["dot_ms"]
     assert window._detect_speed_preset() == "Relaxed"
+
+
+def test_text_controls_follow_the_source_tab(window: MainWindow) -> None:
+    """Text is edited on the Source tab, so its controls live there too.
+
+    On the Rust preview the layers are baked in and untouchable, and a panel
+    of controls for them would only invite the read-only notice.
+    """
+
+    # isHidden rather than isVisible: the window itself is never shown here.
+    assert not window.text_section.isHidden()
+    window.preview_tabs.setCurrentIndex(1)
+    assert window.text_section.isHidden()
+    window.preview_tabs.setCurrentIndex(0)
+    assert not window.text_section.isHidden()
