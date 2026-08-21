@@ -362,12 +362,19 @@ class SendInputController(BaseInputController):
                 f"Input target ({clamped_x}, {clamped_y}) is outside the virtual desktop "
                 f"({virtual.left}, {virtual.top}, {virtual.width}, {virtual.height})"
             )
-        # Windows maps the inclusive range 0..65535 to the inclusive desktop
-        # endpoints.  width-1/height-1 is therefore important at the far edge.
-        denominator_x = max(1, virtual.width - 1)
-        denominator_y = max(1, virtual.height - 1)
-        normalized_x = round((clamped_x - virtual.left) * 65535 / denominator_x)
-        normalized_y = round((clamped_y - virtual.top) * 65535 / denominator_y)
+        # win32k recovers the pixel by truncation - x = (dx * width) >> 16 - so
+        # the safe encoding aims at the *center* of the target pixel's slice of
+        # the 0..65535 range.  The older inclusive-endpoint formula
+        # (round(x * 65535 / (width - 1))) landed one pixel short for a scatter
+        # of positions on every desktop wider than 65536/width-ish pixels.
+        normalized_x = min(
+            65535,
+            int((clamped_x - virtual.left + 0.5) * 65536 / max(1, virtual.width)),
+        )
+        normalized_y = min(
+            65535,
+            int((clamped_y - virtual.top + 0.5) * 65536 / max(1, virtual.height)),
+        )
         flags = (
             self._MOUSEEVENTF_MOVE
             | self._MOUSEEVENTF_ABSOLUTE

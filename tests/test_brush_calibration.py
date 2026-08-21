@@ -210,3 +210,179 @@ def test_canonical_rows_reject_nonsense_measurements() -> None:
     assert canonical_texture_rows(-12.0) == 0
     assert canonical_texture_rows(float("nan")) == 0
     assert canonical_texture_rows(float("inf")) == 0
+
+
+def test_band_width_measures_the_horizontal_footprint() -> None:
+    """The band sticks out half the brush width past each drag endpoint.
+
+    Height alone cannot say how wide the brush paints: that is only equal on a
+    canvas whose rectangle has exactly the sign texture's aspect ratio, which
+    a hand-dragged rectangle never quite does.
+    """
+
+    before = _canvas()
+    after = _with_band(before, top=90, height=21, left=50, right=349)
+
+    band = measure_stroke_band(before, after)
+
+    assert band.width == pytest.approx(300.0)
+    assert not band.x_clipped
+
+
+def test_band_running_into_a_side_reports_x_clipped() -> None:
+    before = _canvas()
+    after = _with_band(before, top=90, height=21, left=0, right=340)
+
+    band = measure_stroke_band(before, after)
+
+    assert band.x_clipped
+
+
+def test_conversions_interpolate_between_the_measured_probes() -> None:
+    """Inside the probed range the samples answer, not the fitted line.
+
+    These are the actual probe measurements from a live 10x8 run: the fitted
+    line misses the size-29.75 probe by over four pixels, and four pixels is
+    the entire seam budget of a one-cell brush.  Interpolating between the
+    bracketing probes sizes the brush from what the sign actually painted.
+    """
+
+    canvas_height = 1081.0
+    samples = [
+        (14.75, 66.0 / canvas_height),
+        (29.75, 128.0 / canvas_height),
+        (59.5, 271.0 / canvas_height),
+        (100.0, 448.0 / canvas_height),
+    ]
+    model = fit_brush_size_model(samples)
+
+    # Forward reads hit every probe exactly.
+    for size, fraction in samples:
+        assert model.fraction_for_size(size) == pytest.approx(fraction)
+    # The inverse lands between the bracketing probes, where the global line
+    # (which claims 132px at size 30.9) would have left a bare seam.
+    wanted = 137.4 / canvas_height
+    size = model.size_for_fraction(wanted)
+    assert 29.75 < size < 59.5
+    assert model.fraction_for_size(size) == pytest.approx(wanted)
+    # Outside the probed range the global slope continues from the endpoint
+    # sample, so the curve stays continuous instead of jumping onto the line.
+    just_past = model.fraction_for_size(100.5)
+    assert just_past == pytest.approx(448.0 / canvas_height + 0.5 * model.slope)
+
+
+def test_noisy_samples_fall_back_to_the_fitted_line() -> None:
+    """A band that shrank as the size grew cannot anchor an interpolation."""
+
+    samples = [(12.0, 0.10), (30.0, 0.08), (60.0, 0.47)]
+    model = fit_brush_size_model(samples)
+
+    # Non-monotonic fractions: every conversion reads the affine fit.
+    assert model.fraction_for_size(30.0) == pytest.approx(
+        model.slope * 30.0 + model.intercept
+    )
+
+
+def test_horizontal_samples_fit_their_own_axis() -> None:
+    """A sign whose texture is wider than tall paints wider than it does tall."""
+
+    vertical = [(size, size / 320.0) for size in (12, 30, 60)]
+    horizontal = [(size, size * 0.5 / 640.0) for size in (12, 30, 60)]
+    model = fit_brush_size_model(vertical, samples_x=horizontal)
+
+    assert model.has_horizontal_model
+    assert model.sign_pixel_rows == pytest.approx(320.0)
+    assert model.sign_pixel_columns == pytest.approx(1280.0)
+    assert model.fraction_x_for_size(20) == pytest.approx(10.0 / 640.0)
+    assert model.size_for_fraction_x(10.0 / 640.0) == pytest.approx(20.0)
+
+
+def test_unusable_horizontal_samples_degrade_to_the_vertical_model() -> None:
+    """A constant-width band never describes a brush; sizing falls back."""
+
+    vertical = [(size, size / 320.0) for size in (12, 30, 60)]
+    flat = [(size, 0.25) for size in (12, 30, 60)]
+    model = fit_brush_size_model(vertical, samples_x=flat)
+
+    assert not model.has_horizontal_model
+    with pytest.raises(ValueError, match="no horizontal measurement"):
+        model.fraction_x_for_size(20)
+
+
+def test_horizontal_model_survives_a_round_trip_through_a_profile() -> None:
+    model = fit_brush_size_model(
+        [(60, 0.47), (12, 0.094)],
+        samples_x=[(60, 0.235), (12, 0.047)],
+    )
+
+    restored = BrushSizeModel.from_dict(model.to_dict())
+
+    assert restored.slope_x == pytest.approx(model.slope_x)
+    assert restored.intercept_x == pytest.approx(model.intercept_x)
+    assert restored.samples_x == model.samples_x
+
+
+def test_profiles_written_before_horizontal_measurement_still_load() -> None:
+    """Stored profiles predate ``slopeX``; they must load as vertical-only."""
+
+    legacy = {
+        "schemaVersion": 1,
+        "slope": 0.003,
+        "intercept": 0.0005,
+        "samples": [[12.0, 0.036], [60.0, 0.18]],
+        "capturedAt": "2026-08-20T06:58:45+00:00",
+    }
+    model = BrushSizeModel.from_dict(legacy)
+
+    assert not model.has_horizontal_model
+    assert model.sign_pixel_columns == 0.0
+
+
+def test_band_centers_locate_the_stroke_for_bias_measurement() -> None:
+    """Comparing where the band landed against where the drag was commanded is
+    what measures the sign's rendering bias, so the centroid must be right."""
+
+    before = _canvas()
+    after = _with_band(before, top=90, height=21, left=50, right=349)
+
+    band = measure_stroke_band(before, after)
+
+    assert band.center_x == pytest.approx((50 + 349) / 2, abs=0.5)
+    assert band.center_y == pytest.approx(90 + 10, abs=0.5)
+
+
+def test_rendering_bias_survives_a_round_trip() -> None:
+    model = fit_brush_size_model(
+        [(60, 0.47), (12, 0.094)], bias=(-0.004, 0.0019)
+    )
+
+    restored = BrushSizeModel.from_dict(model.to_dict())
+
+    assert restored.bias_x == pytest.approx(-0.004)
+    assert restored.bias_y == pytest.approx(0.0019)
+
+
+def test_implausible_bias_degrades_to_no_compensation() -> None:
+    """A bias of a tenth of the sign is a broken measurement, not a convention."""
+
+    model = fit_brush_size_model(
+        [(60, 0.47), (12, 0.094)], bias=(0.1, float("nan"))
+    )
+
+    assert model.bias_x == 0.0
+    assert model.bias_y == 0.0
+
+
+def test_canonical_sizes_include_rusts_four_by_three_textures() -> None:
+    """A live probe measured the large wooden sign at 318x238 texels: 320x240.
+
+    Power-of-two-only snapping would bend 238 rows into 256 and misalign every
+    native-resolution cell; the nearest canonical size within a tight
+    tolerance is the right reading.
+    """
+
+    assert canonical_texture_rows(238.4) == 240
+    assert canonical_texture_rows(318.4) == 320
+    # Nearest candidate wins where families sit close together.
+    assert canonical_texture_rows(250.0) == 256
+    assert canonical_texture_rows(243.0) == 240

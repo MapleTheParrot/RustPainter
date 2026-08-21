@@ -62,30 +62,33 @@ _SOLID_TOLERANCE = 0.30
 # measured the same band - the digits never reached Rust's Size field.
 _MIN_SLOPE = 1e-5
 
-# Rust's sign textures come in power-of-two sizes.  A fitted row count carries
-# a few percent of band-measurement noise - reading 527 rows on a 512-row sign
-# is normal - so a measurement within this tolerance of a power of two *is*
-# that power of two.  A measurement far from every one is kept as measured:
-# rounding it to a size the sign cannot be would misalign every row.
-_CANONICAL_TEXTURE_SIZES = (32, 64, 128, 256, 512, 1024, 2048)
-_CANONICAL_TOLERANCE = 0.15
+# Rust's sign textures are not all powers of two: a live probe of the large
+# wooden sign measured 318x238 texels - a 4:3 texture of 320x240.  The table
+# therefore carries the power-of-two family and the 4:3 sizes seen in game.
+# A fitted texel count carries a little band-measurement noise (repeat
+# measurements land within a percent of each other), so a measurement within
+# the tolerance of its *nearest* candidate is that candidate.  A measurement
+# far from every one is kept as measured: rounding it to a size the sign
+# cannot be would misalign every row.
+_CANONICAL_TEXTURE_SIZES = (32, 64, 128, 240, 256, 320, 512, 1024, 2048)
+_CANONICAL_TOLERANCE = 0.08
 
 
 def canonical_texture_rows(measured: float) -> int:
-    """Snap a measured texel count to the power of two it is within noise of.
+    """Snap a measured texel count to the canonical size it is within noise of.
 
     The distinction matters most at native resolution: planning 527 rows on a
     512-row sign guarantees fifteen collisions where two logical rows fight
     over one texel, while planning exactly 512 lines every cell up with its
-    texel.  The measurement's job is to pick the right power of two, not to be
+    texel.  The measurement's job is to pick the right texture size, not to be
     believed to the last row.
     """
 
     if not np.isfinite(measured) or measured <= 0:
         return 0
-    for size in _CANONICAL_TEXTURE_SIZES:
-        if abs(measured / size - 1.0) <= _CANONICAL_TOLERANCE:
-            return size
+    nearest = min(_CANONICAL_TEXTURE_SIZES, key=lambda size: abs(measured / size - 1.0))
+    if abs(measured / nearest - 1.0) <= _CANONICAL_TOLERANCE:
+        return nearest
     return int(round(measured))
 
 
@@ -105,6 +108,20 @@ class StrokeBand:
     # gap between it and ``height`` is how much of the brush fades out instead
     # of covering, which is what makes a narrow brush behave unlike a wide one.
     touched_height: float = 0.0
+    # Horizontal extent of the solid band in capture pixels.  Subtracting the
+    # drag length from it yields the brush's *horizontal* footprint, which a
+    # sign whose texture aspect differs from the calibrated rectangle renders
+    # wider or narrower than the vertical one - measured, not assumed.
+    width: float = 0.0
+    # Whether the band ran into the left or right edge of the capture, which
+    # makes ``width`` a floor rather than a measurement.
+    x_clipped: bool = False
+    # Centroid of the solid band in capture pixels.  Compared against where
+    # the stroke was commanded, this measures the sign's rendering bias: a
+    # live probe showed Rust stamping the brush about a texel left and a
+    # fraction of one down from the cursor, uniformly across the sign.
+    center_x: float = 0.0
+    center_y: float = 0.0
 
     @property
     def bottom(self) -> float:
@@ -182,29 +199,125 @@ def measure_stroke_band(before: "Image", after: "Image") -> StrokeBand:
         )
 
     rows = touched.any(axis=1)
+    solid_columns = np.flatnonzero(solid.any(axis=0))
+    band_width = (
+        float(solid_columns[-1] - solid_columns[0] + 1) if solid_columns.size else 0.0
+    )
+    touched_columns = touched.any(axis=0)
+    solid_rows, solid_cols = np.nonzero(solid)
     return StrokeBand(
         top=int(np.argmax(rows)),
         height=band_height,
         changed_pixels=int(solid.sum()),
         clipped=bool(rows[0] or rows[-1]),
         touched_height=_band_thickness(touched),
+        width=band_width,
+        x_clipped=bool(touched_columns[0] or touched_columns[-1]),
+        center_x=float(solid_cols.mean()),
+        center_y=float(solid_rows.mean()),
     )
+
+
+def _interpolation_table(
+    samples: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Sorted, strictly increasing (sizes, fractions) fit for interpolation.
+
+    Returns empty tuples when the samples cannot anchor an interpolation - a
+    duplicate size or a band that shrank as the size grew is measurement noise
+    the affine fit absorbs better than a lookup table would.
+    """
+
+    ordered = sorted((float(size), float(fraction)) for size, fraction in samples)
+    if len(ordered) < 2:
+        return (), ()
+    sizes = tuple(size for size, _ in ordered)
+    fractions = tuple(fraction for _, fraction in ordered)
+    if any(b <= a for a, b in zip(sizes, sizes[1:])):
+        return (), ()
+    if any(b <= a for a, b in zip(fractions, fractions[1:])):
+        return (), ()
+    return sizes, fractions
+
+
+def _piecewise_forward(
+    size: float, samples: Sequence[tuple[float, float]], slope: float
+) -> float | None:
+    """Fraction painted at ``size``, read from the nearest measurements.
+
+    Inside the measured range the answer is a straight interpolation between
+    the two bracketing probes - the fitted line can miss a probe by a few
+    pixels where the sign's texel snapping bends the relationship, and a few
+    pixels is the entire seam budget of a one-cell brush.  Outside the range
+    the global slope continues from the endpoint sample, so the curve stays
+    continuous instead of jumping onto the fitted line.
+    """
+
+    sizes, fractions = _interpolation_table(samples)
+    if not sizes:
+        return None
+    if size <= sizes[0]:
+        return fractions[0] + slope * (size - sizes[0])
+    if size >= sizes[-1]:
+        return fractions[-1] + slope * (size - sizes[-1])
+    return float(np.interp(size, sizes, fractions))
+
+
+def _piecewise_inverse(
+    fraction: float, samples: Sequence[tuple[float, float]], slope: float
+) -> float | None:
+    """The Size number that paints ``fraction``, read from the measurements."""
+
+    sizes, fractions = _interpolation_table(samples)
+    if not sizes:
+        return None
+    if fraction <= fractions[0]:
+        return sizes[0] + (fraction - fractions[0]) / slope
+    if fraction >= fractions[-1]:
+        return sizes[-1] + (fraction - fractions[-1]) / slope
+    return float(np.interp(fraction, fractions, sizes))
+
+
+def _quantized_field_size(size: float) -> float:
+    """A raw size quantized to the field's step and held inside its range."""
+
+    quantized = round(size / BRUSH_SIZE_STEP) * BRUSH_SIZE_STEP
+    return float(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, quantized)))
 
 
 @dataclass(frozen=True, slots=True)
 class BrushSizeModel:
-    """Affine map from Rust's Size number to a fraction of the sign.
+    """Map from Rust's Size number to a fraction of the sign.
 
     ``fraction = slope * size + intercept`` where ``fraction`` is the painted
     band height divided by the calibrated canvas height.  Both sides are
     dimensionless, which is what makes the model independent of how close the
-    camera happens to be standing.
+    camera happens to be standing.  Within the measured range the conversions
+    interpolate between the stored samples rather than reading the fitted
+    line: the line summarizes the sign, the samples *are* the sign.
+
+    ``slope_x`` describes the same brush along the canvas width.  The two only
+    agree when the calibrated rectangle has exactly the sign texture's aspect
+    ratio, which a hand-dragged rectangle never quite does - and on signs
+    whose texture is not square at all, the axes differ by design.  ``0.0``
+    means the horizontal footprint was never measured, in which case sizing
+    falls back to assuming the footprint is square in screen pixels.
     """
 
     slope: float
     intercept: float
     samples: tuple[tuple[float, float], ...]
     captured_at: str = ""
+    slope_x: float = 0.0
+    intercept_x: float = 0.0
+    samples_x: tuple[tuple[float, float], ...] = ()
+    # Where the sign renders a stroke relative to where it was commanded, as
+    # fractions of the canvas (positive = right/down).  A live probe measured
+    # Rust stamping about a texel left and a fraction of one down; the painter
+    # subtracts this bias from every artwork coordinate so the rendered image
+    # lands centered on the calibrated rectangle instead of uniformly shifted.
+    bias_x: float = 0.0
+    bias_y: float = 0.0
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.slope) or self.slope < _MIN_SLOPE:
@@ -215,18 +328,64 @@ class BrushSizeModel:
             raise ValueError("Brush size intercept must be finite")
         if len(self.samples) < 2:
             raise ValueError("A brush size model needs at least two measurements")
+        # A horizontal model is an upgrade, never a requirement: anything
+        # implausible (an old profile, a corrupted value) degrades back to the
+        # square-in-screen-pixels assumption instead of failing the model.
+        if not np.isfinite(self.slope_x) or self.slope_x < _MIN_SLOPE:
+            object.__setattr__(self, "slope_x", 0.0)
+            object.__setattr__(self, "intercept_x", 0.0)
+            object.__setattr__(self, "samples_x", ())
+        if not np.isfinite(self.intercept_x):
+            object.__setattr__(self, "intercept_x", 0.0)
+        # A bias beyond a twentieth of the sign is not a rendering convention,
+        # it is a measurement gone wrong; compensating it would shift the whole
+        # artwork visibly, so an implausible value degrades to no compensation.
+        for name in ("bias_x", "bias_y"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or abs(value) > 0.05:
+                object.__setattr__(self, name, 0.0)
         if not self.captured_at:
             object.__setattr__(self, "captured_at", _utc_now())
+
+    @property
+    def has_horizontal_model(self) -> bool:
+        return self.slope_x >= _MIN_SLOPE
 
     def fraction_for_size(self, size: float) -> float:
         """Canvas-height fraction a given Size number paints."""
 
+        interpolated = _piecewise_forward(float(size), self.samples, self.slope)
+        if interpolated is not None:
+            return interpolated
         return self.slope * float(size) + self.intercept
 
     def size_for_fraction(self, fraction: float) -> float:
         """The Size number that paints ``fraction`` of the canvas height."""
 
+        interpolated = _piecewise_inverse(float(fraction), self.samples, self.slope)
+        if interpolated is not None:
+            return interpolated
         return (float(fraction) - self.intercept) / self.slope
+
+    def fraction_x_for_size(self, size: float) -> float:
+        """Canvas-width fraction a given Size number paints."""
+
+        if not self.has_horizontal_model:
+            raise ValueError("This brush model has no horizontal measurement")
+        interpolated = _piecewise_forward(float(size), self.samples_x, self.slope_x)
+        if interpolated is not None:
+            return interpolated
+        return self.slope_x * float(size) + self.intercept_x
+
+    def size_for_fraction_x(self, fraction: float) -> float:
+        """The Size number that paints ``fraction`` of the canvas width."""
+
+        if not self.has_horizontal_model:
+            raise ValueError("This brush model has no horizontal measurement")
+        interpolated = _piecewise_inverse(float(fraction), self.samples_x, self.slope_x)
+        if interpolated is not None:
+            return interpolated
+        return (float(fraction) - self.intercept_x) / self.slope_x
 
     def clamped_size_for_fraction(self, fraction: float) -> float:
         """``size_for_fraction`` quantized and held inside Rust's accepted range.
@@ -236,8 +395,12 @@ class BrushSizeModel:
         correct brush and one twice as wide as the cell it paints.
         """
 
-        size = round(self.size_for_fraction(fraction) / BRUSH_SIZE_STEP) * BRUSH_SIZE_STEP
-        return float(min(BRUSH_SIZE_MAX, max(BRUSH_SIZE_MIN, size)))
+        return _quantized_field_size(self.size_for_fraction(fraction))
+
+    def clamped_size_for_fraction_x(self, fraction: float) -> float:
+        """``size_for_fraction_x`` quantized and held inside the field's range."""
+
+        return _quantized_field_size(self.size_for_fraction_x(fraction))
 
     @property
     def smallest_fraction(self) -> float:
@@ -269,27 +432,51 @@ class BrushSizeModel:
 
         return 1.0 / self.slope if self.slope > 0 else 0.0
 
+    @property
+    def sign_pixel_columns(self) -> float:
+        """Columns in the sign's texture, when the horizontal axis was measured."""
+
+        return 1.0 / self.slope_x if self.has_horizontal_model else 0.0
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schemaVersion": BRUSH_SIZE_MODEL_SCHEMA,
             "slope": self.slope,
             "intercept": self.intercept,
             "samples": [[float(size), float(fraction)] for size, fraction in self.samples],
             "capturedAt": self.captured_at,
         }
+        if self.has_horizontal_model:
+            value["slopeX"] = self.slope_x
+            value["interceptX"] = self.intercept_x
+            value["samplesX"] = [
+                [float(size), float(fraction)] for size, fraction in self.samples_x
+            ]
+        if self.bias_x or self.bias_y:
+            value["biasX"] = self.bias_x
+            value["biasY"] = self.bias_y
+        return value
+
+    @staticmethod
+    def _sample_pairs(raw: Any) -> tuple[tuple[float, float], ...]:
+        samples: list[tuple[float, float]] = []
+        for entry in raw or ():
+            if isinstance(entry, Sequence) and len(entry) >= 2:
+                samples.append((float(entry[0]), float(entry[1])))
+        return tuple(samples)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "BrushSizeModel":
-        raw_samples = value.get("samples") or ()
-        samples: list[tuple[float, float]] = []
-        for entry in raw_samples:
-            if isinstance(entry, Sequence) and len(entry) >= 2:
-                samples.append((float(entry[0]), float(entry[1])))
         return cls(
             slope=float(value["slope"]),
             intercept=float(value.get("intercept", 0.0)),
-            samples=tuple(samples),
+            samples=cls._sample_pairs(value.get("samples")),
             captured_at=str(value.get("capturedAt") or value.get("captured_at") or ""),
+            slope_x=float(value.get("slopeX", 0.0)),
+            intercept_x=float(value.get("interceptX", 0.0)),
+            samples_x=cls._sample_pairs(value.get("samplesX")),
+            bias_x=float(value.get("biasX", 0.0)),
+            bias_y=float(value.get("biasY", 0.0)),
         )
 
 
@@ -305,14 +492,13 @@ def format_brush_size(size: float) -> str:
     return text or "1"
 
 
-def fit_brush_size_model(
-    samples: Sequence[tuple[float, float]], *, captured_at: str | None = None
-) -> BrushSizeModel:
-    """Least-squares fit of Size number to painted canvas fraction.
+def _fit_line(
+    samples: Sequence[tuple[float, float]],
+) -> tuple[float, float, list[tuple[float, float]]]:
+    """Least-squares line through (size, fraction) samples.
 
-    Rust's brush is expected to run through the origin, but the fit keeps an
-    intercept so a minimum footprint or an off-by-one radius convention shows
-    up in the constant instead of bending every stroke's size.
+    Raises ``ValueError`` when the samples cannot describe a brush: fewer than
+    two distinct sizes, or a band that never grew with the number typed.
     """
 
     usable = [(float(size), float(fraction)) for size, fraction in samples]
@@ -329,11 +515,51 @@ def fit_brush_size_model(
             "The painted band did not grow with the Size value. Confirm the Size "
             "field accepts typed numbers and that Enter commits them."
         )
+    return float(slope), float(intercept), usable
+
+
+def fit_brush_size_model(
+    samples: Sequence[tuple[float, float]],
+    *,
+    samples_x: Sequence[tuple[float, float]] = (),
+    bias: tuple[float, float] = (0.0, 0.0),
+    captured_at: str | None = None,
+) -> BrushSizeModel:
+    """Least-squares fit of Size number to painted canvas fraction.
+
+    Rust's brush is expected to run through the origin, but the fit keeps an
+    intercept so a minimum footprint or an off-by-one radius convention shows
+    up in the constant instead of bending every stroke's size.
+
+    ``samples_x`` are optional (size, fraction-of-canvas-width) measurements of
+    the same strokes' horizontal footprint.  They are fitted the same way, but
+    a failure there is silent: the vertical model still sizes a brush, just
+    under the older square-in-screen-pixels assumption.
+
+    ``bias`` is the sign's measured rendering offset as canvas fractions
+    (positive = the paint landed right/down of the command); implausible
+    values degrade to zero inside the model.
+    """
+
+    slope, intercept, usable = _fit_line(samples)
+    slope_x = 0.0
+    intercept_x = 0.0
+    usable_x: list[tuple[float, float]] = []
+    if samples_x:
+        try:
+            slope_x, intercept_x, usable_x = _fit_line(samples_x)
+        except ValueError:
+            slope_x, intercept_x, usable_x = 0.0, 0.0, []
     return BrushSizeModel(
-        slope=float(slope),
-        intercept=float(intercept),
+        slope=slope,
+        intercept=intercept,
         samples=tuple(usable),
         captured_at=captured_at or _utc_now(),
+        slope_x=slope_x,
+        intercept_x=intercept_x,
+        samples_x=tuple(usable_x),
+        bias_x=float(bias[0]),
+        bias_y=float(bias[1]),
     )
 
 

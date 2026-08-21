@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 
 from .brush_calibration import (
@@ -21,6 +22,7 @@ from .brush_calibration import (
     BRUSH_SIZE_MIN,
     BrushSizeModel,
     StrokeBand,
+    canonical_texture_rows,
     fit_brush_size_model,
     format_brush_size,
     measure_stroke_band,
@@ -861,15 +863,29 @@ class Painter:
         """
 
         canvas = target.canvas
-        pitch = min(canvas.width / plan.width, canvas.height / plan.height)
         diameters = {max(1, int(group.brush_diameter)) for group in plan.color_groups}
         for diameter in sorted(diameters):
-            wanted = self._brush_target_fraction(
+            size = self._brush_plan_size(
                 target, plan, diameter, settings.logical_pixel_spacing, model
             )
-            size = model.clamped_size_for_fraction(wanted)
-            painted = model.fraction_for_size(size) * canvas.height
-            nominal = pitch * diameter
+            # Painted extent and required extent per axis, in that axis's own
+            # screen pixels.  Without a horizontal measurement the vertical
+            # footprint stands in for both axes - the square-in-screen-pixels
+            # assumption sizing itself falls back to.
+            painted_y = model.fraction_for_size(size) * canvas.height
+            checks = [("rows", painted_y, canvas.height / plan.height * diameter)]
+            if model.has_horizontal_model:
+                checks.append(
+                    (
+                        "columns",
+                        model.fraction_x_for_size(size) * canvas.width,
+                        canvas.width / plan.width * diameter,
+                    )
+                )
+            else:
+                checks.append(
+                    ("columns", painted_y, canvas.width / plan.width * diameter)
+                )
             smallest, largest = model.fitted_range
             if size * 2 < smallest or size > largest * 2:
                 LOGGER.warning(
@@ -881,7 +897,10 @@ class Painter:
                     format_brush_size(smallest),
                     format_brush_size(largest),
                 )
-            if diameter == 1 and painted > nominal * self._DETAIL_OVERSHOOT_LIMIT:
+            worst_overshoot = max(
+                painted / nominal for _, painted, nominal in checks
+            )
+            if diameter == 1 and worst_overshoot > self._DETAIL_OVERSHOOT_LIMIT:
                 # A calibrated sign must stay paintable: the plan's cells are
                 # finer than the game's minimum brush, so detail will soften
                 # as neighbouring strokes overlap - a degraded image is the
@@ -892,18 +911,24 @@ class Painter:
                     "resolution, so fine detail will blur together. This sign "
                     "resolves about %d rows; at or below that the plan is "
                     "pixel-accurate.",
-                    painted / pitch,
+                    worst_overshoot,
                     rows,
                 )
             # Adjacent multi-cell bands overlap one row, which tolerates a brush
             # up to one cell under its nominal footprint; anything narrower
             # leaves stripes the plan already counts as covered.
-            if diameter > 1 and painted < nominal * (diameter - 1) / diameter:
-                raise ValueError(
-                    f"A {diameter}-cell brush needs {nominal:.0f}px but the Size field "
-                    f"reaches only {painted:.0f}px here. Choose a lower optimization "
-                    "mode or a higher painting resolution."
-                )
+            for axis, painted, nominal in checks:
+                if axis == "columns" and model.has_horizontal_model:
+                    # Row-sized brushes cover the columns by stroke extension,
+                    # so a narrow footprint here is by design, not a stripe.
+                    continue
+                if diameter > 1 and painted < nominal * (diameter - 1) / diameter:
+                    raise ValueError(
+                        f"A {diameter}-cell brush needs {nominal:.0f}px across its "
+                        f"{axis} but the Size field reaches only {painted:.0f}px "
+                        "here. Choose a lower optimization mode or a higher "
+                        "painting resolution."
+                    )
 
     def _run(self) -> None:
         if getattr(self.input, "emits_real_input", True):
@@ -991,9 +1016,16 @@ class Painter:
 
         The plan is stretched across the whole canvas, so one row is
         ``1/height`` of it and one column ``1/width``.  A round or square brush
-        spans the same distance both ways and therefore has to respect
-        whichever pitch is tighter.  The result is expressed against the canvas
-        height because that is the axis brush calibration measured.
+        spans the same distance both ways and therefore has to cover whichever
+        pitch is *wider*: cells are only square when the calibrated rectangle's
+        aspect divides evenly into the plan's, and sizing to the narrow axis
+        leaves a bare stripe along every seam of the wide one.  Overshooting
+        the narrow axis instead is invisible - the later-painted color simply
+        owns the shared texels.  The result is expressed against the canvas
+        height because that is the axis brush calibration measured.  (When the
+        model carries a horizontal measurement, :meth:`_brush_plan_size` sizes
+        each axis against its own data instead of using this square-footprint
+        assumption.)
 
         A one-cell brush targets the full pitch plus a fraction of a sign
         texel.  The sign renders every stroke snapped to its own texture rows,
@@ -1017,7 +1049,7 @@ class Painter:
         """
 
         canvas = target.canvas
-        pitch = min(canvas.width / plan.width, canvas.height / plan.height)
+        pitch = max(canvas.width / plan.width, canvas.height / plan.height)
         span = pitch * diameter_cells * min(spacing, 1.0)
         fraction = span / canvas.height
         if diameter_cells <= 1 and model is not None and model.slope > 0:
@@ -1025,6 +1057,120 @@ class Painter:
             overlap = min(0.5, max(0.25, 0.25 * texels_per_cell))
             fraction += overlap * model.slope
         return fraction
+
+    @staticmethod
+    def _axis_brush_fraction(
+        cells: int, diameter_cells: int, spacing: float, slope: float
+    ) -> float:
+        """The fraction of one canvas axis a ``diameter_cells`` brush should paint.
+
+        One cell is ``1/cells`` of the axis, so the wanted span is dimensionless
+        before the canvas size ever enters.  The overlap hedge is the same
+        half-to-quarter texel taper :meth:`_brush_target_fraction` documents,
+        expressed in this axis's own texels.
+        """
+
+        fraction = (diameter_cells * min(spacing, 1.0)) / cells
+        if diameter_cells <= 1 and slope > 0:
+            texels_per_cell = fraction / slope
+            overlap = min(0.5, max(0.25, 0.25 * texels_per_cell))
+            fraction += overlap * slope
+        return fraction
+
+    @classmethod
+    def _brush_plan_size(
+        cls,
+        target: PaintingTarget,
+        plan: PaintPlan,
+        diameter_cells: int,
+        spacing: float,
+        model: BrushSizeModel,
+    ) -> float:
+        """The Size number to type for a ``diameter_cells`` pass of this plan.
+
+        With a horizontal measurement the brush is sized to the *rows* alone:
+        Rust's brush is square in the sign's own texels, so on cells wider
+        than tall a row-exact brush undercovers the columns - and that gap is
+        closed by geometry instead, extending each stroke sideways by the
+        shortfall (:meth:`_stroke_extension_pixels`).  Rows can never be
+        stretched that way (strokes are horizontal), so the vertical pitch is
+        the one the Size number must honor exactly.  Without a horizontal
+        measurement, the vertical model is read under the older
+        square-in-screen-pixels assumption and sized to the wider pitch.
+        """
+
+        if model.has_horizontal_model:
+            return model.clamped_size_for_fraction(
+                cls._axis_brush_fraction(
+                    plan.height, diameter_cells, spacing, model.slope
+                )
+            )
+        return model.clamped_size_for_fraction(
+            cls._brush_target_fraction(target, plan, diameter_cells, spacing, model)
+        )
+
+    @staticmethod
+    def _stroke_extension_pixels(
+        canvas: RectangleLike,
+        plan: PaintPlan,
+        model: BrushSizeModel | None,
+        size: float,
+    ) -> float:
+        """How far each stroke end reaches out so cells are covered edge-to-edge.
+
+        The brush is sized to the rows, so on cells wider than tall it paints
+        a band narrower than the cell at each stroke end.  Dragging that much
+        further out (a dab becomes a tiny horizontal drag) covers the full
+        cell width with no vertical overshoot at all - the trick a human sign
+        painter uses when the roller is narrower than the board.  ``canvas``
+        is whatever rectangle the strokes are being laid out on, so the pitch
+        matches the grid the endpoints came from.
+        """
+
+        if model is None or not model.has_horizontal_model:
+            return 0.0
+        pitch_x = canvas.width / plan.width
+        texel_x = model.slope_x * canvas.width
+        brush_width = model.fraction_x_for_size(size) * canvas.width
+        # The half-texel hedge mirrors the vertical one: stamps snap to whole
+        # texels, and a boundary reached exactly can still round away.
+        return max(0.0, (pitch_x + 0.5 * texel_x - brush_width) / 2.0)
+
+    @staticmethod
+    def _registered_canvas(
+        canvas: RectangleLike, model: BrushSizeModel | None
+    ) -> RectangleLike:
+        """Stretch the stroke grid to the sign texture's canonical extent.
+
+        The calibrated rectangle covers the sign only to hand-drag precision -
+        318.4 of a 320-column texture in live measurement - so cells laid out
+        on the rectangle are a fraction of a texel narrower than the texture's
+        own grid.  Stamps land on whole texels, and that fraction accumulates:
+        every dozen cells the rounding slips one texel and a later neighbour's
+        stamp eats a texel of the cell before it, which a sign texture
+        downloaded from the game showed as painted cells of visibly uneven
+        width.  Anchoring at the rectangle's origin and stretching the grid to
+        ``canonical texels x measured texel size`` makes the cell pitch exact,
+        so stamps tile uniformly however many cells the plan has.
+        """
+
+        if model is None or not model.has_horizontal_model:
+            return canvas
+        rows = canonical_texture_rows(model.sign_pixel_rows)
+        columns = canonical_texture_rows(model.sign_pixel_columns)
+        if rows < 8 or columns < 8:
+            return canvas
+        width = columns * model.slope_x * canvas.width
+        height = rows * model.slope * canvas.height
+        # A canonical guess far from the rectangle would stretch the artwork
+        # off the sign; hand-drag slop is a couple of texels, not a tenth.
+        if not (0.9 <= width / canvas.width <= 1.1):
+            return canvas
+        if not (0.9 <= height / canvas.height <= 1.1):
+            return canvas
+        return SimpleNamespace(
+            left=canvas.left, top=canvas.top, width=width, height=height
+        )
 
     def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:
         """Type the Size number that paints ``diameter_cells`` logical cells.
@@ -1041,10 +1187,9 @@ class Painter:
         model = job.target.brush_size_model
         if not settings.apply_brush_size or box is None or model is None:
             return
-        fraction = self._brush_target_fraction(
+        size = self._brush_plan_size(
             job.target, job.plan, diameter_cells, settings.logical_pixel_spacing, model
         )
-        size = model.clamped_size_for_fraction(fraction)
         self._update_progress_state(
             PainterState.RUNNING,
             f"Brush size {format_brush_size(size)} for {diameter_cells} logical "
@@ -1052,11 +1197,15 @@ class Painter:
         )
         self._write_brush_size(box, size, settings, epoch)
         LOGGER.info(
-            "Brush size %s typed for %d cell(s): wanted %.5f of the sign, paints %.5f",
+            "Brush size %s typed for %d cell(s): paints %.5f of the sign height%s",
             format_brush_size(size),
             diameter_cells,
-            fraction,
             model.fraction_for_size(size),
+            (
+                f", {model.fraction_x_for_size(size):.5f} of its width"
+                if model.has_horizontal_model
+                else ""
+            ),
         )
 
     # The OEM period key, for the decimal point in sizes such as "1.35".
@@ -1275,6 +1424,8 @@ class Painter:
         close the camera happens to be standing.
         """
 
+        import numpy as np
+
         target = job.target
         settings = job.settings
         box = target.brush_size_box
@@ -1291,14 +1442,28 @@ class Painter:
             int(round(target.color_box.left + target.color_box.width / 2.0)),
             int(round(target.color_box.top + target.color_box.height / 2.0)),
         )
-        # Drawn through the vertical middle and well short of both sides, so the
-        # straight section of the stroke dominates the measurement even when the
-        # widest probe rounds off its ends.
+        # Drawn through the vertical middle and well short of both sides.  The
+        # drag is deliberately short: the band extends past each end by half
+        # the brush's horizontal footprint, and a size-100 probe on a close-up
+        # sign is wider than the margin a longer drag would leave.  A clipped
+        # band loses its horizontal sample, and losing the widest probe is
+        # what left the horizontal fit leaning on a handful of narrow ones -
+        # measured live as the column count swinging six percent between runs.
         stroke_y = int(round(canvas.top + canvas.height / 2.0))
-        start = (int(round(canvas.left + canvas.width * 0.15)), stroke_y)
-        end = (int(round(canvas.left + canvas.width * 0.85)), stroke_y)
+        start = (int(round(canvas.left + canvas.width * 0.32)), stroke_y)
+        end = (int(round(canvas.left + canvas.width * 0.68)), stroke_y)
+        drag_pixels = float(end[0] - start[0])
 
         samples: list[tuple[float, float]] = []
+        samples_x: list[tuple[float, float]] = []
+        # Rendering bias per probe: where the solid band's center landed minus
+        # where the stroke was commanded, in capture pixels.  A live probe
+        # showed Rust stamping about a texel left and a fraction of one down of
+        # the cursor; measuring it here lets painting cancel it out.
+        biases_x: list[float] = []
+        biases_y: list[float] = []
+        drag_center_x = (start[0] + end[0]) / 2.0 - canvas.left
+        stroke_y_local = float(stroke_y - canvas.top)
         clipped: list[float] = []
         probe_index = 0
 
@@ -1347,6 +1512,14 @@ class Painter:
                 clipped.append(size)
                 continue
             samples.append((size, band.height / canvas.height))
+            biases_y.append(band.center_y - stroke_y_local)
+            # The band's ends stick out half the brush's *horizontal* footprint
+            # past each drag endpoint, so the same capture also measures the
+            # axis the vertical band cannot: subtract the drag and what is
+            # left is how wide this Size number really paints on this sign.
+            if not band.x_clipped and band.width > drag_pixels:
+                samples_x.append((size, (band.width - drag_pixels) / canvas.width))
+                biases_x.append(band.center_x - drag_center_x)
 
         if len(samples) < 2:
             detail = (
@@ -1361,12 +1534,27 @@ class Painter:
                 "Brush measurement needs two usable probe strokes but got "
                 f"{len(samples)}. {detail}"
             )
-        model = fit_brush_size_model(samples)
+        # The median shrugs off one probe whose band was misread; positive
+        # means the paint landed right/down of the command.
+        bias = (
+            float(np.median(biases_x)) / canvas.width if biases_x else 0.0,
+            float(np.median(biases_y)) / canvas.height if biases_y else 0.0,
+        )
+        model = fit_brush_size_model(samples, samples_x=samples_x, bias=bias)
         LOGGER.info(
-            "Brush size model: %.6f of the sign per unit (~%.0f sign rows), offset %.6f",
+            "Brush size model: %.6f of the sign per unit (~%.0f sign rows), "
+            "offset %.6f%s; rendering bias %+.1fpx, %+.1fpx",
             model.slope,
             model.sign_pixel_rows,
             model.intercept,
+            (
+                f"; horizontal {model.slope_x:.6f} per unit "
+                f"(~{model.sign_pixel_columns:.0f} sign columns)"
+                if model.has_horizontal_model
+                else "; horizontal footprint not measurable"
+            ),
+            model.bias_x * canvas.width,
+            model.bias_y * canvas.height,
         )
         return model
 
@@ -1500,6 +1688,25 @@ class Painter:
             and target.brush_size_box is not None
             and target.brush_size_model is not None
         )
+        # The sign renders strokes slightly off from where they are commanded
+        # (about a texel left and a fraction of one down, measured live).
+        # Aiming every artwork coordinate the same distance the other way
+        # cancels it.  Probe strokes never come through here, so they keep
+        # measuring the raw response.  Only a freshly measured model is
+        # trusted: with sizing off the model on file may describe another
+        # sign, and a stale shift is worse than none.
+        model = target.brush_size_model if sizing_enabled else None
+        if model is not None:
+            bias = (
+                model.bias_x * target.canvas.width,
+                model.bias_y * target.canvas.height,
+            )
+        else:
+            bias = (0.0, 0.0)
+        # Strokes are laid out on the texture's canonical extent rather than
+        # the hand-dragged rectangle, so the cell pitch is texel-exact; the
+        # physical rectangle still bounds every actual mouse coordinate.
+        paint_canvas = self._registered_canvas(target.canvas, model)
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
         # Rust, so an epoch bump re-applies the size before the next stroke -
@@ -1509,6 +1716,18 @@ class Painter:
         selected: tuple[RGBColor, int] | None = None
         for color_index, group in enumerate(plan.color_groups, start=1):
             diameter = max(1, int(group.brush_diameter))
+            extension = (
+                self._stroke_extension_pixels(
+                    paint_canvas,
+                    plan,
+                    model,
+                    self._brush_plan_size(
+                        target, plan, diameter, settings.logical_pixel_spacing, model
+                    ),
+                )
+                if model is not None
+                else 0.0
+            )
             for index_in_group, stroke in enumerate(group.strokes, start=1):
                 while True:
                     self._checkpoint(check_focus=True)
@@ -1523,7 +1742,16 @@ class Painter:
                         if selected != (group.color, current_epoch):
                             self._select_color(group.color, target, settings, current_epoch)
                             selected = (group.color, current_epoch)
-                        self._execute_stroke(stroke, plan, target.canvas, settings, current_epoch)
+                        self._execute_stroke(
+                            stroke,
+                            plan,
+                            paint_canvas,
+                            settings,
+                            current_epoch,
+                            bias,
+                            extension,
+                            clamp_rect=target.canvas,
+                        )
                         break
                     except _RetryAction:
                         selected = None
@@ -1698,10 +1926,27 @@ class Painter:
         canvas: RectangleLike,
         settings: PainterSettings,
         epoch: int,
+        bias: tuple[float, float] = (0.0, 0.0),
+        extension: float = 0.0,
+        clamp_rect: RectangleLike | None = None,
     ) -> None:
         start, end = logical_stroke_to_screen(stroke, plan.width, plan.height, canvas)  # type: ignore[arg-type]
-        start = self._space_and_clamp(start, canvas, settings.logical_pixel_spacing)
-        end = self._space_and_clamp(end, canvas, settings.logical_pixel_spacing)
+        if extension > 0.0:
+            # The brush is row-sized, so each stroke reaches out sideways to
+            # cover the cell width; a dab becomes a tiny horizontal drag.
+            direction = 1.0 if end[0] >= start[0] else -1.0
+            start = (start[0] - direction * extension, start[1])
+            end = (end[0] + direction * extension, end[1])
+        if bias != (0.0, 0.0):
+            # The sign paints where the cursor is plus its measured rendering
+            # bias, so the cursor aims the same distance the other way.
+            start = (start[0] - bias[0], start[1] - bias[1])
+            end = (end[0] - bias[0], end[1] - bias[1])
+        # The mouse itself must stay inside the *calibrated* rectangle even
+        # when the strokes were laid out on the registered texture extent.
+        bounds = clamp_rect if clamp_rect is not None else canvas
+        start = self._space_and_clamp(start, bounds, settings.logical_pixel_spacing)
+        end = self._space_and_clamp(end, bounds, settings.logical_pixel_spacing)
         # Cell centers such as 0.5 must use floor, not Python's ties-to-even
         # round(), or adjacent logical pixels can collapse onto one coordinate.
         start_int = math.floor(start[0]), math.floor(start[1])
@@ -1724,11 +1969,16 @@ class Painter:
         try:
             distance = math.hypot(end_int[0] - start_int[0], end_int[1] - start_int[1])
             if distance == 0:
-                self._interruptible_sleep(
-                    settings.mouse_down_duration_seconds,
-                    epoch=epoch,
-                    check_focus=True,
-                )
+                # A drag spends whole frames moving, but a dab is one press and
+                # release - inside a single 67 ms frame of Rust's 15 FPS paint
+                # UI it can be sampled as nothing at all, exactly like the
+                # picker clicks held for the same reason.  A silently dropped
+                # dab is a missing cell the verification pass then has to buy
+                # back with a whole extra capture-and-repaint round.
+                hold = settings.mouse_down_duration_seconds
+                if self.input.emits_real_input:
+                    hold = max(hold, self._DAB_HOLD_SECONDS)
+                self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
                 return
             steps = max(1, int(math.ceil(distance / settings.stroke_interpolation_step_pixels)))
             duration = distance / settings.stroke_speed_pixels_per_second
@@ -1771,6 +2021,12 @@ class Painter:
     # rare (a handful per color change), so holding them across a frame costs
     # nothing next to a silently unchanged color.
     _PICKER_CLICK_HOLD_SECONDS = 0.09
+
+    # Single-cell dabs are held at least this long for the same 15 FPS reason.
+    # Slightly under a frame rather than the picker's 90 ms because dabs can
+    # number in the thousands, and a press this long straddles a frame boundary
+    # in all but the unluckiest alignment.
+    _DAB_HOLD_SECONDS = 0.07
 
     @classmethod
     def _inset_into(

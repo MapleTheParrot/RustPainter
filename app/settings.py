@@ -246,9 +246,13 @@ def _validate(settings: Mapping[str, Any]) -> None:
             for value in focus
         ):
             raise SettingsError("image.crop_focus must be two fractions from 0 to 1")
+    # "max" and "custom" are GUI-computed presets: the sign measurement or the
+    # spin boxes decide the dimensions, so they own no entry in the preset
+    # table.  Rejecting them here silently discarded every settings save made
+    # while one of them was selected.
     if not isinstance(image.get("quality_preset"), str) or image.get(
         "quality_preset"
-    ) not in {*QUALITY_PRESETS, "custom"}:
+    ) not in {*QUALITY_PRESETS, "max", "custom"}:
         raise SettingsError("image.quality_preset is invalid")
     paint_modes = {mode.value for mode in PaintMode}
     if not isinstance(image.get("paint_mode"), str) or image.get(

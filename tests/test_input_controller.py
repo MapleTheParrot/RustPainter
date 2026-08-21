@@ -47,8 +47,13 @@ def test_absolute_move_rejects_targets_outside_virtual_desktop() -> None:
 
     controller.move_mouse(-100, -50)
     controller.move_mouse(99, 49)
-    assert calls[0][1:] == (0, 0)
-    assert calls[1][1:] == (65535, 65535)
+    # win32k recovers the pixel by truncation: pixel = (dx * extent) >> 16.
+    # The encoding aims at the center of each pixel's slice, so every corner
+    # must recover exactly - the old inclusive-endpoint formula missed a
+    # scatter of pixels by one on wide desktops.
+    for (_, dx, dy), (pixel_x, pixel_y) in zip(calls, ((0, 0), (199, 99))):
+        assert (dx * 200) >> 16 == pixel_x
+        assert (dy * 100) >> 16 == pixel_y
 
 
 def test_mac_virtual_key_codes_cover_hotkeys_letters_and_digits() -> None:

@@ -394,6 +394,42 @@ still favor the **square** brush: a circle of one cell across leaves gaps at
 the cell corners. Along a horizontal run the two shapes behave alike; the
 difference shows at run ends and on isolated pixels.
 
+The probe strokes measure both axes of the brush at once: the band's height
+is its vertical footprint, and the amount its ends stick out past the drag is
+its horizontal one. The two only agree when the calibrated rectangle has
+exactly the sign texture's aspect ratio. (A live probe of the large wooden
+sign measured 4.08px per Size unit across against 4.53px down - a 320x240
+texture under a 1.20 rectangle - which is why assuming a square footprint
+left a bare stripe beside every column.) Rust's brush is square in the sign's
+own texels, so the Size number is chosen to match the *rows* exactly, and on
+cells wider than tall the remaining width is covered by geometry instead:
+each stroke drags a little further sideways, a dab becoming a tiny horizontal
+drag - the trick a sign painter uses when the roller is narrower than the
+board. Within the probed range, converting between Size numbers and painted
+fractions interpolates between the recorded probes rather than reading the
+fitted line: the line can miss a nearby probe by a few pixels, and a few
+pixels is the entire seam budget of a one-cell brush.
+
+Strokes are laid out on the texture's canonical extent rather than on the
+hand-dragged rectangle. The rectangle covers the sign only to hand-drag
+precision - 318.4 of a 320-column texture in live measurement - so cells laid
+out on it are a fraction of a texel narrower than the texture's grid, and
+because stamps land on whole texels that fraction accumulates until a later
+neighbour's stamp eats a texel of the cell before it (visible as unevenly
+wide cells in a sign texture downloaded from the game). Registered to
+``canonical texels x measured texel size``, the cell pitch is texel-exact and
+stamps tile uniformly; the mouse still never leaves the calibrated
+rectangle.
+
+The same probes also measure the sign's rendering bias: Rust stamps the brush
+about a texel left and a fraction of one down from the cursor, uniformly
+across the sign. Painting aims every artwork coordinate the same distance the
+other way, so the rendered image lands centered on the calibrated rectangle
+instead of uniformly shifted. Colors that share a boundary still meet in a
+one-texel blend line - the brush's own edge falloff, visible on a
+checkerboard and invisible on ordinary artwork - which is the game's
+rendering, not a placement error.
+
 ## Timelapse
 
 The **Timelapse** tab, next to Workspace in the header, captures the calibrated

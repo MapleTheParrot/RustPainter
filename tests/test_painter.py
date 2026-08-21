@@ -1180,10 +1180,14 @@ def test_brush_measurement_probes_around_the_brush_the_plan_needs() -> None:
     assert typed[1:] == ["40", "20", "10", "5", "2.5"]
     model = painter.measured_brush_size_model
     assert model is not None
-    # The simulator rounds bands to whole pixels, which feeds a small
-    # quantization error into the fit; a twentieth of a size unit is well
-    # under what one sign texel resolves.
-    assert model.clamped_size_for_fraction(5 / 128) == pytest.approx(5.0, abs=0.15)
+    # The conversion interpolates between the bracketing probes rather than
+    # reading a global fitted line: the simulator quantizes bands to whole
+    # pixels, so its size-5 probe painted 12px where the wanted cell is 12.5 -
+    # and the interpolated answer sizes up until the measurements say the cell
+    # is covered, instead of trusting a line that misses the nearby probes.
+    size = model.clamped_size_for_fraction(5 / 128)
+    assert 5.0 <= size <= 5.5
+    assert model.fraction_for_size(size) >= 5 / 128
 
 
 def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:
@@ -1285,3 +1289,139 @@ def test_native_resolution_types_a_size_barely_over_one() -> None:
     fraction = Painter._brush_target_fraction(target, plan, 1, 1.0, model)
 
     assert model.clamped_size_for_fraction(fraction) == pytest.approx(1.25)
+
+
+def test_non_square_cells_size_the_brush_to_the_wider_pitch() -> None:
+    """The bug behind bare seams between rows on non-square logical cells.
+
+    A 640x320 canvas under a 64x20 grid has cells 10px wide and 16px tall.
+    Sizing to the narrower pitch (10px, the old ``min``) leaves a 6px bare
+    stripe under every row boundary; sizing to the wider pitch overshoots the
+    columns instead, which the later-painted color simply owns.
+    """
+
+    controller = MockInputController()
+    profile = _sized_profile("Tall cells")
+    plan = PaintPlan(
+        64,
+        20,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(2.0))
+
+    assert painter.state is PainterState.COMPLETED
+    # 16px pitch plus the half-texel hedge; the old code typed 10.5.
+    assert _typed_values(controller) == ["16.5"]
+
+
+def test_row_sized_brush_covers_cell_width_by_stroke_extension() -> None:
+    """A brush narrower than the cell drags further instead of sizing up.
+
+    One Size unit paints one vertical pixel but only half a horizontal one
+    here - the shape a calibrated rectangle whose aspect does not match the
+    sign texture's produces.  Sizing up to cover the columns would smear the
+    rows; keeping the row-exact size and extending each stroke sideways
+    covers the full cell width with no vertical overshoot at all.
+    """
+
+    model = fit_brush_size_model(
+        [(size, size / 320.0) for size in (12, 30, 60)],
+        samples_x=[(size, size * 0.5 / 640.0) for size in (12, 30, 60)],
+    )
+    target = PaintingTarget(
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+    )
+    plan = PaintPlan(64, 32, ())
+
+    size = Painter._brush_plan_size(target, plan, 1, 1.0, model)
+    assert size == pytest.approx(10.5)  # rows decide the Size number alone
+    # The 10.5-unit brush paints only 5.25px of a 10px-wide cell; each stroke
+    # end reaches out the 2.5px that covers the rest (plus a half-texel hedge).
+    extension = Painter._stroke_extension_pixels(target.canvas, plan, model, size)
+    assert extension == pytest.approx(2.5)
+
+    # A comfortably wide footprint needs no extension at all.
+    wide = fit_brush_size_model(
+        [(size_, size_ / 320.0) for size_ in (12, 30, 60)],
+        samples_x=[(size_, size_ * 3.0 / 640.0) for size_ in (12, 30, 60)],
+    )
+    assert Painter._brush_plan_size(target, plan, 1, 1.0, wide) == pytest.approx(10.5)
+    assert Painter._stroke_extension_pixels(target.canvas, plan, wide, 10.5) == 0.0
+
+
+def test_stroke_grid_registers_to_the_canonical_texture_extent() -> None:
+    """Cells must be whole texels wide or stamps drift one texel per few cells.
+
+    The live sign measured 318.4 columns x 238.4 rows inside the hand-dragged
+    rectangle - a 320x240 texture with its outermost texels under the frame.
+    Laying 10 cells on the rectangle makes them 31.84 texels wide; stamps land
+    on whole texels, so the rounding slips one texel every few cells and a
+    later neighbour's stamp eats a texel column of the cell before it (seen
+    directly in a sign texture downloaded from the game).  Registering the
+    grid to 320 x the measured texel size makes the pitch exact.
+    """
+
+    model = fit_brush_size_model(
+        [(10, 10 / 238.4), (50, 50 / 238.4)],
+        samples_x=[(10, 10 / 318.4), (50, 50 / 318.4)],
+    )
+    canvas = ScreenRect(491, -1260, 1299, 1080)
+
+    registered = Painter._registered_canvas(canvas, model)
+
+    assert registered.left == canvas.left and registered.top == canvas.top
+    assert registered.width == pytest.approx(320 * 1299 / 318.4)
+    assert registered.height == pytest.approx(240 * 1080 / 238.4)
+
+    # Without a horizontal measurement there is nothing to register against.
+    vertical_only = fit_brush_size_model([(10, 10 / 238.4), (50, 50 / 238.4)])
+    assert Painter._registered_canvas(canvas, vertical_only) is canvas
+    assert Painter._registered_canvas(canvas, None) is canvas
+
+
+def test_measured_rendering_bias_shifts_artwork_strokes_the_other_way() -> None:
+    """Rust stamps about a texel off the cursor; painting must cancel it.
+
+    The model carries the measured bias (paint landed 5px right and 2px down
+    here), so the dab is commanded 5px left and 2px up of the cell center and
+    the rendered result lands centered.
+    """
+
+    controller = MockInputController()
+    profile = CalibrationProfile.new(
+        "Biased sign",
+        canvas=ScreenRect(100, 100, 640, 320),
+        color_box=ScreenRect(600, 500, 100, 100),
+        hue_bar=ScreenRect(720, 500, 12, 100),
+        brush_size_box=ScreenRect(800, 100, 60, 24),
+    )
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 320.0) for size in (60, 30, 12)],
+        bias=(5 / 640.0, 2 / 320.0),
+    ).to_dict()
+    plan = PaintPlan(
+        64,
+        32,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+    painter = Painter(controller, screen_capture=_panel_capture)
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=True))
+    assert painter.wait(_t(2.0))
+    assert painter.state is PainterState.COMPLETED
+
+    canvas = profile.canvas
+    dabs = [
+        _position_at(controller, index)
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down"
+        and canvas.contains(*_position_at(controller, index))
+    ]
+    # Cell (0, 0) of a 64x32 plan on this canvas centers at (105, 105); the
+    # measured bias pulls the command to (100, 103).
+    assert dabs == [(100, 103)]

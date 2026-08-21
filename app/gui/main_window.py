@@ -3489,17 +3489,26 @@ class MainWindow(QMainWindow):
             return None
         from app.brush_calibration import canonical_texture_rows
 
-        # Rust's sign textures come in power-of-two sizes, and the measured
-        # count carries a few percent of noise: 527 measured rows on a 512-row
-        # sign is normal.  Snapping to the canonical size is what lets a
-        # native-resolution plan line every cell up with its texel instead of
-        # scattering collisions wherever the noise said an extra row existed.
+        # Rust's sign textures come in canonical sizes (powers of two and the
+        # 4:3 family measured in game), and the measured count carries a little
+        # noise: 527 measured rows on a 512-row sign is normal.  Snapping to
+        # the canonical size is what lets a native-resolution plan line every
+        # cell up with its texel instead of scattering collisions wherever the
+        # noise said an extra row existed.
         rows = canonical_texture_rows(model.sign_pixel_rows)
         if rows < 8:
             return None
-        aspect = max(0.001, self._canvas_aspect_ratio())
         height = min(rows, 2048)
-        width = canonical_texture_rows(height * aspect)
+        # Columns come from the measured horizontal footprint when the model
+        # has one; deriving them from the calibrated rectangle's aspect assumes
+        # the texture and the rectangle have the same shape, which a live probe
+        # showed they need not (a 320x240 texture under a 1.20 rectangle).
+        columns = model.sign_pixel_columns
+        if columns > 0:
+            width = canonical_texture_rows(columns)
+        else:
+            aspect = max(0.001, self._canvas_aspect_ratio())
+            width = canonical_texture_rows(height * aspect)
         width = max(8, min(2048, width))
         return width, height
 

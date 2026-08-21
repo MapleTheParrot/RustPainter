@@ -525,5 +525,50 @@ class SmartBackgroundRemovalTests(unittest.TestCase):
         )
 
 
+class UpscaleCrispnessTests(unittest.TestCase):
+    def test_upscaling_pixel_art_yields_blocks_not_blur(self) -> None:
+        """Blowing a tiny image up to a large sign must not invent colors.
+
+        A 10x8 sign texture downloaded from the game and re-imported at Max
+        quality came out as a smear: Lanczos interpolated hundreds of blend
+        colors between the original pixels.  An upscale reveals nothing new,
+        so it must reproduce the source pixels as crisp blocks.
+        """
+
+        from PIL import Image
+
+        rng = np.random.default_rng(7)
+        tiny = Image.fromarray(
+            np.dstack(
+                [
+                    rng.integers(0, 255, (8, 10, 3), dtype=np.uint8),
+                    np.full((8, 10, 1), 255, dtype=np.uint8),
+                ]
+            ),
+            "RGBA",
+        )
+        scaled, _mask = scale_image(tiny, (320, 240), "stretch")
+        colors = np.unique(
+            np.asarray(scaled.convert("RGB")).reshape(-1, 3), axis=0
+        )
+        self.assertLessEqual(len(colors), 80)
+        # Downscales must keep the smooth linear-light path: a gradient
+        # reduced 4x should still produce colors between the source's.
+        gradient = Image.fromarray(
+            np.dstack(
+                [
+                    np.tile(np.arange(0, 240, dtype=np.uint8), (64, 1)),
+                    np.zeros((64, 240), dtype=np.uint8),
+                    np.zeros((64, 240), dtype=np.uint8),
+                    np.full((64, 240), 255, dtype=np.uint8),
+                ]
+            ),
+            "RGBA",
+        )
+        reduced, _mask = scale_image(gradient, (60, 16), "stretch")
+        reds = np.unique(np.asarray(reduced.convert("RGB"))[:, :, 0])
+        self.assertGreater(len(reds), 30)
+
+
 if __name__ == "__main__":
     unittest.main()

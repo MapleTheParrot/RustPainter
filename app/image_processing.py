@@ -92,11 +92,13 @@ def crop_centering(
 
 try:
     _LANCZOS = Image.Resampling.LANCZOS
+    _NEAREST = Image.Resampling.NEAREST
     _DITHER_NONE = Image.Dither.NONE
     _DITHER_FS = Image.Dither.FLOYDSTEINBERG
     _MEDIANCUT = Image.Quantize.MEDIANCUT
 except AttributeError:  # Pillow < 9.1
     _LANCZOS = Image.LANCZOS
+    _NEAREST = Image.NEAREST
     _DITHER_NONE = Image.NONE
     _DITHER_FS = Image.FLOYDSTEINBERG
     _MEDIANCUT = Image.MEDIANCUT
@@ -275,6 +277,14 @@ def _resample(
     """
 
     array = np.asarray(source.convert("RGBA"), dtype=np.uint8)
+    # A pure upscale averages nothing, so linear light buys nothing and
+    # Lanczos actively hurts: blowing a 10x8 pixel image up to a 320x240 sign
+    # must yield crisp blocks, not a blur of colors the source never held -
+    # interpolation invents nothing an upscale could reveal.
+    source_width = (box[2] - box[0]) if box is not None else source.width
+    source_height = (box[3] - box[1]) if box is not None else source.height
+    scaling_up = size[0] >= source_width and size[1] >= source_height
+    filter_choice = _NEAREST if scaling_up else _LANCZOS
     resized = []
     # One channel at a time: a phone photo is already fifty megabytes as bytes,
     # and holding all four as float at once would quadruple that for nothing.
@@ -285,7 +295,7 @@ def _resample(
             plane = np.ascontiguousarray(array[:, :, channel], dtype=np.float32) / 255.0
         resized.append(
             np.asarray(
-                Image.fromarray(plane, mode="F").resize(size, _LANCZOS, box=box),
+                Image.fromarray(plane, mode="F").resize(size, filter_choice, box=box),
                 dtype=np.float32,
             )
         )

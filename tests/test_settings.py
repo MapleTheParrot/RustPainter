@@ -213,3 +213,20 @@ def test_settings_still_reject_a_modifier_hotkey_the_chooser_cannot_offer(
         SettingsStore(tmp_path / "settings.json").save(
             {"hotkeys": {"start_resume": "CTRL+ALT+Q"}}
         )
+
+
+def test_gui_computed_quality_presets_are_saveable(tmp_path) -> None:
+    """"max" and "custom" come from the GUI, not the preset table.
+
+    Their dimensions are computed (from the sign measurement and the spin
+    boxes respectively), so they own no table entry - but rejecting them
+    silently discarded every settings save made while one was selected.
+    """
+
+    store = SettingsStore(tmp_path / "settings.json")
+    for preset in ("max", "custom", "balanced"):
+        saved = store.save({"image": {"quality_preset": preset}})
+        assert saved["image"]["quality_preset"] == preset
+
+    with pytest.raises(SettingsError, match="quality_preset"):
+        store.save({"image": {"quality_preset": "ultra"}})
