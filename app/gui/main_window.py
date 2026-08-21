@@ -2554,6 +2554,23 @@ class MainWindow(QMainWindow):
             max_brush_pixels=max_brush_pixels,
         )
 
+    def _texel_grid(self) -> Any:
+        """The texel grid the last job measured on this profile's sign, if any."""
+
+        profile = self._current_profile
+        if profile is None:
+            return None
+        stored = profile.metadata.get("texel_grid")
+        if not isinstance(stored, dict):
+            return None
+        try:
+            from app.texel_grid import TexelGridModel
+
+            return TexelGridModel.from_dict(stored)
+        except (KeyError, TypeError, ValueError):
+            LOGGER.warning("Stored texel grid is invalid", exc_info=True)
+            return None
+
     def _brush_size_model(self) -> Any:
         """The profile's measured Size-number model, or ``None`` if unmeasured."""
 
@@ -3587,6 +3604,14 @@ class MainWindow(QMainWindow):
         sign.
         """
 
+        grid = self._texel_grid()
+        if grid is not None:
+            # Counted on the sign itself, texel by texel: nothing to snap and
+            # nothing to infer from the brush.
+            return (
+                max(8, min(2048, grid.columns)),
+                max(8, min(2048, grid.rows)),
+            )
         model = self._brush_size_model()
         if model is None:
             return None
@@ -4935,7 +4960,7 @@ class MainWindow(QMainWindow):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
                 if isinstance(source.metadata, dict):
-                    for key in ("color_correction", "brush_size_model"):
+                    for key in ("color_correction", "brush_size_model", "texel_grid"):
                         if key in source.metadata:
                             candidate.metadata[key] = deepcopy(source.metadata[key])
                 profile = self._profile_store.save(candidate)
@@ -5058,8 +5083,10 @@ class MainWindow(QMainWindow):
             # The brush model is a fraction of the sign, so re-framing the same
             # sign keeps it valid however the zoom changed.  A different aspect
             # ratio means a different sign, whose texture resolution the old
-            # measurement says nothing about.
+            # measurement says nothing about - and neither does its texel
+            # count.
             candidate.metadata.pop("brush_size_model", None)
+            candidate.metadata.pop("texel_grid", None)
         try:
             candidate.display = current_display
             self._current_profile = self._profile_store.save(candidate)
@@ -5586,10 +5613,16 @@ class MainWindow(QMainWindow):
         from app.brush_calibration import canonical_texture_rows
 
         rows = canonical_texture_rows(model.sign_pixel_rows)
+        grid = self._texel_grid()
+        if grid is not None:
+            texture = (
+                f"a {grid.columns}×{grid.rows}-texel texture, counted on the sign"
+            )
+        else:
+            texture = f"about a {rows}-row texture, inferred from the brush"
         self.brush_model_status.setText(
             f"Last measured: size 1 covers {model.smallest_fraction * 100:.2f}% of "
-            f"the sign (a {rows}-row texture). Every job "
-            "measures again before it paints."
+            f"the sign ({texture}). Every job measures again before it paints."
         )
 
     def _canvas_shape_changed(self, rectangle: Any) -> bool:
@@ -5622,22 +5655,36 @@ class MainWindow(QMainWindow):
         painter = self._painter
         profile = self._current_profile
         model = painter.measured_brush_size_model if painter is not None else None
+        grid = getattr(painter, "measured_texel_grid", None) if painter is not None else None
         if model is None or profile is None:
             return
         stored = profile.metadata.get("brush_size_model")
-        if isinstance(stored, dict) and stored.get("slope") == model.slope:
+        stored_grid = profile.metadata.get("texel_grid")
+        grid_value = grid.to_dict() if grid is not None else None
+        if (
+            isinstance(stored, dict)
+            and stored.get("slope") == model.slope
+            and (grid is None or stored_grid == grid_value)
+        ):
             return
         try:
             candidate = Profile.from_dict(profile.to_dict())
             candidate.metadata["brush_size_model"] = model.to_dict()
+            if grid_value is not None:
+                candidate.metadata["texel_grid"] = grid_value
             self._current_profile = self._profile_store.save(candidate)
         except Exception:
             LOGGER.exception("Could not save the measured brush size model")
             return
         LOGGER.info(
-            "Brush size measured: %.6f of the sign per unit (~%.0f rows)",
+            "Brush size measured: %.6f of the sign per unit (~%.0f rows)%s",
             model.slope,
             model.sign_pixel_rows,
+            (
+                f"; texel grid {grid.columns}x{grid.rows} counted on the sign"
+                if grid is not None
+                else ""
+            ),
         )
         self._refresh_profile_ui()
         # A fresh measurement can move the sign's resolution ceiling, and the
@@ -6591,6 +6638,7 @@ class MainWindow(QMainWindow):
                 canvas_width=float(canvas.width),
                 plan_width=plan.width,
                 plan_height=plan.height,
+                texel_grid=getattr(painter, "measured_texel_grid", None),
             )
         # A full-screen PNG takes long enough to encode that capturing it on
         # the GUI thread would visibly stall the first strokes' progress.
@@ -6623,6 +6671,7 @@ class MainWindow(QMainWindow):
                     canvas_width=float(canvas.width),
                     plan_width=plan.width,
                     plan_height=plan.height,
+                    texel_grid=getattr(painter, "measured_texel_grid", None),
                 )
             except Exception:
                 LOGGER.exception("Could not record the brush in the run report")

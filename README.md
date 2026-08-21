@@ -466,25 +466,50 @@ fractions interpolates between the recorded probes rather than reading the
 fitted line: the line can miss a nearby probe by a few pixels, and a few
 pixels is the entire seam budget of a one-cell brush.
 
-Strokes are laid out on the texture's canonical extent rather than on the
-hand-dragged rectangle. The rectangle covers the sign only to hand-drag
-precision - 318.4 of a 320-column texture in live measurement - so cells laid
-out on it are a fraction of a texel narrower than the texture's grid, and
-because stamps land on whole texels that fraction accumulates until a later
-neighbour's stamp eats a texel of the cell before it (visible as unevenly
-wide cells in a sign texture downloaded from the game). Registered to
-``canonical texels x measured texel size``, the cell pitch is texel-exact and
-stamps tile uniformly; the mouse still never leaves the calibrated
-rectangle.
+### Finding the sign's texel grid
 
-The same probes also measure the sign's rendering bias: Rust stamps the brush
-about a texel left and a fraction of one down from the cursor, uniformly
-across the sign. Painting aims every artwork coordinate the same distance the
-other way, so the rendered image lands centered on the calibrated rectangle
-instead of uniformly shifted. Colors that share a boundary still meet in a
-one-texel blend line - the brush's own edge falloff, visible on a
-checkerboard and invisible on ordinary artwork - which is the game's
-rendering, not a placement error.
+Strokes are laid out on the sign texture's own grid, not on the hand-dragged
+rectangle. The rectangle covers the sign only to hand-drag precision, so
+cells laid out on it are a fraction of a texel off the texture's grid, and
+because stamps land on whole texels that fraction accumulates until a later
+neighbour's stamp eats a texel of the cell before it - visible as unevenly
+wide cells in a sign texture downloaded from the game.
+
+The grid is measured, not inferred, at the start of every job, right after
+the brush. Paint lands in texture space: wherever the cursor is inside a
+texel, the stamp covers that whole texel. So the job stamps the smallest
+brush along a row one screen pixel at a time and watches the stamp stay put,
+stay put, then jump a whole texel - that staircase is the grid showing
+through, and it gives the texel pitch to a few percent and the cursor
+positions that cross from one texel to the next. A ladder of stamps further
+and further along the sign then tightens the pitch: each rung is far enough
+out to be counted exactly with the pitch known so far, and locating it pins
+the pitch down further, until the far side of the sign is a whole number of
+texels with nothing to round. The sign's own edge in the capture - the quad
+the game draws the texture on - says which lattice line is texel zero. Both
+axes are measured; under fifty dabs, all wiped with the brush probes.
+
+What comes out is the texture's size in texels (no table of sign sizes is
+consulted, so a sign of a size no table lists - the artist canvases, say -
+is counted just the same), exactly where each texel sits on screen, and how
+far from a texel's centre the cursor has to be for the game to stamp that
+texel. Painting aims every cell there; verification reads every cell back
+from there. Max quality plans one cell per counted texel. The measurement is
+absolute screen pixels, so it is never reused from a stored profile for
+painting - only its texel count is kept, to size the next plan.
+
+Only a measurement that snaps - stamps within one texel agreeing on where they
+landed, every ladder rung a whole number of texels out, the grid sitting on
+the calibrated rectangle - is used. Anything else is logged and the job falls
+back to the older inference: the brush measurement's texel size, snapped to
+the nearest canonical texture size and anchored at the rectangle's corner,
+with the brush probes' measured rendering bias (about a texel left and a
+fraction of one down, on a live sign) aimed out. ``painting.measure_texel_grid``
+in settings.json turns the probe off outright if it ever needs to be.
+
+Colors that share a boundary still meet in a one-texel blend line - the
+brush's own edge falloff, visible on a checkerboard and invisible on ordinary
+artwork - which is the game's rendering, not a placement error.
 
 ### Strokes the game never sees, and the touch-up that repairs them
 

@@ -1162,6 +1162,43 @@ def test_max_quality_plans_one_cell_per_measured_texel(
     assert window.logical_height_spin.value() == 128
 
 
+def test_a_measured_texel_grid_outranks_the_brush_inference(
+    window: MainWindow,
+) -> None:
+    """A grid counted on the sign is the ceiling; the brush only guesses it.
+
+    The brush measurement here implies a 320-ish row texture, which the
+    canonical snap makes 640x320 on this 2:1 canvas.  The grid says the sign
+    is really 300x150 - a
+    size no table lists - and Max has to plan exactly that, because a cell
+    planned on a texel that is not there fights its neighbour for one that is.
+    """
+
+    from app.texel_grid import TexelGridModel
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 900, 450)
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 315.0) for size in (60, 30, 12)]
+    ).to_dict()
+    window._current_profile.metadata["texel_grid"] = TexelGridModel(
+        columns=300, rows=150, pitch_x=3.0, pitch_y=3.0, origin_x=10.0, origin_y=10.0
+    ).to_dict()
+    window._refresh_profile_ui()
+
+    window.quality_combo.setCurrentText("Max")
+    assert window.logical_width_spin.value() == 300
+    assert window.logical_height_spin.value() == 150
+
+    # A re-framed sign of another shape forgets the grid with the brush.
+    window._current_profile.metadata.pop("texel_grid")
+    window._refresh_profile_ui()
+    window.quality_combo.setCurrentText("Balanced")
+    window.quality_combo.setCurrentText("Max")
+    assert window.logical_height_spin.value() == 320
+    assert window.logical_width_spin.value() == 640
+
+
 def test_max_quality_without_a_measurement_plans_the_screen_grid(
     window: MainWindow,
 ) -> None:

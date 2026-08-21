@@ -45,6 +45,13 @@ from .paint_timing import (
     remaining_seconds,
 )
 from .picker_calibration import trim_to_widget
+from .texel_grid import (
+    GridProbePlan,
+    TexelGridModel,
+    find_quad_edges,
+    measure_grid,
+    stamp_diff,
+)
 from .screen import (
     ForegroundRequirement,
     VirtualScreen,
@@ -215,6 +222,11 @@ class PainterSettings:
     logical_pixel_spacing: float = 1.0
     brush_size: float = 1.0
     apply_brush_size: bool = False
+    # Measure the sign's texel grid at the start of each job and lay the
+    # strokes on it.  Needs the same calibration as brush sizing; a sign the
+    # probe cannot read falls back to the brush-derived grid, so this is an
+    # escape hatch rather than a feature switch.
+    measure_texel_grid: bool = True
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
@@ -319,6 +331,7 @@ class PainterSettings:
             logical_pixel_spacing=float(pick(painting, "logical_pixel_spacing", 1.0)),
             brush_size=float(pick(painting, "brush_size", 1.0)),
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
+            measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.06)),
@@ -403,6 +416,10 @@ class _Job:
     # stroke the game dropped is recognised as a hole rather than only when
     # the wood happens to resemble some other palette entry.
     bare_canvas: Any = None
+    # The texel grid this job measured on this sign, if the probe could read
+    # one.  Only a grid measured by the job itself is ever painted on: a
+    # stored one describes where the sign sat on screen some other day.
+    texel_grid: TexelGridModel | None = None
 
 
 def _describe_seconds(seconds: float) -> str:
@@ -483,6 +500,7 @@ class Painter:
         self._mouse_drift_pixels = 0.0
         self._mouse_drift_started = 0.0
         self._measured_brush_size_model: BrushSizeModel | None = None
+        self._measured_texel_grid: TexelGridModel | None = None
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -646,6 +664,7 @@ class Painter:
                 cell_fraction=cell_fraction,
             )
             self._measured_brush_size_model = None
+            self._measured_texel_grid = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -662,6 +681,13 @@ class Painter:
 
         with self._condition:
             return self._measured_brush_size_model
+
+    @property
+    def measured_texel_grid(self) -> TexelGridModel | None:
+        """The texel grid the last job measured on its sign, if it could."""
+
+        with self._condition:
+            return self._measured_texel_grid
 
     def start(
         self,
@@ -974,6 +1000,10 @@ class Painter:
                 measured = self._measure_brush_size_model(job)
                 with self._condition:
                     self._measured_brush_size_model = measured
+                job.target = replace(job.target, brush_size_model=measured)
+                grid = self._measure_texel_grid_safely(job)
+                with self._condition:
+                    self._measured_texel_grid = grid
             else:
                 self._calibrate_brush_for_plan(job)
                 self._update_progress_state(
@@ -1339,6 +1369,9 @@ class Painter:
                 job.target = replace(job.target, brush_size_model=model)
                 with self._condition:
                     self._measured_brush_size_model = model
+                job.texel_grid = self._measure_texel_grid_safely(job)
+                with self._condition:
+                    self._measured_texel_grid = job.texel_grid
                 self._clear_canvas(job)
                 break
             except _RetryAction:
@@ -1625,6 +1658,191 @@ class Painter:
         )
         return model
 
+    @staticmethod
+    def _grid_cell_centers(
+        job: _Job, plan: PaintPlan, canvas: ScreenRect
+    ) -> tuple[Any, Any] | None:
+        """Where the plan's cells sit in a capture of ``canvas``, per the grid.
+
+        ``None`` when no grid was measured, which leaves the sampler on the
+        rectangle's own even spacing.
+        """
+
+        import numpy as np
+
+        grid = job.texel_grid
+        if grid is None or not grid.agrees_with(canvas):
+            return None
+        rect = grid.registered_rect()
+        columns = np.arange(plan.width, dtype=np.float64)
+        rows = np.arange(plan.height, dtype=np.float64)
+        centers_x = rect.left - canvas.left + (columns + 0.5) * rect.width / plan.width
+        centers_y = rect.top - canvas.top + (rows + 0.5) * rect.height / plan.height
+        return centers_x, centers_y
+
+    def _measure_texel_grid_safely(self, job: _Job) -> TexelGridModel | None:
+        """Probe the texel grid, and paint on the old inference if it fails.
+
+        A sign whose stamps do not snap, a capture the probe cannot read, or a
+        result that does not sit on the calibrated rectangle all end here as
+        ``None`` with the reason logged; only a pause or an abort is allowed
+        through, because those belong to the job, not the measurement.
+        """
+
+        settings = job.settings
+        if (
+            not settings.measure_texel_grid
+            or not settings.apply_brush_size
+            or not self.input.emits_real_input
+            or job.target.brush_size_box is None
+        ):
+            return None
+        try:
+            return self._measure_texel_grid(job)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:  # the fallback is the previous behaviour
+            LOGGER.warning(
+                "The texel grid could not be measured (%s); strokes are laid "
+                "out from the brush measurement instead",
+                exc,
+            )
+            return None
+
+    # Margin captured around the calibrated rectangle so the sign quad's own
+    # edges are in shot, as a fraction of the longer side and a floor in pixels.
+    _EDGE_MARGIN_FRACTION = 0.02
+    _EDGE_MARGIN_MIN_PIXELS = 8
+
+    def _measure_texel_grid(self, job: _Job) -> TexelGridModel:
+        """Stamp the smallest brush around the sign and read its texel grid.
+
+        The probe's logic lives in :mod:`app.texel_grid`; this method lends it
+        the mouse and the captures.  A scout stamp, a staircase and a ladder
+        per axis is under fifty dabs, each a single press, and every one of
+        them is wiped with the brush probes before the artwork starts.
+        """
+
+        import numpy as np
+
+        target = job.target
+        settings = job.settings
+        box = target.brush_size_box
+        if box is None:
+            raise RuntimeError("Rust's Size value box is not calibrated")
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        epoch = self._pause_generation_value()
+        self._update_progress_state(
+            PainterState.RUNNING, "Measuring the sign's texel grid", phase="calibrate"
+        )
+        self._write_brush_size(box, BRUSH_SIZE_MIN, settings, epoch)
+
+        # The quad's edges, from a capture a little wider than the rectangle.
+        margin = max(
+            self._EDGE_MARGIN_MIN_PIXELS,
+            int(round(self._EDGE_MARGIN_FRACTION * max(canvas.width, canvas.height))),
+        )
+        edges = None
+        try:
+            wide = ScreenRect(
+                canvas.left - margin,
+                canvas.top - margin,
+                canvas.width + 2 * margin,
+                canvas.height + 2 * margin,
+            )
+            self._move(park, epoch)
+            if self.input.emits_real_input:
+                self._interruptible_sleep(
+                    self._CAPTURE_SETTLE_SECONDS, epoch=epoch, check_focus=True
+                )
+            found = find_quad_edges(
+                np.asarray(self._screen_capture(wide).convert("RGB"), dtype=np.float32),
+                (margin, margin, margin + canvas.width, margin + canvas.height),
+                margin - 2,
+            )
+            edges = (
+                None if found[0] is None else found[0] + wide.left,
+                None if found[1] is None else found[1] + wide.top,
+                None if found[2] is None else found[2] + wide.left,
+                None if found[3] is None else found[3] + wide.top,
+            )
+            LOGGER.info(
+                "Sign quad edges: left %s, top %s, right %s, bottom %s (rectangle "
+                "%d, %d, %d, %d)",
+                *("?" if e is None else f"{e:.1f}" for e in edges),
+                canvas.left,
+                canvas.top,
+                canvas.left + canvas.width,
+                canvas.top + canvas.height,
+            )
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.info("The sign's edges could not be captured (%s)", exc)
+
+        batch_index = 0
+
+        def stamp_batch(plan: GridProbePlan) -> np.ndarray:
+            nonlocal batch_index
+            batch_epoch = self._pause_generation_value()
+            color = self._BRUSH_PROBE_COLORS[batch_index % len(self._BRUSH_PROBE_COLORS)]
+            batch_index += 1
+            self._select_color(color, target, settings, batch_epoch, apply_correction=False)
+            before = self._capture_parked(canvas, park, batch_epoch)
+            for x, y in plan.points:
+                point = (math.floor(x), math.floor(y))
+                point = (
+                    min(max(point[0], canvas.left), canvas.left + canvas.width - 1),
+                    min(max(point[1], canvas.top), canvas.top + canvas.height - 1),
+                )
+                self._screen_stroke(point, point, settings, batch_epoch)
+            after = self._capture_parked(canvas, park, batch_epoch)
+            return stamp_diff(before, after)
+
+        model = target.brush_size_model
+        stamp_hint = (
+            model.fraction_for_size(BRUSH_SIZE_MIN) * canvas.height
+            if model is not None
+            else 6.0
+        )
+        grid = measure_grid(
+            canvas,
+            stamp_batch,
+            pitch_hint=stamp_hint,
+            stamp_hint=stamp_hint,
+            edges=edges,
+        )
+        if not grid.agrees_with(canvas):
+            raise ValueError(
+                f"the measured grid ({grid.columns}x{grid.rows} texels at "
+                f"{grid.origin_x:.0f}, {grid.origin_y:.0f}) does not sit on the "
+                "calibrated rectangle"
+            )
+        LOGGER.info(
+            "Texel grid: %dx%d texels, %.4f x %.4f px each, origin %.2f, %.2f, "
+            "aim %+.2f, %+.2f px, worst rung %.2f texel (%s)",
+            grid.columns,
+            grid.rows,
+            grid.pitch_x,
+            grid.pitch_y,
+            grid.origin_x,
+            grid.origin_y,
+            grid.aim_x,
+            grid.aim_y,
+            grid.residual,
+            "counted from the sign's edges" if grid.from_edges else "counted from the rectangle",
+        )
+        return grid
+
     def _probe_sizes(
         self,
         job: _Job,
@@ -1831,6 +2049,14 @@ class Painter:
         # the hand-dragged rectangle, so the cell pitch is texel-exact; the
         # physical rectangle still bounds every actual mouse coordinate.
         paint_canvas = self._registered_canvas(target.canvas, model)
+        grid = job.texel_grid
+        if grid is not None and grid.agrees_with(target.canvas):
+            # Measured, not inferred: the texture's own lattice, and the
+            # cursor offset that lands a stamp on the texel aimed at.  The
+            # brush-derived bias describes the same offset less precisely,
+            # so the grid's replaces it rather than adding to it.
+            paint_canvas = grid.registered_rect()
+            bias = (-grid.aim_x, -grid.aim_y)
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
         # Rust, so an epoch bump re-applies the size before the next stroke -
@@ -1974,6 +2200,7 @@ class Painter:
                     np.asarray(job.bare_canvas.convert("RGB"), dtype=np.float32),
                     plan.width,
                     plan.height,
+                    centers=self._grid_cell_centers(job, plan, canvas),
                 )
             except Exception:
                 LOGGER.exception("The bare-sign capture could not be sampled")
@@ -1999,6 +2226,7 @@ class Painter:
                     np.asarray(capture.convert("RGB"), dtype=np.float32),
                     plan.width,
                     plan.height,
+                    centers=self._grid_cell_centers(job, plan, canvas),
                 )
                 verdict = classify_cells(
                     sampled,

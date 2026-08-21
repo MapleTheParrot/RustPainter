@@ -165,15 +165,21 @@ class RunReport:
         canvas_width: float,
         plan_width: int,
         plan_height: int,
+        texel_grid: Any = None,
     ) -> None:
         """Record the measured brush next to what the plan asked it to do.
 
         The pair is the whole diagnosis for a blurred sign: a brush that covers
         several logical cells repaints its neighbours on every stroke, and the
-        last color to cross a cell is the one that keeps it.
+        last color to cross a cell is the one that keeps it.  The texel grid,
+        when one was measured, says what the sign really resolves and where
+        its cells sit - the numbers to hold a downloaded sign texture against.
         """
 
         try:
+            self._document["texelGrid"] = (
+                texel_grid.to_dict() if texel_grid is not None else None
+            )
             if model is None:
                 self._document["brush"] = None
                 return

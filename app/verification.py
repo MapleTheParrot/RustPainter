@@ -144,7 +144,11 @@ def plan_expectations(plan: PaintPlan) -> tuple[np.ndarray, np.ndarray]:
 
 
 def sample_cell_colors(
-    capture_rgb: np.ndarray, logical_width: int, logical_height: int
+    capture_rgb: np.ndarray,
+    logical_width: int,
+    logical_height: int,
+    *,
+    centers: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """One robust color per logical cell, read from a canvas capture.
 
@@ -153,22 +157,34 @@ def sample_cell_colors(
     way an area resize would.  When cells are under three pixels across the
     window would reach into the neighbours, so the centre pixel alone is
     read instead.
+
+    ``centers`` overrides where the cells are: ``(xs, ys)`` in capture pixels,
+    one per column and one per row.  A measured texel grid puts the cells on
+    the texture's own lattice rather than spread evenly over the rectangle,
+    and reading them anywhere else would sample a neighbour's paint.
     """
 
     pixels = np.asarray(capture_rgb, dtype=np.float32)
     if pixels.ndim != 3 or pixels.shape[2] < 3:
         raise ValueError("Canvas capture must be an RGB array")
     height, width = pixels.shape[:2]
-    centers_y = np.clip(
-        ((np.arange(logical_height) + 0.5) * height / logical_height).astype(np.int64),
-        1,
-        max(1, height - 2),
-    )
-    centers_x = np.clip(
-        ((np.arange(logical_width) + 0.5) * width / logical_width).astype(np.int64),
-        1,
-        max(1, width - 2),
-    )
+    if centers is not None:
+        raw_x, raw_y = centers
+        if len(raw_x) != logical_width or len(raw_y) != logical_height:
+            raise ValueError("Cell centres must match the logical size")
+        centers_x = np.clip(np.floor(np.asarray(raw_x, dtype=np.float64)).astype(np.int64), 1, max(1, width - 2))
+        centers_y = np.clip(np.floor(np.asarray(raw_y, dtype=np.float64)).astype(np.int64), 1, max(1, height - 2))
+    else:
+        centers_y = np.clip(
+            ((np.arange(logical_height) + 0.5) * height / logical_height).astype(np.int64),
+            1,
+            max(1, height - 2),
+        )
+        centers_x = np.clip(
+            ((np.arange(logical_width) + 0.5) * width / logical_width).astype(np.int64),
+            1,
+            max(1, width - 2),
+        )
     if min(height / max(1, logical_height), width / max(1, logical_width)) < 3.0:
         return pixels[centers_y][:, centers_x, :3].copy()
     neighborhood = np.stack(

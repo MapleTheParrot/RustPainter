@@ -129,6 +129,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "painting": {
         "brush_size": 0.15,
         "apply_brush_size": False,
+        # Measure the sign's texel grid at the start of each job (needs brush
+        # sizing).  An escape hatch, not a feature switch: a sign the probe
+        # cannot read already falls back to the brush-derived grid on its own.
+        "measure_texel_grid": True,
         "brush_direction": "low_to_high",
         "logical_pixel_spacing": 1.0,
         "stroke_speed_pixels_per_second": 700.0,
@@ -452,6 +456,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError("painting.brush_size must be between 0 and 1")
     if not isinstance(painting.get("apply_brush_size"), bool):
         raise SettingsError("painting.apply_brush_size must be true or false")
+    if not isinstance(painting.get("measure_texel_grid"), bool):
+        raise SettingsError("painting.measure_texel_grid must be true or false")
     if not isinstance(painting.get("brush_direction"), str) or painting.get(
         "brush_direction"
     ) not in {"low_to_high", "high_to_low"}:
