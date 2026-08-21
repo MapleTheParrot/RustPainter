@@ -1063,12 +1063,8 @@ class MainWindow(QMainWindow):
         form.addRow("Alpha fill", self.alpha_fill_check)
         layout.addWidget(composition)
 
-        quality = QGroupBox("Palette and strokes")
-        form = QFormLayout(quality)
-        self.color_count_combo = NoWheelComboBox()
-        for value in (8, 16, 24, 32, 48, 64, 96, 128, 256):
-            self.color_count_combo.addItem(str(value), value)
-        self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
+        strokes = QGroupBox("Strokes")
+        form = QFormLayout(strokes)
         self.merge_combo = NoWheelComboBox()
         self.merge_combo.addItem("Off — exact strokes (slower, same picture)", "off")
         self.merge_combo.addItem("Balanced — small gaps", "balanced")
@@ -1090,24 +1086,8 @@ class MainWindow(QMainWindow):
             "Only Exact paint mode uses this setting. Quality, Balanced and\n"
             "Fast merge automatically through the optimizer."
         )
-        self.sharpen_combo = NoWheelComboBox()
-        self.sharpen_combo.addItem("Off", SharpenMode.OFF.value)
-        self.sharpen_combo.addItem("Light — recommended", SharpenMode.LIGHT.value)
-        self.sharpen_combo.addItem("Strong — for line art", SharpenMode.STRONG.value)
-        self._set_combo_data(self.sharpen_combo, SharpenMode.LIGHT.value)
-        self.sharpen_combo.setToolTip(
-            "Rust draws the sign's texture with a filter that softens every\n"
-            "edge, so an image shrunk to the sign looks blurrier in game than\n"
-            "it did on screen.  Sharpening before painting puts back about\n"
-            "the contrast that filter takes away.  Light suits nearly\n"
-            "everything; Strong makes line art bite at the price of a faint\n"
-            "halo beside dark lines.  Images that are enlarged rather than\n"
-            "shrunk are never sharpened."
-        )
-        form.addRow("Maximum colors", self.color_count_combo)
-        form.addRow("Sharpen", self.sharpen_combo)
         form.addRow("Stroke merging", self.merge_combo)
-        layout.addWidget(quality)
+        layout.addWidget(strokes)
 
         layout.addStretch(1)
         return content
@@ -1690,11 +1670,40 @@ class MainWindow(QMainWindow):
             "calibrated — fill large areas with a big brush first and\n"
             "paint the details over them."
         )
+        # Everything that changes the picture lives here, beside the preview
+        # that shows the change; the settings pages hold what changes only
+        # how it is painted.
+        self.color_count_combo = NoWheelComboBox()
+        for value in (8, 16, 24, 32, 48, 64, 96, 128, 256):
+            self.color_count_combo.addItem(str(value), value)
+        self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
+        self.color_count_combo.setToolTip(
+            "The most colors the plan may use.  Fewer colors mean fewer\n"
+            "picker trips and fewer strokes; more keep gradients and shading."
+        )
+        self.sharpen_combo = NoWheelComboBox()
+        self.sharpen_combo.addItem("Off", SharpenMode.OFF.value)
+        self.sharpen_combo.addItem("Light — recommended", SharpenMode.LIGHT.value)
+        self.sharpen_combo.addItem("Strong — for line art", SharpenMode.STRONG.value)
+        self._set_combo_data(self.sharpen_combo, SharpenMode.LIGHT.value)
+        self.sharpen_combo.setToolTip(
+            "Rust draws the sign's texture with a filter that softens every\n"
+            "edge, so an image shrunk to the sign looks blurrier in game than\n"
+            "it did on screen.  Sharpening before painting puts back about\n"
+            "the contrast that filter takes away.  Light suits nearly\n"
+            "everything; Strong makes line art bite at the price of a faint\n"
+            "halo beside dark lines.  Images that are enlarged rather than\n"
+            "shrunk are never sharpened.  The change is a few levels per\n"
+            "cell - compare with Smooth off on the Rust preview, or watch\n"
+            "the stroke count."
+        )
         for combo in (
             self.scale_mode_combo,
             self.quality_combo,
             self.crop_alignment_combo,
             self.paint_mode_combo,
+            self.color_count_combo,
+            self.sharpen_combo,
         ):
             combo.setSizeAdjustPolicy(
                 QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -1726,12 +1735,17 @@ class MainWindow(QMainWindow):
         ):
             quick_grid.addWidget(QLabel(label), 2, column)
             quick_grid.addWidget(control, 3, column)
+        for column, (label, control) in enumerate(
+            (("Colors", self.color_count_combo), ("Sharpen", self.sharpen_combo))
+        ):
+            quick_grid.addWidget(QLabel(label), 4, column)
+            quick_grid.addWidget(control, 5, column)
         for column, checkbox in enumerate(
             (self.remove_background_check, self.dither_check)
         ):
             quick_grid.addWidget(
                 checkbox,
-                4,
+                6,
                 column,
                 alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             )
@@ -1758,7 +1772,7 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(self.logical_width_spin)
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
-        quick_grid.addWidget(self.custom_resolution_panel, 5, 0, 1, 2)
+        quick_grid.addWidget(self.custom_resolution_panel, 7, 0, 1, 2)
 
         self.background_removal_panel = QFrame()
         self.background_removal_panel.setObjectName("inlinePanel")
@@ -1822,7 +1836,7 @@ class MainWindow(QMainWindow):
         removal_grid.setColumnStretch(1, 1)
         removal_grid.setColumnStretch(2, 1)
         self.background_removal_panel.setVisible(False)
-        quick_grid.addWidget(self.background_removal_panel, 6, 0, 1, 2)
+        quick_grid.addWidget(self.background_removal_panel, 8, 0, 1, 2)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)

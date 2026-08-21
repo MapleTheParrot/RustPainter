@@ -207,7 +207,7 @@ stroke will paint. The choice is remembered between sessions.
 The same filtering happens in game, and it is why an image shrunk to the sign
 looks softer there than it did on screen: the sign has a few hundred texels a
 side, and the game blends each one into its neighbours when it draws them.
-**Sharpen**, under Settings → Artwork, puts back about the edge contrast that
+**Sharpen**, in Quick settings beside the preview, puts back about the edge contrast that
 blending takes away, before the image is painted. **Light** (the default)
 restores roughly what the filter costs a line and suits nearly everything;
 **Strong** is for line art that should bite, at the price of a faint light
