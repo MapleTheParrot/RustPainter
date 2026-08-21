@@ -2,4 +2,5 @@
 pytest>=8,<10
 pytest-qt>=4.4,<5
 PyInstaller>=6.11,<7
-
+# Optional: only tools/dump_sign_sizes.py needs it.
+# UnityPy>=1.20

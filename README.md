@@ -511,6 +511,14 @@ Colors that share a boundary still meet in a one-texel blend line - the
 brush's own edge falloff, visible on a checkerboard and invisible on ordinary
 artwork - which is the game's rendering, not a placement error.
 
+For development there is also `tools/dump_sign_sizes.py`, which reads the
+texture sizes Rust's own prefabs declare out of the game's asset bundles
+(files on disk, nothing running) with UnityPy. The bundles embed their type
+trees, so no game assembly is needed. `--smoke` lists the paintable items
+from the small preload bundle in under a second; the sizes themselves are on
+the deployable prefabs in `content.bundle`, which is decompressed whole, so
+run that with the game closed and about twice its size free in memory.
+
 ### Strokes the game never sees, and the touch-up that repairs them
 
 Rust samples the mouse a frame at a time, and its paint UI has been measured
