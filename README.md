@@ -441,12 +441,15 @@ logical cell, RustPainter says so and names the resolution that would fit -
 that limit is the sign's own texture resolution, which no setting can raise.
 
 That ceiling is also why the quality presets stop making a difference on a
-small sign. A 320x240 sign holds fewer cells than High, Very High or Max ask
-for, so all three are held at 320x240 and paint the same picture - which
-looks exactly like the setting doing nothing. Quick settings says so under
-the presets whenever the one selected is being held there, naming the ones
-that are now the same choice, and the plan summary repeats the size next to
-the stroke counts. On a bigger sign the presets separate again.
+small sign. A 320x240 sign holds fewer cells than High or Very High ask for,
+so both used to be held at 320x240 and paint exactly what Max paints - a
+setting that looks finer and is not. Once a job has measured the sign, the
+presets it cannot deliver are greyed out in the list instead, each carrying
+the reason as a tooltip, and a selection sitting on one moves to Max, which
+is the honest name for the same size. Quick settings says why underneath,
+and the plan summary repeats the size next to the stroke counts. Max and
+Custom are never greyed - Custom can still ask for less - and on a bigger
+sign the presets separate again and nothing is greyed at all.
 
 A one-cell brush targets the full logical cell plus half a sign texel: the
 sign renders strokes snapped to its own texture rows, and a brush sized

@@ -288,6 +288,9 @@ QComboBox QAbstractItemView {{
     padding: 3px;
     selection-background-color: {ACCENT_DEEP};
 }}
+/* A choice the sign cannot deliver is offered as unavailable rather than
+   silently doing nothing when it is picked. */
+QComboBox QAbstractItemView::item:disabled {{ color: #6b5f55; }}
 QCheckBox, QRadioButton {{ spacing: 8px; background: transparent; }}
 QCheckBox::indicator, QRadioButton::indicator {{ width: 17px; height: 17px; }}
 QCheckBox::indicator {{

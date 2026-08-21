@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import (
+    MAX_QUALITY_PRESET,
     MainWindow,
     PLAN_SETTLE_MS,
     _PendingPaint,
@@ -1162,53 +1163,72 @@ def test_max_quality_plans_one_cell_per_measured_texel(
     assert window.logical_height_spin.value() == 128
 
 
-def test_the_quality_presets_say_when_the_sign_is_the_limit(
+def test_presets_the_sign_cannot_hold_are_greyed_out(
     window: MainWindow,
 ) -> None:
-    """Turning the quality up on a small sign does nothing, visibly.
+    """Turning the quality up on a small sign used to do nothing, silently.
 
-    High, Very High and Max all get held at the sign's own texel count, so
-    the presets look broken unless the panel says why - and the question is
-    asked at the combo box, before any image is loaded, which is why the
-    plan summary's note is not enough on its own.
+    High and Very High ask for more cells than a 320x240 sign has, so they
+    were held at 320x240 and painted exactly what Max paints - a setting
+    that looks finer and is not.  They are offered as unavailable instead,
+    and the panel says why.
     """
+
+    from PySide6.QtCore import Qt
 
     from app.texel_grid import TexelGridModel
 
+    def enabled(preset: str) -> bool:
+        index = window.quality_combo.findText(preset)
+        flags = window.quality_combo.itemData(index, Qt.ItemDataRole.UserRole - 1)
+        return flags is None or bool(flags & Qt.ItemFlag.ItemIsEnabled)
+
     assert window._current_profile is not None
     window._current_profile.canvas = ScreenRect(10, 10, 1299, 1085)
+    window.quality_combo.setCurrentText("High")
+    # Nothing measured yet: every preset is still worth offering.
+    assert enabled("High") and enabled("Very High")
+
     window._current_profile.metadata["texel_grid"] = TexelGridModel(
         columns=320, rows=240, pitch_x=4.06, pitch_y=4.51, origin_x=10.0, origin_y=10.0
     ).to_dict()
     window._refresh_profile_ui()
 
-    window.quality_combo.setCurrentText("High")
+    # The two that cannot be delivered are greyed out, and the selection
+    # moves off the one that was chosen - to the same size, honestly named.
+    assert not enabled("High")
+    assert not enabled("Very High")
+    assert enabled("Balanced") and enabled(MAX_QUALITY_PRESET)
+    assert window.quality_combo.currentText() == MAX_QUALITY_PRESET
+    assert (window.logical_width_spin.value(), window.logical_height_spin.value()) == (
+        320,
+        240,
+    )
+    # Picking one from a saved setting lands on Max just the same.
+    window.quality_combo.setCurrentText("Very High")
+    assert window.quality_combo.currentText() == MAX_QUALITY_PRESET
+
+    # The panel says why the greyed entries are greyed.
     assert window.resolution_cap_panel.isVisibleTo(window)
     text = window.resolution_cap_label.text()
     assert "320×240" in text
-    # Where the number came from is a tooltip away, not in the way.
+    assert "High and Very High" in text
+    assert "greyed out" in text
     assert "measured" in window.resolution_cap_panel.toolTip()
-    # The presets that land on the cap are named, so the user can see at a
-    # glance which choices are the same choice.
-    assert "High, Very High and Max" in text
-    # ...and the sizes really are identical.
-    sizes = {}
-    for preset in ("High", "Very High", "Max"):
-        window.quality_combo.setCurrentText(preset)
-        sizes[preset] = (
-            window.logical_width_spin.value(),
-            window.logical_height_spin.value(),
-        )
-    assert len(set(sizes.values())) == 1, sizes
+    # The unavailable entries carry the reason too.
+    index = window.quality_combo.findText("High")
+    assert "320×240" in window.quality_combo.itemData(index, Qt.ItemDataRole.ToolTipRole)
 
-    # A preset the sign can actually hold says nothing.
+    # A preset the sign can hold is quiet and selectable.
     window.quality_combo.setCurrentText("Fast")
     assert not window.resolution_cap_panel.isVisibleTo(window)
 
-    # Without a measurement there is no ceiling to announce.
+    # Losing the measurement restores every preset.
     window._current_profile.metadata.pop("texel_grid")
     window._refresh_profile_ui()
+    assert enabled("High") and enabled("Very High")
     window.quality_combo.setCurrentText("Very High")
+    assert window.quality_combo.currentText() == "Very High"
     assert not window.resolution_cap_panel.isVisibleTo(window)
 
 
@@ -1304,7 +1324,10 @@ def test_plan_summary_announces_a_capped_resolution(
         [(size, size / 128.0) for size in (60, 30, 12)]
     ).to_dict()
     window._refresh_profile_ui()
-    window.quality_combo.setCurrentText("Very High")
+    # Very High is greyed out on this sign, so the way to ask for more than
+    # it holds is a custom resolution.
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(512)
 
     source_path = tmp_path / "source.png"
     Image.new("RGB", (64, 32), (210, 30, 40)).save(source_path)
@@ -1315,6 +1338,14 @@ def test_plan_summary_announces_a_capped_resolution(
     # says so next to the stroke counts instead of silently swapping sizes.
     assert (window._plan.width, window._plan.height) == (256, 128)
     assert "capped at 256×128" in window.processing_label.text()
+
+    # Max is not capped - it asked for the ceiling - but the summary still
+    # names the size, which is what a finished plan is read for.
+    window.quality_combo.setCurrentText(MAX_QUALITY_PRESET)
+    qtbot.waitUntil(
+        lambda: "full resolution" in window.processing_label.text(), timeout=5000
+    )
+    assert "256×128, this sign's full resolution" in window.processing_label.text()
 
 
 def test_dry_run_completes_without_sendinput(

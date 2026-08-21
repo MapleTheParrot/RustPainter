@@ -3713,6 +3713,54 @@ class MainWindow(QMainWindow):
             return "".join(names)
         return f"{', '.join(names[:-1])} and {names[-1]}"
 
+    def _refresh_quality_preset_availability(self) -> bool:
+        """Grey out the presets this sign has no texels for.
+
+        A preset that asks for more cells than the texture holds is held at
+        the sign's resolution, so offering it is a false affordance: it
+        looks like a finer setting and paints exactly what the entry above
+        it paints.  Max stays, being the honest name for the ceiling, and so
+        does Custom, which can still ask for less.  Returns whether the
+        selection had to move.
+        """
+
+        cap = self._sign_resolution_cap()
+        moved = False
+        for index in range(self.quality_combo.count()):
+            preset = self.quality_combo.itemText(index)
+            if preset not in QUALITY_LONG_EDGE:
+                continue
+            size = self._preset_dimensions(preset)
+            unavailable = cap is not None and (size[0] > cap[0] or size[1] > cap[1])
+            # Flags via the model, which is what greys the row out; the
+            # entry stays in the list so the ceiling is visible rather than
+            # mysteriously absent.
+            flags = (
+                Qt.ItemFlag.NoItemFlags
+                if unavailable
+                else Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+            )
+            self.quality_combo.setItemData(index, flags, Qt.ItemDataRole.UserRole - 1)
+            if unavailable:
+                self.quality_combo.setItemData(
+                    index,
+                    f"This sign holds only {cap[0]}×{cap[1]} texels, fewer than "
+                    f"{preset}'s {size[0]}×{size[1]}.  Max paints the sign's own "
+                    "resolution.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+                if index == self.quality_combo.currentIndex():
+                    # Selected but unpaintable - from a saved setting, or a
+                    # measurement that has just lowered the ceiling.  Max is
+                    # the same size and says what it is.
+                    self.quality_combo.blockSignals(True)
+                    self.quality_combo.setCurrentText(MAX_QUALITY_PRESET)
+                    self.quality_combo.blockSignals(False)
+                    moved = True
+            else:
+                self.quality_combo.setItemData(index, None, Qt.ItemDataRole.ToolTipRole)
+        return moved
+
     def _refresh_resolution_cap_notice(self) -> None:
         """Say, next to the setting itself, when the sign is the limit.
 
@@ -3755,17 +3803,20 @@ class MainWindow(QMainWindow):
             )
             self.resolution_cap_panel.setVisible(True)
             return
-        # Only when the preset in front of the user is one of the ones being
-        # held: on a coarser choice the ceiling is not in the way, and a
-        # notice that is always up is one nobody reads.
+        # Only while the ceiling is actually in the way - on a coarser
+        # choice it is not, and a notice that is always up is one nobody
+        # reads.  With the unpaintable presets greyed out, that means while
+        # Max is selected.
         shared = self._presets_at_the_cap(cap)
         if self.quality_combo.currentText() not in shared:
             self.resolution_cap_panel.setVisible(False)
             return
+        unavailable = [preset for preset in shared if preset != MAX_QUALITY_PRESET]
         self.resolution_cap_label.setText(
-            f"This sign holds {cap_width}×{cap_height} texels, so "
-            f"{self._join_names(shared)} all paint at that size — the finest "
-            "detail it can show."
+            f"Max is painting this sign's full resolution, {cap_width}×"
+            f"{cap_height} texels. {self._join_names(unavailable)} "
+            f"{'ask' if len(unavailable) > 1 else 'asks'} for more than the "
+            "sign holds, so they are greyed out."
         )
         self.resolution_cap_panel.setVisible(True)
 
@@ -3791,6 +3842,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _update_quality_dimensions(self) -> None:
+        # Availability first: a preset the sign cannot hold is greyed out
+        # here, and the selection may move off it before the size is read.
+        self._refresh_quality_preset_availability()
         preset = self.quality_combo.currentText()
         custom = preset == "Custom"
         self.custom_resolution_panel.setVisible(custom)
@@ -3806,9 +3860,17 @@ class MainWindow(QMainWindow):
                 # a plan could express, and a later measurement only trims
                 # the strokes that would repeat inside one texel.
                 self._resolution_cap_note = ""
-                cap = self._sign_resolution_cap() or self._screen_resolution_cap()
+                measured = self._sign_resolution_cap()
+                cap = measured or self._screen_resolution_cap()
                 if cap is not None:
                     width, height = cap
+                    if measured is not None:
+                        # Not a cap - it is what Max asked for - but the
+                        # number is still the run's headline fact, and the
+                        # summary is where a finished plan is read.
+                        self._resolution_cap_note = (
+                            f"  •  {width}×{height}, this sign's full resolution"
+                        )
                 else:
                     # Neither a measurement nor a calibrated canvas: nothing
                     # to derive a grid from until the sign is framed.
@@ -4983,6 +5045,8 @@ class MainWindow(QMainWindow):
             bool(status.get("clear_button")), brush_optional
         )
         self._refresh_brush_model_status()
+        if self._refresh_quality_preset_availability():
+            self._update_quality_dimensions()
         self._refresh_resolution_cap_notice()
         correction = (
             profile.metadata.get("color_correction")
