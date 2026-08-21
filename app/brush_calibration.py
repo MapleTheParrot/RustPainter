@@ -62,15 +62,19 @@ _SOLID_TOLERANCE = 0.30
 # measured the same band - the digits never reached Rust's Size field.
 _MIN_SLOPE = 1e-5
 
-# Rust's sign textures are not all powers of two: a live probe of the large
-# wooden sign measured 318x238 texels - a 4:3 texture of 320x240.  The table
-# therefore carries the power-of-two family and the 4:3 sizes seen in game.
-# A fitted texel count carries a little band-measurement noise (repeat
-# measurements land within a percent of each other), so a measurement within
-# the tolerance of its *nearest* candidate is that candidate.  A measurement
-# far from every one is kept as measured: rounding it to a size the sign
-# cannot be would misalign every row.
-_CANONICAL_TEXTURE_SIZES = (32, 64, 128, 240, 256, 320, 512, 1024, 2048)
+# Every edge length a deployable paintable declares in the game's own prefabs
+# (tools/sign_sizes.json, read from the asset bundles with
+# tools/dump_sign_sizes.py).  Rust's sign textures are far from all powers of
+# two: picture frames are 205x256 and 256x192, the artist canvases 192x256
+# and 256x640, the DLC frames 128x175 and 320x256.  This table is only the
+# fallback for when the texel grid could not be measured on the sign: a
+# fitted texel count carries a little band-measurement noise, so a count
+# within the tolerance of its *nearest* candidate is that candidate, and a
+# count far from every one is kept as measured - rounding it to a size the
+# sign cannot be would misalign every row.
+_CANONICAL_TEXTURE_SIZES = (
+    128, 170, 175, 192, 205, 240, 256, 267, 320, 384, 512, 640, 1024,
+)
 _CANONICAL_TOLERANCE = 0.08
 
 

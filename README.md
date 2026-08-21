@@ -514,10 +514,15 @@ artwork - which is the game's rendering, not a placement error.
 For development there is also `tools/dump_sign_sizes.py`, which reads the
 texture sizes Rust's own prefabs declare out of the game's asset bundles
 (files on disk, nothing running) with UnityPy. The bundles embed their type
-trees, so no game assembly is needed. `--smoke` lists the paintable items
-from the small preload bundle in under a second; the sizes themselves are on
-the deployable prefabs in `content.bundle`, which is decompressed whole, so
-run that with the game closed and about twice its size free in memory.
+trees, so no game assembly is needed, and they open lazily, so even the
+multi-gigabyte ones scan in under a minute. Its last output is committed as
+`tools/sign_sizes.json`: 26 distinct sizes across the deployable signs,
+frames, canvases and banners, and they are not what the community tables
+say - the wooden signs are 256x128 / 512x256 / 512x256 / 1024x256 (small,
+medium, large, huge), the picture frames include 205x256 and 256x192, the
+artist canvases run 192x256, 320x240, 256x640, 512x512 and 1024x512, and the
+DLC frames 128x175, 320x240, 320x256, 128x320. That table is what the
+fallback snapping uses; the probe itself never consults it.
 
 ### Strokes the game never sees, and the touch-up that repairs them
 

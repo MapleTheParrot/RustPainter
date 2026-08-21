@@ -1,0 +1,416 @@
+[
+  {
+    "object": "artists_canvas_L_100x250",
+    "width": 256,
+    "height": 640,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "artists_canvas_M_150x125 (1)",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "artists_canvas_S_125x100",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "artists_canvas_XL_250x250",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "artists_canvas_XS_75x100",
+    "width": 192,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "artists_canvas_XXL_500x250",
+    "width": 1024,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.large.prefab",
+    "width": 320,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.medium.prefab",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.small.prefab",
+    "width": 128,
+    "height": 175,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.standing.prefab",
+    "width": 128,
+    "height": 320,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.xl.prefab",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/light-up frame/lightupframe.xxl.prefab",
+    "width": 1024,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.large.prefab",
+    "width": 320,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.medium.prefab",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.small.prefab",
+    "width": 128,
+    "height": 175,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.standing.prefab",
+    "width": 128,
+    "height": 320,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.xl.prefab",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/ornate frame/goldframe.xxl.prefab",
+    "width": 1024,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/paintable window/window.paintable.prefab",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.large.prefab",
+    "width": 320,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.medium.prefab",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.small.prefab",
+    "width": 128,
+    "height": 175,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.standing.prefab",
+    "width": 128,
+    "height": 320,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.xl.prefab",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/scrap frame/scrapframe.xxl.prefab",
+    "width": 1024,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/wood frame (unused)/woodframe.large.prefab",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/wood frame (unused)/woodframe.medium.prefab",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/wood frame (unused)/woodframe.small.prefab",
+    "width": 267,
+    "height": 320,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "assets/prefabs/misc/artist_dlc/wood frame (unused)/woodframe.standing.prefab",
+    "width": 170,
+    "height": 320,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "carvable_pumpkin",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "egg_suit_LOD0",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "frame_LOD0",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "frame_LOD0",
+    "width": 320,
+    "height": 384,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "paintable_reactive_target_rig",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_A_LOD0",
+    "width": 1200,
+    "height": 280,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_B_LOD0",
+    "width": 1200,
+    "height": 360,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_C_LOD0",
+    "width": 1200,
+    "height": 280,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_D_LOD0",
+    "width": 850,
+    "height": 300,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_E_LOD0",
+    "width": 800,
+    "height": 160,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "rentable_shop_sign_F_LOD0",
+    "width": 1320,
+    "height": 280,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.hanging.100x150_LOD0",
+    "width": 256,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.hanging.150x100_LOD0",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.hanging.banner.large_LOD0",
+    "width": 256,
+    "height": 1024,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.125x125_LOD0",
+    "width": 128,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.125x215.frame_2",
+    "width": 256,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.125x215.frame_3",
+    "width": 256,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.125x215_LOD0",
+    "width": 256,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.250x250.frame_2",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.250x250.frame_3",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.250x250.frame_4",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.250x250.frame_5",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.neonsign.250x250_LOD0",
+    "width": 256,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pictureframe.100x250_LOD0",
+    "width": 128,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pictureframe.125x100_LOD0",
+    "width": 256,
+    "height": 192,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pictureframe.150x125_LOD0",
+    "width": 205,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pictureframe.250x250_LOD0",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pictureframe.500x250_LOD0",
+    "width": 1024,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.pole.banner.large_LOD0",
+    "width": 256,
+    "height": 1024,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.post.double_LOD0",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.post.single_LOD0",
+    "width": 256,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.town.a_LOD0",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "sign.town.b_LOD0",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "spinner_wheel",
+    "width": 512,
+    "height": 512,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "window.paintable",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "wooden_sign_1x05_LOD0",
+    "width": 256,
+    "height": 128,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "wooden_sign_2x1_LOD0",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "wooden_sign_3x105_LOD0",
+    "width": 512,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "wooden_sign_6x3_LOD0",
+    "width": 1024,
+    "height": 256,
+    "bundle": "assetscenes.bundle"
+  },
+  {
+    "object": "woodframe.large",
+    "width": 320,
+    "height": 240,
+    "bundle": "assetscenes.bundle"
+  }
+]
