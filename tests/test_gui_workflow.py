@@ -1162,6 +1162,56 @@ def test_max_quality_plans_one_cell_per_measured_texel(
     assert window.logical_height_spin.value() == 128
 
 
+def test_the_quality_presets_say_when_the_sign_is_the_limit(
+    window: MainWindow,
+) -> None:
+    """Turning the quality up on a small sign does nothing, visibly.
+
+    High, Very High and Max all get held at the sign's own texel count, so
+    the presets look broken unless the panel says why - and the question is
+    asked at the combo box, before any image is loaded, which is why the
+    plan summary's note is not enough on its own.
+    """
+
+    from app.texel_grid import TexelGridModel
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(10, 10, 1299, 1085)
+    window._current_profile.metadata["texel_grid"] = TexelGridModel(
+        columns=320, rows=240, pitch_x=4.06, pitch_y=4.51, origin_x=10.0, origin_y=10.0
+    ).to_dict()
+    window._refresh_profile_ui()
+
+    window.quality_combo.setCurrentText("High")
+    assert window.resolution_cap_panel.isVisibleTo(window)
+    text = window.resolution_cap_label.text()
+    assert "320×240" in text
+    # Where the number came from is a tooltip away, not in the way.
+    assert "measured" in window.resolution_cap_panel.toolTip()
+    # The presets that land on the cap are named, so the user can see at a
+    # glance which choices are the same choice.
+    assert "High, Very High and Max" in text
+    # ...and the sizes really are identical.
+    sizes = {}
+    for preset in ("High", "Very High", "Max"):
+        window.quality_combo.setCurrentText(preset)
+        sizes[preset] = (
+            window.logical_width_spin.value(),
+            window.logical_height_spin.value(),
+        )
+    assert len(set(sizes.values())) == 1, sizes
+
+    # A preset the sign can actually hold says nothing.
+    window.quality_combo.setCurrentText("Fast")
+    assert not window.resolution_cap_panel.isVisibleTo(window)
+
+    # Without a measurement there is no ceiling to announce.
+    window._current_profile.metadata.pop("texel_grid")
+    window._refresh_profile_ui()
+    window.quality_combo.setCurrentText("Very High")
+    assert not window.resolution_cap_panel.isVisibleTo(window)
+
+
 def test_a_measured_texel_grid_outranks_the_brush_inference(
     window: MainWindow,
 ) -> None:

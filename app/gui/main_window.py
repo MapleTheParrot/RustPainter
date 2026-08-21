@@ -1750,6 +1750,24 @@ class MainWindow(QMainWindow):
                 alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             )
 
+        # Why the quality presets stop making a difference.  Three of them
+        # ask for more cells than a small sign has texels, and the plan is
+        # held at the sign's own resolution - which without a word of
+        # explanation looks like the setting doing nothing at all.
+        self.resolution_cap_panel = QFrame()
+        self.resolution_cap_panel.setObjectName("inlinePanel")
+        cap_layout = QHBoxLayout(self.resolution_cap_panel)
+        cap_layout.setContentsMargins(10, 7, 10, 7)
+        cap_layout.setSpacing(8)
+        self.resolution_cap_icon = _glyph_label("resolution", 16)
+        self.resolution_cap_label = QLabel()
+        self.resolution_cap_label.setObjectName("muted")
+        self.resolution_cap_label.setWordWrap(True)
+        cap_layout.addWidget(self.resolution_cap_icon, 0, Qt.AlignmentFlag.AlignTop)
+        cap_layout.addWidget(self.resolution_cap_label, 1)
+        self.resolution_cap_panel.setVisible(False)
+        quick_grid.addWidget(self.resolution_cap_panel, 7, 0, 1, 2)
+
         self.custom_resolution_panel = QFrame()
         self.custom_resolution_panel.setObjectName("inlinePanel")
         custom_layout = QHBoxLayout(self.custom_resolution_panel)
@@ -1772,7 +1790,7 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(self.logical_width_spin)
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
-        quick_grid.addWidget(self.custom_resolution_panel, 7, 0, 1, 2)
+        quick_grid.addWidget(self.custom_resolution_panel, 8, 0, 1, 2)
 
         self.background_removal_panel = QFrame()
         self.background_removal_panel.setObjectName("inlinePanel")
@@ -1836,7 +1854,7 @@ class MainWindow(QMainWindow):
         removal_grid.setColumnStretch(1, 1)
         removal_grid.setColumnStretch(2, 1)
         self.background_removal_panel.setVisible(False)
-        quick_grid.addWidget(self.background_removal_panel, 8, 0, 1, 2)
+        quick_grid.addWidget(self.background_removal_panel, 9, 0, 1, 2)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
         image_layout.addLayout(quick_grid)
@@ -3560,6 +3578,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.setCurrentText("Custom")
             self.quality_combo.blockSignals(False)
         self._sync_custom_resolution(axis)
+        self._refresh_resolution_cap_notice()
         self._rescale_text_layers()
         # A canvas of a new shape restretches the backdrop under it, which
         # _rescale_text_layers only redraws when a layer's size moved too.
@@ -3659,6 +3678,97 @@ class MainWindow(QMainWindow):
         height = max(8, round(rect.height * scale))
         return width, height
 
+    def _preset_dimensions(self, preset: str) -> tuple[int, int]:
+        """The logical size a named quality preset asks for, before capping."""
+
+        aspect = self._canvas_aspect_ratio()
+        longest = QUALITY_LONG_EDGE[preset]
+        if aspect >= 1.0:
+            return longest, max(8, round(longest / aspect))
+        return max(8, round(longest * aspect)), longest
+
+    def _presets_at_the_cap(self, cap: tuple[int, int]) -> list[str]:
+        """Every preset that lands on the sign's own resolution.
+
+        Max is always one of them - that is what Max means - so the list is
+        only worth showing when a fixed-size preset joins it, which is
+        exactly the case where turning the quality up changes nothing.
+        """
+
+        cap_width, cap_height = cap
+        capped = [
+            preset
+            for preset in QUALITY_LONG_EDGE
+            if (lambda size: size[0] > cap_width or size[1] > cap_height)(
+                self._preset_dimensions(preset)
+            )
+        ]
+        if not capped:
+            return []
+        return [*capped, MAX_QUALITY_PRESET]
+
+    @staticmethod
+    def _join_names(names: list[str]) -> str:
+        if len(names) <= 1:
+            return "".join(names)
+        return f"{', '.join(names[:-1])} and {names[-1]}"
+
+    def _refresh_resolution_cap_notice(self) -> None:
+        """Say, next to the setting itself, when the sign is the limit.
+
+        The plan summary already notes a capped resolution once a plan
+        exists, but the question this answers - "why does turning the
+        quality up do nothing?" - is asked at the combo box, often before
+        any image is loaded, so the answer belongs there too.
+        """
+
+        cap = self._sign_resolution_cap()
+        if cap is None:
+            self.resolution_cap_panel.setVisible(False)
+            return
+        cap_width, cap_height = cap
+        if self._texel_grid() is not None:
+            self.resolution_cap_panel.setToolTip(
+                f"The last paint job measured this sign's texture at "
+                f"{cap_width}×{cap_height} texels by stamping its grid, so this "
+                "is the sign's own resolution rather than an estimate.  A plan "
+                "with more cells than that cannot add detail: neighbouring "
+                "cells would land on the same texel and overpaint each other."
+            )
+        else:
+            self.resolution_cap_panel.setToolTip(
+                f"Estimated from the brush measurement at about "
+                f"{cap_width}×{cap_height} texels.  The next paint job measures "
+                "the sign's grid directly and may refine this."
+            )
+        if self.quality_combo.currentText() == "Custom":
+            requested = (
+                self.logical_width_spin.value(),
+                self.logical_height_spin.value(),
+            )
+            if requested[0] < cap_width or requested[1] < cap_height:
+                self.resolution_cap_panel.setVisible(False)
+                return
+            self.resolution_cap_label.setText(
+                f"This sign holds {cap_width}×{cap_height} texels — as fine as "
+                "a custom resolution can go here."
+            )
+            self.resolution_cap_panel.setVisible(True)
+            return
+        # Only when the preset in front of the user is one of the ones being
+        # held: on a coarser choice the ceiling is not in the way, and a
+        # notice that is always up is one nobody reads.
+        shared = self._presets_at_the_cap(cap)
+        if self.quality_combo.currentText() not in shared:
+            self.resolution_cap_panel.setVisible(False)
+            return
+        self.resolution_cap_label.setText(
+            f"This sign holds {cap_width}×{cap_height} texels, so "
+            f"{self._join_names(shared)} all paint at that size — the finest "
+            "detail it can show."
+        )
+        self.resolution_cap_panel.setVisible(True)
+
     def _cap_to_sign_resolution(self, width: int, height: int) -> tuple[int, int]:
         """Hold a requested logical size at what the sign can actually show.
 
@@ -3722,6 +3832,7 @@ class MainWindow(QMainWindow):
             self.logical_height_spin.blockSignals(False)
         else:
             self._sync_custom_resolution("width")
+        self._refresh_resolution_cap_notice()
         self._rescale_text_layers()
         self._schedule_processing()
 
@@ -4872,6 +4983,7 @@ class MainWindow(QMainWindow):
             bool(status.get("clear_button")), brush_optional
         )
         self._refresh_brush_model_status()
+        self._refresh_resolution_cap_notice()
         correction = (
             profile.metadata.get("color_correction")
             if profile and isinstance(profile.metadata, dict)

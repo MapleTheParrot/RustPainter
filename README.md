@@ -440,6 +440,14 @@ discovered as smearing. If the smallest brush Rust offers is wider than one
 logical cell, RustPainter says so and names the resolution that would fit -
 that limit is the sign's own texture resolution, which no setting can raise.
 
+That ceiling is also why the quality presets stop making a difference on a
+small sign. A 320x240 sign holds fewer cells than High, Very High or Max ask
+for, so all three are held at 320x240 and paint the same picture - which
+looks exactly like the setting doing nothing. Quick settings says so under
+the presets whenever the one selected is being held there, naming the ones
+that are now the same choice, and the plan summary repeats the size next to
+the stroke counts. On a bigger sign the presets separate again.
+
 A one-cell brush targets the full logical cell plus half a sign texel: the
 sign renders strokes snapped to its own texture rows, and a brush sized
 exactly to the row pitch still lands half a texel narrow wherever snapping
