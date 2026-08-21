@@ -102,7 +102,7 @@ Paint a sign in five steps:
 5. **Paint.** Start with a small, low-color test image and focus Rust during
    the countdown.
 
-**Hotkeys:** `F8` start/resume, `F9` pause, `F10` abort. Abort immediately
+**Hotkeys:** `F8` start/resume, `F9` pause, `F10` stop. Stop immediately
 releases any held mouse button.
 
 Keep a hand near **F10** during your first runs, and do not leave the tool
@@ -142,7 +142,7 @@ painting unattended. Everything below is detail you only need when tuning.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
 8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
-9. Begin with a small, low-color test image. Keep the abort hotkey available.
+9. Begin with a small, low-color test image. Keep the stop hotkey available.
 
 The niche **Run without mouse input** diagnostic remains available under
 **Settings → Diagnostics** for plan timing and troubleshooting, but is off by default.
@@ -361,7 +361,7 @@ Two steps of the pipeline exist purely to keep the sign faithful to the source:
 
 The current Rust picker layout is fixed in the application: hue runs bottom to top, saturation increases left to right, brightness decreases top to bottom, and brush size increases left to right.
 
-Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** abort. Abort is designed to release any held mouse button immediately.
+Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** stop. Stop is designed to release any held mouse button immediately.
 
 Compact laptop keyboards often put F5-F12 behind an **Fn** key that the keyboard
 firmware handles itself, so those presses never reach the app and the hotkeys

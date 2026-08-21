@@ -974,7 +974,7 @@ class MainWindow(QMainWindow):
         self.state_badge = QLabel()
         badge_layout.addWidget(self.state_badge_icon)
         badge_layout.addWidget(self.state_badge)
-        self._set_state_badge("idle", "SAFE IDLE")
+        self._set_state_badge("idle", "IDLE")
 
         layout.addWidget(mark)
         layout.addWidget(title)
@@ -2217,7 +2217,7 @@ class MainWindow(QMainWindow):
         self._set_icon(self.start_button, "play", ON_ACCENT, size=22)
         run_buttons = QHBoxLayout()
         self.pause_button = QPushButton("Pause  •  F9")
-        self.abort_button = QPushButton("Abort  •  F10")
+        self.abort_button = QPushButton("Stop  •  F10")
         self.abort_button.setObjectName("danger")
         self._set_icon(self.pause_button, "pause", TEXT, size=16)
         self._set_icon(self.abort_button, "abort", ON_ACCENT, size=16)
@@ -2300,7 +2300,7 @@ class MainWindow(QMainWindow):
         safety_form.addRow("UI check", self.verify_ui_check)
         safety_form.addRow("Start / resume", self.start_hotkey_combo)
         safety_form.addRow("Pause", self.pause_hotkey_combo)
-        safety_form.addRow("Abort", self.abort_hotkey_combo)
+        safety_form.addRow("Stop", self.abort_hotkey_combo)
         layout.addWidget(safety_group)
         layout.addStretch(1)
         return content
@@ -5271,7 +5271,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Operation is active",
-                "Abort or wait for the current operation before changing calibration.",
+                "Stop or wait for the current operation before changing calibration.",
             )
             return
         instruction = f"Drag just inside the {description}"
@@ -5556,7 +5556,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Operation is active",
-                "Pause or abort the active operation before capturing a reference.",
+                "Pause or stop the active operation before capturing a reference.",
             )
             return
         profile = self._current_profile
@@ -5653,7 +5653,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Operation is active",
-                "Finish or abort the current operation before preparing a color chart.",
+                "Finish or stop the current operation before preparing a color chart.",
             )
             return
         profile = self._current_profile
@@ -5953,7 +5953,7 @@ class MainWindow(QMainWindow):
             self._hotkeys_ready = bool(
                 self._hotkeys is not None and getattr(self._hotkeys, "running", False)
             )
-            self._on_hotkey_error("Start, pause, and abort hotkeys must be different.")
+            self._on_hotkey_error("Start, pause, and stop hotkeys must be different.")
             self._update_start_availability()
             return
         previous = self._hotkeys
@@ -6067,7 +6067,7 @@ class MainWindow(QMainWindow):
             f"Pause  •  {self.pause_hotkey_combo.currentText()}"
         )
         self.abort_button.setText(
-            f"Abort  •  {self.abort_hotkey_combo.currentText()}"
+            f"Stop  •  {self.abort_hotkey_combo.currentText()}"
         )
         self._update_start_availability()
 
@@ -6209,7 +6209,7 @@ class MainWindow(QMainWindow):
             return "Finish calibrating this profile before painting."
         if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
             return (
-                "The global abort hotkey is not active, so real painting is blocked. "
+                "The global stop hotkey is not active, so real painting is blocked. "
                 "Another program may already own "
                 f"{self.abort_hotkey_combo.currentText()}; pick different hotkeys above."
             )
@@ -6381,7 +6381,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Emergency hotkey unavailable",
-                "Real painting is disabled because the global abort hotkey is not active. "
+                "Real painting is disabled because the global stop hotkey is not active. "
                 "Choose three distinct, available hotkeys and try again.",
             )
             return
@@ -6511,7 +6511,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Emergency hotkey unavailable",
-                "Painting was cancelled because the global abort hotkey stopped "
+                "Painting was cancelled because the global stop hotkey stopped "
                 "during the countdown.",
             )
             self._set_idle_ui("Start cancelled: emergency hotkey unavailable")
@@ -6781,7 +6781,7 @@ class MainWindow(QMainWindow):
             "running": "PAINTING",
             "paused": "PAUSED",
             "error": "ERROR",
-            "aborted": "ABORTED",
+            "aborted": "STOPPED",
         }.get(value, value.upper())
         self._set_state_badge(value, badge_text)
         active = value in {"countdown", "running", "paused"}
@@ -7422,7 +7422,7 @@ class MainWindow(QMainWindow):
         self.progress_state_label.setText("Idle")
         self.progress_detail_label.setText(detail)
         self._set_active_progress_visible(False)
-        self._set_state_badge("idle", "SAFE IDLE")
+        self._set_state_badge("idle", "IDLE")
         self._update_start_availability()
 
     # --------------------------------------------------------------- debug mode
@@ -7452,7 +7452,7 @@ class MainWindow(QMainWindow):
             )
             return
         if self._painter_is_active():
-            QMessageBox.warning(self, "Painting is active", "Pause or abort the paint job first.")
+            QMessageBox.warning(self, "Painting is active", "Pause or stop the paint job first.")
             return
         if (
             not self.dry_run_check.isChecked()
@@ -7461,7 +7461,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Emergency hotkey unavailable",
-                "Real calibration tests are disabled because the global abort hotkey "
+                "Real calibration tests are disabled because the global stop hotkey "
                 "is not active. Choose three distinct, available hotkeys and try again.",
             )
             return
@@ -7499,7 +7499,7 @@ class MainWindow(QMainWindow):
             dry_run = self.dry_run_check.isChecked()
             if not dry_run and not self._emergency_hotkey_available():
                 raise RuntimeError(
-                    "The global abort hotkey stopped before the debug action began."
+                    "The global stop hotkey stopped before the debug action began."
                 )
             expected_title = self.expected_window_edit.text().strip()
             expected_process = self.expected_process_edit.text().strip()
@@ -7732,7 +7732,7 @@ class MainWindow(QMainWindow):
                     status = "error"
                     message = f"Could not release input: {exc}"
         # A controller is retained only when its final release failed.  Keep
-        # real-input starts locked and the Abort button enabled until a later
+        # real-input starts locked and the Stop button enabled until a later
         # abort/close retry succeeds; never overwrite the only record of a
         # potentially held mouse button.
         self._debug_running = self._debug_controller is not None

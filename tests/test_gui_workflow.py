@@ -1652,11 +1652,11 @@ def test_stale_same_generation_running_callback_cannot_hide_abort(
 
     window._painter = AbortedPainter()
     window._paint_generation = 7
-    window.state_badge.setText("ABORTED")
+    window.state_badge.setText("STOPPED")
 
     window._on_paint_state(7, PainterState.RUNNING, "late worker callback")
 
-    assert window.state_badge.text() == "ABORTED"
+    assert window.state_badge.text() == "STOPPED"
 
 
 def test_previous_held_button_blocks_painter_replacement(
