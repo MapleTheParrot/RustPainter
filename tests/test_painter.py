@@ -416,6 +416,57 @@ def test_pause_holds_progress_then_resume_completes() -> None:
     assert not input_controller.held_buttons
 
 
+def test_a_paused_job_takes_new_timing_and_keeps_its_shape() -> None:
+    """A pause is when timing gets changed, and the resumed strokes run on it.
+
+    Only the timing and the guards move; what shaped the job - the brush it
+    measured, the spacing its strokes were laid out with - stays as it was
+    configured, whatever the new settings say about it.
+    """
+
+    input_controller = MockInputController()
+    painter = Painter(input_controller)
+    started = _settings(
+        mouse_down_duration_seconds=0.004,
+        delay_between_strokes_seconds=0.0,
+        logical_pixel_spacing=1.0,
+    )
+    retuned = _settings(
+        mouse_down_duration_seconds=0.004,
+        delay_between_strokes_seconds=0.05,
+        delay_between_colors_seconds=0.2,
+        corner_abort_enabled=True,
+        logical_pixel_spacing=2.0,
+        apply_brush_size=True,
+    )
+    # Nothing to retune before the job is paused.
+    assert not painter.retune(retuned)
+    painter.start(_dot_plan(8), _profile(), started)
+    assert not painter.retune(retuned)
+    assert _wait_until(lambda: painter.progress.completed_strokes >= 2)
+
+    assert painter.pause()
+    assert painter.retune(retuned)
+    live = painter._job.settings
+    assert live.delay_between_strokes_seconds == 0.05
+    assert live.delay_between_colors_seconds == 0.2
+    assert live.corner_abort_enabled is True
+    assert live.logical_pixel_spacing == 1.0
+    assert live.apply_brush_size is False
+    # The run's pace no longer says anything about the machine's overhead.
+    assert painter.paint_phase_timing is None
+
+    paused_at = painter.progress.completed_strokes
+    resumed = time.monotonic()
+    assert painter.resume()
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+    # Every stroke after the pause waited the new gap, which the old one
+    # never did.
+    remaining = 8 - paused_at
+    assert time.monotonic() - resumed >= remaining * 0.05
+
+
 def test_abort_stops_queued_strokes_and_releases_mouse() -> None:
     input_controller = MockInputController()
     painter = Painter(input_controller)

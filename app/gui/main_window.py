@@ -1131,8 +1131,13 @@ class MainWindow(QMainWindow):
 
         title = QLabel("Painting")
         title.setObjectName("pageTitle")
-        note = QLabel("Tune brush behavior and input timing when a preset needs adjustment.")
+        note = QLabel(
+            "Tune brush behavior and input timing when a preset needs adjustment. "
+            "Timing can also be changed while a job is paused, and takes effect "
+            "when it resumes."
+        )
         note.setObjectName("muted")
+        note.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(note)
 
@@ -6157,7 +6162,7 @@ class MainWindow(QMainWindow):
             or self._countdown_callback_running
             or self._debug_running
         )
-        self._set_job_controls_locked(job_locked)
+        self._set_job_controls_locked(job_locked, retunable=paused)
         self._update_calibration_overlay()
 
     def _missing_sizing_rectangles(self) -> list[str]:
@@ -6215,7 +6220,30 @@ class MainWindow(QMainWindow):
             )
         return "Painting is unavailable right now."
 
-    def _set_job_controls_locked(self, locked: bool) -> None:
+    # The controls a paused job may still take new values from: the holds
+    # and speeds every remaining stroke is run with, and the guards that
+    # decide when to stop.  The painter applies them on resume.  Everything
+    # that shaped the plan or the job stays locked until the job is over.
+    def _retunable_controls(self) -> tuple[QWidget, ...]:
+        return (
+            self.speed_preset_combo,
+            self.stroke_speed_spin,
+            self.dot_duration_spin,
+            self.hue_delay_spin,
+            self.sv_delay_spin,
+            self.brush_delay_spin,
+            self.stroke_delay_spin,
+            self.color_delay_spin,
+            self.interpolation_spin,
+            self.verify_passes_spin,
+            self.focus_guard_check,
+            self.expected_window_edit,
+            self.expected_process_edit,
+            self.corner_abort_check,
+            self.mouse_pause_check,
+        )
+
+    def _set_job_controls_locked(self, locked: bool, *, retunable: bool = False) -> None:
         controls = (
             self.browse_button,
             self.scale_mode_combo,
@@ -6278,8 +6306,9 @@ class MainWindow(QMainWindow):
             self.clear_color_correction_button,
             *self.debug_buttons.values(),
         )
+        live = set(self._retunable_controls()) if retunable else set()
         for control in controls:
-            control.setEnabled(not locked)
+            control.setEnabled(not locked or control in live)
         if not locked:
             is_fit = self.scale_mode_combo.currentData() == ScaleMode.FIT.value
             is_fill = self.scale_mode_combo.currentData() == ScaleMode.FILL.value
@@ -6363,6 +6392,7 @@ class MainWindow(QMainWindow):
                 from app.painter import PainterState
 
                 if self._painter.state == PainterState.PAUSED:
+                    self._retune_paused_painter()
                     self._painter.resume()
                     return
                 if self._painter_is_active():
@@ -6551,7 +6581,7 @@ class MainWindow(QMainWindow):
                 DryRunInputController,
                 create_system_input_controller,
             )
-            from app.painter import Painter, PainterSettings
+            from app.painter import Painter
 
             input_controller = (
                 DryRunInputController(
@@ -6564,26 +6594,7 @@ class MainWindow(QMainWindow):
                 if dry_run
                 else create_system_input_controller()
             )
-            settings_document = pending.settings
-            # The visible Qt countdown has already completed.  Keeping the
-            # worker countdown at zero avoids a confusing second countdown.
-            settings_document["safety"]["countdown_seconds"] = 0
-            if dry_run:
-                # A dry run is a plan visualizer, not a wall-clock simulation.
-                # Preserve ordering/progress while omitting deliberate waits.
-                settings_document["painting"].update(
-                    stroke_speed_pixels_per_second=1_000_000_000.0,
-                    mouse_down_duration_seconds=0.0,
-                    delay_after_hue_seconds=0.0,
-                    delay_after_saturation_value_seconds=0.0,
-                    delay_between_strokes_seconds=0.0,
-                    delay_between_colors_seconds=0.0,
-                    stroke_interpolation_step_pixels=100_000.0,
-                    apply_brush_size=False,
-                )
-                settings_document["safety"]["require_rust_foreground"] = False
-                settings_document["safety"]["corner_abort_enabled"] = False
-            settings = PainterSettings.from_mapping(settings_document)
+            settings = self._painter_settings(pending.settings, dry_run)
             if self._pending_start_cancelled:
                 self._set_idle_ui("Start cancelled")
                 return
@@ -6651,6 +6662,59 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             LOGGER.exception("Could not start painting")
             self._on_paint_error(self._paint_generation, str(exc))
+
+    def _painter_settings(self, settings_document: dict[str, Any], dry_run: bool) -> Any:
+        """The painter's settings for a job, with a dry run's waits taken out."""
+
+        from app.painter import PainterSettings
+
+        # The visible Qt countdown has already completed.  Keeping the
+        # worker countdown at zero avoids a confusing second countdown.
+        settings_document["safety"]["countdown_seconds"] = 0
+        if dry_run:
+            # A dry run is a plan visualizer, not a wall-clock simulation.
+            # Preserve ordering/progress while omitting deliberate waits.
+            settings_document["painting"].update(
+                stroke_speed_pixels_per_second=1_000_000_000.0,
+                mouse_down_duration_seconds=0.0,
+                delay_after_hue_seconds=0.0,
+                delay_after_saturation_value_seconds=0.0,
+                delay_between_strokes_seconds=0.0,
+                delay_between_colors_seconds=0.0,
+                stroke_interpolation_step_pixels=100_000.0,
+                apply_brush_size=False,
+            )
+            settings_document["safety"]["require_rust_foreground"] = False
+            settings_document["safety"]["corner_abort_enabled"] = False
+        return PainterSettings.from_mapping(settings_document)
+
+    def _retune_paused_painter(self) -> None:
+        """Give the paused job the timing and guards the controls show now.
+
+        The timing and safety controls stay live through a pause precisely
+        so a hold that looked too short on the sign can be lengthened before
+        the next stroke.  A value the painter rejects is reported and left
+        out; the job resumes on the timing it had rather than not at all.
+        """
+
+        painter = self._painter
+        if painter is None:
+            return
+        # A dry run's input controller is the one thing that says for sure
+        # the job is a dry run, whatever the controls show now.
+        dry_run = not bool(
+            getattr(getattr(painter, "input", None), "emits_real_input", True)
+        )
+        try:
+            settings = self._painter_settings(self._settings_document(), dry_run)
+            painter.retune(settings)
+        except Exception as exc:
+            LOGGER.warning("Could not apply the changed settings to the paused job: %s", exc)
+            self.statusBar().showMessage(
+                f"Resumed on the previous timing - the changed settings were not "
+                f"accepted: {exc}",
+                8000,
+            )
 
     def _execution_profile(self, dry_run: bool, plan: PaintPlan) -> Any:
         profile = self._current_profile

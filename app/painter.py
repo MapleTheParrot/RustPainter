@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, ClassVar, Iterator
 
 from .brush_calibration import (
     BRUSH_SIZE_MAX,
@@ -251,6 +251,41 @@ class PainterSettings:
     mouse_move_tolerance_pixels: float = 3.0
     safety_poll_interval_seconds: float = 0.01
     progress_callback_interval_seconds: float = 0.04
+
+    # The fields a paused job may take new values for.  Everything else
+    # shaped the job - which brush it measured, how its strokes were laid
+    # out, whether it counted down - and changing those under a half-painted
+    # sign would not produce the sign the plan promised.
+    RETUNABLE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "stroke_speed_pixels_per_second",
+        "mouse_down_duration_seconds",
+        "delay_after_hue_seconds",
+        "delay_after_saturation_value_seconds",
+        "delay_between_strokes_seconds",
+        "delay_between_colors_seconds",
+        "stroke_interpolation_step_pixels",
+        "delay_after_brush_seconds",
+        "verify_passes",
+        "require_foreground",
+        "expected_window_title_contains",
+        "expected_process_name",
+        "focus_check_interval_seconds",
+        "corner_abort_enabled",
+        "corner_abort_margin_pixels",
+        "corner_abort_minimum_distance_pixels",
+        "pause_on_mouse_move",
+        "mouse_move_pause_threshold_pixels",
+        "mouse_move_tolerance_pixels",
+        "safety_poll_interval_seconds",
+        "progress_callback_interval_seconds",
+    )
+
+    def retuned(self, other: "PainterSettings") -> "PainterSettings":
+        """These settings with ``other``'s timing and safety values."""
+
+        return replace(
+            self, **{name: getattr(other, name) for name in self.RETUNABLE_FIELDS}
+        )
 
     def __post_init__(self) -> None:
         positive = {
@@ -513,6 +548,10 @@ class Painter:
         # shown is already this machine's, not a generic one.
         self._stroke_overhead_seconds = stroke_overhead_seconds
         self._paint_phase_timing: PhaseTiming | None = None
+        # Set once a pause changes the stroke timing.  The run's predicted
+        # seconds were priced on the timing it started with, so its measured
+        # pace then says nothing about the machine's per-stroke overhead.
+        self._timing_retuned = False
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -731,6 +770,7 @@ class Painter:
             self._reset_mouse_movement_baseline()
             self._last_progress_emit = 0.0
             self._paint_phase_timing = None
+            self._timing_retuned = False
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -818,6 +858,36 @@ class Painter:
         self._emit_state(resumed_state, "resumed")
         message = "Countdown resumed" if resumed_state is PainterState.COUNTDOWN else "Painting"
         self._update_progress_state(resumed_state, message)
+        return True
+
+    def retune(self, settings: PainterSettings | Mapping[str, Any]) -> bool:
+        """Give a paused job new timing and safety values for when it resumes.
+
+        A pause is the one moment the user can see the sign and the painter
+        at the same time, so it is when a hold that looked too short, or a
+        guard that keeps tripping, gets changed.  Only the retunable fields
+        are taken from ``settings``; the rest of the job stays as it was
+        configured.  Returns False when there is no paused job to retune.
+        """
+
+        resolved = (
+            settings
+            if isinstance(settings, PainterSettings)
+            else PainterSettings.from_mapping(settings)
+        )
+        with self._condition:
+            job = self._job
+            if job is None or self._state != PainterState.PAUSED:
+                return False
+            before = job.settings
+            job.settings = before.retuned(resolved)
+            if StrokeTiming.from_settings(
+                job.settings, overhead_seconds=0.0, real_input=True
+            ) != StrokeTiming.from_settings(
+                before, overhead_seconds=0.0, real_input=True
+            ):
+                self._timing_retuned = True
+        LOGGER.info("Painting settings retuned while paused")
         return True
 
     def abort(self, reason: str = "user") -> bool:
@@ -2093,6 +2163,8 @@ class Painter:
         """
 
         with self._condition:
+            if self._timing_retuned:
+                return None
             return self._paint_phase_timing
 
     def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
@@ -2197,6 +2269,12 @@ class Painter:
                 while True:
                     self._checkpoint(check_focus=True)
                     current_epoch = self._pause_generation_value()
+                    # A pause may have retuned the job, so every stroke is
+                    # held and paced by the settings the job has now, not the
+                    # ones it started with.  The schedule keeps its original
+                    # pricing: percent still climbs monotonically, and the
+                    # time left is corrected by the measured pace anyway.
+                    settings = job.settings
                     try:
                         if applied_epoch != current_epoch:
                             applied_diameter = None
@@ -2246,11 +2324,12 @@ class Painter:
                     message="Painting",
                 )
                 self._interruptible_sleep(
-                    self._stroke_gap(settings.delay_between_strokes_seconds),
+                    self._stroke_gap(job.settings.delay_between_strokes_seconds),
                     check_focus=True,
                 )
             self._interruptible_sleep(
-                self._settle(settings.delay_between_colors_seconds), check_focus=True
+                self._settle(job.settings.delay_between_colors_seconds),
+                check_focus=True,
             )
 
     def _verify_and_touch_up(self, job: _Job) -> None:

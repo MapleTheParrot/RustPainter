@@ -3530,3 +3530,66 @@ def test_text_controls_follow_the_source_tab(window: MainWindow) -> None:
     assert window.text_section.isHidden()
     window.preview_tabs.setCurrentIndex(0)
     assert not window.text_section.isHidden()
+
+
+def test_a_paused_job_leaves_the_timing_controls_live_and_retunes_on_resume(
+    window: MainWindow,
+) -> None:
+    """A pause is when a hold that looked too short gets lengthened.
+
+    The timing and the guards stay editable through a pause and reach the
+    painter when the job resumes; everything that shaped the job - the image,
+    the plan, the calibration - stays locked until it is over.
+    """
+
+    from types import SimpleNamespace
+
+    class _PausedPainter:
+        state = PainterState.PAUSED
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+
+        def __init__(self) -> None:
+            self.retuned: list = []
+            self.resumed = 0
+
+        def retune(self, settings) -> bool:
+            self.retuned.append(settings)
+            return True
+
+        def resume(self) -> bool:
+            self.resumed += 1
+            return True
+
+    painter = _PausedPainter()
+    window._painter = painter
+    window._update_start_availability()
+
+    assert window.speed_preset_combo.isEnabled()
+    assert window.stroke_delay_spin.isEnabled()
+    assert window.corner_abort_check.isEnabled()
+    assert window.verify_passes_spin.isEnabled()
+    assert not window.quality_combo.isEnabled()
+    assert not window.pixel_spacing_spin.isEnabled()
+    assert not window.browse_button.isEnabled()
+    assert not window.apply_brush_check.isEnabled()
+    assert not window.abort_hotkey_combo.isEnabled()
+
+    window.stroke_delay_spin.setValue(250)
+    window.corner_abort_check.setChecked(False)
+    window._start_or_resume()
+
+    assert painter.resumed == 1
+    assert len(painter.retuned) == 1
+    settings = painter.retuned[0]
+    assert settings.delay_between_strokes_seconds == pytest.approx(0.25)
+    assert settings.corner_abort_enabled is False
+    # The worker's own countdown never runs again after a resume.
+    assert settings.countdown_seconds == 0
+
+    # Once the job is over, the ordinary lock lifts everything together.
+    window._painter = None
+    window._update_start_availability()
+    assert window.quality_combo.isEnabled()
+    assert window.stroke_delay_spin.isEnabled()
