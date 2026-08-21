@@ -27,13 +27,27 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
+import logging
+
 import numpy as np
 
 if TYPE_CHECKING:
     from PIL.Image import Image
 
 
+LOGGER = logging.getLogger("rust_painter.texel_grid")
+
 TEXEL_GRID_SCHEMA = 1
+
+# The game takes paint clicks only on the texture itself, frame or no frame:
+# live, a click a pixel above the texture's top edge was swallowed and one on
+# the last column's outer half-pixel was not.  The mouse is therefore held on
+# whole pixels inside the rendered texture, with the calibrated rectangle -
+# hand-dragged, so allowed this much slack - as the outer bound.
+RECTANGLE_SLACK_PIXELS = 1.0
+# How far inside a texel the visible quad's edge has to fall, on both sides,
+# to count as cutting through it rather than lying on its lattice line.
+_EDGE_CUT_MARGIN = 0.75
 
 # A stamp has to move the capture by at least this much, as an RGB distance,
 # to be a stamp rather than the sign's grain or a compression wobble.
@@ -51,12 +65,40 @@ _MAX_STAIR_SPREAD = 0.3
 _MAX_LADDER_RESIDUAL = 0.35
 
 # Locating a blurred one-texel stamp by its centroid is good to a fraction of a
-# screen pixel; the ladder is planned against this figure.
+# screen pixel on a clean render.  The staircase measures the real scatter on
+# the sign in front of it (a grainy, speckled canvas is noisier than that),
+# and the ladder is planned against the larger of the two.
 _CENTROID_SIGMA_PIXELS = 0.45
+# The measured scatter is inflated by this much when planning rungs: a rung
+# counted wrong by one texel is the one failure the ladder must not have.
+_NOISE_SAFETY = 1.5
 
 # The fractional-texel error the next ladder rung may carry and still count
-# unambiguously.  Half a texel is the cliff; a third leaves room for noise.
-_LADDER_TARGET_ERROR = 0.3
+# unambiguously.  Half a texel is the cliff; a quarter leaves room for noise.
+_LADDER_TARGET_ERROR = 0.25
+
+# A dab now and then lands a whole texel from where the cursor was - seen
+# live as one staircase stamp a texel behind its neighbours, most likely the
+# game sampling the press a frame before the move.  Centroid noise is tiny
+# beside that, so every ladder rung is stamped this many times on separate
+# rows and the median is the rung; one stray stamp then changes nothing.
+_STAMPS_PER_RUNG = 3
+
+# The sign's extent is measured with dabs aimed at the texels the calibrated
+# rectangle's edges fall in and at their neighbours, so the outermost texel
+# that can be painted is seen whether the rectangle was dragged a little wide
+# or a little narrow - or a frame is drawn over the edge of the texture.
+# (Live, the visible quad edge sat 2.7 px inside the texture for exactly
+# that reason, which is why the quad edge is logged but never trusted.)
+# Texels tried at each edge, relative to the one the rectangle's edge falls
+# in: one outward, and two inward - a stamp that lands a texel from the
+# cursor makes the outermost texel reachable only from a texel further in.
+_EXTENT_NEIGHBOURS = (-1, 0, 1, 2)
+_EXTENT_DABS = len(_EXTENT_NEIGHBOURS)
+# Each of those positions is dabbed this many times: a stray dab lands a
+# texel inward, so the outermost stamp seen at an edge is the true edge as
+# long as one copy was not stray.
+_EXTENT_COPIES = 2
 
 # The sign's edge must sit within this many texels of a lattice line for the
 # lattice and the edge to be describing the same texture.
@@ -88,6 +130,7 @@ def locate_stamps(
     diff: np.ndarray,
     points: Sequence[tuple[float, float]],
     window: float,
+    max_extent: float | None = None,
 ) -> list[tuple[float, float] | None]:
     """Centre of the stamp nearest each expected point, in capture pixels.
 
@@ -97,7 +140,11 @@ def locate_stamps(
     of each other's windows.  The centre is the diff-weighted centroid of the
     pixels that changed strongly; a bilinear-filtered texel blurs
     symmetrically, so the centroid is the texel's centre however soft its
-    edges came out.  ``None`` marks a stamp that never landed.
+    edges came out.  ``None`` marks a stamp that never landed - or a window
+    holding more than one stamp, which a strong region wider than
+    ``max_extent`` pixels betrays: a neighbour's stamp that slipped a texel
+    into this window would otherwise be averaged into a centre between the
+    two, a position no texel has.
     """
 
     height, width = diff.shape
@@ -145,6 +192,13 @@ def locate_stamps(
                 float((weights * xs).sum() / total) + 0.5,
                 float((weights * ys).sum() / total) + 0.5,
             )
+        if max_extent is not None and strong.any():
+            rows_hit = np.flatnonzero(strong.any(axis=1))
+            cols_hit = np.flatnonzero(strong.any(axis=0))
+            extent = max(rows_hit[-1] - rows_hit[0] + 1, cols_hit[-1] - cols_hit[0] + 1)
+            if extent > max_extent:
+                found.append(None)
+                continue
         found.append(centre)
     return found
 
@@ -193,13 +247,17 @@ class Staircase:
 
     # Texel pitch in screen pixels, to a few percent.
     coarse_pitch: float
-    # Stamp centres of the stairs, one per texel landed on, ascending.
+    # Stamp centre of the first stair, then of the stair after each jump, so
+    # ``levels[1:]`` pairs with ``jumps``.
     levels: tuple[float, ...]
     # Cursor positions where the stamp jumped to the next texel: midway
     # between the last cursor on one stair and the first on the next.
     jumps: tuple[float, ...]
     # How far, in cursor pixels, a jump could be from where it was bracketed.
     jump_uncertainty: float
+    # Scatter of stamp centres within a stair, in pixels: the centroid noise
+    # of one stamp on this sign, measured rather than assumed.
+    noise: float = 0.0
 
 
 def fit_staircase(
@@ -211,6 +269,10 @@ def fit_staircase(
     stamp centres they produced along the same axis, in the same units.  The
     centres cluster on the texels landed on; the gaps between clusters are the
     pitch and the cursor positions between clusters are the boundaries.
+
+    A dab now and then lands a texel from where its cursor was.  Each stamp
+    is therefore first given a texel index, and a stamp whose index disagrees
+    with both its neighbours is dropped before anything is read off the rest.
     """
 
     pairs = sorted(
@@ -221,44 +283,80 @@ def fit_staircase(
     positions = np.array([c for c, _ in pairs])
     measured = np.array([m for _, m in pairs])
     # Consecutive stamps either share a texel (centres agree to noise) or
-    # sit a texel apart.  A step well clear of the centroid noise and at
-    # least half the largest step is a jump; anything smaller is noise.
+    # sit a texel apart - or two, around a stray.  The median of the steps
+    # that clear the centroid noise is a first reading of the pitch, good
+    # enough to give every stamp a texel index.
     steps = np.abs(np.diff(measured))
     if steps.max() < 4.0 * _CENTROID_SIGMA_PIXELS:
         raise ValueError("The stamps never moved: no texel boundary was crossed")
-    jump_here = steps > max(3.0 * _CENTROID_SIGMA_PIXELS, 0.5 * float(steps.max()))
-    jump_sizes = steps[jump_here]
-    if jump_sizes.max() > 1.5 * jump_sizes.min():
-        raise ValueError(
-            "Stamps jumped by unequal amounts: the cursor step skipped texels"
-        )
-    if int((~jump_here).sum()) < 2:
+    jump_here = steps > 3.0 * _CENTROID_SIGMA_PIXELS
+    first_pitch = float(np.median(steps[jump_here]))
+    index = np.rint((measured - measured.min()) / first_pitch).astype(int)
+    # A stamp whose texel disagrees with both neighbours is a stray dab.
+    stray = np.zeros(len(index), dtype=bool)
+    for i in range(1, len(index) - 1):
+        if index[i] != index[i - 1] and index[i] != index[i + 1]:
+            stray[i] = True
+    if len(index) > 1:
+        stray[0] = index[0] > index[1]
+        stray[-1] = index[-1] < index[-2]
+    if stray.any():
+        positions, measured, index = positions[~stray], measured[~stray], index[~stray]
+    if len(measured) < 4:
+        raise ValueError("Too few clean stamps left to read a staircase")
+    if np.any(np.diff(index) < 0):
+        raise ValueError("Stamps moved backwards along the axis")
+    # Stairs: maximal groups sharing a texel index, in cursor order.
+    boundaries = np.flatnonzero(np.diff(index) != 0) + 1
+    runs = np.split(np.arange(len(measured)), boundaries)
+    if len(runs) < 2:
+        raise ValueError("The stamps never moved: no texel boundary was crossed")
+    levels = [float(measured[run].mean()) for run in runs]
+    texels = [int(index[run[0]]) for run in runs]
+    if not any(len(run) > 1 for run in runs):
         raise ValueError(
             "Every stamp landed on a new texel: the cursor step is too coarse "
             "to see the grid"
         )
-    # Levels: mean centre of each run between jumps.
-    boundaries = np.flatnonzero(jump_here) + 1
-    runs = np.split(np.arange(len(measured)), boundaries)
-    levels = [float(measured[run].mean()) for run in runs]
-    spreads = [float(np.ptp(measured[run])) for run in runs if len(run) > 1]
-    coarse_pitch = float(np.median(np.diff(levels)))
+    per_texel = [
+        (levels[i + 1] - levels[i]) / (texels[i + 1] - texels[i]) for i in range(len(runs) - 1)
+    ]
+    coarse_pitch = float(np.median(per_texel))
     if coarse_pitch <= 0.0:
         raise ValueError("Stamps moved backwards along the axis")
+    if max(per_texel) > 1.5 * min(per_texel):
+        raise ValueError(
+            "Stamps jumped by unequal amounts: the cursor step skipped texels"
+        )
+    spreads = [float(np.ptp(measured[run])) for run in runs if len(run) > 1]
     if spreads and max(spreads) > _MAX_STAIR_SPREAD * coarse_pitch:
         raise ValueError(
             "Stamps within one texel did not agree on where they landed: the "
             "brush is not snapping to a texel grid"
         )
-    jumps = tuple(
-        float((positions[index - 1] + positions[index]) / 2.0) for index in boundaries
+    # Jumps: only between stairs one texel apart - a gap of two means the
+    # stamps in between were dropped, and the boundary is not bracketed.
+    jumps = []
+    jump_levels = []
+    for i, boundary in enumerate(boundaries):
+        if texels[i + 1] - texels[i] == 1:
+            jumps.append(float((positions[boundary - 1] + positions[boundary]) / 2.0))
+            jump_levels.append(levels[i + 1])
+    if not jumps:
+        raise ValueError("No texel boundary was bracketed cleanly")
+    jump_uncertainty = float(
+        max(positions[boundary] - positions[boundary - 1] for boundary in boundaries)
+    ) / 2.0
+    deviations = np.concatenate(
+        [measured[run] - measured[run].mean() for run in runs if len(run) > 1]
     )
-    jump_uncertainty = float(max(positions[index] - positions[index - 1] for index in boundaries)) / 2.0
+    noise = float(np.sqrt((deviations**2).mean())) if deviations.size else 0.0
     return Staircase(
         coarse_pitch=coarse_pitch,
-        levels=tuple(levels),
-        jumps=jumps,
+        levels=(levels[0], *jump_levels),
+        jumps=tuple(jumps),
         jump_uncertainty=jump_uncertainty,
+        noise=noise,
     )
 
 
@@ -266,7 +364,10 @@ def fit_staircase(
 
 
 def ladder_offsets(
-    coarse_pitch: float, relative_error: float, max_texels: int
+    coarse_pitch: float,
+    relative_error: float,
+    max_texels: int,
+    sigma: float = _CENTROID_SIGMA_PIXELS,
 ) -> tuple[int, ...]:
     """Texel offsets for the ladder, each rung countable from the one before.
 
@@ -280,8 +381,8 @@ def ladder_offsets(
     error = max(relative_error, 1e-6)
     while True:
         reach = int(_LADDER_TARGET_ERROR / error)
-        if reach < 1:
-            reach = 1
+        if reach < 2:
+            reach = 2
         if reach >= max_texels:
             if not offsets or offsets[-1] < max_texels:
                 offsets.append(max_texels)
@@ -289,35 +390,71 @@ def ladder_offsets(
         if offsets and reach <= offsets[-1]:
             reach = offsets[-1] + 1
         offsets.append(reach)
-        error = _CENTROID_SIGMA_PIXELS / (reach * coarse_pitch)
+        error = sigma / (reach * coarse_pitch)
         if len(offsets) > 12:
             break
     return tuple(offsets)
 
 
+@dataclass(frozen=True, slots=True)
+class Ladder:
+    """What the rungs settled: the pitch and the furthest counted rung."""
+
+    pitch: float
+    worst_residual: float
+    far_span: float
+    far_count: int
+
+
 def refine_pitch(
     base: float,
-    rungs: Sequence[tuple[int, float | None]],
+    rungs: Sequence[tuple[int, Sequence[float]]],
     coarse_pitch: float,
-) -> tuple[float, float]:
-    """Tighten the pitch rung by rung; returns ``(pitch, worst residual)``.
+) -> Ladder:
+    """Tighten the pitch rung by rung.
 
-    ``rungs`` are ``(intended texel offset, measured centre)`` pairs in the
-    order they were planned.  Each centre is counted in texels with the pitch
-    known so far, and the count must come out close to a whole number -
-    otherwise the ladder broke and the measurement is not to be trusted.
+    ``rungs`` are ``(intended texel offset, measured centres)`` pairs in the
+    order they were planned, each rung stamped more than once.  The copies
+    of a rung are counted in texels with the pitch known so far and the
+    texel most of them landed on is the rung; a copy that strayed a texel is
+    outvoted.  The count must come out close to a whole number - otherwise
+    the ladder broke and the measurement is not to be trusted.
     """
 
     pitch = float(coarse_pitch)
     worst = 0.0
     counted = 0
-    for _intended, centre in rungs:
-        if centre is None:
+    far_span = 0.0
+    far_count = 0
+    for intended, copies in rungs:
+        copies = [float(c) for c in copies]
+        if not copies:
+            LOGGER.info("  rung %d texels out: no stamp found", intended)
             continue
-        span = float(centre) - float(base)
+        counts = [int(round((c - base) / pitch)) for c in copies]
+        tally: dict[int, list[float]] = {}
+        for count, centre in zip(counts, copies):
+            tally.setdefault(count, []).append(centre)
+        most = max(len(group) for group in tally.values())
+        majority = [count for count, group in tally.items() if len(group) == most]
+        # No majority: the copy nearest where the rung was aimed.
+        count = min(majority, key=lambda c: abs(c - intended))
+        centre = float(np.mean(tally[count]))
+        span = centre - float(base)
         texels = span / pitch
-        count = int(round(texels))
         residual = abs(texels - count)
+        LOGGER.info(
+            "  rung %d texels out: %d of %d stamps agree, centre %.2f, %.3f "
+            "texels by the pitch so far -> counted %d (off by %.2f), pitch now %.4f",
+            intended,
+            len(tally[count]),
+            len(copies),
+            centre,
+            texels,
+            count,
+            residual,
+            span / count if count else float("nan"),
+        )
         if count < 1 or residual > _MAX_LADDER_RESIDUAL:
             raise ValueError(
                 f"A ladder stamp landed {texels:.2f} texels out, too far from a "
@@ -326,9 +463,11 @@ def refine_pitch(
         worst = max(worst, residual)
         pitch = span / count
         counted += 1
+        if abs(span) > abs(far_span):
+            far_span, far_count = span, count
     if counted == 0:
         raise ValueError("No ladder stamp landed")
-    return pitch, worst
+    return Ladder(pitch=pitch, worst_residual=worst, far_span=far_span, far_count=far_count)
 
 
 # ------------------------------------------------------------------- edges
@@ -401,71 +540,200 @@ class AxisFit:
     # Leading edge of texel zero.
     origin: float
     count: int
-    # Added to a texel's centre to get the cursor position that stamps it.
-    aim_offset: float
+    # The cursor lattice: the cursor at ``aim_origin + (k + 0.5) * aim_pitch``
+    # stamps texel ``k``.  Its pitch need not equal the rendered pitch.
+    aim_origin: float
+    aim_pitch: float
     # Worst fractional-texel miss across the ladder; a confidence figure.
     residual: float
-    # Whether ``origin`` and ``count`` came from the quad's edges (True) or
-    # had to be taken from the calibrated rectangle (False).
+    # Whether ``origin`` and ``count`` were pinned by stamps at the sign's
+    # edges (True) or had to be taken from the calibrated rectangle (False).
     from_edges: bool
+    # How far the cursor lattice slides along this axis per pixel across it:
+    # the shear a sheared cursor map has, in pixels per pixel.
+    aim_shear: float = 0.0
+    # The fitted inverse map ``k = a + b * along + c * across + d * along *
+    # across``, in phase-relative texels; the model re-anchors it.
+    aim_coefficients: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
 
 def fit_axis(
     staircase: Staircase,
-    pitch: float,
+    ladder: Ladder,
     *,
     reference_centre: float,
     rect_low: float,
     rect_high: float,
-    edge_low: float | None,
-    edge_high: float | None,
-    residual: float,
+    extent: tuple[float, float] | None,
+    aim_origin: float,
+    aim_pitch: float,
+    edge_low: float | None = None,
+    edge_high: float | None = None,
+    aim_shear: float = 0.0,
+    aim_coefficients: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> AxisFit:
     """Place the lattice on the screen and count its texels along one axis.
 
-    The lattice is fixed by one stamp centre and the pitch.  The sign's low
-    edge picks which lattice line is texel zero; the high edge counts the
-    texels.  Both edges have to fall on lattice lines - an edge that does not
-    is not this texture's edge, and the calibrated rectangle is used instead.
+    The lattice is fixed by one stamp centre and the ladder's pitch.  The
+    sign's extent comes from stamps made at its edges: ``extent`` holds the
+    centres of the outermost stamps that landed at the low and high ends,
+    and the texels they sit on are the first and last texel - observed, not
+    inferred.  Without them the calibrated rectangle supplies the count, to
+    hand-drag precision.
     """
 
+    pitch = ladder.pitch
     phase = (reference_centre - pitch / 2.0) % pitch
 
-    def nearest_line(position: float) -> float:
-        return phase + round((position - phase) / pitch) * pitch
+    def texel_of(position: float) -> int:
+        return int(round((position - phase) / pitch - 0.5))
+
+    def line(texel: int) -> float:
+        return phase + texel * pitch
 
     from_edges = False
-    if edge_low is not None and edge_high is not None:
-        origin = nearest_line(edge_low)
-        far = nearest_line(edge_high)
-        low_misfit = abs(edge_low - origin) / pitch
-        high_misfit = abs(edge_high - far) / pitch
-        if low_misfit <= _MAX_EDGE_MISFIT and high_misfit <= _MAX_EDGE_MISFIT:
+    if extent is not None:
+        first, last = texel_of(extent[0]), texel_of(extent[1])
+        # A texel the visible quad's edge cuts through - part in view, the
+        # rest under the frame the UI draws over the texture's edge - may
+        # show no stamp at all, so none seen is no evidence it is not there.
+        # Textures end on lattice lines, so an edge inside a texel means
+        # that texel exists.  (Live: the last column had 1.5 px in view and
+        # 2.6 px under the frame, painted but invisible in the UI - and on
+        # the sign in the world.)  An edge on a lattice line is the texture's
+        # own edge, and nothing lies beyond it.
+        def cut_through(texel: int, edge: float) -> bool:
+            return (
+                line(texel) + _EDGE_CUT_MARGIN < edge < line(texel + 1) - _EDGE_CUT_MARGIN
+            )
+
+        if edge_low is not None and cut_through(first - 1, edge_low):
+            first -= 1
+        if edge_high is not None and cut_through(last + 1, edge_high):
+            last += 1
+        if last > first:
+            origin = line(first)
+            count = last - first + 1
             from_edges = True
     if not from_edges:
-        origin = nearest_line(rect_low)
-        far = nearest_line(rect_high)
-    count = int(round((far - origin) / pitch))
+        first = int(round((rect_low - phase) / pitch))
+        origin = line(first)
+        count = int(round((rect_high - origin) / pitch))
     if count < 2:
         raise ValueError("The sign measured fewer than two texels across")
+    residual = ladder.worst_residual
 
-    # Where the cursor has to be.  Each jump is where the cursor crossed into
-    # the texel whose stamp centre is the next level; that texel's cursor
-    # window runs one pitch from the jump, so its middle is half a pitch in.
-    offsets: list[float] = []
-    for jump, level in zip(staircase.jumps, staircase.levels[1:]):
-        texel = int(round((level - origin) / pitch - 0.5))
-        centre = origin + (texel + 0.5) * pitch
-        offsets.append(jump + pitch / 2.0 - centre)
-    aim_offset = float(np.median(offsets)) if offsets else 0.0
+    # The cursor lattice was fitted against phase-relative texel indices;
+    # re-anchor it on the sign's texel zero.
     return AxisFit(
         pitch=float(pitch),
         origin=float(origin),
         count=count,
-        aim_offset=aim_offset,
+        aim_origin=float(aim_origin + first * aim_pitch),
+        aim_pitch=float(aim_pitch),
+        aim_shear=float(aim_shear),
+        # Re-anchored on the sign's texel zero: ``k' = k - first``.
+        aim_coefficients=(
+            float(aim_coefficients[0] - first),
+            float(aim_coefficients[1]),
+            float(aim_coefficients[2]),
+            float(aim_coefficients[3]),
+        ),
         residual=float(residual),
         from_edges=from_edges,
     )
+
+
+def fit_cursor_lattice(
+    boundaries: Sequence[tuple[float, int]], render_pitch: float
+) -> tuple[float, float, float]:
+    """The cursor lattice along one axis from staircase jumps.
+
+    ``boundaries`` are ``(cursor position of a jump, rendered texel index the
+    jump crossed into)`` pairs.  The cursor crosses into texel ``k`` at
+    ``origin + k * pitch``; a least-squares line through the pairs gives
+    both, and the spread of the jumps about it says how well one lattice
+    describes the axis.  Returns ``(origin, pitch, rms)``.
+    """
+
+    if not boundaries:
+        raise ValueError("No texel boundaries were bracketed")
+    positions = np.array([b for b, _ in boundaries], dtype=np.float64)
+    texels = np.array([k for _, k in boundaries], dtype=np.float64)
+    if len(boundaries) >= 3 and np.ptp(texels) >= 8:
+        design = np.stack([texels, np.ones_like(texels)], axis=1)
+        (pitch, origin), *_ = np.linalg.lstsq(design, positions, rcond=None)
+    else:
+        pitch = float(render_pitch)
+        origin = float(np.mean(positions - texels * pitch))
+    fitted = origin + texels * pitch
+    rms = float(np.sqrt(np.mean((positions - fitted) ** 2)))
+    return float(origin), float(pitch), rms
+
+
+def fit_cursor_map(
+    boundaries: Sequence[tuple[float, float, int]],
+    render_pitch: float,
+    min_across_spread: float = 0.0,
+) -> tuple[tuple[float, float, float, float], float]:
+    """One axis of the cursor map from jumps seen at several places across it.
+
+    ``boundaries`` are ``(along, across, texel)``: the cursor position along
+    the axis at which a jump crossed into ``texel``, and where across the
+    axis that staircase sat.  The cursor crosses into texel ``k`` where
+    ``a + b * along + c * across + d * along * across == k``: a plane with a
+    twist, so a boundary that drifts across the sign - a sheared cursor map
+    - is followed, and so is a drift that itself changes along the sign - a
+    keystoned one, the cursor being ray-cast onto a sign seen in
+    perspective.  Returns ``((a, b, c, d), rms)`` with the rms in texels.
+    Terms the jumps cannot support are left at zero: with one band there is
+    no ``c``; the twist needs jumps spread both ways and enough of them.
+    """
+
+    if not boundaries:
+        raise ValueError("No texel boundaries were bracketed")
+    along = np.array([b[0] for b in boundaries], dtype=np.float64)
+    across = np.array([b[1] for b in boundaries], dtype=np.float64)
+    texels = np.array([b[2] for b in boundaries], dtype=np.float64)
+    spread_along = np.ptp(texels) >= 8 and len(boundaries) >= 3
+    # Flights in one band differ a little in where across they sat; only
+    # bands genuinely apart can support a slope across the sign.
+    spread_across = np.ptp(across) > max(min_across_spread, 1e-6) and len(boundaries) >= 4
+    # The twist needs jumps at several places along the axis in more than
+    # one band, and enough of them that it is not fitted to noise.
+    bands = len(np.unique(np.round(across / max(1.0, min_across_spread / 4.0))))
+    twist = spread_across and bands >= 3 and len(boundaries) >= 12 and np.ptp(texels) >= 40
+    if not spread_along:
+        b = 1.0 / float(render_pitch)
+        a = float(np.mean(texels - b * along))
+        fitted = a + b * along
+        return (a, b, 0.0, 0.0), float(np.sqrt(np.mean((texels - fitted) ** 2)))
+    columns = [np.ones_like(along), along]
+    if spread_across:
+        columns.append(across)
+    if twist:
+        columns.append(along * across)
+    design = np.stack(columns, axis=1)
+    coefficients, *_ = np.linalg.lstsq(design, texels, rcond=None)
+    a, b = float(coefficients[0]), float(coefficients[1])
+    c = float(coefficients[2]) if spread_across else 0.0
+    d = float(coefficients[3]) if twist else 0.0
+    fitted = design @ coefficients
+    return (a, b, c, d), float(np.sqrt(np.mean((texels - fitted) ** 2)))
+
+
+def pixel_span(
+    texture_low: float, texture_high: float, rect_low: float, rect_high: float
+) -> tuple[int, int]:
+    """First and last whole pixel that is on the texture and near the rectangle.
+
+    A pixel ``x`` is on the texture when ``texture_low <= x < texture_high``;
+    the rectangle, hand-dragged, bounds it with a pixel of slack either side.
+    """
+
+    first = int(np.ceil(max(texture_low, rect_low - RECTANGLE_SLACK_PIXELS)))
+    last = int(np.floor(min(texture_high - 1e-6, rect_high - 1.0 + RECTANGLE_SLACK_PIXELS)))
+    return first, max(first, last)
 
 
 # -------------------------------------------------------------------- model
@@ -475,12 +743,18 @@ def fit_axis(
 class TexelGridModel:
     """The sign's texture grid, measured, in absolute screen pixels.
 
-    ``columns`` by ``rows`` texels, ``pitch`` screen pixels each, with texel
-    (0, 0) starting at ``origin``.  ``aim`` is how far from a texel's centre
-    the cursor has to be for the game to stamp that texel.  All of it is
-    specific to where the sign sits on the screen right now; the painter
-    measures it afresh on every job and the stored copy only informs the
-    planner about the sign's resolution.
+    Two lattices.  The *rendered* one - ``columns`` by ``rows`` texels,
+    ``pitch`` screen pixels each, texel (0, 0) starting at ``origin`` - is
+    where the texture's texels are drawn, and so where a capture is read
+    back.  The *cursor* one - ``aim_origin`` and ``aim_pitch`` - is where the
+    cursor has to be to stamp texel ``k``: ``aim_origin + (k + 0.5) *
+    aim_pitch``.  The game maps the cursor and draws the texture over
+    slightly different rectangles, so the two pitches differ by a fraction
+    of a percent, which is a texel of drift across a sign.
+
+    All of it is specific to where the sign sits on the screen right now;
+    the painter measures it afresh on every job and the stored copy only
+    informs the planner about the sign's resolution.
     """
 
     columns: int
@@ -489,8 +763,22 @@ class TexelGridModel:
     pitch_y: float
     origin_x: float
     origin_y: float
-    aim_x: float = 0.0
-    aim_y: float = 0.0
+    aim_origin_x: float = float("nan")
+    aim_origin_y: float = float("nan")
+    aim_pitch_x: float = float("nan")
+    aim_pitch_y: float = float("nan")
+    # Shear of the cursor map: the cursor lattice along x slides by
+    # ``aim_shear_x`` pixels per pixel of screen y (absolute), and vice
+    # versa; ``aim_origin`` is the lattice's intercept at y = 0.  Zero for a
+    # map that is a plain lattice.
+    aim_shear_x: float = 0.0
+    aim_shear_y: float = 0.0
+    # The full inverse cursor map, per axis: ``u = ax + bx * x + cx * y + dx
+    # * x * y`` gives the texel column the cursor at ``(x, y)`` stamps, and
+    # likewise ``v`` from ``(ay, by, cy, dy)`` with the roles of x and y
+    # swapped.  All-zero means "use the lattice and shear" (an old record).
+    aim_map_x: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    aim_map_y: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     residual: float = 0.0
     from_edges: bool = False
     captured_at: str = ""
@@ -501,9 +789,16 @@ class TexelGridModel:
         for name in ("pitch_x", "pitch_y"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0.0:
                 raise ValueError("Texel pitch must be a positive, finite number")
-        for name in ("origin_x", "origin_y", "aim_x", "aim_y", "residual"):
+        for name in ("origin_x", "origin_y", "residual", "aim_shear_x", "aim_shear_y"):
             if not np.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
+        # A grid without a measured cursor lattice aims at the rendered one.
+        if not np.isfinite(self.aim_origin_x) or not np.isfinite(self.aim_pitch_x):
+            object.__setattr__(self, "aim_origin_x", self.origin_x)
+            object.__setattr__(self, "aim_pitch_x", self.pitch_x)
+        if not np.isfinite(self.aim_origin_y) or not np.isfinite(self.aim_pitch_y):
+            object.__setattr__(self, "aim_origin_y", self.origin_y)
+            object.__setattr__(self, "aim_pitch_y", self.pitch_y)
         if not self.captured_at:
             object.__setattr__(self, "captured_at", _utc_now())
 
@@ -516,10 +811,82 @@ class TexelGridModel:
         return self.rows * self.pitch_y
 
     def registered_rect(self) -> SimpleNamespace:
-        """The texture's extent on screen, as a rectangle strokes lay out on."""
+        """Where the texels are drawn: the rectangle a capture is read on."""
 
         return SimpleNamespace(
             left=self.origin_x, top=self.origin_y, width=self.width, height=self.height
+        )
+
+    def aim_rect(self) -> SimpleNamespace:
+        """Where the cursor stamps them: the rectangle strokes are laid out on.
+
+        A plan of ``columns`` by ``rows`` cells laid out over this rectangle
+        puts every cell's centre exactly where the cursor has to be to stamp
+        that cell's texel.
+        """
+
+        return SimpleNamespace(
+            left=self.aim_origin_x,
+            top=self.aim_origin_y,
+            width=self.columns * self.aim_pitch_x,
+            height=self.rows * self.aim_pitch_y,
+        )
+
+    def cursor_point(self, u: float, v: float) -> tuple[float, float]:
+        """Where the cursor has to be to stamp texel coordinates ``(u, v)``.
+
+        ``u`` and ``v`` are continuous texel coordinates - ``(k + 0.5, m +
+        0.5)`` is the middle of texel ``(k, m)``'s cursor window.  The map
+        is affine: each axis's lattice plus its shear against the other
+        axis, so the two are solved together.
+        """
+
+        # x = ox + u * px + sx * y;  y = oy + v * py + sy * x  (screen-absolute)
+        ox, oy = self.aim_origin_x, self.aim_origin_y
+        px, py = self.aim_pitch_x, self.aim_pitch_y
+        sx, sy = self.aim_shear_x, self.aim_shear_y
+        bx = ox + u * px
+        by = oy + v * py
+        determinant = 1.0 - sx * sy
+        if abs(determinant) < 1e-9:
+            x, y = bx, by
+        else:
+            x = (bx + sx * by) / determinant
+            y = (by + sy * bx) / determinant
+        if self.aim_map_x[1] == 0.0 or self.aim_map_y[1] == 0.0:
+            return x, y
+        # The full map, with its twist: ``u = a + b x + c y + d x y`` solves
+        # for x at a given y in closed form, and the two axes are iterated
+        # from the affine answer - the twist is a few thousandths, so three
+        # rounds settle it to far below a pixel.
+        ax, bx_, cx, dx = self.aim_map_x
+        ay, by_, cy, dy = self.aim_map_y
+        for _ in range(3):
+            x = (u - ax - cx * y) / (bx_ + dx * y)
+            y = (v - ay - cy * x) / (by_ + dy * x)
+        return x, y
+
+    def clamp_rect(self, canvas: Any) -> SimpleNamespace:
+        """Where the mouse may go: whole pixels on the rendered texture.
+
+        The game takes paint clicks on the texture and nowhere else, and the
+        texture is known to a fraction of a pixel; the calibrated rectangle
+        still bounds it, being what the user vouched for, with a pixel of
+        slack for the hand that dragged it.  In the rectangle convention the
+        last usable coordinate is ``left + width - 1``.
+        """
+
+        left, right = pixel_span(
+            self.origin_x, self.origin_x + self.width, canvas.left, canvas.left + canvas.width
+        )
+        top, bottom = pixel_span(
+            self.origin_y, self.origin_y + self.height, canvas.top, canvas.top + canvas.height
+        )
+        return SimpleNamespace(
+            left=float(left),
+            top=float(top),
+            width=float(max(1, right - left + 1)),
+            height=float(max(1, bottom - top + 1)),
         )
 
     def agrees_with(self, canvas: Any, tolerance: float = 0.1) -> bool:
@@ -551,8 +918,14 @@ class TexelGridModel:
             "pitchY": self.pitch_y,
             "originX": self.origin_x,
             "originY": self.origin_y,
-            "aimX": self.aim_x,
-            "aimY": self.aim_y,
+            "aimOriginX": self.aim_origin_x,
+            "aimOriginY": self.aim_origin_y,
+            "aimPitchX": self.aim_pitch_x,
+            "aimPitchY": self.aim_pitch_y,
+            "aimShearX": self.aim_shear_x,
+            "aimShearY": self.aim_shear_y,
+            "aimMapX": list(self.aim_map_x),
+            "aimMapY": list(self.aim_map_y),
             "residual": self.residual,
             "fromEdges": self.from_edges,
             "capturedAt": self.captured_at,
@@ -567,8 +940,14 @@ class TexelGridModel:
             pitch_y=float(value["pitchY"]),
             origin_x=float(value["originX"]),
             origin_y=float(value["originY"]),
-            aim_x=float(value.get("aimX", 0.0)),
-            aim_y=float(value.get("aimY", 0.0)),
+            aim_origin_x=float(value.get("aimOriginX", float("nan"))),
+            aim_origin_y=float(value.get("aimOriginY", float("nan"))),
+            aim_pitch_x=float(value.get("aimPitchX", float("nan"))),
+            aim_pitch_y=float(value.get("aimPitchY", float("nan"))),
+            aim_shear_x=float(value.get("aimShearX", 0.0)),
+            aim_shear_y=float(value.get("aimShearY", 0.0)),
+            aim_map_x=tuple(float(v) for v in value.get("aimMapX", (0.0, 0.0, 0.0, 0.0))),
+            aim_map_y=tuple(float(v) for v in value.get("aimMapY", (0.0, 0.0, 0.0, 0.0))),
             residual=float(value.get("residual", 0.0)),
             from_edges=bool(value.get("fromEdges", False)),
             captured_at=str(value.get("capturedAt") or ""),
@@ -580,12 +959,32 @@ class TexelGridModel:
 # Stamps slid one step at a time along an axis, each on its own row or column
 # so they can be told apart in one capture.
 _STAIRCASE_STAMPS = 18
-_MIN_STAIRCASE_STAMPS = 10
+_MIN_STAIRCASE_STAMPS = 8
+# Where along the axis the staircases sit, as fractions of the sign.  The
+# first is the long one the ladder grows from; the others are shorter and
+# exist to measure the *cursor* lattice: live, the game mapped the cursor
+# over the visible quad while drawing the texture a few pixels wider under
+# its frame, so the cursor pitch was 0.4% off the rendered pitch - over a
+# texel of drift across the sign, which one offset cannot describe.
+_STAIRCASE_POSITIONS = (0.12, 0.50, 0.85)
+_SHORT_STAIRCASE_STAMPS = 10
+# The short staircases are repeated in bands across the axis, so a boundary
+# along one axis is seen at several places along the other.  Live, the
+# cursor map was sheared: the column boundaries sat up to three pixels
+# further left at the bottom of the sign than at the top (a cursor ray-cast
+# onto the sign in the world, while the canvas is drawn flat), which a
+# lattice measured in one band cannot know.
+# The least a staircase should span, in texels, so it brackets a boundary
+# or two however few stamps a small sign leaves room for.
+_STAIRCASE_SPAN_TEXELS = 2.2
 # Cursor steps per hinted texel: fine enough to bracket a boundary closely,
 # coarse enough to cross a few of them in one staircase.
 _STEPS_PER_TEXEL = 5
 # Stamps are kept this many stamp-widths apart across the axis being measured.
 _STAMP_SPACING = 3.0
+# A located blob wider than this many scout-stamp widths is two stamps, not
+# one, and is discarded rather than read as a centre between them.
+_STAMP_EXTENT_LIMIT = 1.6
 # Texels of margin kept between any stamp and the sign's edge.
 _EDGE_MARGIN_TEXELS = 2.0
 # Coarsest the staircase's pitch can be trusted to, whatever its jumps say.
@@ -646,27 +1045,58 @@ def measure_grid(
     )
     # A stamp is at least one texel, so stepping a fifth of the smaller of
     # the stamp and the hinted texel crosses a boundary every few stamps
-    # without ever skipping one.
-    step = max(1, int(min(stamp, 1.5 * max(pitch_hint, 1.0)) / _STEPS_PER_TEXEL))
+    # without ever skipping one - and the whole staircase has to span a
+    # couple of texels, or a short one on a coarse sign sees no boundary.
+    texel_guess = min(stamp, 1.5 * max(pitch_hint, 1.0))
+    step = max(1, int(texel_guess / _STEPS_PER_TEXEL))
 
-    def layout(across_span: float) -> tuple[int, float]:
-        """Staircase length and stamp spacing that fit across the sign.
+    @dataclass(frozen=True, slots=True)
+    class Layout:
+        stamps: int  # stamps in the long staircase
+        spacing: float  # pixels between stamps across the axis
+        rung_copies: int  # stamps per ladder rung
+        extent_copies: int  # stamps per edge dab position
+        short: int  # stamps in each short staircase
+        extra_bands: int  # short-staircase bands beyond the first
 
-        Comfortable spacing first; a sign too small for that packs the
-        stamps closer, then shortens the staircase, and refuses only when
-        even the shortest staircase cannot fit.
+        @property
+        def rows(self) -> int:
+            return (
+                self.stamps
+                + 8 * self.rung_copies
+                + _EXTENT_DABS * self.extent_copies
+                + self.extra_bands * self.short
+            )
+
+    def layout(across_span: float) -> "Layout":
+        """How the probe's stamps share the rows across the axis.
+
+        Everything the probe wants, in the order it gives things up when a
+        sign is too small: extra bands across the sign come before a third
+        stamp per rung, because a sheared cursor map (seen live) can only be
+        measured from several bands, while a third rung stamp only guards
+        against a rare stray dab.  A sign too small even for the leanest
+        layout is refused.
         """
 
-        rungs = 8
-        count = _STAIRCASE_STAMPS
-        spacing = max(8.0, _STAMP_SPACING * stamp)
-        if (count + rungs) * spacing > across_span:
-            spacing = max(8.0, 2.0 * stamp)
-            while (count + rungs) * spacing > across_span and count > _MIN_STAIRCASE_STAMPS:
-                count -= 1
-            if (count + rungs) * spacing > across_span:
-                raise ValueError("The sign is too small for the texel probe to fit on")
-        return count, spacing
+        preferences = (
+            dict(stamps=18, rung_copies=3, extent_copies=2, short=10, extra_bands=2),
+            dict(stamps=18, rung_copies=2, extent_copies=2, short=10, extra_bands=2),
+            dict(stamps=16, rung_copies=2, extent_copies=1, short=8, extra_bands=2),
+            dict(stamps=14, rung_copies=2, extent_copies=1, short=8, extra_bands=1),
+            dict(stamps=12, rung_copies=2, extent_copies=1, short=8, extra_bands=1),
+            dict(stamps=12, rung_copies=1, extent_copies=1, short=8, extra_bands=1),
+            dict(stamps=12, rung_copies=1, extent_copies=1, short=8, extra_bands=0),
+            dict(stamps=10, rung_copies=1, extent_copies=1, short=8, extra_bands=0),
+            dict(stamps=8, rung_copies=1, extent_copies=1, short=8, extra_bands=0),
+        )
+        for spacing in (max(8.0, _STAMP_SPACING * stamp), max(8.0, 2.0 * stamp)):
+            rows = int(across_span // spacing)
+            for preference in preferences:
+                candidate = Layout(spacing=spacing, **preference)
+                if candidate.rows <= rows:
+                    return candidate
+        raise ValueError("The sign is too small for the texel probe to fit on")
 
     def shifted(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
         return [(x + shift[0], y + shift[1]) for x, y in points]
@@ -684,63 +1114,271 @@ def measure_grid(
         edge_low: float | None,
         edge_high: float | None,
     ) -> AxisFit:
-        stamps, spacing = layout(across_high - across_start - 2.0 * stamp)
+        plan_rows = layout(across_high - across_start - 2.0 * stamp)
+        stamps, spacing = plan_rows.stamps, plan_rows.spacing
+        copies_per_rung, extent_copies = plan_rows.rung_copies, plan_rows.extent_copies
         window = max(3.0, spacing / 2.0 - 1.0)
-        # Staircase: slide along the axis, one stamp per row across it.
-        cursor = [along_start + index * step for index in range(stamps)]
-        across = [across_start + index * spacing for index in range(stamps)]
-        points = tuple(make_point(a, c) for a, c in zip(cursor, across))
-        diff = stamp_batch(GridProbePlan(points, f"{name} staircase"))
-        centres = locate_stamps(diff, to_capture(shifted(points)), window)
-        along_centres = [
+        stride = max(step, int(np.ceil(_STAIRCASE_SPAN_TEXELS * texel_guess / stamps)))
+        # Staircases: slide along the axis, one stamp per row across it, at
+        # several places along the sign and in several bands across it.
+        # Flights in a band share rows - their windows are far apart along
+        # the axis - so one capture reads them all.  The first flight is the
+        # long one the ladder grows from, in the band the ladder and extent
+        # rows follow; the other bands sit beyond those rows.
+        along_extent = along_high - along_start
+        short = plan_rows.short
+        starts = [along_start] + [
+            along_start + fraction * along_extent * 0.92
+            for fraction in _STAIRCASE_POSITIONS[1:]
+        ]
+        # The first band, the ladder and the extent rows come first; the
+        # extra bands spread over whatever is left, the last one as far
+        # across the sign as it will go, for the longest lever on the shear.
+        probe_rows = stamps + 8 * copies_per_rung + _EXTENT_DABS * extent_copies
+        band_starts = [across_start]
+        across_free = across_start + probe_rows * spacing
+        across_last = across_high - 2.0 * stamp - short * spacing
+        if plan_rows.extra_bands == 1:
+            band_starts.append(across_last)
+        elif plan_rows.extra_bands >= 2:
+            band_starts.append((across_free + across_last) / 2.0)
+            band_starts.append(across_last)
+        flights: list[tuple[list[float], float]] = []
+        all_points: list[tuple[float, float]] = []
+        for band_index, band in enumerate(band_starts):
+            for flight_index, start in enumerate(starts):
+                length = stamps if band_index == 0 and flight_index == 0 else short
+                cursor = [start + index * stride for index in range(length)]
+                across_of = [band + index * spacing for index in range(length)]
+                flights.append((cursor, float(np.mean(across_of))))
+                all_points.extend(make_point(a, c) for a, c in zip(cursor, across_of))
+        diff = stamp_batch(GridProbePlan(tuple(all_points), f"{name} staircases"))
+        centres = locate_stamps(diff, to_capture(shifted(all_points)), window, max_extent=_STAMP_EXTENT_LIMIT * stamp)
+        along_all = [
             (pick(c) + (left if name == "columns" else top)) if c is not None else None
             for c in centres
         ]
-        staircase = fit_staircase(cursor, along_centres)
+        staircases: list[tuple[Staircase, float]] = []
+        consumed = 0
+        for flight_index, (cursor, across_mean) in enumerate(flights):
+            flight_centres = along_all[consumed : consumed + len(cursor)]
+            consumed += len(cursor)
+            try:
+                staircases.append((fit_staircase(cursor, flight_centres), across_mean))
+            except ValueError as exc:
+                if flight_index == 0:
+                    raise
+                LOGGER.info("%s staircase %d unusable: %s", name, flight_index + 1, exc)
+        staircase = staircases[0][0]
+        cursor = flights[0][0]
         coarse = staircase.coarse_pitch
         jumps = max(1, len(staircase.jumps))
-        coarse_error = max(
-            _MIN_COARSE_ERROR, 2.0 * _CENTROID_SIGMA_PIXELS / (coarse * np.sqrt(jumps))
-        )
+        sigma = max(_CENTROID_SIGMA_PIXELS, _NOISE_SAFETY * staircase.noise)
+        coarse_error = max(_MIN_COARSE_ERROR, 2.0 * sigma / (coarse * np.sqrt(jumps)))
         base = staircase.levels[0]
+        LOGGER.info(
+            "%s staircase: %d stamps, %d jumps, coarse pitch %.3f px, stamp "
+            "scatter %.2f px (planning with %.2f), jumps at %s",
+            name,
+            len(cursor),
+            len(staircase.jumps),
+            coarse,
+            staircase.noise,
+            sigma,
+            ", ".join(f"{j:.1f}" for j in staircase.jumps),
+        )
 
         # Ladder: rungs further and further out along the axis, each on the
         # next row across it, until the far side of the sign.
         reach = int((along_high - _EDGE_MARGIN_TEXELS * coarse - base) / coarse)
         if reach < 2:
             raise ValueError(f"The sign is too narrow along its {name} to ladder")
-        offsets = ladder_offsets(coarse, coarse_error, reach)
+        offsets = ladder_offsets(coarse, coarse_error, reach, sigma=sigma)
+        LOGGER.info(
+            "%s ladder: rungs at %s texels, %d stamps each",
+            name,
+            ", ".join(map(str, offsets)),
+            copies_per_rung,
+        )
         # Rungs are commanded from the first staircase cursor, whose stamp is
-        # ``base``; the count is read against ``base`` itself.
+        # ``base``; the count is read against ``base`` itself.  Each rung is
+        # stamped several times on its own rows and read as their median, so
+        # a dab that lands a texel astray cannot miscount the ladder.
         rung_points = tuple(
             make_point(
                 cursor[0] + offset * coarse,
-                across_start + (stamps + index) * spacing,
+                across_start + (stamps + index * copies_per_rung + copy) * spacing,
             )
             for index, offset in enumerate(offsets)
+            for copy in range(copies_per_rung)
         )
         diff = stamp_batch(GridProbePlan(rung_points, f"{name} ladder"))
-        rung_centres = locate_stamps(diff, to_capture(shifted(rung_points)), window)
-        rungs = [
-            (offset, (pick(c) + (left if name == "columns" else top)) if c is not None else None)
-            for offset, c in zip(offsets, rung_centres)
+        rung_centres = locate_stamps(diff, to_capture(shifted(rung_points)), window, max_extent=_STAMP_EXTENT_LIMIT * stamp)
+        along_rungs = [
+            (pick(c) + (left if name == "columns" else top)) if c is not None else None
+            for c in rung_centres
         ]
-        pitch, residual = refine_pitch(base, rungs, coarse)
-        return fit_axis(
-            staircase,
+        rungs: list[tuple[int, list[float]]] = []
+        for index, offset in enumerate(offsets):
+            copies = [
+                value
+                for value in along_rungs[index * copies_per_rung : (index + 1) * copies_per_rung]
+                if value is not None
+            ]
+            rungs.append((offset, copies))
+        ladder = refine_pitch(base, rungs, coarse)
+
+        # The rendered lattice, from the ladder.
+        pitch = ladder.pitch
+        phase = (base - pitch / 2.0) % pitch
+
+        def texel_of(position: float) -> int:
+            return int(round((position - phase) / pitch - 0.5))
+
+        # The cursor map along this axis, from every jump of every
+        # staircase: the cursor position that crossed into a texel, where
+        # across the axis it was seen, and which texel it was.  Fitted as a
+        # plane, so a boundary that slides across the sign is followed.
+        boundaries = [
+            (jump, across_mean, texel_of(level))
+            for flight, across_mean in staircases
+            for jump, level in zip(flight.jumps, flight.levels[1:])
+        ]
+        (plane_a, plane_b, plane_c, plane_d), plane_rms = fit_cursor_map(
+            boundaries, pitch, min_across_spread=0.2 * (across_high - across_start)
+        )
+        # k = a + b * along + c * across (+ d * along * across): summarised as
+        # a lattice and a shear at the middle of the sign for the log and the
+        # edge dabs; the painter uses the full map.
+        across_mid = (across_start + across_high) / 2.0
+        slope_mid = plane_b + plane_d * across_mid
+        aim_pitch = 1.0 / slope_mid
+        aim_origin = -plane_a / slope_mid
+        aim_shear = -plane_c / slope_mid
+        LOGGER.info(
+            "%s cursor map: %d boundaries from %d staircases in %d bands, pitch "
+            "%.4f px (rendered %.4f), origin %.2f, shear %+.5f px/px, twist %+.2e, "
+            "jumps %.2f texel rms off the fit",
+            name,
+            len(boundaries),
+            len(staircases),
+            len(band_starts),
+            aim_pitch,
             pitch,
+            aim_origin,
+            aim_shear,
+            plane_d,
+            plane_rms,
+        )
+        # Where the extent row sits across the axis, for aiming on it.
+        extent_across = across_start + (stamps + len(offsets) * copies_per_rung) * spacing
+
+        # Texels known to exist: the first stair's and the ladder's far rung's.
+        known_low = min(texel_of(base), texel_of(base + ladder.far_span))
+        known_high = max(texel_of(base), texel_of(base + ladder.far_span))
+
+        def cursor_for(texel: int, side: str) -> float | None:
+            """Where to click to stamp ``texel``, or None if nowhere will do.
+
+            The click has to land on the texture.  If ``texel`` exists the
+            texture covers everything from it to the texels the ladder
+            already stamped, so the cursor - which may sit a texel or two
+            from the texel it stamps - is held inside that stretch, and
+            inside the calibrated rectangle as the outer bound.
+            """
+
+            # The texture certainly covers the candidate texel (if it exists),
+            # the texels the ladder stamped, and everything up to the quad
+            # edge seen in the capture; a cursor window that stamps a texel
+            # from one or two texels over (a stamp offset) is still inside
+            # that stretch.
+            if side == "low":
+                texture_low = min(phase + texel * pitch, edge_low if edge_low is not None else np.inf)
+                texture_high = max(phase + (known_high + 1) * pitch, edge_high if edge_high is not None else -np.inf)
+            else:
+                texture_low = min(phase + known_low * pitch, edge_low if edge_low is not None else np.inf)
+                texture_high = max(phase + (texel + 1) * pitch, edge_high if edge_high is not None else -np.inf)
+            # The same rule the painter clamps strokes by, so a texel counted
+            # here is one the painter can reach.
+            low, high = pixel_span(texture_low, texture_high, rect_low, rect_high)
+            if high < low:
+                return None
+            aimed = (texel + 0.5 - plane_a - plane_c * extent_across) / (
+                plane_b + plane_d * extent_across
+            )
+            return float(min(max(int(np.floor(aimed + 0.5)), low), high))
+
+        # Extent: dab at the texels the rectangle's edges fall in and their
+        # neighbours, aimed with the cursor lattice and held inside the
+        # clickable area.  The outermost stamp that appears at each end sits
+        # on the first and last paintable texel - whether the rectangle was
+        # dragged a little wide or a little narrow.
+        low_guess = texel_of(rect_low + 1.0)
+        high_guess = texel_of(rect_high - 2.0)
+        extent_row = extent_across
+        extent_plan: list[tuple[str, tuple[float, float]]] = []
+        for index, neighbour in enumerate(_EXTENT_NEIGHBOURS):
+            for copy in range(extent_copies):
+                across_here = extent_row + (index * extent_copies + copy) * spacing
+                for side, texel in (("low", low_guess + neighbour), ("high", high_guess - neighbour)):
+                    along = cursor_for(texel, side)
+                    if along is not None:
+                        extent_plan.append((side, make_point(along, across_here)))
+        extent_points = tuple(point for _side, point in extent_plan)
+        diff = stamp_batch(GridProbePlan(extent_points, f"{name} extent"))
+        extent_centres = locate_stamps(
+            diff,
+            to_capture(shifted(extent_points)),
+            max(window, ladder.pitch),
+            max_extent=_STAMP_EXTENT_LIMIT * stamp,
+        )
+        along_extent = [
+            (pick(c) + (left if name == "columns" else top)) if c is not None else None
+            for c in extent_centres
+        ]
+        lows = [v for (side, _p), v in zip(extent_plan, along_extent) if side == "low" and v is not None]
+        highs = [v for (side, _p), v in zip(extent_plan, along_extent) if side == "high" and v is not None]
+        extent = (min(lows), max(highs)) if lows and highs else None
+        LOGGER.info(
+            "%s extent: low-edge stamps at %s, high-edge stamps at %s (quad edge in "
+            "the capture: %s to %s)",
+            name,
+            ", ".join(f"{v:.1f}" for v in lows) or "none",
+            ", ".join(f"{v:.1f}" for v in highs) or "none",
+            "?" if edge_low is None else f"{edge_low:.1f}",
+            "?" if edge_high is None else f"{edge_high:.1f}",
+        )
+
+        fit = fit_axis(
+            staircase,
+            ladder,
             reference_centre=base,
             rect_low=rect_low,
             rect_high=rect_high,
+            extent=extent,
+            aim_origin=aim_origin,
+            aim_pitch=aim_pitch,
             edge_low=edge_low,
             edge_high=edge_high,
-            residual=residual,
+            aim_shear=aim_shear,
+            aim_coefficients=(plane_a, plane_b, plane_c, plane_d),
         )
+        LOGGER.info(
+            "%s: %d texels of %.4f px from %.2f; cursor %.4f px from %.2f (%s)",
+            name,
+            fit.count,
+            fit.pitch,
+            fit.origin,
+            fit.aim_pitch,
+            fit.aim_origin,
+            "edge stamps" if fit.from_edges else "rectangle",
+        )
+        return fit
 
     columns = axis(
         "columns",
         along_start=left + 0.12 * width,
-        across_start=top + 0.30 * height,
+        across_start=top + 0.04 * height,
         along_high=right,
         across_high=bottom,
         make_point=lambda a, c: (a, c),
@@ -753,7 +1391,7 @@ def measure_grid(
     rows = axis(
         "rows",
         along_start=top + 0.10 * height,
-        across_start=left + 0.45 * width,
+        across_start=left + 0.04 * width,
         along_high=bottom,
         across_high=right,
         make_point=lambda a, c: (c, a),
@@ -770,22 +1408,33 @@ def measure_grid(
         pitch_y=rows.pitch,
         origin_x=columns.origin,
         origin_y=rows.origin,
-        aim_x=columns.aim_offset,
-        aim_y=rows.aim_offset,
+        aim_origin_x=columns.aim_origin,
+        aim_origin_y=rows.aim_origin,
+        aim_pitch_x=columns.aim_pitch,
+        aim_pitch_y=rows.aim_pitch,
+        aim_shear_x=columns.aim_shear,
+        aim_shear_y=rows.aim_shear,
+        aim_map_x=columns.aim_coefficients,
+        aim_map_y=rows.aim_coefficients,
         residual=max(columns.residual, rows.residual),
         from_edges=columns.from_edges and rows.from_edges,
     )
 
 
 __all__ = [
+    "RECTANGLE_SLACK_PIXELS",
+    "pixel_span",
     "TEXEL_GRID_SCHEMA",
     "GridProbePlan",
     "measure_grid",
     "AxisFit",
+    "Ladder",
     "Staircase",
     "TexelGridModel",
     "find_quad_edges",
     "fit_axis",
+    "fit_cursor_lattice",
+    "fit_cursor_map",
     "fit_staircase",
     "ladder_offsets",
     "locate_stamps",

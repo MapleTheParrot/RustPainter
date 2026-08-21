@@ -485,27 +485,61 @@ positions that cross from one texel to the next. A ladder of stamps further
 and further along the sign then tightens the pitch: each rung is far enough
 out to be counted exactly with the pitch known so far, and locating it pins
 the pitch down further, until the far side of the sign is a whole number of
-texels with nothing to round. The sign's own edge in the capture - the quad
-the game draws the texture on - says which lattice line is texel zero. Both
-axes are measured; under fifty dabs, all wiped with the brush probes.
+texels with nothing to round. Each rung is stamped more than once on
+separate rows and read by majority, so a dab the game drops a texel astray
+cannot miscount it. Then dabs aimed at the texels the rectangle's edges fall
+in, and their neighbours, show which texel is the first and which the last -
+the sign's extent, observed rather than inferred. Both axes; a little over a
+hundred dabs, all wiped with the brush probes.
+
+Two things a live sign taught the probe. The game draws a frame over the
+outer edge of the texture, so the visible quad is not the texture's extent:
+the last column had 1.5 px in view and 2.6 px under the frame, painted but
+invisible in the UI - and on the sign in the world. A texel the visible edge
+cuts through therefore counts even when no stamp can be seen on it. And the
+game takes paint clicks only on the texture, frame or no frame, so the mouse
+is held on whole pixels inside the measured texture, with the rectangle as a
+one-pixel-slack outer bound.
+
+The second thing is that *where the cursor has to be* is not the same grid as
+*where the texels are drawn*. The canvas is drawn flat, but the cursor is
+mapped as if onto the sign in the world: its lattice has a slightly
+different pitch from the rendered one, is sheared - the column boundaries
+sat three pixels further left at the bottom of the sign than at the top -
+and keystoned a little on top of that. One offset cannot describe that; on
+a 320-texel sign it put a sixth of a test lattice's dots a texel over in one
+corner. So the short staircases are repeated in bands across each axis, and
+the cursor map is fitted as a plane with a twist from every boundary they
+bracket. Painting maps every cell through it; verification reads every cell
+back from the rendered lattice. Painted one cell per texel on a measured
+grid, the brush is typed as exactly Size 1 - the half-texel overlap the brush
+model adds exists to bridge a grid off by a fraction of a texel, and on an
+exact grid it only spills into the neighbour.
+
+Measured on a large artist canvas (320x240): a lattice of 1,200 single-texel
+dots landed 1,200 of 1,200 on the intended texel, 0.17 x 0.12 px rms from its
+centre, worst 0.4 px. The brush-derived inference the app used before put
+165 of them nowhere and 459 of the rest a texel or more off.
 
 What comes out is the texture's size in texels (no table of sign sizes is
-consulted, so a sign of a size no table lists - the artist canvases, say -
-is counted just the same), exactly where each texel sits on screen, and how
-far from a texel's centre the cursor has to be for the game to stamp that
-texel. Painting aims every cell there; verification reads every cell back
-from there. Max quality plans one cell per counted texel. The measurement is
-absolute screen pixels, so it is never reused from a stored profile for
-painting - only its texel count is kept, to size the next plan.
+consulted, so a sign of a size no table lists is counted just the same),
+exactly where each texel is drawn, and exactly where to click for each.
+Max quality plans one cell per counted texel. The measurement is absolute
+screen pixels, so it is never reused from a stored profile for painting -
+only its texel count is kept, to size the next plan.
 
 Only a measurement that snaps - stamps within one texel agreeing on where they
 landed, every ladder rung a whole number of texels out, the grid sitting on
 the calibrated rectangle - is used. Anything else is logged and the job falls
 back to the older inference: the brush measurement's texel size, snapped to
-the nearest canonical texture size and anchored at the rectangle's corner,
-with the brush probes' measured rendering bias (about a texel left and a
-fraction of one down, on a live sign) aimed out. ``painting.measure_texel_grid``
+the nearest known texture size and anchored at the rectangle's corner, with
+the brush probes' measured rendering bias aimed out. ``painting.measure_texel_grid``
 in settings.json turns the probe off outright if it ever needs to be.
+
+Probe colours are chosen against what is already on the sign where each
+batch lands: a probe in the colour of an earlier probe at the same place
+reads as no change at all, which is how a second measurement on an uncleared
+sign once found its scout stroke and scout stamp "did not change the sign".
 
 Colors that share a boundary still meet in a one-texel blend line - the
 brush's own edge falloff, visible on a checkerboard and invisible on ordinary

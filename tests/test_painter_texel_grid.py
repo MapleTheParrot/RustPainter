@@ -65,6 +65,15 @@ class ReplayingTexelSign(SimulatedSign):
         self.base = self.texture.copy()
         self.painted: dict[tuple[int, int], tuple[int, int, int]] = {}
 
+    def _on_texture(self, x: float, y: float) -> bool:
+        """The game takes paint clicks on the texture, not on a rectangle."""
+
+        ox, oy = self.origin
+        return (
+            ox <= x < ox + self.columns * self.pitch[0]
+            and oy <= y < oy + self.rows * self.pitch[1]
+        )
+
     def _stamp(self, x: float, y: float, size: float, color) -> None:
         ox, oy = self.origin
         px, py = self.pitch
@@ -89,7 +98,7 @@ class ReplayingTexelSign(SimulatedSign):
         for event in self.controller.events:
             if event.kind == "move" and event.x is not None and event.y is not None:
                 new_position = (event.x, event.y)
-                if down and self.canvas.contains(*position):
+                if down and self._on_texture(*position):
                     steps = max(1, int(math.hypot(new_position[0] - position[0], new_position[1] - position[1])))
                     for step in range(1, steps + 1):
                         t = step / steps
@@ -119,7 +128,7 @@ class ReplayingTexelSign(SimulatedSign):
                 elif self.profile.hue_bar.contains(*position):
                     color_index += 1
                     color = self.PALETTE[color_index % len(self.PALETTE)]
-                elif self.canvas.contains(*position):
+                elif self._on_texture(*position):
                     self._stamp(position[0], position[1], size, color)
             elif event.kind == "mouse_up":
                 down = False

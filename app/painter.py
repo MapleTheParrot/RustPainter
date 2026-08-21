@@ -1236,9 +1236,25 @@ class Painter:
         model = job.target.brush_size_model
         if not settings.apply_brush_size or box is None or model is None:
             return
-        size = self._brush_plan_size(
-            job.target, job.plan, diameter_cells, settings.logical_pixel_spacing, model
-        )
+        grid = job.texel_grid
+        if (
+            diameter_cells <= 1
+            and grid is not None
+            and (job.plan.width, job.plan.height) == (grid.columns, grid.rows)
+        ):
+            # Native resolution on a measured grid: every cell is one texel
+            # and sits exactly on it, so the brush is the smallest the game
+            # has - one texel.  The half-texel overlap the model would add
+            # exists to bridge a grid that is off by a fraction of a texel,
+            # and on an exact grid it does the opposite: a 1.1-texel stamp
+            # spills into the neighbour whenever the cursor sits in the
+            # outer part of its texel (live: a tenth of the dots of a test
+            # lattice landed a texel over for exactly that reason).
+            size = BRUSH_SIZE_MIN
+        else:
+            size = self._brush_plan_size(
+                job.target, job.plan, diameter_cells, settings.logical_pixel_spacing, model
+            )
         self._update_progress_state(
             PainterState.RUNNING,
             f"Brush size {format_brush_size(size)} for {diameter_cells} logical "
@@ -1337,6 +1353,42 @@ class Painter:
         (0, 200, 255),
         (255, 80, 80),
     )
+
+    @classmethod
+    def _probe_color_against(
+        cls, capture: Any, points: "Sequence[tuple[float, float]]", skip: RGBColor | None = None
+    ) -> RGBColor:
+        """The probe colour that will show best against what is on the sign.
+
+        Probes are read as the difference between two captures, so a probe in
+        the colour already sitting where it lands reads as nothing: live, a
+        second measurement on an uncleared sign found its scout stroke and
+        its scout stamp both "did not change the sign", and the run fell
+        back to guesswork.  Each probe therefore picks, from the table, the
+        colour farthest from the pixels under its points; ``skip`` keeps two
+        consecutive probes at the same place from choosing alike.
+        """
+
+        import numpy as np
+
+        pixels = np.asarray(capture.convert("RGB"), dtype=np.float32)
+        height, width = pixels.shape[:2]
+        samples = []
+        for x, y in points:
+            column = min(max(int(round(x)), 0), width - 1)
+            row = min(max(int(round(y)), 0), height - 1)
+            samples.append(pixels[row, column])
+        if not samples:
+            return cls._BRUSH_PROBE_COLORS[0]
+        under = np.array(samples, dtype=np.float32)
+        best = None
+        for color in cls._BRUSH_PROBE_COLORS:
+            if skip is not None and color == skip:
+                continue
+            distance = float(np.linalg.norm(under - np.array(color, dtype=np.float32), axis=1).min())
+            if best is None or distance > best[0]:
+                best = (distance, color)
+        return best[1] if best is not None else cls._BRUSH_PROBE_COLORS[0]
 
     def _calibrate_brush_for_plan(self, job: _Job) -> None:
         """Measure this sign's brush, wipe the probes, then let painting start.
@@ -1565,21 +1617,27 @@ class Painter:
         drag_center_x = (start[0] + end[0]) / 2.0 - canvas.left
         stroke_y_local = float(stroke_y - canvas.top)
         clipped: list[float] = []
-        probe_index = 0
+        last_color: RGBColor | None = None
 
         def probe(size: float, label: str) -> "StrokeBand | None":
-            nonlocal probe_index
+            nonlocal last_color
             epoch = self._pause_generation_value()
             self._update_progress_state(
                 PainterState.RUNNING,
                 f"Measuring brush size {format_brush_size(size)} ({label})",
                 phase="calibrate",
             )
-            color = self._BRUSH_PROBE_COLORS[probe_index % len(self._BRUSH_PROBE_COLORS)]
-            probe_index += 1
-            self._select_color(color, target, settings, epoch, apply_correction=False)
             self._write_brush_size(box, size, settings, epoch)
             before = self._capture_parked(canvas, park, epoch)
+            # Chosen against what the band will cover, so a probe over an
+            # earlier probe of the same colour cannot read as no change.
+            along = [
+                (start[0] + (end[0] - start[0]) * t - canvas.left, stroke_y_local)
+                for t in (0.0, 0.25, 0.5, 0.75, 1.0)
+            ]
+            color = self._probe_color_against(before, along, skip=last_color)
+            last_color = color
+            self._select_color(color, target, settings, epoch, apply_correction=False)
             self._screen_stroke(start, end, settings, epoch)
             after = self._capture_parked(canvas, park, epoch)
             try:
@@ -1789,15 +1847,19 @@ class Painter:
         except Exception as exc:
             LOGGER.info("The sign's edges could not be captured (%s)", exc)
 
-        batch_index = 0
+        last_batch_color: RGBColor | None = None
 
         def stamp_batch(plan: GridProbePlan) -> np.ndarray:
-            nonlocal batch_index
+            nonlocal last_batch_color
             batch_epoch = self._pause_generation_value()
-            color = self._BRUSH_PROBE_COLORS[batch_index % len(self._BRUSH_PROBE_COLORS)]
-            batch_index += 1
-            self._select_color(color, target, settings, batch_epoch, apply_correction=False)
             before = self._capture_parked(canvas, park, batch_epoch)
+            color = self._probe_color_against(
+                before,
+                [(x - canvas.left, y - canvas.top) for x, y in plan.points],
+                skip=last_batch_color,
+            )
+            last_batch_color = color
+            self._select_color(color, target, settings, batch_epoch, apply_correction=False)
             for x, y in plan.points:
                 point = (math.floor(x), math.floor(y))
                 point = (
@@ -1828,16 +1890,18 @@ class Painter:
                 "calibrated rectangle"
             )
         LOGGER.info(
-            "Texel grid: %dx%d texels, %.4f x %.4f px each, origin %.2f, %.2f, "
-            "aim %+.2f, %+.2f px, worst rung %.2f texel (%s)",
+            "Texel grid: %dx%d texels, %.4f x %.4f px each, origin %.2f, %.2f; "
+            "cursor lattice %.4f x %.4f px from %.2f, %.2f; worst rung %.2f texel (%s)",
             grid.columns,
             grid.rows,
             grid.pitch_x,
             grid.pitch_y,
             grid.origin_x,
             grid.origin_y,
-            grid.aim_x,
-            grid.aim_y,
+            grid.aim_pitch_x,
+            grid.aim_pitch_y,
+            grid.aim_origin_x,
+            grid.aim_origin_y,
             grid.residual,
             "counted from the sign's edges" if grid.from_edges else "counted from the rectangle",
         )
@@ -2049,14 +2113,28 @@ class Painter:
         # the hand-dragged rectangle, so the cell pitch is texel-exact; the
         # physical rectangle still bounds every actual mouse coordinate.
         paint_canvas = self._registered_canvas(target.canvas, model)
+        clamp_canvas: RectangleLike = target.canvas
+        mapper: Callable[[float, float], tuple[float, float]] | None = None
         grid = job.texel_grid
         if grid is not None and grid.agrees_with(target.canvas):
-            # Measured, not inferred: the texture's own lattice, and the
-            # cursor offset that lands a stamp on the texel aimed at.  The
-            # brush-derived bias describes the same offset less precisely,
-            # so the grid's replaces it rather than adding to it.
-            paint_canvas = grid.registered_rect()
-            bias = (-grid.aim_x, -grid.aim_y)
+            # Measured, not inferred: the cursor map, which says for every
+            # texel exactly where the cursor stamps it - including the shear
+            # a cursor ray-cast onto the sign in the world has against the
+            # flat canvas.  The brush-derived bias describes the same thing
+            # less precisely and for one spot only, so the grid replaces it.
+            # The mouse stays on the texture, where the game takes clicks.
+            bias = (0.0, 0.0)
+            clamp_canvas = grid.clamp_rect(target.canvas)
+            scale_u = grid.columns / plan.width
+            scale_v = grid.rows / plan.height
+
+            def mapper(cell_x: float, cell_y: float) -> tuple[float, float]:
+                # Rounded to the nearest pixel here, because the stroke
+                # floors its coordinates: rounding keeps the cursor within
+                # half a pixel of the middle of the texel's cursor window,
+                # flooring would pull it up to a pixel toward one edge.
+                x, y = grid.cursor_point((cell_x + 0.5) * scale_u, (cell_y + 0.5) * scale_v)
+                return math.floor(x + 0.5), math.floor(y + 0.5)
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
         # Rust, so an epoch bump re-applies the size before the next stroke -
@@ -2101,7 +2179,8 @@ class Painter:
                             current_epoch,
                             bias,
                             extension,
-                            clamp_rect=target.canvas,
+                            clamp_rect=clamp_canvas,
+                            mapper=mapper,
                         )
                         break
                     except _RetryAction:
@@ -2349,8 +2428,15 @@ class Painter:
         bias: tuple[float, float] = (0.0, 0.0),
         extension: float = 0.0,
         clamp_rect: RectangleLike | None = None,
+        mapper: "Callable[[float, float], tuple[float, float]] | None" = None,
     ) -> None:
-        start, end = logical_stroke_to_screen(stroke, plan.width, plan.height, canvas)  # type: ignore[arg-type]
+        if mapper is not None:
+            # A measured cursor map places each cell itself; the rectangle
+            # only bounds the mouse.
+            start = mapper(stroke.start_x, stroke.start_y)  # type: ignore[attr-defined]
+            end = mapper(stroke.end_x, stroke.end_y)  # type: ignore[attr-defined]
+        else:
+            start, end = logical_stroke_to_screen(stroke, plan.width, plan.height, canvas)  # type: ignore[arg-type]
         if extension > 0.0:
             # The brush is row-sized, so each stroke reaches out sideways to
             # cover the cell width; a dab becomes a tiny horizontal drag.
