@@ -12,6 +12,11 @@ from app.color_calibration import ColorCorrectionModel
 from app.color_mapping import map_rgb_to_picker
 from app.input_controller import DryRunInputController, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
+from app.paint_timing import (
+    LONG_DRAG_MAX_TEXELS_PER_SECOND,
+    SETTLE_FLOOR_SECONDS,
+    STROKE_GAP_FLOOR_SECONDS,
+)
 from app.painter import Painter, PainterSettings, PainterState, PaintingTarget
 from app.screen import VirtualScreen
 from app.brush_calibration import fit_brush_size_model
@@ -896,6 +901,11 @@ def _impatient(painter: Painter) -> Painter:
     painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
+    painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
+    painter._SETTLE_FLOOR_SECONDS = 0.0  # type: ignore[misc]
+    painter._STROKE_GAP_FLOOR_SECONDS = 0.0  # type: ignore[misc]
+    painter._LONG_DRAG_MAX_TEXELS_PER_SECOND = float("inf")  # type: ignore[misc]
+    painter._LONG_DRAG_MAX_STEP_TEXELS = float("inf")  # type: ignore[misc]
     return painter
 
 
@@ -1521,6 +1531,100 @@ def test_a_long_drag_is_not_held_at_its_end() -> None:
     assert drag >= 0.18
     # The button comes up as soon as the cursor arrives.
     assert tail < 0.03 * _TIMEOUT_SCALE
+
+
+def _turbo(**overrides: object) -> PainterSettings:
+    """The fastest preset as the user can type it, floors and all."""
+
+    values: dict[str, object] = {
+        "stroke_speed_pixels_per_second": 2200.0,
+        "mouse_down_duration_seconds": 0.012,
+        "delay_after_hue_seconds": 0.0,
+        "delay_after_saturation_value_seconds": 0.0,
+        "delay_between_strokes_seconds": 0.0,
+        "delay_between_colors_seconds": 0.0,
+        "stroke_interpolation_step_pixels": 8.0,
+    }
+    values.update(overrides)
+    return _settings(**values)
+
+
+def _moves_during_press(controller: MockInputController, press: int) -> list[tuple[int, int]]:
+    """The cursor positions commanded while the ``press``-th button was down."""
+
+    positions: list[tuple[int, int]] = []
+    seen = -1
+    down = False
+    for event in controller.events:
+        if event.kind == "mouse_down":
+            seen += 1
+            down = seen == press
+        elif event.kind == "mouse_up":
+            if down:
+                break
+            down = False
+        elif down and event.kind == "move" and event.x is not None and event.y is not None:
+            positions.append((event.x, event.y))
+    return positions
+
+
+def test_a_short_run_at_top_speed_costs_only_the_frame_hold() -> None:
+    """A run of a few texels is a dab that moved: the hold lands it, and the
+    long-drag cap never touches it."""
+
+    controller = _TimedInput()
+    painter = Painter(controller, screen_capture=_panel_capture)
+    # One cell per screen pixel on the 400-wide canvas: a two-pixel run.
+    plan = PaintPlan(400, 1, (ColorGroup((220, 40, 20), (Stroke(0, 0, 2, 0),), 3),))
+    assert painter.start(plan, _profile(), _turbo())
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+
+    ((drag, _),) = _canvas_presses(controller)
+    assert Painter._MIN_PRESS_SECONDS * 0.9 <= drag < Painter._MIN_PRESS_SECONDS + 0.05 * _TIMEOUT_SCALE
+
+
+def test_a_long_drag_at_top_speed_is_paced_by_the_texel() -> None:
+    """However fast the preset, a long drag crosses the sign no faster than
+    the rate the game paints faithfully, with a cursor event on every texel.
+    No measured grid here, so the logical cell - one pixel - is the texel."""
+
+    controller = _TimedInput()
+    painter = Painter(controller, screen_capture=_panel_capture)
+    plan = PaintPlan(400, 1, (ColorGroup((220, 40, 20), (Stroke(0, 0, 399, 0),), 400),))
+    assert painter.start(plan, _profile(), _turbo())
+    assert painter.wait(_t(10.0))
+    assert painter.state is PainterState.COMPLETED
+
+    ((drag, _),) = _canvas_presses(controller)
+    # 399 px at the capped 250 texels/s, not at 2200 px/s.
+    assert drag >= 399 / LONG_DRAG_MAX_TEXELS_PER_SECOND * 0.9
+    # The canvas press is the third (two picker clicks come first), and the
+    # 8 px step was brought down to the texel.
+    moves = _moves_during_press(controller, 2)
+    assert len(moves) >= 399
+    assert all(abs(b[0] - a[0]) <= 1 for a, b in zip(moves, moves[1:]))
+    assert moves[-1][0] - moves[0][0] >= 398
+
+
+def test_delays_under_the_frame_floor_are_run_at_the_floor() -> None:
+    """Zero between the picker clicks or between strokes is run as a frame's
+    worth - the game would not see the click otherwise - whatever the preset
+    says."""
+
+    controller = _TimedInput()
+    painter = Painter(controller, screen_capture=_panel_capture)
+    plan = PaintPlan(
+        400, 1, (ColorGroup((220, 40, 20), (Stroke(0, 0, 0, 0), Stroke(10, 0, 10, 0)), 2),)
+    )
+    assert painter.start(plan, _profile(), _turbo())
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+
+    hue, saturation_value, first_dab, second_dab = controller.presses
+    assert saturation_value[0] - hue[2] >= SETTLE_FLOOR_SECONDS * 0.9
+    assert first_dab[0] - saturation_value[2] >= SETTLE_FLOOR_SECONDS * 0.9
+    assert second_dab[0] - first_dab[2] >= STROKE_GAP_FLOOR_SECONDS * 0.9
 
 
 def test_dry_runs_do_not_wait_out_the_minimum_press() -> None:

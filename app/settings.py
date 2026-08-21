@@ -136,11 +136,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "brush_direction": "low_to_high",
         "logical_pixel_spacing": 1.0,
         "stroke_speed_pixels_per_second": 700.0,
-        "mouse_down_duration_seconds": 0.028,
+        # The Standard preset.  Holds and settles sit on the game's frame
+        # floors (app/paint_timing.py); anything lower is run at the floor.
+        "mouse_down_duration_seconds": 0.07,
         "delay_after_hue_seconds": 0.09,
         "delay_after_saturation_value_seconds": 0.09,
-        "delay_after_brush_seconds": 0.06,
-        "delay_between_strokes_seconds": 0.018,
+        "delay_after_brush_seconds": 0.07,
+        "delay_between_strokes_seconds": 0.02,
         "delay_between_colors_seconds": 0.12,
         "stroke_interpolation_step_pixels": 4.0,
         "stroke_merge_mode": "balanced",

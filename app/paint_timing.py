@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
@@ -32,6 +33,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 LOGGER = logging.getLogger("rust_painter.timing")
 
 # Rust has been observed running its painting UI at 15 FPS (a 67 ms frame).
+# Everything the game is asked to notice - a press, a picker click, the
+# color a click just changed - has to survive until the next frame samples
+# it, which makes a frame the floor under several of the timing settings.
+# Each floor is a cliff rather than a slope: below it the event is simply
+# not seen, above it extra waiting buys nothing.
+FRAME_SECONDS = 1.0 / 15.0
+
 # A press and release inside one frame can be sampled as nothing, so the
 # painter keeps every stroke's button down until the press has lasted this
 # long.  Slightly over a frame, so a press that starts late in one frame
@@ -41,6 +49,106 @@ MIN_PRESS_SECONDS = 0.07
 # Picker clicks are rare (a handful per color change) and a dropped one
 # paints a whole color wrong, so they are held longer still.
 PICKER_CLICK_HOLD_SECONDS = 0.09
+
+# After a picker or Size-field click, and before the picker is touched at
+# all between colors, the UI must get a frame in which to apply the click:
+# the S/V box is laid out for the hue just chosen, and the next stroke takes
+# the color that is current when it is sampled.  One frame plus margin.
+SETTLE_FLOOR_SECONDS = 0.07
+
+# Between a stroke's release and the next press.  The game orders these as
+# events rather than sampling them - a frame here is not needed, and would
+# cost half again on every stroke - so this is only slack for the scheduler
+# to deliver the release before the cursor jumps to the next stroke.
+STROKE_GAP_FLOOR_SECONDS = 0.02
+
+# A run of up to this many texels is a dab that moved: the press is held for
+# a frame at its far end anyway, so it goes at whatever speed is set and
+# cannot overshoot.  Longer drags are the ones the game samples mid-flight.
+SHORT_RUN_TEXELS = 3.0
+
+# The fastest a long drag crosses the sign, in texels per second, and the
+# most of the sign the cursor skips between input events on one.  Above the
+# rate the game has been seen to paint past a stroke's ends and skip texels
+# in the middle; at it, with an event on every texel, it paints exactly the
+# run.  Measured on the 320x240 artist canvas: Relaxed's ~130 texels/s is
+# clean and Turbo's ~730 is not.
+LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0
+LONG_DRAG_MAX_STEP_TEXELS = 1.0
+
+# Which timing settings have a floor, and what it is.  Every value is read
+# through :func:`floored` at its point of use under real input, so a preset
+# or a typed value below its floor is lifted - the painter logs once per
+# job which ones were.
+TIMING_FLOORS: dict[str, float] = {
+    "mouse_down_duration_seconds": MIN_PRESS_SECONDS,
+    "delay_after_hue_seconds": SETTLE_FLOOR_SECONDS,
+    "delay_after_saturation_value_seconds": SETTLE_FLOOR_SECONDS,
+    "delay_after_brush_seconds": SETTLE_FLOOR_SECONDS,
+    "delay_between_colors_seconds": SETTLE_FLOOR_SECONDS,
+    "delay_between_strokes_seconds": STROKE_GAP_FLOOR_SECONDS,
+}
+
+
+def floored(settings: "PainterSettings", name: str, *, real_input: bool = True) -> float:
+    """A timing setting, lifted to its floor when the input is real."""
+
+    value = float(getattr(settings, name))
+    if not real_input:
+        return value
+    return max(value, TIMING_FLOORS.get(name, 0.0))
+
+
+def fields_below_floor(settings: "PainterSettings") -> tuple[str, ...]:
+    """The timing settings a real run lifts, in declaration order."""
+
+    return tuple(
+        name
+        for name, floor in TIMING_FLOORS.items()
+        if float(getattr(settings, name)) < floor
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StrokePace:
+    """How a drag of one length is driven: the event spacing and the time."""
+
+    step_pixels: float
+    move_seconds: float
+
+
+def stroke_pace(
+    distance_pixels: float,
+    *,
+    speed_pixels_per_second: float,
+    step_pixels: float,
+    texel_pitch_pixels: float,
+    real_input: bool = True,
+    max_texels_per_second: float = LONG_DRAG_MAX_TEXELS_PER_SECOND,
+    max_step_texels: float = LONG_DRAG_MAX_STEP_TEXELS,
+) -> StrokePace:
+    """Pick the speed and interpolation step for a drag of this length.
+
+    Short runs take the settings as they are - the frame hold at their far
+    end is what makes them land, and there is nothing for them to overshoot.
+    A long drag is capped at :data:`LONG_DRAG_MAX_TEXELS_PER_SECOND` and its
+    step at one texel, so every texel on the way gets its own input event and
+    the cursor never crosses more of the sign per frame than the game paints
+    faithfully.  Mock input has no game behind it and is not capped.
+    """
+
+    speed = max(float(speed_pixels_per_second), 1e-9)
+    step = max(float(step_pixels), 1e-9)
+    pitch = float(texel_pitch_pixels)
+    if (
+        real_input
+        and math.isfinite(pitch)
+        and pitch > 0.0
+        and distance_pixels > SHORT_RUN_TEXELS * pitch
+    ):
+        speed = min(speed, max_texels_per_second * pitch)
+        step = min(step, max_step_texels * pitch)
+    return StrokePace(step_pixels=step, move_seconds=max(0.0, distance_pixels) / speed)
 
 # Keystrokes into Rust's Size field are held across a frame boundary and
 # separated from the next, for the same reason.
@@ -80,6 +188,7 @@ class StrokeTiming:
     delay_after_saturation_value_seconds: float
     delay_between_colors_seconds: float
     delay_after_brush_seconds: float
+    stroke_interpolation_step_pixels: float = 4.0
     overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS
     # Mock and dry-run input skips the frame holds entirely.
     real_input: bool = True
@@ -102,6 +211,7 @@ class StrokeTiming:
             ),
             delay_between_colors_seconds=settings.delay_between_colors_seconds,
             delay_after_brush_seconds=settings.delay_after_brush_seconds,
+            stroke_interpolation_step_pixels=settings.stroke_interpolation_step_pixels,
             overhead_seconds=overhead_seconds,
             real_input=real_input,
         )
@@ -109,17 +219,36 @@ class StrokeTiming:
     def _held(self, seconds: float, floor: float) -> float:
         return max(seconds, floor) if self.real_input else seconds
 
-    def stroke_seconds(self, screen_length_pixels: float) -> float:
-        """One stroke of this on-screen length, start of press to next stroke."""
+    def stroke_seconds(
+        self, screen_length_pixels: float, texel_pitch_pixels: float | None = None
+    ) -> float:
+        """One stroke of this on-screen length, start of press to next stroke.
+
+        ``texel_pitch_pixels`` is what the painter paces long drags by; the
+        estimate uses the same rule so a plan of long sweeps is not promised
+        at a speed the drags are never driven at.
+        """
 
         if screen_length_pixels <= 0:
             press = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
         else:
-            press = self._held(
-                screen_length_pixels / max(self.stroke_speed_pixels_per_second, 1e-9),
-                MIN_PRESS_SECONDS,
+            pace = stroke_pace(
+                screen_length_pixels,
+                speed_pixels_per_second=self.stroke_speed_pixels_per_second,
+                step_pixels=self.stroke_interpolation_step_pixels,
+                texel_pitch_pixels=(
+                    texel_pitch_pixels if texel_pitch_pixels is not None else float("nan")
+                ),
+                real_input=self.real_input,
             )
-        return press + self.delay_between_strokes_seconds + self.overhead_seconds
+            press = self._held(pace.move_seconds, MIN_PRESS_SECONDS)
+        gap = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
+        return press + gap + self.overhead_seconds
+
+    def group_gap_seconds(self) -> float:
+        """The pause after a color's last stroke, before the picker."""
+
+        return self._held(self.delay_between_colors_seconds, SETTLE_FLOOR_SECONDS)
 
     def color_change_seconds(self) -> float:
         """Two held picker clicks and the settle after each."""
@@ -127,15 +256,19 @@ class StrokeTiming:
         click = self._held(self.mouse_down_duration_seconds, PICKER_CLICK_HOLD_SECONDS)
         return (
             2 * click
-            + self.delay_after_hue_seconds
-            + self.delay_after_saturation_value_seconds
+            + self._held(self.delay_after_hue_seconds, SETTLE_FLOOR_SECONDS)
+            + self._held(self.delay_after_saturation_value_seconds, SETTLE_FLOOR_SECONDS)
             + 2 * self.overhead_seconds
         )
 
     def brush_change_seconds(self) -> float:
         """Clicking into the Size field, retyping it, and committing."""
 
-        settle = max(self.delay_after_brush_seconds, 0.05) if self.real_input else 0.0
+        settle = (
+            max(self.delay_after_brush_seconds, SETTLE_FLOOR_SECONDS)
+            if self.real_input
+            else 0.0
+        )
         click = self._held(self.mouse_down_duration_seconds, PICKER_CLICK_HOLD_SECONDS)
         keys = (
             BRUSH_FIELD_KEYSTROKES * (KEY_HOLD_SECONDS + KEY_GAP_SECONDS)
@@ -194,9 +327,16 @@ class PlanProfile:
         cell_width_pixels: float,
         *,
         sizing: bool,
+        texel_pitch_pixels: float | None = None,
     ) -> float:
-        """Painting time for the whole plan, calibration and countdown excluded."""
+        """Painting time for the whole plan, calibration and countdown excluded.
 
+        Long drags are paced by the sign's texel pitch; until a job has
+        measured one, a logical cell - never smaller than a texel - stands
+        in, which errs toward promising speed rather than time.
+        """
+
+        pitch = texel_pitch_pixels if texel_pitch_pixels is not None else cell_width_pixels
         total = 0.0
         previous_color: RGBColor | None = None
         previous_diameter: int | None = None
@@ -210,8 +350,10 @@ class PlanProfile:
                 total += timing.brush_change_seconds()
                 previous_diameter = group.brush_diameter
             for cells, count in group.length_counts:
-                total += count * timing.stroke_seconds((cells - 1) * cell_width_pixels)
-            total += timing.delay_between_colors_seconds
+                total += count * timing.stroke_seconds(
+                    (cells - 1) * cell_width_pixels, pitch
+                )
+            total += timing.group_gap_seconds()
         return total
 
 
@@ -222,9 +364,12 @@ def estimate_plan_seconds(
     *,
     sizing: bool,
     profile: PlanProfile | None = None,
+    texel_pitch_pixels: float | None = None,
 ) -> float:
     profile = profile if profile is not None else PlanProfile.from_plan(plan)
-    return profile.seconds(timing, cell_width_pixels, sizing=sizing)
+    return profile.seconds(
+        timing, cell_width_pixels, sizing=sizing, texel_pitch_pixels=texel_pitch_pixels
+    )
 
 
 class PlanWorkSchedule:
@@ -245,7 +390,9 @@ class PlanWorkSchedule:
         cell_width_pixels: float,
         *,
         sizing: bool,
+        texel_pitch_pixels: float | None = None,
     ) -> None:
+        pitch = texel_pitch_pixels if texel_pitch_pixels is not None else cell_width_pixels
         group_costs: list[float] = []
         stroke_costs: list[list[float]] = []
         previous_color: RGBColor | None = None
@@ -261,11 +408,11 @@ class PlanWorkSchedule:
                 if sizing and diameter != previous_diameter:
                     cost += timing.brush_change_seconds()
                     previous_diameter = diameter
-            cost += timing.delay_between_colors_seconds
+            cost += timing.group_gap_seconds()
             group_costs.append(cost)
             costs = [
                 timing.stroke_seconds(
-                    (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels
+                    (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels, pitch
                 )
                 for stroke in group.strokes
             ]
@@ -397,15 +544,26 @@ class PhaseTiming:
 __all__ = [
     "BRUSH_CALIBRATION_SECONDS",
     "DEFAULT_STROKE_OVERHEAD_SECONDS",
+    "FRAME_SECONDS",
     "KEY_GAP_SECONDS",
     "KEY_HOLD_SECONDS",
+    "LONG_DRAG_MAX_STEP_TEXELS",
+    "LONG_DRAG_MAX_TEXELS_PER_SECOND",
     "LearnedTiming",
     "MIN_PRESS_SECONDS",
     "PICKER_CLICK_HOLD_SECONDS",
     "PhaseTiming",
     "PlanProfile",
     "PlanWorkSchedule",
+    "SETTLE_FLOOR_SECONDS",
+    "SHORT_RUN_TEXELS",
+    "STROKE_GAP_FLOOR_SECONDS",
+    "StrokePace",
     "StrokeTiming",
+    "TIMING_FLOORS",
     "estimate_plan_seconds",
+    "fields_below_floor",
+    "floored",
     "remaining_seconds",
+    "stroke_pace",
 ]

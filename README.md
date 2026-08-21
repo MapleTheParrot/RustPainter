@@ -125,7 +125,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Brush sizing measured from the sign itself at the start of every job: a few probe strokes fit what Rust's Size numbers really cover, the sign is wiped clean again, and only then does the artwork go down
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
-- Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting
+- Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting - every hold and settle floored at a frame of the game's paint UI, and long drags paced by the sign's own texel pitch, so the fastest preset is also an accurate one
 - Per-profile color correction measured from a painted 32-swatch chart
 - A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required, and playback speed is a slider that says how much of the paint job one second of video covers
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
@@ -404,14 +404,48 @@ Rust brush behavior can vary with sign type, selected in-game brush, frame rate,
 - Picker and inter-stroke delays
 - Canvas inset and logical resolution
 
-Start with a low-resolution 8-color test. If adjacent rows bleed together, reduce the in-game brush size, increase logical spacing, or lower the logical resolution. If strokes have gaps, slow the stroke or reduce the interpolation step. Faster speed presets assume the game keeps up with rapid input; if paint goes missing, step back down to Standard.
+Start with a low-resolution 8-color test. If adjacent rows bleed together, reduce the in-game brush size, increase logical spacing, or lower the logical resolution. The speed presets differ in how much margin they leave above the game's frame floors (see *Speed and accuracy* below), not in whether the paint lands; if strokes still have gaps, raise the touch-up passes before slowing anything.
 
 **Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is the default; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. *Off* exists for comparing against exact strokes and is never faster. The paint-plan panel reports how many strokes merging removed. Only **Exact** paint mode reads this setting - Quality, Balanced and Fast merge automatically as part of the optimizer, and the box shows *Automatic* while one of them is selected.
+
+### Speed and accuracy
+
+The speed preset is not one knob but a bundle of timings, and they fail in
+different ways. Rust samples its paint UI at about 15 FPS, so anything it is
+asked to notice - a press, a picker click, the color a click just changed -
+has to last until the next frame samples it. That is a cliff, not a slope:
+below about 70 ms the event is simply not seen (an overnight run once lost
+708 cells to a short hold), and above it extra waiting buys nothing. The
+press hold, the settles after the hue, S/V and Size-field clicks, and the
+pause before the picker between colors therefore have **floors** of one
+frame that no preset goes under; the Advanced timing spinboxes stop there,
+and a value from an older profile below a floor is run at the floor and
+logged once at the start of the job. The gap between strokes is different -
+the press and release are events the game orders itself - so its floor is
+only a few milliseconds of slack.
+
+Overshoot is the other failure, and it belongs to the stroke speed alone: a
+long drag at thousands of pixels a second with a coarse interpolation step is
+sampled mid-flight, and paints past its ends and skips texels in the middle.
+A dab or a run of a few texels cannot overshoot at any speed, because the
+frame hold at its far end is what lands it. So the painter paces each drag
+by its length and by the sign's measured texel pitch (the grid probe's, or
+the brush measurement's, or the logical cell's): short runs go at the set
+speed, and a long drag is capped at 250 texels per second with a cursor
+event on every texel, whatever the preset says. Relaxed on a 320x240 canvas
+runs at about 130 texels/s and was always clean; the old Turbo ran at about
+730 and was not.
+
+Which makes **Turbo** simply "the floors everywhere": as fast as the game can
+take input with nothing dropped, and Relaxed the same with margin on top. The
+touch-up pass stays the backstop for what the game drops anyway; what this
+prevents up front is overshoot, which paints wrong texels the touch-up would
+then have to repaint.
 
 ### How long it will take
 
 A stroke costs the same whether it paints one cell or thirty. Every press is
-held for at least a frame of Rust's 15 FPS paint UI (see below), and at any
+held for at least a frame of Rust's 15 FPS paint UI (see above), and at any
 usable speed setting nearly every stroke is shorter than that hold, so a run
 is essentially *strokes × about 85 ms* plus a color change per color. The
 estimate in the plan panel is priced from exactly the rules the painter
@@ -420,9 +454,11 @@ change, the retyped Size field per brush change, the countdown and the brush
 measurement before the first stroke - and the one machine-dependent term, the
 overhead of input calls and timer slack per stroke, is learned from every run
 and kept in `timing.json` next to the settings. On the two runs used to check
-it the estimate landed within 4% of the clock. The speed slider barely moves
-it, because it barely moves the run: the way to paint faster is fewer
-strokes - fewer colors, a lower resolution, or an optimizing paint mode.
+it the estimate landed within 4% of the clock. Long drags are priced at the
+texel-paced rate they are actually driven at. The speed preset barely moves
+the estimate, because it barely moves the run: the way to paint faster is
+fewer strokes - fewer colors, a lower resolution, or an optimizing paint
+mode.
 
 While painting, the time left is the same prediction corrected by the pace
 measured so far, with progress advancing in predicted seconds rather than in

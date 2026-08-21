@@ -3453,3 +3453,65 @@ def test_time_estimate_prices_the_frame_hold_per_stroke(window: MainWindow) -> N
     # Dabs do not move, so speed changes nothing; each still costs its hold.
     assert fast == pytest.approx(slow)
     assert fast >= plan.stroke_count * MIN_PRESS_SECONDS
+
+
+def test_speed_presets_sit_on_the_frame_floors_and_old_profiles_still_match(
+    window: MainWindow,
+) -> None:
+    """The holds and settles cannot go under a game frame, so the presets
+    start there and a profile saved with the old, lower values - which the
+    painter always ran at the floor anyway - is still recognised."""
+
+    from app.gui.main_window import SPEED_FLOORS_MS, SPEED_PRESETS
+    from app.paint_timing import TIMING_FLOORS
+
+    # Turbo is the floors everywhere.
+    turbo = SPEED_PRESETS["Turbo"]
+    for key, floor in SPEED_FLOORS_MS.items():
+        if key in turbo:
+            assert turbo[key] == floor, key
+    # The spinboxes stop at the floors, in the painter's own numbers.
+    assert window.dot_duration_spin.minimum() == round(
+        TIMING_FLOORS["mouse_down_duration_seconds"] * 1000
+    )
+    assert window.stroke_delay_spin.minimum() == round(
+        TIMING_FLOORS["delay_between_strokes_seconds"] * 1000
+    )
+    window.dot_duration_spin.setValue(1)
+    assert window.dot_duration_spin.value() == window.dot_duration_spin.minimum()
+
+    # A profile saved before the floors: Standard with a 28 ms hold and an
+    # 18 ms gap.
+    document = window._settings_document()
+    document["painting"].update(
+        {
+            "stroke_speed_pixels_per_second": 700.0,
+            "mouse_down_duration_seconds": 0.028,
+            "delay_after_hue_seconds": 0.09,
+            "delay_after_saturation_value_seconds": 0.09,
+            "delay_between_strokes_seconds": 0.018,
+            "delay_between_colors_seconds": 0.12,
+            "stroke_interpolation_step_pixels": 4.0,
+        }
+    )
+    window._apply_settings(document)
+    assert window.speed_preset_combo.currentText() == "Standard"
+    # And the old Turbo, every value under its floor, is still Turbo.
+    document["painting"].update(
+        {
+            "stroke_speed_pixels_per_second": 2200.0,
+            "mouse_down_duration_seconds": 0.012,
+            "delay_after_hue_seconds": 0.045,
+            "delay_after_saturation_value_seconds": 0.045,
+            "delay_between_strokes_seconds": 0.005,
+            "delay_between_colors_seconds": 0.05,
+            "stroke_interpolation_step_pixels": 8.0,
+        }
+    )
+    window._apply_settings(document)
+    assert window.speed_preset_combo.currentText() == "Turbo"
+    assert window.dot_duration_spin.value() == SPEED_FLOORS_MS["dot_ms"]
+
+    window.speed_preset_combo.setCurrentText("Relaxed")
+    assert window.dot_duration_spin.value() == SPEED_PRESETS["Relaxed"]["dot_ms"]
+    assert window._detect_speed_preset() == "Relaxed"

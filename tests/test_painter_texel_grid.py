@@ -151,6 +151,10 @@ def _impatient(painter: Painter) -> Painter:
     painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
+    painter._SETTLE_FLOOR_SECONDS = 0.0  # type: ignore[misc]
+    painter._STROKE_GAP_FLOOR_SECONDS = 0.0  # type: ignore[misc]
+    painter._LONG_DRAG_MAX_TEXELS_PER_SECOND = float("inf")  # type: ignore[misc]
+    painter._LONG_DRAG_MAX_STEP_TEXELS = float("inf")  # type: ignore[misc]
     return painter
 
 
@@ -197,6 +201,74 @@ def test_a_paint_job_lands_every_cell_on_its_texel() -> None:
     expected = {(x, 10) for x in range(10, 31)} | {(0, 0), (64, 40), (127, 63)}
     assert set(sign.painted) == expected
     assert not controller.held_buttons
+
+
+def _frameless(painter: Painter) -> Painter:
+    """Strip only the waits that exist for a real sign to redraw.
+
+    Unlike :func:`_impatient` this keeps the timing floors and the long-drag
+    cap, which are what the test below is about.
+    """
+
+    painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
+    painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
+    return painter
+
+
+def test_a_long_drag_at_top_speed_paints_exactly_its_run_on_the_measured_grid() -> None:
+    """Turbo as typed - 2200 px/s, an 8 px step, zero delays - on a measured
+    sign: the drag is brought down to the texel rate with an event on every
+    texel, and paints its cells and nothing past either end."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _frameless(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(4, 30, 123, 30),), 1),),
+    )
+    turbo = _settings(
+        stroke_speed_pixels_per_second=2200.0,
+        stroke_interpolation_step_pixels=8.0,
+        mouse_down_duration_seconds=0.012,
+    )
+
+    assert painter.start(plan, profile, turbo)
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    grid = painter.measured_texel_grid
+    assert grid is not None and (grid.columns, grid.rows) == (128, 64)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    assert set(sign.painted) == {(x, 30) for x in range(4, 124)}
+
+    # The artwork stroke is the last press on the texture: find its moves.
+    presses: list[list[tuple[int, int]]] = []
+    down = False
+    for event in controller.events:
+        if event.kind == "mouse_down":
+            down = True
+            presses.append([])
+        elif event.kind == "mouse_up":
+            down = False
+        elif down and event.kind == "move" and event.x is not None:
+            presses[-1].append((event.x, event.y))
+    moves = [m for m in presses if len(m) > 50][-1]
+    assert all(abs(b[0] - a[0]) <= math.ceil(grid.pitch_x) for a, b in zip(moves, moves[1:]))
+    assert len(moves) >= 119
 
 
 def _wide_profile() -> CalibrationProfile:

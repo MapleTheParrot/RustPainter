@@ -37,12 +37,18 @@ from .paint_timing import (
     DEFAULT_STROKE_OVERHEAD_SECONDS,
     KEY_GAP_SECONDS,
     KEY_HOLD_SECONDS,
+    LONG_DRAG_MAX_STEP_TEXELS,
+    LONG_DRAG_MAX_TEXELS_PER_SECOND,
     MIN_PRESS_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
+    SETTLE_FLOOR_SECONDS,
+    STROKE_GAP_FLOOR_SECONDS,
     PhaseTiming,
     PlanWorkSchedule,
     StrokeTiming,
+    fields_below_floor,
     remaining_seconds,
+    stroke_pace,
 )
 from .picker_calibration import trim_to_widget
 from .texel_grid import (
@@ -213,12 +219,12 @@ class PainterSettings:
     """All timing and safety values that may need in-game tuning."""
 
     stroke_speed_pixels_per_second: float = 700.0
-    mouse_down_duration_seconds: float = 0.025
-    delay_after_hue_seconds: float = 0.06
-    delay_after_saturation_value_seconds: float = 0.06
-    delay_between_strokes_seconds: float = 0.025
-    delay_between_colors_seconds: float = 0.10
-    stroke_interpolation_step_pixels: float = 3.0
+    mouse_down_duration_seconds: float = 0.07
+    delay_after_hue_seconds: float = 0.09
+    delay_after_saturation_value_seconds: float = 0.09
+    delay_between_strokes_seconds: float = 0.02
+    delay_between_colors_seconds: float = 0.12
+    stroke_interpolation_step_pixels: float = 4.0
     logical_pixel_spacing: float = 1.0
     brush_size: float = 1.0
     apply_brush_size: bool = False
@@ -231,7 +237,7 @@ class PainterSettings:
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
     brush_direction: str = "low_to_high"
-    delay_after_brush_seconds: float = 0.06
+    delay_after_brush_seconds: float = 0.07
     countdown_seconds: float = 3.0
     require_foreground: bool = False
     expected_window_title_contains: str | None = "Rust"
@@ -311,22 +317,22 @@ class PainterSettings:
                 pick(painting, "stroke_speed_pixels_per_second", 700.0, "stroke_speed")
             ),
             mouse_down_duration_seconds=float(
-                pick(painting, "mouse_down_duration_seconds", 0.025, "dot_duration_seconds")
+                pick(painting, "mouse_down_duration_seconds", 0.07, "dot_duration_seconds")
             ),
             delay_after_hue_seconds=float(
-                pick(painting, "delay_after_hue_seconds", 0.06)
+                pick(painting, "delay_after_hue_seconds", 0.09)
             ),
             delay_after_saturation_value_seconds=float(
-                pick(painting, "delay_after_saturation_value_seconds", 0.06, "delay_after_sv_seconds")
+                pick(painting, "delay_after_saturation_value_seconds", 0.09, "delay_after_sv_seconds")
             ),
             delay_between_strokes_seconds=float(
-                pick(painting, "delay_between_strokes_seconds", 0.025)
+                pick(painting, "delay_between_strokes_seconds", 0.02)
             ),
             delay_between_colors_seconds=float(
-                pick(painting, "delay_between_colors_seconds", 0.10)
+                pick(painting, "delay_between_colors_seconds", 0.12)
             ),
             stroke_interpolation_step_pixels=float(
-                pick(painting, "stroke_interpolation_step_pixels", 3.0)
+                pick(painting, "stroke_interpolation_step_pixels", 4.0)
             ),
             logical_pixel_spacing=float(pick(painting, "logical_pixel_spacing", 1.0)),
             brush_size=float(pick(painting, "brush_size", 1.0)),
@@ -334,7 +340,7 @@ class PainterSettings:
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
-            delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.06)),
+            delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
             require_foreground=bool(
                 pick(safety, "require_rust_foreground", False, "require_foreground")
@@ -747,7 +753,18 @@ class Painter:
                 daemon=True,
             )
             thread = self._thread
+            job_settings = self._job.settings
         LOGGER.info("Painting worker starting")
+        if bool(getattr(self.input, "emits_real_input", True)):
+            lifted = fields_below_floor(job_settings)
+            if lifted:
+                # Once per job, not per stroke: the floors are the game's
+                # frame rate, and a setting under one is run at the floor.
+                LOGGER.info(
+                    "Timing settings below the game's frame floor are run at "
+                    "the floor: %s",
+                    ", ".join(lifted),
+                )
         thread.start()
         return True
 
@@ -1309,7 +1326,7 @@ class Painter:
         """
 
         settle = (
-            max(settings.delay_after_brush_seconds, 0.05)
+            self._settle(settings.delay_after_brush_seconds)
             if self.input.emits_real_input
             else 0.0
         )
@@ -1539,7 +1556,10 @@ class Painter:
             hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
         )
         self._interruptible_sleep(
-            max(job.settings.delay_between_colors_seconds, self._CLEAR_SETTLE_SECONDS),
+            max(
+                self._settle(job.settings.delay_between_colors_seconds),
+                self._CLEAR_SETTLE_SECONDS,
+            ),
             epoch=epoch,
             check_focus=True,
         )
@@ -2014,7 +2034,11 @@ class Painter:
         )
 
     def _work_schedule(
-        self, plan: PaintPlan, target: PaintingTarget, settings: PainterSettings
+        self,
+        plan: PaintPlan,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        grid: TexelGridModel | None = None,
     ) -> PlanWorkSchedule:
         cell_width = target.canvas.width / max(1, plan.width)
         sizing = bool(
@@ -2023,7 +2047,18 @@ class Painter:
             and target.brush_size_model is not None
         )
         return PlanWorkSchedule(
-            plan, self._stroke_timing(settings), cell_width, sizing=sizing
+            plan,
+            self._stroke_timing(settings),
+            cell_width,
+            sizing=sizing,
+            texel_pitch_pixels=(
+                self._texel_pitch_pixels(
+                    plan,
+                    target.canvas,
+                    target.brush_size_model if sizing else None,
+                    grid,
+                )
+            ),
         )
 
     def _initial_estimate(self, job: _Job) -> float | None:
@@ -2071,7 +2106,7 @@ class Painter:
         # rules the strokes below execute with, so percent and time left move
         # at the pace of the clock instead of racing through the big,
         # long-stroke colors and crawling through the small ones.
-        schedule = self._work_schedule(plan, target, settings)
+        schedule = self._work_schedule(plan, target, settings, job.texel_grid)
         total_work = schedule.total
         completed_work = 0.0
         # Each plan gets its own clock.  A touch-up pass re-enters here after
@@ -2135,6 +2170,7 @@ class Painter:
                 # flooring would pull it up to a pixel toward one edge.
                 x, y = grid.cursor_point((cell_x + 0.5) * scale_u, (cell_y + 0.5) * scale_v)
                 return math.floor(x + 0.5), math.floor(y + 0.5)
+        texel_pitch = self._texel_pitch_pixels(plan, paint_canvas, model, grid)
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
         # Rust, so an epoch bump re-applies the size before the next stroke -
@@ -2181,6 +2217,7 @@ class Painter:
                             extension,
                             clamp_rect=clamp_canvas,
                             mapper=mapper,
+                            texel_pitch=texel_pitch,
                         )
                         break
                     except _RetryAction:
@@ -2209,9 +2246,12 @@ class Painter:
                     message="Painting",
                 )
                 self._interruptible_sleep(
-                    settings.delay_between_strokes_seconds, check_focus=True
+                    self._stroke_gap(settings.delay_between_strokes_seconds),
+                    check_focus=True,
                 )
-            self._interruptible_sleep(settings.delay_between_colors_seconds, check_focus=True)
+            self._interruptible_sleep(
+                self._settle(settings.delay_between_colors_seconds), check_focus=True
+            )
 
     def _verify_and_touch_up(self, job: _Job) -> None:
         """Read the sign back and repaint the cells that missed their color.
@@ -2405,7 +2445,7 @@ class Painter:
             hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
         )
         self._interruptible_sleep(
-            settings.delay_after_hue_seconds, epoch=epoch, check_focus=True
+            self._settle(settings.delay_after_hue_seconds), epoch=epoch, check_focus=True
         )
         self._safe_click(
             self._inset_into(coordinates.saturation_value, target.color_box),
@@ -2413,7 +2453,7 @@ class Painter:
             hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
         )
         self._interruptible_sleep(
-            settings.delay_after_saturation_value_seconds,
+            self._settle(settings.delay_after_saturation_value_seconds),
             epoch=epoch,
             check_focus=True,
         )
@@ -2429,6 +2469,7 @@ class Painter:
         extension: float = 0.0,
         clamp_rect: RectangleLike | None = None,
         mapper: "Callable[[float, float], tuple[float, float]] | None" = None,
+        texel_pitch: float | None = None,
     ) -> None:
         if mapper is not None:
             # A measured cursor map places each cell itself; the rectangle
@@ -2457,7 +2498,45 @@ class Painter:
         # round(), or adjacent logical pixels can collapse onto one coordinate.
         start_int = math.floor(start[0]), math.floor(start[1])
         end_int = math.floor(end[0]), math.floor(end[1])
-        self._screen_stroke(start_int, end_int, settings, epoch)
+        self._screen_stroke(start_int, end_int, settings, epoch, texel_pitch=texel_pitch)
+
+    @staticmethod
+    def _texel_pitch_pixels(
+        plan: PaintPlan,
+        canvas: RectangleLike,
+        model: BrushSizeModel | None,
+        grid: TexelGridModel | None,
+    ) -> float:
+        """Screen pixels per sign texel, from the best measurement at hand.
+
+        The grid probe measures it directly.  Failing that, the brush model's
+        slope is one Size unit - one texel - as a fraction of the canvas.
+        Failing both, a logical cell, which is never smaller than a texel, so
+        the cap it sets on long drags errs on the quick side.
+        """
+
+        if grid is not None:
+            return min(grid.pitch_x, grid.pitch_y)
+        if model is not None:
+            candidates = [model.slope * canvas.height]
+            if model.has_horizontal_model:
+                candidates.append(model.slope_x * canvas.width)
+            pitch = min(candidates)
+            if math.isfinite(pitch) and pitch > 0.0:
+                return pitch
+        return min(canvas.width / max(1, plan.width), canvas.height / max(1, plan.height))
+
+    def _settle(self, seconds: float) -> float:
+        """A picker, brush or between-colors delay, lifted to a frame."""
+
+        if self.input.emits_real_input:
+            return max(seconds, self._SETTLE_FLOOR_SECONDS)
+        return seconds
+
+    def _stroke_gap(self, seconds: float) -> float:
+        if self.input.emits_real_input:
+            return max(seconds, self._STROKE_GAP_FLOOR_SECONDS)
+        return seconds
 
     def _screen_stroke(
         self,
@@ -2465,8 +2544,16 @@ class Painter:
         end_int: tuple[int, int],
         settings: PainterSettings,
         epoch: int,
+        *,
+        texel_pitch: float | None = None,
     ) -> None:
-        """Drag between two physical points, or dab when they are the same."""
+        """Drag between two physical points, or dab when they are the same.
+
+        ``texel_pitch`` paces the drag: a run of a few texels goes at the
+        set speed and is caught by the frame hold below, a longer drag is
+        capped to a rate and an event spacing the game paints faithfully
+        (:func:`app.paint_timing.stroke_pace`).
+        """
 
         self._checkpoint(epoch=epoch, check_focus=True)
         self._move(start_int, epoch)
@@ -2487,9 +2574,17 @@ class Painter:
                     hold = max(hold, self._MIN_PRESS_SECONDS)
                 self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
                 return
-            steps = max(1, int(math.ceil(distance / settings.stroke_interpolation_step_pixels)))
-            duration = distance / settings.stroke_speed_pixels_per_second
-            delay = duration / steps
+            pace = stroke_pace(
+                distance,
+                speed_pixels_per_second=settings.stroke_speed_pixels_per_second,
+                step_pixels=settings.stroke_interpolation_step_pixels,
+                texel_pitch_pixels=texel_pitch if texel_pitch is not None else float("nan"),
+                real_input=bool(self.input.emits_real_input),
+                max_texels_per_second=self._LONG_DRAG_MAX_TEXELS_PER_SECOND,
+                max_step_texels=self._LONG_DRAG_MAX_STEP_TEXELS,
+            )
+            steps = max(1, int(math.ceil(distance / pace.step_pixels)))
+            delay = pace.move_seconds / steps
             for step in range(1, steps + 1):
                 self._checkpoint(epoch=epoch, check_focus=True)
                 ratio = step / steps
@@ -2553,6 +2648,15 @@ class Painter:
     # the picker's 90 ms because these strokes can number in the thousands.
     # Long drags spend more than this moving and are not held at all.
     _MIN_PRESS_SECONDS = MIN_PRESS_SECONDS
+
+    # The floors under the settle and between-stroke delays, and the rate
+    # cap on long drags (:mod:`app.paint_timing`).  Class attributes so a
+    # test driving a simulated sign, which has no frame rate, can switch
+    # them off the way it does the other frame waits.
+    _SETTLE_FLOOR_SECONDS = SETTLE_FLOOR_SECONDS
+    _STROKE_GAP_FLOOR_SECONDS = STROKE_GAP_FLOOR_SECONDS
+    _LONG_DRAG_MAX_TEXELS_PER_SECOND = LONG_DRAG_MAX_TEXELS_PER_SECOND
+    _LONG_DRAG_MAX_STEP_TEXELS = LONG_DRAG_MAX_STEP_TEXELS
 
     @classmethod
     def _inset_into(

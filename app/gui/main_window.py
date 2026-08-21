@@ -105,6 +105,9 @@ from app.models import (
 from app.paint_plan import count_unmerged_strokes, generate_paint_plan
 from app.paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
+    MIN_PRESS_SECONDS,
+    SETTLE_FLOOR_SECONDS,
+    STROKE_GAP_FLOOR_SECONDS,
     LearnedTiming,
     PlanProfile,
     StrokeTiming,
@@ -232,11 +235,30 @@ PREVIEW_HINTS: dict[str, str] = {
     "rust": "Read-only - edit the artwork on the Source tab",
 }
 
-# All timing values one speed preset controls, in the spinbox units used below.
+# The floor under each timing spinbox, in milliseconds: Rust samples its
+# paint UI at ~15 FPS, and an event shorter than a frame is not seen at
+# all.  The painter runs anything under a floor at the floor, so the
+# spinboxes stop there too - a value they cannot reach is not a speed.
+SPEED_FLOORS_MS: dict[str, int] = {
+    "dot_ms": int(round(MIN_PRESS_SECONDS * 1000)),
+    "hue_ms": int(round(SETTLE_FLOOR_SECONDS * 1000)),
+    "sv_ms": int(round(SETTLE_FLOOR_SECONDS * 1000)),
+    "brush_ms": int(round(SETTLE_FLOOR_SECONDS * 1000)),
+    "stroke_ms": int(round(STROKE_GAP_FLOOR_SECONDS * 1000)),
+    "color_ms": int(round(SETTLE_FLOOR_SECONDS * 1000)),
+}
+
+# All timing values one speed preset controls, in the spinbox units used
+# below.  The presets differ only where a difference can be painted: the
+# holds and settles sit at their floors in every preset but Relaxed, which
+# adds margin above them, and the stroke speed is what separates the rest -
+# and even that only on long drags, since the painter caps those at a rate
+# the game paints faithfully and runs short runs flat out regardless.
+# Turbo is the floors everywhere.
 SPEED_PRESETS: dict[str, dict[str, float]] = {
     "Relaxed": {
         "stroke_speed": 400.0,
-        "dot_ms": 40,
+        "dot_ms": 80,
         "hue_ms": 120,
         "sv_ms": 120,
         "stroke_ms": 35,
@@ -245,32 +267,41 @@ SPEED_PRESETS: dict[str, dict[str, float]] = {
     },
     "Standard": {
         "stroke_speed": 700.0,
-        "dot_ms": 28,
+        "dot_ms": 70,
         "hue_ms": 90,
         "sv_ms": 90,
-        "stroke_ms": 18,
+        "stroke_ms": 20,
         "color_ms": 120,
         "interp_px": 4.0,
     },
     "Fast": {
         "stroke_speed": 1300.0,
-        "dot_ms": 20,
-        "hue_ms": 60,
-        "sv_ms": 60,
-        "stroke_ms": 10,
+        "dot_ms": 70,
+        "hue_ms": 70,
+        "sv_ms": 70,
+        "stroke_ms": 20,
         "color_ms": 80,
         "interp_px": 6.0,
     },
     "Turbo": {
         "stroke_speed": 2200.0,
-        "dot_ms": 12,
-        "hue_ms": 45,
-        "sv_ms": 45,
-        "stroke_ms": 5,
-        "color_ms": 50,
+        "dot_ms": 70,
+        "hue_ms": 70,
+        "sv_ms": 70,
+        "stroke_ms": 20,
+        "color_ms": 70,
         "interp_px": 8.0,
     },
 }
+
+
+def _floored_speed_values(values: dict[str, float]) -> dict[str, float]:
+    """Preset values as the painter would run them."""
+
+    return {
+        key: max(float(value), float(SPEED_FLOORS_MS.get(key, 0)))
+        for key, value in values.items()
+    }
 
 # Logical-pixel gap each stroke-merging mode may paint across.
 MERGE_MODE_GAPS: dict[str, int | None] = {"off": 0, "balanced": 6, "maximum": None}
@@ -1111,14 +1142,18 @@ class MainWindow(QMainWindow):
         self.speed_preset_combo.addItems([*SPEED_PRESETS.keys(), "Custom"])
         self.speed_preset_combo.setCurrentText("Standard")
         self.speed_preset_combo.setToolTip(
-            "One-click timing profiles. Faster presets assume Rust keeps up with\n"
-            "quick strokes; if rows bleed or strokes get gaps, step back down.\n"
+            "One-click timing profiles.  Every hold and settle has a floor of\n"
+            "one game frame that no preset goes under, and long drags are\n"
+            "capped at a rate the sign paints faithfully, so the presets differ\n"
+            "in how much margin they add - not in whether the paint lands.\n"
             "Editing any value under Advanced Timing switches this to Custom."
         )
         speed_form.addRow("Preset", self.speed_preset_combo)
         speed_note = QLabel(
-            "Turbo can outrun Rust's UI on slower machines — test it with a "
-            "small image first."
+            "Turbo is the floors everywhere: as fast as Rust's 15 FPS paint UI "
+            "can take input.  Every stroke still costs about a frame, so fewer "
+            "strokes - the paint mode and merging - save more time than any "
+            "preset."
         )
         speed_note.setWordWrap(True)
         speed_note.setObjectName("muted")
@@ -1129,13 +1164,27 @@ class MainWindow(QMainWindow):
         advanced_layout = QFormLayout(advanced)
         self.pixel_spacing_spin = self._double_spin(0.25, 3.0, 1.0, 0.05, " ×")
         self.stroke_speed_spin = self._double_spin(10.0, 5000.0, 700.0, 10.0, " px/s")
-        self.dot_duration_spin = self._int_spin(1, 1000, 28, " ms")
-        self.hue_delay_spin = self._int_spin(0, 3000, 90, " ms")
-        self.sv_delay_spin = self._int_spin(0, 3000, 90, " ms")
-        self.brush_delay_spin = self._int_spin(0, 3000, 60, " ms")
-        self.stroke_delay_spin = self._int_spin(0, 3000, 18, " ms")
-        self.color_delay_spin = self._int_spin(0, 5000, 120, " ms")
+        self.dot_duration_spin = self._int_spin(SPEED_FLOORS_MS["dot_ms"], 1000, 70, " ms")
+        self.hue_delay_spin = self._int_spin(SPEED_FLOORS_MS["hue_ms"], 3000, 90, " ms")
+        self.sv_delay_spin = self._int_spin(SPEED_FLOORS_MS["sv_ms"], 3000, 90, " ms")
+        self.brush_delay_spin = self._int_spin(SPEED_FLOORS_MS["brush_ms"], 3000, 70, " ms")
+        self.stroke_delay_spin = self._int_spin(
+            SPEED_FLOORS_MS["stroke_ms"], 3000, 20, " ms"
+        )
+        self.color_delay_spin = self._int_spin(
+            SPEED_FLOORS_MS["color_ms"], 5000, 120, " ms"
+        )
         self.interpolation_spin = self._double_spin(1.0, 100.0, 4.0, 1.0, " px")
+        self.stroke_speed_spin.setToolTip(
+            "Cursor speed on a drag.  Runs of a few texels go at this speed\n"
+            "whatever it is - the frame hold at their end is what lands them -\n"
+            "and longer drags are capped at a rate the sign paints exactly,\n"
+            "so past that cap this number changes nothing."
+        )
+        self.interpolation_spin.setToolTip(
+            "Screen pixels between cursor events on a drag.  On a long drag\n"
+            "the step is never wider than one sign texel, whatever is set here."
+        )
         advanced_layout.addRow("Logical spacing", self.pixel_spacing_spin)
         advanced_layout.addRow("Stroke speed", self.stroke_speed_spin)
         advanced_layout.addRow("Dot hold", self.dot_duration_spin)
@@ -3338,11 +3387,15 @@ class MainWindow(QMainWindow):
         }
 
     def _detect_speed_preset(self) -> str:
-        current = self._speed_preset_values()
+        # Compared as the painter runs them, so a profile saved before the
+        # floors existed - with a 28 ms hold that was always run at 70 - still
+        # reads as the preset it was.
+        current = _floored_speed_values(self._speed_preset_values())
         for name, values in SPEED_PRESETS.items():
+            expected_values = _floored_speed_values(values)
             if all(
                 math.isclose(float(current[key]), float(expected), abs_tol=0.01)
-                for key, expected in values.items()
+                for key, expected in expected_values.items()
             ):
                 return name
         return "Custom"
@@ -4775,7 +4828,7 @@ class MainWindow(QMainWindow):
                 float(painting.get("stroke_speed_pixels_per_second", 700.0))
             )
             self.dot_duration_spin.setValue(
-                round(float(painting.get("mouse_down_duration_seconds", 0.028)) * 1000)
+                round(float(painting.get("mouse_down_duration_seconds", 0.07)) * 1000)
             )
             self.hue_delay_spin.setValue(
                 round(float(painting.get("delay_after_hue_seconds", 0.09)) * 1000)
@@ -4787,10 +4840,10 @@ class MainWindow(QMainWindow):
                 )
             )
             self.brush_delay_spin.setValue(
-                round(float(painting.get("delay_after_brush_seconds", 0.06)) * 1000)
+                round(float(painting.get("delay_after_brush_seconds", 0.07)) * 1000)
             )
             self.stroke_delay_spin.setValue(
-                round(float(painting.get("delay_between_strokes_seconds", 0.018)) * 1000)
+                round(float(painting.get("delay_between_strokes_seconds", 0.02)) * 1000)
             )
             self.color_delay_spin.setValue(
                 round(float(painting.get("delay_between_colors_seconds", 0.12)) * 1000)
