@@ -102,6 +102,12 @@ from app.models import (
     TransparencyMode,
 )
 from app.paint_plan import count_unmerged_strokes, generate_paint_plan
+from app.paint_timing import (
+    BRUSH_CALIBRATION_SECONDS,
+    LearnedTiming,
+    PlanProfile,
+    StrokeTiming,
+)
 from app.paint_optimizer import (
     BrushCapabilities,
     OptimizationStatistics,
@@ -267,6 +273,10 @@ SPEED_PRESETS: dict[str, dict[str, float]] = {
 
 # Logical-pixel gap each stroke-merging mode may paint across.
 MERGE_MODE_GAPS: dict[str, int | None] = {"off": 0, "balanced": 6, "maximum": None}
+# Shown in the (disabled) merge box while a paint mode other than Exact is
+# chosen: those modes merge through the optimizer, and a greyed-out "Off"
+# read as merging being switched off when it was the opposite.
+MERGE_MODE_OPTIMIZER = "optimizer"
 
 # Bounds on the pixel font size of a text layer. Layers keep their size as a
 # fraction of the logical canvas height and derive pixels within these bounds,
@@ -297,8 +307,9 @@ class _ProcessResult:
     processed: ProcessedImage
     plan: PaintPlan
     simulation: Image.Image
-    stroke_pixel_steps: int
-    dot_count: int
+    # Stroke lengths and group changes reduced to what the time estimate
+    # needs, built here off the GUI thread because it walks every stroke.
+    timing_profile: PlanProfile
     unmerged_stroke_count: int
     optimization: OptimizationStatistics | None = None
 
@@ -568,24 +579,13 @@ class _ImageWorker(QRunnable):
             simulation = _build_simulation_image(
                 simulation_processed, self.color_correction
             )
-            stroke_pixel_steps = sum(
-                max(0, stroke.pixel_count - 1)
-                for group in plan.color_groups
-                for stroke in group.strokes
-            )
-            dot_count = sum(
-                stroke.pixel_count == 1
-                for group in plan.color_groups
-                for stroke in group.strokes
-            )
             self.signals.completed.emit(
                 _ProcessResult(
                     self.serial,
                     processed,
                     plan,
                     simulation,
-                    stroke_pixel_steps,
-                    dot_count,
+                    PlanProfile.from_plan(plan),
                     unmerged_stroke_count,
                     optimization,
                 )
@@ -731,8 +731,10 @@ class MainWindow(QMainWindow):
         self._processed: ProcessedImage | None = None
         self._plan: PaintPlan | None = None
         self._plan_metric_source: PaintPlan | None = None
-        self._plan_stroke_pixel_steps = 0
-        self._plan_dot_count = 0
+        self._plan_timing_profile: PlanProfile | None = None
+        # What a stroke costs on this machine beyond its scripted holds,
+        # learned from every run and kept between sessions.
+        self._learned_timing = LearnedTiming.load(self._timing_path())
         # Finished plans, newest last, keyed by everything that shaped them.
         # Stepping back to a preset already tried is then instant instead of
         # another full recalculation of a plan that has not changed.
@@ -1067,14 +1069,25 @@ class MainWindow(QMainWindow):
             self.color_count_combo.addItem(str(value), value)
         self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
         self.merge_combo = NoWheelComboBox()
-        self.merge_combo.addItem("Off — exact strokes", "off")
+        self.merge_combo.addItem("Off — exact strokes (slower, same picture)", "off")
         self.merge_combo.addItem("Balanced — small gaps", "balanced")
         self.merge_combo.addItem("Maximum — longest strokes", "maximum")
+        self.merge_combo.addItem(
+            "Automatic — handled by the optimizer", MERGE_MODE_OPTIMIZER
+        )
+        # The optimizer entry is a caption, not a choice: it is shown while
+        # the box is disabled and hidden from the drop-down list.
+        self.merge_combo.view().setRowHidden(
+            self.merge_combo.findData(MERGE_MODE_OPTIMIZER), True
+        )
+        self._merge_mode_choice = "balanced"
         self._set_combo_data(self.merge_combo, "balanced")
         self.merge_combo.setToolTip(
             "Lets early colors paint straight through pixels that later colors\n"
             "repaint anyway. The finished image is identical, but fragmented\n"
-            "areas need far fewer strokes, so painting is much faster."
+            "areas need fewer strokes, so painting is faster.\n\n"
+            "Only Exact paint mode uses this setting. Quality, Balanced and\n"
+            "Fast merge automatically through the optimizer."
         )
         form.addRow("Maximum colors", self.color_count_combo)
         form.addRow("Stroke merging", self.merge_combo)
@@ -2356,7 +2369,7 @@ class MainWindow(QMainWindow):
         )
         self.color_count_combo.currentIndexChanged.connect(self._schedule_processing)
         self.dither_check.toggled.connect(self._schedule_processing)
-        self.merge_combo.currentIndexChanged.connect(self._schedule_processing)
+        self.merge_combo.currentIndexChanged.connect(self._on_merge_mode_changed)
         self.paint_mode_combo.currentIndexChanged.connect(self._on_paint_mode_changed)
         self.add_text_button.clicked.connect(self._add_text_layer)
         self.undo_text_button.clicked.connect(self._undo_text_edit)
@@ -2440,8 +2453,21 @@ class MainWindow(QMainWindow):
         self.apply_brush_check.toggled.connect(self._schedule_processing)
         self.pixel_spacing_spin.valueChanged.connect(self._schedule_processing)
 
+    def _merge_mode(self) -> str:
+        """The user's stroke-merging choice, whatever the box is showing."""
+
+        data = str(self.merge_combo.currentData() or "")
+        if data in MERGE_MODE_GAPS:
+            self._merge_mode_choice = data
+        return self._merge_mode_choice
+
     def _current_overpaint_gap(self) -> int | None:
-        return MERGE_MODE_GAPS.get(str(self.merge_combo.currentData()), 6)
+        return MERGE_MODE_GAPS.get(self._merge_mode(), 6)
+
+    @Slot()
+    def _on_merge_mode_changed(self, *_args: Any) -> None:
+        self._merge_mode()
+        self._schedule_processing()
 
     def _current_paint_mode(self) -> str:
         # A calibration chart measures the raw material response, so it is
@@ -2507,10 +2533,22 @@ class MainWindow(QMainWindow):
         self._schedule_processing()
 
     def _sync_paint_mode_dependent_controls(self) -> None:
-        """Stroke merging is superseded by the optimizer outside Exact mode."""
+        """Stroke merging is superseded by the optimizer outside Exact mode.
+
+        The box then shows that it is automatic rather than the user's Exact
+        mode choice, which it remembers for when Exact is chosen again.
+        """
 
         exact = self.paint_mode_combo.currentData() == PaintMode.EXACT.value
-        self.merge_combo.setEnabled(exact)
+        combo = self.merge_combo
+        wanted = self._merge_mode() if exact else MERGE_MODE_OPTIMIZER
+        if str(combo.currentData() or "") != wanted:
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(combo.findData(wanted))
+            finally:
+                combo.blockSignals(False)
+        combo.setEnabled(exact)
 
     @staticmethod
     def _text_layer_label(index: int, layer: _TextOverlayOptions) -> str:
@@ -3299,8 +3337,7 @@ class MainWindow(QMainWindow):
         self._processed = None
         self._plan = None
         self._plan_metric_source = None
-        self._plan_stroke_pixel_steps = 0
-        self._plan_dot_count = 0
+        self._plan_timing_profile = None
         self._source_pixmap = QPixmap()
         self._source_preview_size = None
         self._show_preview_after_processing = True
@@ -3688,8 +3725,7 @@ class MainWindow(QMainWindow):
         self._plan = None
         self._processed = None
         self._plan_metric_source = None
-        self._plan_stroke_pixel_steps = 0
-        self._plan_dot_count = 0
+        self._plan_timing_profile = None
         self._plan_pending = True
         self._process_timer.start(TYPING_SETTLE_MS if typing else PLAN_SETTLE_MS)
         self._refresh_statistics()
@@ -3945,8 +3981,7 @@ class MainWindow(QMainWindow):
         self._processed = result.processed
         self._plan = result.plan
         self._plan_metric_source = result.plan
-        self._plan_stroke_pixel_steps = result.stroke_pixel_steps
-        self._plan_dot_count = result.dot_count
+        self._plan_timing_profile = result.timing_profile
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
         if not (
             self.original_preview.is_interacting
@@ -4057,62 +4092,79 @@ class MainWindow(QMainWindow):
         )
 
     def _estimate_seconds(self, plan: PaintPlan) -> float:
+        """Predict the run from the painter's own timing rules.
+
+        Strokes are priced as the painter executes them - a held press per
+        stroke, held picker clicks per color change, a retyped Size field per
+        brush change - plus the countdown and the brush measurement that
+        precede the first stroke.  Mouse speed barely matters: at any usable
+        setting nearly every stroke is shorter than the frame it is held for.
+        """
+
         canvas = self._profile_rect("canvas")
         cell_width = canvas.width / plan.width if canvas else 1.0
-        if plan is self._plan_metric_source:
-            stroke_pixel_steps = self._plan_stroke_pixel_steps
-            dot_count = self._plan_dot_count
+        if plan is self._plan_metric_source and self._plan_timing_profile is not None:
+            profile = self._plan_timing_profile
         else:
-            stroke_pixel_steps = sum(
-                max(0, stroke.pixel_count - 1)
-                for group in plan.color_groups
-                for stroke in group.strokes
-            )
-            dot_count = sum(
-                stroke.pixel_count == 1
-                for group in plan.color_groups
-                for stroke in group.strokes
-            )
-        travel = stroke_pixel_steps * cell_width
-        # One walk over the groups tracks everything the painter tracks: the
-        # picker is selected once per run of same-color groups, and the brush is
-        # retyped whenever the diameter changes.
-        sizing = (
+            profile = PlanProfile.from_plan(plan)
+        document = self._settings_document()
+        from app.painter import PainterSettings
+
+        try:
+            settings = PainterSettings.from_mapping(document)
+        except (TypeError, ValueError):
+            settings = PainterSettings()
+        timing = StrokeTiming.from_settings(
+            settings, overhead_seconds=self._learned_timing.overhead_seconds
+        )
+        # The painter measures the brush before every sizing run, which needs
+        # the Size field and clear control calibrated.
+        calibrates = bool(
             self.apply_brush_check.isChecked()
             and self._profile_rect("brush_size_box") is not None
-            and self._brush_size_model() is not None
+            and self._profile_rect("clear_button") is not None
         )
-        selections = 0
-        previous_color: tuple[int, int, int] | None = None
-        previous_diameter: int | None = None
-        size_changes = 0
-        for group in plan.color_groups:
-            if group.color != previous_color:
-                selections += 1
-                previous_color = group.color
-            if sizing:
-                diameter = max(1, group.brush_diameter)
-                if diameter != previous_diameter:
-                    size_changes += 1
-                    previous_diameter = diameter
-        # The Size number is computed, not searched for, so a change costs one
-        # click into the field, a dozen keystrokes, and two settles.
-        settle = max(self.brush_delay_spin.value() / 1000.0, 0.05)
-        click = self.dot_duration_spin.value() / 1000.0
-        brush_seconds = size_changes * (2 * settle + click + 12 * 0.01)
-        color_ms = selections * (
-            self.hue_delay_spin.value()
-            + self.sv_delay_spin.value()
-            + 2 * self.dot_duration_spin.value()
-        ) + len(plan.color_groups) * self.color_delay_spin.value()
-        stroke_ms = plan.stroke_count * self.stroke_delay_spin.value()
-        dot_ms = dot_count * self.dot_duration_spin.value()
-        movement_seconds = travel / max(1.0, self.stroke_speed_spin.value())
-        return (
-            movement_seconds
-            + (color_ms + stroke_ms + dot_ms) / 1000.0
-            + brush_seconds
+        seconds = profile.seconds(timing, cell_width, sizing=calibrates)
+        seconds += max(0.0, float(self.countdown_spin.value()))
+        if calibrates:
+            seconds += BRUSH_CALIBRATION_SECONDS
+        return seconds
+
+    @classmethod
+    def _timing_path(cls) -> Path:
+        return cls._local_data_directory() / "timing.json"
+
+    def _learn_timing(self) -> None:
+        """Fold the finished (or stopped) run's pace into the estimate."""
+
+        painter = self._painter
+        measured = getattr(painter, "paint_phase_timing", None) if painter else None
+        if measured is None:
+            return
+        if getattr(getattr(painter, "input", None), "emits_real_input", True) is False:
+            return  # a dry run skips the holds the estimate is about
+        before = self._learned_timing.overhead_seconds
+        learned = self._learned_timing.observe(
+            predicted_seconds=measured.predicted_seconds,
+            actual_seconds=measured.actual_seconds,
+            strokes=measured.strokes,
         )
+        if not learned:
+            return
+        LOGGER.info(
+            "Run timing: predicted %.0fs, took %.0fs over %d strokes; per-stroke "
+            "overhead %.1f ms -> %.1f ms",
+            measured.predicted_seconds,
+            measured.actual_seconds,
+            measured.strokes,
+            before * 1000.0,
+            self._learned_timing.overhead_seconds * 1000.0,
+        )
+        try:
+            self._learned_timing.save(self._timing_path())
+        except OSError:
+            LOGGER.warning("Could not save the learned timing", exc_info=True)
+        self._refresh_statistics()
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -4513,12 +4565,11 @@ class MainWindow(QMainWindow):
             self._set_combo_data(
                 self.timelapse_format_combo, str(timelapse.get("export_format", "avi"))
             )
-            merge_index = self.merge_combo.findData(
-                str(painting.get("stroke_merge_mode", "balanced"))
-            )
-            self.merge_combo.setCurrentIndex(
-                merge_index if merge_index >= 0 else self.merge_combo.findData("balanced")
-            )
+            merge_mode = str(painting.get("stroke_merge_mode", "balanced"))
+            if merge_mode not in MERGE_MODE_GAPS:
+                merge_mode = "balanced"
+            self._merge_mode_choice = merge_mode
+            self.merge_combo.setCurrentIndex(self.merge_combo.findData(merge_mode))
             self.speed_preset_combo.setCurrentText(self._detect_speed_preset())
             ui = settings.get("ui", {})
             self.show_calibration_check.setChecked(
@@ -4623,7 +4674,7 @@ class MainWindow(QMainWindow):
             "stroke_interpolation_step_pixels": self.interpolation_spin.value(),
             "apply_brush_size": self.apply_brush_check.isChecked(),
             "brush_direction": "low_to_high",
-            "stroke_merge_mode": str(self.merge_combo.currentData() or "balanced"),
+            "stroke_merge_mode": self._merge_mode(),
             "verify_passes": int(self.verify_passes_spin.value()),
         }
         current["timelapse"] = {
@@ -6206,6 +6257,7 @@ class MainWindow(QMainWindow):
             generation = self._paint_generation + 1
             painter = Painter(
                 input_controller,
+                stroke_overhead_seconds=self._learned_timing.overhead_seconds,
                 on_progress=lambda progress: self._painter_bridge.progress.emit(
                     generation, progress
                 ),
@@ -6389,6 +6441,7 @@ class MainWindow(QMainWindow):
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
             self._finish_run_report(value, reason)
+            self._learn_timing()
             # The run measured this sign whatever its outcome, and that
             # measurement is what stops the next plan from asking for a
             # resolution the brush cannot paint.  Losing it because the

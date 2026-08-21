@@ -6,6 +6,7 @@ import pytest
 
 from app.settings import (
     DEFAULT_COLOR_COUNT,
+    SETTINGS_SCHEMA_VERSION,
     SettingsError,
     SettingsStore,
     default_settings,
@@ -230,3 +231,32 @@ def test_gui_computed_quality_presets_are_saveable(tmp_path) -> None:
 
     with pytest.raises(SettingsError, match="quality_preset"):
         store.save({"image": {"quality_preset": "ultra"}})
+
+
+def test_stroke_merging_switched_off_under_the_old_schema_is_lifted_to_balanced(
+    tmp_path,
+) -> None:
+    """Merging never changes the picture, only how many strokes it takes, so
+    an "off" saved before that was understood is turned on once."""
+
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "painting": {"stroke_merge_mode": "off"}}),
+        encoding="utf-8",
+    )
+    loaded = SettingsStore(path).load()
+    assert loaded["painting"]["stroke_merge_mode"] == "balanced"
+    assert loaded["schema_version"] == SETTINGS_SCHEMA_VERSION
+
+    # A document that never said: the same lift (it predates the version key).
+    path.write_text(json.dumps({"painting": {"stroke_merge_mode": "off"}}), encoding="utf-8")
+    assert SettingsStore(path).load()["painting"]["stroke_merge_mode"] == "balanced"
+
+    # Chosen under the current schema, "off" is the user's and stays.
+    path.write_text(
+        json.dumps(
+            {"schema_version": SETTINGS_SCHEMA_VERSION, "painting": {"stroke_merge_mode": "off"}}
+        ),
+        encoding="utf-8",
+    )
+    assert SettingsStore(path).load()["painting"]["stroke_merge_mode"] == "off"

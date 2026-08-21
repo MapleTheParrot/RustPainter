@@ -3246,3 +3246,51 @@ def test_a_run_report_records_the_plan_and_survives_an_abort(
     assert (directory / "plan.png").exists()
     assert (directory / "progress.csv").exists()
     window._painter = None
+
+
+def test_merge_box_says_it_is_automatic_outside_exact_mode_and_keeps_the_choice(
+    window: MainWindow,
+) -> None:
+    from app.gui.main_window import MERGE_MODE_OPTIMIZER
+
+    # Balanced paint mode: the box is disabled and says why, rather than
+    # showing a greyed-out choice that reads as merging being off.
+    assert window.paint_mode_combo.currentData() == "balanced"
+    assert not window.merge_combo.isEnabled()
+    assert window.merge_combo.currentData() == MERGE_MODE_OPTIMIZER
+    assert "optimizer" in window.merge_combo.currentText()
+    # The user's real choice is what gets saved and planned with.
+    assert window._settings_document()["painting"]["stroke_merge_mode"] == "balanced"
+    assert window._current_overpaint_gap() == 6
+
+    window._set_combo_data(window.paint_mode_combo, "exact")
+    assert window.merge_combo.isEnabled()
+    assert window.merge_combo.currentData() == "balanced"
+    window._set_combo_data(window.merge_combo, "maximum")
+    assert window._settings_document()["painting"]["stroke_merge_mode"] == "maximum"
+    assert window._current_overpaint_gap() is None
+
+    # Leaving Exact hides the choice behind the caption and keeps it.
+    window._set_combo_data(window.paint_mode_combo, "fast")
+    assert window.merge_combo.currentData() == MERGE_MODE_OPTIMIZER
+    assert window._settings_document()["painting"]["stroke_merge_mode"] == "maximum"
+    window._set_combo_data(window.paint_mode_combo, "exact")
+    assert window.merge_combo.currentData() == "maximum"
+
+
+def test_time_estimate_prices_the_frame_hold_per_stroke(window: MainWindow) -> None:
+    """Fifty dabs are fifty held presses, whatever the speed slider says."""
+
+    from app.models import ColorGroup, PaintPlan, Stroke
+    from app.paint_timing import MIN_PRESS_SECONDS
+
+    strokes = tuple(Stroke(x, 0, x, 0) for x in range(0, 100, 2))
+    plan = PaintPlan(100, 1, (ColorGroup((0, 0, 0), strokes, len(strokes)),))
+
+    window.stroke_speed_spin.setValue(window.stroke_speed_spin.maximum())
+    fast = window._estimate_seconds(plan)
+    window.stroke_speed_spin.setValue(window.stroke_speed_spin.minimum())
+    slow = window._estimate_seconds(plan)
+    # Dabs do not move, so speed changes nothing; each still costs its hold.
+    assert fast == pytest.approx(slow)
+    assert fast >= plan.stroke_count * MIN_PRESS_SECONDS

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -28,7 +29,10 @@ from .models import PaintMode
 # who wants the stricter two-part guard.
 DEFAULT_EXPECTED_PROCESS_NAME = "RustClient.exe" if os.name == "nt" else ""
 
-SETTINGS_SCHEMA_VERSION = 1
+# 2: stroke merging defaults on.  Merging never changes the painted result,
+#    only how many strokes it takes, so a saved "off" from before that was
+#    understood is lifted to "balanced" once.
+SETTINGS_SCHEMA_VERSION = 2
 DEFAULT_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "data" / "settings.json"
 
 
@@ -191,6 +195,23 @@ def default_settings() -> dict[str, Any]:
     """Return an independent copy so callers cannot mutate global defaults."""
 
     return deepcopy(DEFAULT_SETTINGS)
+
+
+def _migrate(settings: dict[str, Any], stored_version: Any) -> None:
+    """Bring a settings document saved by an older schema up to date."""
+
+    try:
+        version = int(stored_version)
+    except (TypeError, ValueError):
+        version = 1
+    painting = settings.get("painting")
+    if version < 2 and isinstance(painting, dict):
+        if painting.get("stroke_merge_mode") == "off":
+            painting["stroke_merge_mode"] = "balanced"
+            logging.getLogger("rust_painter.settings").info(
+                "Stroke merging was off in the saved settings; it is now "
+                "balanced, which paints the same picture in fewer strokes"
+            )
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -578,6 +599,7 @@ class SettingsStore:
                 raw = dict(raw)
                 raw["schema_version"] = raw.pop("schemaVersion")
             result = _deep_merge(self.defaults, raw)
+            _migrate(result, raw.get("schema_version"))
             result["schema_version"] = SETTINGS_SCHEMA_VERSION
             _validate(result)
             return result

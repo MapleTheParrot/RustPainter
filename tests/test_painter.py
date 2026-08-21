@@ -1608,3 +1608,51 @@ def test_the_touch_up_pass_uses_the_cleared_sign_to_see_holes() -> None:
         touch_up,
         center,
     )
+
+
+def test_time_left_is_predicted_before_the_first_stroke_and_measured_after() -> None:
+    input_controller = MockInputController()
+    painter = Painter(input_controller)
+    painter.configure(_dot_plan(40), _profile(), _settings())
+    job = painter._job
+    assert job is not None
+    # A schedule priced from the painter's own timing rules, not "unknown".
+    initial = painter._initial_estimate(job)
+    assert initial is not None and initial > 0
+
+    assert painter.start()
+    assert painter.wait(_t(2.0))
+    assert painter.state is PainterState.COMPLETED
+    measured = painter.paint_phase_timing
+    assert measured is not None
+    assert measured.strokes == 40
+    assert measured.predicted_seconds > 0
+    assert measured.actual_seconds >= 0
+    assert painter.progress.percent == 100.0
+
+
+def test_a_later_pass_is_timed_against_its_own_clock() -> None:
+    """A touch-up re-enters the plan loop after the artwork; measured against
+    the whole run's elapsed, one repainted cell would claim hours left."""
+
+    painter = Painter(MockInputController())
+    painter.configure(_dot_plan(3), _profile(), _settings())
+    painter._started_at = time.monotonic() - 3600.0  # an hour of artwork
+
+    painter._set_progress(
+        color_index=1,
+        total_colors=1,
+        stroke_index_in_color=1,
+        strokes_in_color=100,
+        completed_strokes=1,
+        total_strokes=100,
+        completed_work=1.0,
+        total_work=100.0,
+        phase_elapsed=1.0,
+        message="Touching up",
+    )
+    remaining = painter.progress.estimated_remaining_seconds
+    assert remaining is not None
+    # Ninety-nine seconds of predicted work left, paced by one second done.
+    assert 90.0 < remaining < 110.0
+    assert painter.progress.elapsed_seconds >= 3600.0

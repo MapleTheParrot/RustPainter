@@ -32,6 +32,18 @@ from .color_mapping import map_rgb_to_picker
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect
+from .paint_timing import (
+    BRUSH_CALIBRATION_SECONDS,
+    DEFAULT_STROKE_OVERHEAD_SECONDS,
+    KEY_GAP_SECONDS,
+    KEY_HOLD_SECONDS,
+    MIN_PRESS_SECONDS,
+    PICKER_CLICK_HOLD_SECONDS,
+    PhaseTiming,
+    PlanWorkSchedule,
+    StrokeTiming,
+    remaining_seconds,
+)
 from .picker_calibration import trim_to_widget
 from .screen import (
     ForegroundRequirement,
@@ -393,6 +405,19 @@ class _Job:
     bare_canvas: Any = None
 
 
+def _describe_seconds(seconds: float) -> str:
+    """``45s``, ``12 min``, ``1 h 05 min`` - for log lines and status text."""
+
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return f"{int(round(seconds))}s"
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
 class _AbortRequested(Exception):
     pass
 
@@ -422,6 +447,7 @@ class Painter:
         foreground_checker: Callable[[ForegroundRequirement], bool] | None = None,
         virtual_screen_provider: Callable[[], VirtualScreen] | None = None,
         screen_capture: Callable[[RectangleLike], Any] | None = None,
+        stroke_overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS,
     ) -> None:
         self.input = input_controller
         self._on_progress = on_progress
@@ -458,6 +484,11 @@ class Painter:
         self._mouse_drift_started = 0.0
         self._measured_brush_size_model: BrushSizeModel | None = None
         self._last_progress_emit = 0.0
+        # Per-stroke overhead learned from earlier runs on this machine; the
+        # work schedule prices every stroke with it, so the first time-left
+        # shown is already this machine's, not a generic one.
+        self._stroke_overhead_seconds = stroke_overhead_seconds
+        self._paint_phase_timing: PhaseTiming | None = None
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -667,6 +698,7 @@ class Painter:
             self._last_corner_check = 0.0
             self._reset_mouse_movement_baseline()
             self._last_progress_emit = 0.0
+            self._paint_phase_timing = None
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -680,7 +712,7 @@ class Painter:
                 total_strokes,
                 0.0,
                 0.0,
-                None,
+                self._initial_estimate(self._job),
                 "Starting",
             )
             self._thread = threading.Thread(
@@ -1202,8 +1234,8 @@ class Painter:
     # and release inside one 67 ms frame can be sampled as nothing at all.  A
     # dropped digit with the field unfocused is a hotbar key, so every
     # keystroke is held across a frame boundary and separated from the next.
-    _KEY_HOLD_SECONDS = 0.03
-    _KEY_GAP_SECONDS = 0.02
+    _KEY_HOLD_SECONDS = KEY_HOLD_SECONDS
+    _KEY_GAP_SECONDS = KEY_GAP_SECONDS
 
     def _press_field_key(self, key: int | str, epoch: int) -> None:
         self._checkpoint(epoch=epoch, check_focus=True)
@@ -1692,21 +1724,78 @@ class Painter:
             measured[name] = trimmed
         return replace(target, **measured) if measured else target
 
+    def _stroke_timing(self, settings: PainterSettings) -> StrokeTiming:
+        return StrokeTiming.from_settings(
+            settings,
+            overhead_seconds=self._stroke_overhead_seconds,
+            real_input=bool(getattr(self.input, "emits_real_input", True)),
+        )
+
+    def _work_schedule(
+        self, plan: PaintPlan, target: PaintingTarget, settings: PainterSettings
+    ) -> PlanWorkSchedule:
+        cell_width = target.canvas.width / max(1, plan.width)
+        sizing = bool(
+            settings.apply_brush_size
+            and target.brush_size_box is not None
+            and target.brush_size_model is not None
+        )
+        return PlanWorkSchedule(
+            plan, self._stroke_timing(settings), cell_width, sizing=sizing
+        )
+
+    def _initial_estimate(self, job: _Job) -> float | None:
+        """Time left before a single stroke has gone down: the model's word.
+
+        Includes the brush measurement a sizing job runs first, so the figure
+        shown while the probes are painted is already the whole job's.
+        """
+
+        if job.mode != "paint":
+            return None
+        try:
+            total = self._work_schedule(job.plan, job.target, job.settings).total
+        except Exception:  # an estimate must never stop a job from starting
+            LOGGER.debug("Initial time estimate failed", exc_info=True)
+            return None
+        if (
+            job.settings.apply_brush_size
+            and getattr(self.input, "emits_real_input", True)
+            and job.target.brush_size_box is not None
+        ):
+            total += BRUSH_CALIBRATION_SECONDS
+        return total
+
+    @property
+    def paint_phase_timing(self) -> PhaseTiming | None:
+        """Predicted versus measured seconds for the artwork's own strokes.
+
+        Updated after every stroke of the main plan (touch-up passes are not
+        counted), so an aborted run still reports what it measured.  Callers
+        fold it into the learned per-stroke overhead for the next estimate.
+        """
+
+        with self._condition:
+            return self._paint_phase_timing
+
     def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
+        main_plan = plan is None
         plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
         completed = 0
         total = sum(len(group.strokes) for group in plan.color_groups)
         total_colors = len(plan.color_groups)
-        # Weight progress by stroke length plus a fixed per-stroke overhead so
-        # percent/ETA stay honest when merged strokes vary widely in length.
-        per_stroke_overhead = 4
-        total_work = sum(
-            stroke.pixel_count + per_stroke_overhead
-            for group in plan.color_groups
-            for stroke in group.strokes
-        )
-        completed_work = 0
+        # Progress advances in predicted seconds, priced from the same timing
+        # rules the strokes below execute with, so percent and time left move
+        # at the pace of the clock instead of racing through the big,
+        # long-stroke colors and crawling through the small ones.
+        schedule = self._work_schedule(plan, target, settings)
+        total_work = schedule.total
+        completed_work = 0.0
+        # Each plan gets its own clock.  A touch-up pass re-enters here after
+        # the artwork is done; timed against the whole run's elapsed it would
+        # claim hours left for a few minutes of repainting.
+        phase_started = self._active_elapsed()
         if total == 0:
             self._set_progress(
                 color_index=0,
@@ -1750,6 +1839,7 @@ class Painter:
         applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
         for color_index, group in enumerate(plan.color_groups, start=1):
+            completed_work += schedule.group_cost(color_index - 1)
             diameter = max(1, int(group.brush_diameter))
             extension = (
                 self._stroke_extension_pixels(
@@ -1792,7 +1882,15 @@ class Painter:
                         selected = None
                         continue
                 completed += 1
-                completed_work += stroke.pixel_count + per_stroke_overhead
+                completed_work += schedule.stroke_cost(color_index - 1, index_in_group - 1)
+                phase_elapsed = self._active_elapsed() - phase_started
+                if main_plan:
+                    with self._condition:
+                        self._paint_phase_timing = PhaseTiming(
+                            predicted_seconds=completed_work,
+                            actual_seconds=phase_elapsed,
+                            strokes=completed,
+                        )
                 self._set_progress(
                     color_index=color_index,
                     total_colors=total_colors,
@@ -1802,6 +1900,7 @@ class Painter:
                     total_strokes=total,
                     completed_work=completed_work,
                     total_work=total_work,
+                    phase_elapsed=phase_elapsed,
                     message="Painting",
                 )
                 self._interruptible_sleep(
@@ -1920,6 +2019,15 @@ class Painter:
                     covered,
                     "" if recolor else " (wrong-color cells are left alone)",
                 )
+                if verdict.discarded:
+                    LOGGER.warning(
+                        "Verification pass %d also read %d cells as the wrong "
+                        "color, scattered through colors that are otherwise "
+                        "right; the capture is not resolving cells at this "
+                        "size, so they are left alone and only holes are filled",
+                        pass_number,
+                        verdict.discarded,
+                    )
                 if wrong == 0:
                     if verdict.wrong_color:
                         message = "Verified: no holes left on the sign"
@@ -1937,18 +2045,24 @@ class Painter:
                         covered,
                     )
                     return
+                repaint = touch_up_plan(mismatch, indices, palette)
+                predicted = self._work_schedule(repaint, target, settings).total
                 LOGGER.info(
-                    "Verification pass %d: repainting %d of %d cells",
+                    "Verification pass %d: repainting %d of %d cells in %d "
+                    "strokes, about %s",
                     pass_number,
                     wrong,
                     covered,
+                    repaint.stroke_count,
+                    _describe_seconds(predicted),
                 )
                 self._update_progress_state(
                     PainterState.RUNNING,
-                    f"Touching up {wrong} cells (pass {pass_number})",
+                    f"Touching up {wrong:,} cells (pass {pass_number}, "
+                    f"about {_describe_seconds(predicted)})",
                     phase="verify",
                 )
-                self._execute_plan(job, plan=touch_up_plan(mismatch, indices, palette))
+                self._execute_plan(job, plan=repaint)
                 pass_number += 1
             except _RetryAction:
                 # A pause released the mouse mid-pass; redo this pass whole,
@@ -2116,7 +2230,7 @@ class Painter:
     # shorter than one 67 ms frame can be sampled as nothing.  Picker clicks are
     # rare (a handful per color change), so holding them across a frame costs
     # nothing next to a silently unchanged color.
-    _PICKER_CLICK_HOLD_SECONDS = 0.09
+    _PICKER_CLICK_HOLD_SECONDS = PICKER_CLICK_HOLD_SECONDS
 
     # Every stroke's press lasts at least this long, for the same 15 FPS
     # reason: a dab, or a drag so short it would otherwise be over in a few
@@ -2124,7 +2238,7 @@ class Painter:
     # all but the unluckiest alignment.  Slightly under a frame rather than
     # the picker's 90 ms because these strokes can number in the thousands.
     # Long drags spend more than this moving and are not held at all.
-    _MIN_PRESS_SECONDS = 0.07
+    _MIN_PRESS_SECONDS = MIN_PRESS_SECONDS
 
     @classmethod
     def _inset_into(
@@ -2402,18 +2516,27 @@ class Painter:
         strokes_in_color: int,
         completed_strokes: int,
         total_strokes: int,
-        completed_work: int | None = None,
-        total_work: int | None = None,
+        completed_work: float | None = None,
+        total_work: float | None = None,
+        phase_elapsed: float | None = None,
         message: str,
     ) -> None:
         elapsed = self._active_elapsed()
         if completed_work is None or not total_work:
-            completed_work = completed_strokes
-            total_work = total_strokes
-        percent = 100.0 if total_work == 0 else completed_work * 100.0 / total_work
+            completed_work = float(completed_strokes)
+            total_work = float(total_strokes)
+        percent = (
+            100.0
+            if total_work <= 0 or completed_strokes >= total_strokes
+            else min(100.0, completed_work * 100.0 / total_work)
+        )
         remaining = None
-        if 0 < completed_work < total_work:
-            remaining = elapsed / completed_work * (total_work - completed_work)
+        if completed_strokes < total_strokes:
+            remaining = remaining_seconds(
+                elapsed if phase_elapsed is None else phase_elapsed,
+                completed_work,
+                total_work,
+            )
         with self._condition:
             self._progress = PaintProgress(
                 self._state,

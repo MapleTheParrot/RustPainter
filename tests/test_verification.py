@@ -438,3 +438,81 @@ def test_cells_under_three_pixels_are_read_from_their_centre_pixel() -> None:
     assert tuple(sampled[0, 0]) == (255, 0, 0)
     assert tuple(sampled[0, 1]) == (0, 0, 255)
     assert tuple(sampled[1, 2]) == (255, 0, 0)
+
+
+def test_scattered_wrong_colors_at_scale_are_capture_noise_not_misses() -> None:
+    """Nothing in the painting loop miscolors one cell in four at random
+    through otherwise-right colors; a reading that says so is the capture
+    failing to resolve cells, and acting on it is a second painting."""
+
+    from app.verification import (
+        SCATTERED_WRONG_COLOR_MIN_CELLS,
+        classify_cells,
+    )
+
+    red, blue, green = (200, 30, 30), (30, 60, 200), (30, 180, 60)
+    palette = np.array([red, blue, green], dtype=np.uint8)
+    indices = np.zeros((60, 60), dtype=np.int32)
+    indices[20:40] = 1
+    indices[40:] = 2
+    sampled = _render(indices, palette, holes={(3, 3), (50, 7)})
+    # Every fourth cell of every color reads as one of the other colors.
+    rng = np.random.default_rng(7)
+    scattered = rng.random(indices.shape) < 0.25
+    others = {0: green, 1: red, 2: blue}
+    for index, color in others.items():
+        sampled[scattered & (indices == index)] = color
+    assert int(scattered.sum()) > SCATTERED_WRONG_COLOR_MIN_CELLS
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.wrong_color == 0
+    assert verdict.discarded == int(scattered.sum()) - int(scattered[3, 3]) - int(
+        scattered[50, 7]
+    )
+    # The holes are still filled.
+    assert verdict.count == 2
+    assert verdict.cells[3, 3] and verdict.cells[50, 7]
+
+
+def test_a_wrong_whole_color_is_kept_even_when_other_colors_are_noisy() -> None:
+    """A missed picker click paints a whole color wrong; that is repainted
+    whole even when the capture is also sprinkling noise through the rest."""
+
+    from app.verification import classify_cells
+
+    red, blue, green = (200, 30, 30), (30, 60, 200), (30, 180, 60)
+    palette = np.array([red, blue, green], dtype=np.uint8)
+    indices = np.zeros((60, 60), dtype=np.int32)
+    indices[20:40] = 1
+    indices[40:] = 2
+    sampled = _render(indices, palette)
+    sampled[indices == 0] = green  # all of red came out green
+    rng = np.random.default_rng(11)
+    noisy = (rng.random(indices.shape) < 0.3) & (indices > 0)
+    sampled[noisy & (indices == 1)] = red
+    sampled[noisy & (indices == 2)] = blue
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.wrong_color == int((indices == 0).sum())
+    assert np.array_equal(verdict.cells, indices == 0)
+    assert verdict.discarded == int(noisy.sum())
+
+
+def test_a_few_scattered_wrong_cells_are_still_repainted() -> None:
+    """A stroke the game placed a cell off leaves a handful of wrong cells in
+    a right color; below the floor they are cheap to fix and are fixed."""
+
+    from app.verification import classify_cells
+
+    red, blue = (200, 30, 30), (30, 60, 200)
+    palette = np.array([red, blue], dtype=np.uint8)
+    indices = np.zeros((40, 40), dtype=np.int32)
+    indices[20:] = 1
+    sampled = _render(indices, palette)
+    for x in range(8):
+        sampled[19, x] = blue
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.wrong_color == 8
+    assert verdict.discarded == 0
+    assert verdict.count == 8

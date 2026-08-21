@@ -363,7 +363,9 @@ Exclusive fullscreen applications can prevent overlays, screenshots, focus check
 Rust brush behavior can vary with sign type, selected in-game brush, frame rate, and UI scale. These controls are grouped under **Settings → Painting** so the main workspace stays focused:
 
 - Painting speed preset (Relaxed / Standard / Fast / Turbo); editing any timing value switches it to Custom
-- Stroke merging (Off / Balanced / Maximum) under Paint Quality
+- Stroke merging (Off / Balanced / Maximum) under Paint Quality - only used by
+  Exact paint mode; the other modes merge through the optimizer and the box
+  says so
 - Automatic brush sizing, which types the Size number a logical cell needs (optional; needs the Size value box and the clear button calibrated)
 - Logical pixel spacing
 - Stroke duration/speed and interpolation step
@@ -373,7 +375,30 @@ Rust brush behavior can vary with sign type, selected in-game brush, frame rate,
 
 Start with a low-resolution 8-color test. If adjacent rows bleed together, reduce the in-game brush size, increase logical spacing, or lower the logical resolution. If strokes have gaps, slow the stroke or reduce the interpolation step. Faster speed presets assume the game keeps up with rapid input; if paint goes missing, step back down to Standard.
 
-**Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is almost always the fastest choice; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. The paint-plan panel reports how many strokes merging removed.
+**Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is the default; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. *Off* exists for comparing against exact strokes and is never faster. The paint-plan panel reports how many strokes merging removed. Only **Exact** paint mode reads this setting - Quality, Balanced and Fast merge automatically as part of the optimizer, and the box shows *Automatic* while one of them is selected.
+
+### How long it will take
+
+A stroke costs the same whether it paints one cell or thirty. Every press is
+held for at least a frame of Rust's 15 FPS paint UI (see below), and at any
+usable speed setting nearly every stroke is shorter than that hold, so a run
+is essentially *strokes × about 85 ms* plus a color change per color. The
+estimate in the plan panel is priced from exactly the rules the painter
+executes with - the frame hold per stroke, the held picker clicks per color
+change, the retyped Size field per brush change, the countdown and the brush
+measurement before the first stroke - and the one machine-dependent term, the
+overhead of input calls and timer slack per stroke, is learned from every run
+and kept in `timing.json` next to the settings. On the two runs used to check
+it the estimate landed within 4% of the clock. The speed slider barely moves
+it, because it barely moves the run: the way to paint faster is fewer
+strokes - fewer colors, a lower resolution, or an optimizing paint mode.
+
+While painting, the time left is the same prediction corrected by the pace
+measured so far, with progress advancing in predicted seconds rather than in
+cells - so the bar no longer races through the big, long-stroke colors and
+then crawls through the small ones. A touch-up pass is timed against its own
+clock, and its status line says how long it is expected to take before it
+starts.
 
 Automatic brush sizing works with a solid square or circle. Spray/noise
 brushes do not have a stable footprint and must be sized manually.
@@ -465,6 +490,17 @@ brush, or under two screen pixels across - the touch-up fills holes only. A
 cell that reads as the wrong color there is as likely a neighbour's paint as a
 mistake, and "correcting" it with a brush wider than the cell would smear the
 neighbours it was read from.
+
+Wrong-color verdicts are also held to the shapes painting actually fails in.
+A picker click that misses paints a *whole color* wrong, and a color read as
+mostly wrong is repainted whole. Wrong cells sprinkled a few per color through
+colors that are otherwise right are something else: nothing in the painting
+loop miscolors one cell in five at random, so once they cover more than 5% of
+the sign (and at least 500 cells) they are taken as the capture failing to
+resolve cells and are left alone, with a warning in the log. Before this rule
+a 512-wide sign read at two screen pixels per cell sent 21% of its cells back
+for "recoloring" - 35,000 strokes and most of an hour to repaint a sign that
+was already right.
 
 ## Timelapse
 
@@ -642,7 +678,8 @@ app/
   brush_calibration.py probe-stroke measurement of Rust's Size numbers
   color_calibration.py painted-chart response fitting
   coordinates.py       logical/screen coordinate conversion
-  paint_plan.py        horizontal-run planning and estimates
+  paint_plan.py        horizontal-run planning
+  paint_timing.py      what a plan costs in seconds, learned per machine
   paint_optimizer.py   artist-style optimized planning (modes, brushes)
   input_controller.py  SendInput and dry-run input
   hotkeys.py           Windows global hotkeys

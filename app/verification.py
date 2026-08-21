@@ -74,6 +74,26 @@ BARE_REFERENCE_MIN_CELLS = 16
 # and only holes are repaired.
 RECOLOR_MIN_CELL_PIXELS = 2.0
 
+# Painting goes wrong in two shapes.  A stroke the game dropped is a hole.  A
+# picker click that missed paints *every* cell of that color alike, so a
+# color is either almost entirely right or almost entirely wrong: a color
+# with at least this fraction of its cells read as wrong is taken to have
+# been painted wrong, and all of it is repainted.
+WRONG_COLOR_GROUP_FRACTION = 0.5
+
+# Wrong-color verdicts that are neither - sprinkled a few per color through
+# many colors - are the capture failing to resolve cells, not the painter
+# failing to paint them; nothing in the painting loop miscolors one cell in
+# five at random.  Past this fraction of the sign they are set aside, and
+# the pass fills holes only.  Left in, a 512-wide sign read at two screen
+# pixels per cell turned into a second painting's worth of strokes.
+SCATTERED_WRONG_COLOR_FRACTION = 0.05
+
+# ...unless there are few enough that repainting them is cheap anyway: below
+# this many cells a touch-up is under a minute, and a stroke the game placed
+# a cell off really does leave a few wrong cells in otherwise right colors.
+SCATTERED_WRONG_COLOR_MIN_CELLS = 500
+
 
 @dataclass(frozen=True, slots=True)
 class Mismatch:
@@ -83,6 +103,9 @@ class Mismatch:
     blank: int
     wrong_color: int
     unexplained: int
+    # Wrong-color verdicts set aside as implausible (see
+    # SCATTERED_WRONG_COLOR_FRACTION); not counted in ``wrong_color``.
+    discarded: int = 0
 
     @property
     def count(self) -> int:
@@ -396,13 +419,45 @@ def classify_cells(
     )
 
     wrong = wrong & ~blank & ~unexplained
+    wrong, discarded = _plausible_wrong_color(wrong, indices, covered, len(palette))
     cells = blank | unexplained | (wrong if recolor else np.zeros_like(wrong))
     return Mismatch(
         cells=cells,
         blank=int(blank.sum()),
         wrong_color=int(wrong.sum()),
         unexplained=int(unexplained.sum()),
+        discarded=discarded,
     )
+
+
+def _plausible_wrong_color(
+    wrong: np.ndarray, indices: np.ndarray, covered: np.ndarray, colors: int
+) -> tuple[np.ndarray, int]:
+    """Keep wrong-color verdicts that describe how painting actually fails.
+
+    Colors read as mostly wrong were painted wrong and are kept whole.  The
+    rest are scattered single cells; a few are tolerated, but once they cover
+    more of the sign than :data:`SCATTERED_WRONG_COLOR_FRACTION` the capture
+    is not resolving cells and they are all set aside.
+    """
+
+    total_wrong = int(wrong.sum())
+    if total_wrong == 0 or colors == 0:
+        return wrong, 0
+    flat_indices = indices[covered]
+    per_color_cells = np.bincount(flat_indices, minlength=colors)
+    per_color_wrong = np.bincount(flat_indices, weights=wrong[covered], minlength=colors)
+    whole = per_color_wrong >= WRONG_COLOR_GROUP_FRACTION * np.maximum(per_color_cells, 1)
+    concentrated = wrong & whole[np.where(covered, indices, 0)] & covered
+    scattered = wrong & ~concentrated
+    scattered_count = int(scattered.sum())
+    allowed = max(
+        SCATTERED_WRONG_COLOR_MIN_CELLS,
+        SCATTERED_WRONG_COLOR_FRACTION * int(covered.sum()),
+    )
+    if scattered_count <= allowed:
+        return wrong, 0
+    return concentrated, scattered_count
 
 
 def mismatched_cells(
@@ -486,9 +541,12 @@ __all__ = [
     "Mismatch",
     "OBSERVED_COLOR_TRUST_DELTA_E",
     "RECOLOR_MIN_CELL_PIXELS",
+    "SCATTERED_WRONG_COLOR_FRACTION",
+    "SCATTERED_WRONG_COLOR_MIN_CELLS",
     "SPREAD_MULTIPLIER",
     "UNEXPLAINED_DELTA_E",
     "UNRELIABLE_CAPTURE_FRACTION",
+    "WRONG_COLOR_GROUP_FRACTION",
     "apply_capture_lighting",
     "bare_reference_lab",
     "classify_cells",
