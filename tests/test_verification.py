@@ -190,6 +190,9 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
         corner_abort_enabled=False,
         progress_callback_interval_seconds=0.0,
         safety_poll_interval_seconds=0.002,
+        # The capture stub never changes, so a second pass would repaint the
+        # same three cells again; one pass is what this test is counting.
+        verify_passes=1,
     )
 
     assert painter.start(plan, profile, settings)
@@ -236,12 +239,18 @@ def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:
     captured[..., 0] += truth[..., 2] * 0.35
     captured[..., 2] -= truth[..., 1] * 0.2
 
+    from app.verification import classify_cells
+
     raw_wrong = mismatched_cells(captured, indices, palette).sum()
     corrected = normalize_capture_lighting(captured, indices, palette)
     fixed_wrong = mismatched_cells(corrected, indices, palette).sum()
 
     assert raw_wrong > indices.size * 0.3  # the shift really broke classification
-    assert fixed_wrong == 0
+    # Four colors pin down a per-channel response, which takes most of the
+    # damage out of the plain comparison; the painting path, which also
+    # reads each color's rendering off the sign, sees nothing wrong at all.
+    assert fixed_wrong < raw_wrong * 0.25
+    assert classify_cells(captured, indices, palette).count == 0
 
 
 def test_lighting_normalization_cannot_hide_genuinely_wrong_cells() -> None:
@@ -262,8 +271,9 @@ def test_lighting_normalization_cannot_hide_genuinely_wrong_cells() -> None:
     swapped = palette[(indices + 2) % len(palette)].astype(np.float32)
     captured[wrong_block] = swapped[wrong_block] * 0.55 + np.array([60.0, 45.0, 40.0])
 
-    corrected = normalize_capture_lighting(captured, indices, palette)
-    mismatch = mismatched_cells(corrected, indices, palette)
+    from app.verification import classify_cells
+
+    mismatch = classify_cells(captured, indices, palette).cells
 
     inside = mismatch[wrong_block].mean()
     outside = mismatch[~wrong_block].mean()
@@ -281,3 +291,150 @@ def test_lighting_normalization_leaves_tiny_captures_untouched() -> None:
     corrected = normalize_capture_lighting(sampled, indices, palette)
 
     assert np.array_equal(corrected, sampled)
+
+
+# --- classify_cells: holes, twins, and what can safely be recolored ---------
+
+WOOD = (186, 172, 156)  # the bare sign, as captured on a real run
+DARK = (40, 40, 40)
+NAVY = (30, 60, 200)
+
+
+def _indices(rows: int, cols: int, *, uncovered_rows: int = 0) -> np.ndarray:
+    indices = np.zeros((rows, cols), dtype=np.int32)
+    indices[: rows // 2] = 0
+    indices[rows // 2 :] = 1
+    if uncovered_rows:
+        indices[:uncovered_rows] = -1
+    return indices
+
+
+def _render(indices: np.ndarray, palette: np.ndarray, *, holes=(), uncovered=WOOD) -> np.ndarray:
+    """Per-cell RGB samples of a sign painted exactly to plan, bar the holes."""
+
+    sampled = np.zeros((*indices.shape, 3), dtype=np.float32)
+    for index, color in enumerate(palette):
+        sampled[indices == index] = color
+    sampled[indices < 0] = uncovered
+    for y, x in holes:
+        sampled[y, x] = WOOD
+    return sampled
+
+
+def test_a_hole_is_found_against_the_bare_sign_the_plan_left_unpainted() -> None:
+    """Bare wood under a dark cell is nearer that cell's own color than any
+    other palette entry, so the old two-way comparison never flagged it."""
+
+    from app.verification import classify_cells
+
+    palette = np.array([DARK, NAVY], dtype=np.uint8)
+    indices = _indices(20, 30, uncovered_rows=4)
+    holes = {(6, 3), (6, 4), (6, 5), (15, 20)}
+    sampled = _render(indices, palette, holes=holes)
+
+    # The old two-way comparison: bare wood under a dark cell is nearer dark
+    # than navy, so the holes in the dark half were invisible to it.
+    old = mismatched_cells(sampled, indices, palette)
+    assert not old[6].any()
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.blank == len(holes)
+    assert verdict.wrong_color == 0
+    assert {tuple(cell) for cell in np.argwhere(verdict.cells)} == holes
+
+
+def test_a_hole_is_found_against_the_capture_of_the_cleared_sign() -> None:
+    from app.verification import classify_cells
+
+    palette = np.array([DARK, NAVY], dtype=np.uint8)
+    indices = _indices(20, 30)  # the plan covers the whole sign
+    holes = {(2, 7), (2, 8), (17, 1)}
+    sampled = _render(indices, palette, holes=holes)
+    # The cleared sign was captured under different lighting.
+    bare = np.full((*indices.shape, 3), WOOD, dtype=np.float32) * 0.8
+
+    verdict = classify_cells(sampled, indices, palette, bare_sampled=bare)
+    assert {tuple(cell) for cell in np.argwhere(verdict.cells)} == holes
+    assert verdict.blank == len(holes)
+
+
+def test_a_hole_with_no_bare_reference_is_still_repainted_as_unexplained() -> None:
+    from app.verification import classify_cells
+
+    palette = np.array([DARK, NAVY], dtype=np.uint8)
+    indices = _indices(20, 30)
+    holes = {(3, 3), (12, 12)}
+    sampled = _render(indices, palette, holes=holes)
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.blank == 0
+    assert verdict.unexplained == len(holes)
+    assert {tuple(cell) for cell in np.argwhere(verdict.cells)} == holes
+
+
+def test_twin_colors_the_sign_renders_alike_are_never_confused() -> None:
+    """The real false alarms: (234,234,234) beside (223,213,209), both coming
+    back as one warm off-white, and a quarter of the sign 'repainted'."""
+
+    from app.verification import classify_cells
+
+    palette = np.array([(234, 234, 234), (223, 213, 209)], dtype=np.uint8)
+    rng = np.random.default_rng(3)
+    indices = rng.integers(0, 2, (30, 40)).astype(np.int32)
+    # The material renders both as the same color, give or take grain.
+    sampled = np.full((*indices.shape, 3), (226, 220, 214), dtype=np.float32)
+    sampled += rng.normal(0.0, 1.5, sampled.shape).astype(np.float32)
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.count == 0
+
+
+def test_a_whole_group_painted_the_wrong_color_is_still_caught() -> None:
+    """Reading each color's rendering off the sign must not let a missed
+    picker click declare itself correct."""
+
+    from app.verification import classify_cells
+
+    red, blue, green = (200, 30, 30), (30, 60, 200), (30, 180, 60)
+    palette = np.array([red, blue, green], dtype=np.uint8)
+    indices = np.zeros((12, 12), dtype=np.int32)
+    indices[4:8] = 1
+    indices[8:] = 2
+    sampled = _render(indices, palette)
+    sampled[indices == 0] = green  # every red cell came out green
+
+    verdict = classify_cells(sampled, indices, palette)
+    assert verdict.wrong_color == int((indices == 0).sum())
+    assert np.array_equal(verdict.cells, indices == 0)
+
+
+def test_holes_only_mode_leaves_wrong_colors_alone() -> None:
+    """A brush wider than a cell cannot recolor one cell without smearing
+    its neighbours, so a plan that fine only gets its holes filled."""
+
+    from app.verification import classify_cells
+
+    red, blue, green = (200, 30, 30), (30, 60, 200), (30, 180, 60)
+    palette = np.array([red, blue, green], dtype=np.uint8)
+    indices = np.zeros((12, 12), dtype=np.int32)
+    indices[4:8] = 1
+    indices[8:] = 2
+    sampled = _render(indices, palette, holes={(5, 5)})
+    sampled[0, :] = green  # one row of red came out green
+
+    verdict = classify_cells(sampled, indices, palette, recolor=False)
+    assert verdict.wrong_color == 12
+    assert verdict.blank + verdict.unexplained == 1
+    assert {tuple(cell) for cell in np.argwhere(verdict.cells)} == {(5, 5)}
+
+
+def test_cells_under_three_pixels_are_read_from_their_centre_pixel() -> None:
+    """A 3x3 median over two-pixel cells reads the neighbours, not the cell."""
+
+    capture = np.zeros((4, 8, 3), dtype=np.float32)
+    capture[:, 0::4] = capture[:, 1::4] = (255, 0, 0)
+    capture[:, 2::4] = capture[:, 3::4] = (0, 0, 255)
+    sampled = sample_cell_colors(capture, 4, 2)
+    assert sampled.shape == (2, 4, 3)
+    assert tuple(sampled[0, 0]) == (255, 0, 0)
+    assert tuple(sampled[0, 1]) == (0, 0, 255)
+    assert tuple(sampled[1, 2]) == (255, 0, 0)

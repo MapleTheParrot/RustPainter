@@ -205,7 +205,7 @@ class PainterSettings:
     apply_brush_size: bool = False
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
-    verify_passes: int = 1
+    verify_passes: int = 2
     brush_direction: str = "low_to_high"
     delay_after_brush_seconds: float = 0.06
     countdown_seconds: float = 3.0
@@ -307,7 +307,7 @@ class PainterSettings:
             logical_pixel_spacing=float(pick(painting, "logical_pixel_spacing", 1.0)),
             brush_size=float(pick(painting, "brush_size", 1.0)),
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
-            verify_passes=int(pick(painting, "verify_passes", 1)),
+            verify_passes=int(pick(painting, "verify_passes", 2)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.06)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
@@ -386,6 +386,11 @@ class _Job:
     # probes around the brush the plan will really ask for.  A paint job fills
     # this in from its own plan; a measurement-only job is told.
     cell_fraction: float | None = None
+    # The sign as captured right after it was cleared, before any artwork
+    # went down.  Verification reads the bare sign's color from it, so a
+    # stroke the game dropped is recognised as a hole rather than only when
+    # the wood happens to resemble some other palette entry.
+    bare_canvas: Any = None
 
 
 class _AbortRequested(Exception):
@@ -862,30 +867,12 @@ class Painter:
         blank rather than halfway through covering it.
         """
 
-        canvas = target.canvas
         diameters = {max(1, int(group.brush_diameter)) for group in plan.color_groups}
         for diameter in sorted(diameters):
             size = self._brush_plan_size(
                 target, plan, diameter, settings.logical_pixel_spacing, model
             )
-            # Painted extent and required extent per axis, in that axis's own
-            # screen pixels.  Without a horizontal measurement the vertical
-            # footprint stands in for both axes - the square-in-screen-pixels
-            # assumption sizing itself falls back to.
-            painted_y = model.fraction_for_size(size) * canvas.height
-            checks = [("rows", painted_y, canvas.height / plan.height * diameter)]
-            if model.has_horizontal_model:
-                checks.append(
-                    (
-                        "columns",
-                        model.fraction_x_for_size(size) * canvas.width,
-                        canvas.width / plan.width * diameter,
-                    )
-                )
-            else:
-                checks.append(
-                    ("columns", painted_y, canvas.width / plan.width * diameter)
-                )
+            checks = self._brush_footprint_checks(target, plan, diameter, size, model)
             smallest, largest = model.fitted_range
             if size * 2 < smallest or size > largest * 2:
                 LOGGER.warning(
@@ -1340,6 +1327,53 @@ class Painter:
         # plan cannot be painted on is refused before any artwork goes down.
         self._validate_brush_reach(job.plan, job.target, settings, model)
 
+    @staticmethod
+    def _brush_footprint_checks(
+        target: PaintingTarget,
+        plan: PaintPlan,
+        diameter: int,
+        size: float,
+        model: BrushSizeModel,
+    ) -> list[tuple[str, float, float]]:
+        """Painted and required extent per axis, in that axis's screen pixels.
+
+        Without a horizontal measurement the vertical footprint stands in for
+        both axes - the square-in-screen-pixels assumption sizing itself
+        falls back to.
+        """
+
+        canvas = target.canvas
+        painted_y = model.fraction_for_size(size) * canvas.height
+        checks = [("rows", painted_y, canvas.height / plan.height * diameter)]
+        if model.has_horizontal_model:
+            checks.append(
+                (
+                    "columns",
+                    model.fraction_x_for_size(size) * canvas.width,
+                    canvas.width / plan.width * diameter,
+                )
+            )
+        else:
+            checks.append(("columns", painted_y, canvas.width / plan.width * diameter))
+        return checks
+
+    def _detail_brush_overshoot(self, job: _Job) -> float:
+        """How many logical cells the one-cell brush really covers, at worst.
+
+        1.0 is a brush that fits its cell; anything above spills onto the
+        neighbours.  Without a measured model the brush is whatever the user
+        set in Rust, and is assumed to fit.
+        """
+
+        model = job.target.brush_size_model
+        if model is None or not job.settings.apply_brush_size:
+            return 1.0
+        size = self._brush_plan_size(
+            job.target, job.plan, 1, job.settings.logical_pixel_spacing, model
+        )
+        checks = self._brush_footprint_checks(job.target, job.plan, 1, size, model)
+        return max(painted / nominal for _, painted, nominal in checks)
+
     # How many times a paused-out measurement is restarted before the job gives
     # up. Pausing during the opening strokes is easy to do by accident once;
     # doing it three times running is somebody who wants the job stopped.
@@ -1401,6 +1435,7 @@ class Painter:
             )
         else:
             LOGGER.info("Cleared the sign after measuring the brush")
+        job.bare_canvas = after
 
     def _canvas_changed(self, before: Any, after: Any) -> bool:
         """Whether two captures of the sign differ by more than capture noise."""
@@ -1787,9 +1822,9 @@ class Painter:
         import numpy as np
 
         from .verification import (
-            normalize_capture_lighting,
+            RECOLOR_MIN_CELL_PIXELS,
             UNRELIABLE_CAPTURE_FRACTION,
-            mismatched_cells,
+            classify_cells,
             plan_expectations,
             sample_cell_colors,
             touch_up_plan,
@@ -1812,6 +1847,37 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
+        # Recoloring a single cell needs a brush that fits the cell and a
+        # capture that can tell the cell from its neighbours.  A plan finer
+        # than either still gets its holes filled - a hole is a stroke's
+        # worth of bare sign, which both can see - but a cell read as the
+        # wrong color there is as likely a neighbour's paint as a mistake,
+        # and "correcting" it with a brush wider than the cell would smear
+        # the neighbours it was read from.
+        cell_pixels = min(canvas.width / plan.width, canvas.height / plan.height)
+        overshoot = self._detail_brush_overshoot(job)
+        recolor = (
+            cell_pixels >= RECOLOR_MIN_CELL_PIXELS
+            and overshoot <= self._DETAIL_OVERSHOOT_LIMIT
+        )
+        if not recolor:
+            LOGGER.info(
+                "Verification will fill holes only: cells are %.2f px across and "
+                "the smallest brush covers %.1f cells, too fine to recolor "
+                "single cells without smearing their neighbours",
+                cell_pixels,
+                overshoot,
+            )
+        bare_sampled = None
+        if job.bare_canvas is not None:
+            try:
+                bare_sampled = sample_cell_colors(
+                    np.asarray(job.bare_canvas.convert("RGB"), dtype=np.float32),
+                    plan.width,
+                    plan.height,
+                )
+            except Exception:
+                LOGGER.exception("The bare-sign capture could not be sampled")
         # Parked over the color box, the cursor cannot shadow the capture.
         park = (
             int(round(target.color_box.left + target.color_box.width / 2.0)),
@@ -1835,20 +1901,32 @@ class Painter:
                     plan.width,
                     plan.height,
                 )
-                # The lit sign compresses and tints every color it shows, so
-                # the comparison first removes the one global transform the
-                # material applies - otherwise a perfectly painted dark image
-                # reads as mostly wrong and verification gives up.
-                sampled = normalize_capture_lighting(sampled, indices, palette)
-                mismatch = mismatched_cells(sampled, indices, palette)
-                wrong = int(mismatch.sum())
+                verdict = classify_cells(
+                    sampled,
+                    indices,
+                    palette,
+                    bare_sampled=bare_sampled,
+                    recolor=recolor,
+                )
+                mismatch = verdict.cells
+                wrong = verdict.count
+                LOGGER.info(
+                    "Verification pass %d read %d blank, %d unexplained and %d "
+                    "wrong-color cells of %d%s",
+                    pass_number,
+                    verdict.blank,
+                    verdict.unexplained,
+                    verdict.wrong_color,
+                    covered,
+                    "" if recolor else " (wrong-color cells are left alone)",
+                )
                 if wrong == 0:
-                    LOGGER.info(
-                        "Verification pass %d: the sign matches the plan", pass_number
-                    )
-                    self._update_progress_state(
-                        PainterState.RUNNING, "Verified: the sign matches the plan"
-                    )
+                    if verdict.wrong_color:
+                        message = "Verified: no holes left on the sign"
+                    else:
+                        message = "Verified: the sign matches the plan"
+                    LOGGER.info("Verification pass %d: %s", pass_number, message)
+                    self._update_progress_state(PainterState.RUNNING, message)
                     return
                 if wrong > covered * UNRELIABLE_CAPTURE_FRACTION:
                     LOGGER.warning(
@@ -1966,18 +2044,19 @@ class Painter:
         self._move(start_int, epoch)
         self._checkpoint(epoch=epoch, check_focus=True)
         self._mouse_down(epoch)
+        pressed_at = time.monotonic()
         try:
             distance = math.hypot(end_int[0] - start_int[0], end_int[1] - start_int[1])
             if distance == 0:
-                # A drag spends whole frames moving, but a dab is one press and
-                # release - inside a single 67 ms frame of Rust's 15 FPS paint
-                # UI it can be sampled as nothing at all, exactly like the
-                # picker clicks held for the same reason.  A silently dropped
-                # dab is a missing cell the verification pass then has to buy
-                # back with a whole extra capture-and-repaint round.
+                # A dab is one press and release - inside a single 67 ms frame
+                # of Rust's 15 FPS paint UI it can be sampled as nothing at
+                # all, exactly like the picker clicks held for the same reason.
+                # A silently dropped dab is a missing cell the verification
+                # pass then has to buy back with a whole extra
+                # capture-and-repaint round.
                 hold = settings.mouse_down_duration_seconds
                 if self.input.emits_real_input:
-                    hold = max(hold, self._DAB_HOLD_SECONDS)
+                    hold = max(hold, self._MIN_PRESS_SECONDS)
                 self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
                 return
             steps = max(1, int(math.ceil(distance / settings.stroke_interpolation_step_pixels)))
@@ -1992,6 +2071,23 @@ class Painter:
                 )
                 self._move(point, epoch)
                 self._interruptible_sleep(delay, epoch=epoch, check_focus=True)
+            # A short drag is a dab that moved.  At a fine painting resolution
+            # a run of a few cells is only a few screen pixels, so the whole
+            # press - down, one or two moves, up - is over in under 10 ms and
+            # can fall inside one frame just as a dab can.  The game then
+            # keeps at most the press position and the rest of the run stays
+            # bare; read back from a real sign, every hole was a run of 2-8
+            # cells missing from the middle of a stroke while dabs, protected
+            # by their hold, were fine.  Keeping the button down at the end
+            # until the press has lasted a frame gives the game a frame in
+            # which it sees the cursor held at the far end of the run, and
+            # costs nothing on the long strokes that already spend frames
+            # moving.  The hold is measured from the press rather than summed
+            # from the nominal delays so the scheduler's own slack counts.
+            if self.input.emits_real_input:
+                remaining = self._MIN_PRESS_SECONDS - (time.monotonic() - pressed_at)
+                if remaining > 0:
+                    self._interruptible_sleep(remaining, epoch=epoch, check_focus=True)
         finally:
             self.input.mouse_up(MouseButton.LEFT)
 
@@ -2022,11 +2118,13 @@ class Painter:
     # nothing next to a silently unchanged color.
     _PICKER_CLICK_HOLD_SECONDS = 0.09
 
-    # Single-cell dabs are held at least this long for the same 15 FPS reason.
-    # Slightly under a frame rather than the picker's 90 ms because dabs can
-    # number in the thousands, and a press this long straddles a frame boundary
-    # in all but the unluckiest alignment.
-    _DAB_HOLD_SECONDS = 0.07
+    # Every stroke's press lasts at least this long, for the same 15 FPS
+    # reason: a dab, or a drag so short it would otherwise be over in a few
+    # milliseconds, is held until the press has straddled a frame boundary in
+    # all but the unluckiest alignment.  Slightly under a frame rather than
+    # the picker's 90 ms because these strokes can number in the thousands.
+    # Long drags spend more than this moving and are not held at all.
+    _MIN_PRESS_SECONDS = 0.07
 
     @classmethod
     def _inset_into(

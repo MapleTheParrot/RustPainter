@@ -1138,6 +1138,26 @@ class MainWindow(QMainWindow):
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
         layout.addWidget(advanced)
 
+        touch_up = QGroupBox("Touch-up")
+        touch_up_form = QFormLayout(touch_up)
+        self.verify_passes_spin = self._int_spin(0, 5, 2, "")
+        self.verify_passes_spin.setToolTip(
+            "After the artwork is down, the sign is captured and compared with\n"
+            "the plan, and cells that stayed bare or took the wrong color are\n"
+            "repainted.  Each pass is one capture and repaint; the next pass\n"
+            "checks the previous one, since the game can drop a touch-up\n"
+            "stroke exactly as it dropped the original.  0 turns it off."
+        )
+        touch_up_form.addRow("Passes", self.verify_passes_spin)
+        touch_up_note = QLabel(
+            "Two passes catch a stroke the game dropped and the repaint of it. "
+            "On a plan finer than Rust's smallest brush, only holes are filled."
+        )
+        touch_up_note.setWordWrap(True)
+        touch_up_note.setObjectName("muted")
+        touch_up_form.addRow("", touch_up_note)
+        layout.addWidget(touch_up)
+
         layout.addStretch(1)
         return content
 
@@ -4031,11 +4051,7 @@ class MainWindow(QMainWindow):
         # Verification repaints however many cells the capture disputes, which
         # cannot be known before the sign exists - so the estimate names the
         # extra pass instead of quietly overrunning it.
-        verify_note = (
-            " + touch-up"
-            if int(self._settings.get("painting", {}).get("verify_passes", 1)) > 0
-            else ""
-        )
+        verify_note = " + touch-up" if self.verify_passes_spin.value() > 0 else ""
         self.analysis_time.value_label.setText(  # type: ignore[attr-defined]
             f"{self._format_duration(seconds)}{verify_note}"
         )
@@ -4271,6 +4287,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.apply_brush_check,
+            self.verify_passes_spin,
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,
@@ -4481,6 +4498,7 @@ class MainWindow(QMainWindow):
                 float(painting.get("stroke_interpolation_step_pixels", 4.0))
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
+            self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
             timelapse = settings.get("timelapse", {})
             self.timelapse_check.setChecked(bool(timelapse.get("enabled", False)))
             self.timelapse_interval_spin.setValue(
@@ -4606,6 +4624,7 @@ class MainWindow(QMainWindow):
             "apply_brush_size": self.apply_brush_check.isChecked(),
             "brush_direction": "low_to_high",
             "stroke_merge_mode": str(self.merge_combo.currentData() or "balanced"),
+            "verify_passes": int(self.verify_passes_spin.value()),
         }
         current["timelapse"] = {
             **current.get("timelapse", {}),
@@ -5826,6 +5845,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.apply_brush_check,
+            self.verify_passes_spin,
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,

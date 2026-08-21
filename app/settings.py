@@ -133,9 +133,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "delay_between_colors_seconds": 0.12,
         "stroke_interpolation_step_pixels": 4.0,
         "stroke_merge_mode": "balanced",
-        # After painting, capture the canvas and repaint cells whose color
-        # does not match the plan - up to this many correction passes.
-        "verify_passes": 1,
+        # After painting, capture the canvas and repaint cells that stayed
+        # bare or took the wrong color - up to this many passes.  Two by
+        # default: the touch-up strokes are short and can be dropped by the
+        # game exactly as the originals were, and a second capture is what
+        # catches that.
+        "verify_passes": 2,
     },
     "timelapse": {
         # Capture the calibrated canvas region while painting, one PNG frame
@@ -437,7 +440,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError(
             "painting.stroke_merge_mode must be off, balanced, or maximum"
         )
-    verify_passes = painting.get("verify_passes", 1)
+    verify_passes = painting.get("verify_passes", 2)
     if (
         isinstance(verify_passes, bool)
         or not isinstance(verify_passes, int)

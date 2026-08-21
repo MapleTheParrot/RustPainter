@@ -1425,3 +1425,186 @@ def test_measured_rendering_bias_shifts_artwork_strokes_the_other_way() -> None:
     # Cell (0, 0) of a 64x32 plan on this canvas centers at (105, 105); the
     # measured bias pulls the command to (100, 103).
     assert dabs == [(100, 103)]
+
+
+class _TimedInput(MockInputController):
+    """A real-input mock that timestamps every press and release."""
+
+    emits_real_input = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # (pressed, last move while pressed, released) per press
+        self.presses: list[tuple[float, float, float]] = []
+        self._pressed_at: float | None = None
+        self._moved_at: float | None = None
+
+    def move_mouse(self, x: float, y: float) -> None:
+        super().move_mouse(x, y)
+        self._moved_at = time.monotonic()
+
+    def mouse_down(self, button="left") -> None:  # type: ignore[override]
+        super().mouse_down(button)
+        self._pressed_at = self._moved_at = time.monotonic()
+
+    def mouse_up(self, button="left") -> None:  # type: ignore[override]
+        released_at = time.monotonic()
+        super().mouse_up(button)
+        if self._pressed_at is not None:
+            self.presses.append((self._pressed_at, self._moved_at or released_at, released_at))
+            self._pressed_at = None
+
+
+def _canvas_presses(controller: _TimedInput) -> list[tuple[float, float]]:
+    """(press length, hold after the last move) of each canvas press, in order."""
+
+    canvas = ScreenRect(100, 100, 400, 80)
+    timings: list[tuple[float, float]] = []
+    press_index = 0
+    for index, event in enumerate(controller.events):
+        if event.kind != "mouse_down":
+            continue
+        position = _position_at(controller, index)
+        pressed, moved, released = controller.presses[press_index]
+        press_index += 1
+        if canvas.contains(*position):
+            timings.append((released - pressed, released - moved))
+    return timings
+
+
+def test_a_short_drag_is_held_as_long_as_a_dab() -> None:
+    """A run of a few cells is a few screen pixels: over in milliseconds.
+
+    Read back from a real sign, every hole was such a run, missing from the
+    middle of a stroke, while dabs - which already had a hold - were fine.
+    The press now lasts a frame whatever its length, so the game sees the
+    cursor held at the far end before the button comes up.
+    """
+
+    controller = _TimedInput()
+    painter = Painter(controller, screen_capture=_panel_capture)
+    # One cell per screen pixel: a three-cell run is a two-pixel drag.
+    plan = PaintPlan(
+        400,
+        1,
+        (
+            ColorGroup(
+                (220, 40, 20),
+                (Stroke(0, 0, 2, 0), Stroke(10, 0, 10, 0)),
+                4,
+            ),
+        ),
+    )
+    assert painter.start(plan, _profile(), _settings())
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+
+    (drag, drag_tail), (dab, _) = _canvas_presses(controller)
+    assert drag >= Painter._MIN_PRESS_SECONDS * 0.9
+    assert dab >= Painter._MIN_PRESS_SECONDS * 0.9
+    # The wait is spent at the far end of the drag, not before it starts.
+    assert drag_tail >= Painter._MIN_PRESS_SECONDS * 0.5
+
+
+def test_a_long_drag_is_not_held_at_its_end() -> None:
+    """Strokes that already spend frames moving pay nothing extra."""
+
+    controller = _TimedInput()
+    painter = Painter(controller, screen_capture=_panel_capture)
+    plan = PaintPlan(400, 1, (ColorGroup((220, 40, 20), (Stroke(0, 0, 399, 0),), 400),))
+    # 399 px at 2000 px/s is a 200 ms drag, well past the minimum press.
+    assert painter.start(plan, _profile(), _settings(stroke_speed_pixels_per_second=2000.0))
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+
+    ((drag, tail),) = _canvas_presses(controller)
+    assert drag >= 0.18
+    # The button comes up as soon as the cursor arrives.
+    assert tail < 0.03 * _TIMEOUT_SCALE
+
+
+def test_dry_runs_do_not_wait_out_the_minimum_press() -> None:
+    controller = _TimedInput()
+    controller.emits_real_input = False  # type: ignore[misc]
+    painter = Painter(controller)
+    plan = PaintPlan(400, 1, (ColorGroup((220, 40, 20), (Stroke(0, 0, 2, 0),), 3),))
+    assert painter.start(plan, _profile(), _settings())
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+
+    ((drag, _),) = _canvas_presses(controller)
+    assert drag < Painter._MIN_PRESS_SECONDS / 2
+
+
+def test_the_touch_up_pass_uses_the_cleared_sign_to_see_holes() -> None:
+    """End to end: the job clears the sign, keeps that capture, and the
+    verification pass repaints a cell that stayed bare - which a one-color
+    plan gives the old two-way comparison no second color to notice by.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Holes")
+    assert profile.canvas is not None and profile.clear_button is not None
+    canvas, clear_button = profile.canvas, profile.clear_button
+    probing_sign = _clearable_sign(controller, canvas, clear_button, sign_rows=320)
+    dark, bare = (40, 40, 40), (96, 96, 96)
+    hole = (30, 20)  # logical (x, y) on the 64x32 plan; 10 px cells
+
+    def capture(rect) -> Image.Image:
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            return probing_sign(rect)
+        position = (0, 0)
+        cleared = False
+        artwork_strokes = 0
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+            elif event.kind == "mouse_down":
+                if clear_button.contains(*position):
+                    cleared = True
+                    artwork_strokes = 0
+                elif cleared and canvas.contains(*position):
+                    artwork_strokes += 1
+        if not cleared:
+            return probing_sign(rect)  # the probes, until the clear click
+        image = Image.new("RGB", (rect.width, rect.height), bare)
+        if artwork_strokes:
+            image.paste(dark, (0, 0, rect.width, rect.height))
+            x, y = hole
+            image.paste(bare, (x * 10, y * 10, x * 10 + 10, y * 10 + 10))
+        return image
+
+    painter = _impatient(Painter(controller, screen_capture=capture))
+    plan = PaintPlan(
+        64,
+        32,
+        (ColorGroup(dark, tuple(Stroke(0, y, 63, y) for y in range(32)), 64 * 32),),
+    )
+    assert painter.start(
+        plan, profile, _settings(apply_brush_size=True, verify_passes=1)
+    )
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    cleared_at = next(
+        index
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down"
+        and clear_button.contains(*_position_at(controller, index))
+    )
+    presses = [
+        _position_at(controller, index)
+        for index, event in enumerate(controller.events)
+        if index > cleared_at
+        and event.kind == "mouse_down"
+        and canvas.contains(*_position_at(controller, index))
+    ]
+    # 32 artwork rows, then exactly one touch-up press, on the hole.
+    assert len(presses) == 33, presses
+    center = (canvas.left + hole[0] * 10 + 5, canvas.top + hole[1] * 10 + 5)
+    touch_up = presses[-1]
+    assert abs(touch_up[0] - center[0]) <= 8 and abs(touch_up[1] - center[1]) <= 8, (
+        touch_up,
+        center,
+    )

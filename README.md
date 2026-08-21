@@ -430,6 +430,42 @@ one-texel blend line - the brush's own edge falloff, visible on a
 checkerboard and invisible on ordinary artwork - which is the game's
 rendering, not a placement error.
 
+### Strokes the game never sees, and the touch-up that repairs them
+
+Rust samples the mouse a frame at a time, and its paint UI has been measured
+running at about 15 FPS. A press and release that both fall inside one frame
+can be sampled as nothing, and the painter has no way of knowing: it pushes
+synthetic input into Windows and never hears back from the game. Dabs were
+protected against this early on by being held for most of a frame. Reading a
+finished five-hour sign back showed the same thing happening to *short drags*:
+at a fine painting resolution a run of a few cells is only a few screen
+pixels, over in under ten milliseconds, and every hole in that sign was such a
+run missing from the middle of a stroke. Every stroke's press now lasts at
+least as long as a dab's hold, with a short drag keeping the button down at
+its far end until it has; long strokes already spend frames moving and are not
+slowed at all.
+
+What the game dropped anyway is caught by the **touch-up** passes under
+**Settings → Painting**. After the artwork is down, the sign is captured and
+each cell compared with the plan, and the cells that came out wrong are
+repainted. The comparison is relative, so the sign's lighting and material
+never count against it, and it measures each color against *what that color
+actually looks like on this sign*, read off the capture itself - two palette
+entries the sign renders identically can therefore never be mistaken for one
+another, which is what used to send a quarter of a 256-color sign back for
+repainting. A cell is repainted when it reads as bare sign (the job captures
+the freshly cleared sign for exactly this reference, and any area the plan
+leaves unpainted serves as well), when it looks like nothing the plan painted,
+or when it decisively took another color. The default is two passes: the
+touch-up strokes are short and can be dropped by the game exactly as the
+originals were, and the second capture is what catches that.
+
+On a plan finer than the game can paint - cells narrower than Rust's smallest
+brush, or under two screen pixels across - the touch-up fills holes only. A
+cell that reads as the wrong color there is as likely a neighbour's paint as a
+mistake, and "correcting" it with a brush wider than the cell would smear the
+neighbours it was read from.
+
 ## Timelapse
 
 The **Timelapse** tab, next to Workspace in the header, captures the calibrated
