@@ -40,6 +40,21 @@ class PaintMode(str, Enum):
     FAST = "fast"
 
 
+class SharpenMode(str, Enum):
+    """How much a reduced image is sharpened before it is painted.
+
+    The game magnifies the sign's texture with a bilinear filter, which
+    softens every edge the downscale left.  Sharpening first puts back about
+    the contrast the filter takes away, so a line reads as crisply on the
+    sign as it did in the source.  ``STRONG`` pushes further at the price of
+    a faint halo beside high-contrast lines.
+    """
+
+    OFF = "off"
+    LIGHT = "light"
+    STRONG = "strong"
+
+
 class CropAlignment(str, Enum):
     CENTER = "center"
     TOP = "top"
@@ -196,6 +211,9 @@ class ImageProcessOptions:
     crop_focus: tuple[float, float] | None = None
     color_count: int = 32
     dither: bool = False
+    # Applied only when the source was actually reduced: an upscale has no
+    # lost contrast to put back, and sharpening its blocks would only ring.
+    sharpen: SharpenMode | str = SharpenMode.LIGHT
     background_color: RGBColor | None = None
     transparency_mode: TransparencyMode | str = TransparencyMode.LEAVE_UNPAINTED
     transparent_fill_color: RGBColor | None = None

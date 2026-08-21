@@ -113,7 +113,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Dark, rust-textured workspace built around the image -> calibrate -> paint flow, with advanced controls tucked into Settings
 - Loads PNG, JPEG, WebP, BMP, TIFF and other Pillow-supported images by clicking either preview, browsing, or dropping a file anywhere in the window
 - Fit, fill/crop, and stretch composition with a live paint simulation, with the Fill crop draggable directly on the source image so the sign keeps the part of the picture you meant
-- Adjustable painting resolution, palette size, dithering, transparency, and fit background
+- Adjustable painting resolution, palette size, dithering, sharpening, transparency, and fit background
 - One-click background removal that leaves the backdrop unpainted, by detected or picked color, with a smart matcher for gradients, vignettes and photographic backdrops that also clears the halo off a cut-out subject
 - Multiple draggable text layers edited right on the Source tab - inline editing, resize handles, Ctrl+D or Ctrl+C to copy, Delete to remove, and a bracketed outline showing the part of the image the sign will hold - while the Rust preview shows the text baked in exactly as it will paint, marks itself read-only, and offers a way back to the Source tab if you try to edit there
 - Text editing conveniences you would expect from a graphics app: select several layers with a rubber band, Shift+click, Ctrl+click or Ctrl+A and restyle or drag them together, snap to the middle and edges of the sign and to the other layers while dragging (Alt bypasses), align and spread buttons, and arrow-key nudging
@@ -201,6 +201,22 @@ how: on, cells blend into each other the way Rust filters the sign's texture
 when it draws it, which is the closer guess at the finished sign; off, every
 cell is a hard square, which exaggerates the grid but shows exactly what each
 stroke will paint. The choice is remembered between sessions.
+
+### Sharpening for the sign
+
+The same filtering happens in game, and it is why an image shrunk to the sign
+looks softer there than it did on screen: the sign has a few hundred texels a
+side, and the game blends each one into its neighbours when it draws them.
+**Sharpen**, under Settings → Artwork, puts back about the edge contrast that
+blending takes away, before the image is painted. **Light** (the default)
+restores roughly what the filter costs a line and suits nearly everything;
+**Strong** is for line art that should bite, at the price of a faint light
+halo beside dark lines; **Off** paints the plain downscale. Only images that
+were actually reduced are sharpened - an enlarged image has lost nothing and
+sharpening its blocks would only ring - and a subject cut free of its
+background is sharpened against itself rather than against the backdrop that
+was removed. Sharpening cannot add detail the texels do not have; the only cure
+for that is a larger sign.
 
 ### Saving the Rust preview
 
@@ -568,7 +584,7 @@ stops mid-paint.
 The Paint Simulation uses ordinary RGB, while Rust renders paint through the sign material, wood texture, and lighting. A profile can measure and compensate for that response:
 
 1. Use a blank/reset disposable sign with the profile fully calibrated.
-2. Under **Settings → Color**, click **Prepare Calibration Chart**. This replaces the imported image and selects Stretch, Very Fast, 32 colors, and no dithering.
+2. Under **Settings → Color**, click **Prepare Calibration Chart**. This replaces the imported image and selects Stretch, Very Fast, 32 colors, no dithering, and no sharpening.
 3. Paint the complete chart through the normal Start/countdown workflow. Any older correction is automatically bypassed for this chart.
 4. Leave the finished chart visible in Rust and click **Measure Painted Chart**.
 5. Focus Rust during the capture countdown. The app samples 32 large swatches, rejects inconsistent captures, and saves the measured correction to that profile.

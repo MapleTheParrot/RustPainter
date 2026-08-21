@@ -19,7 +19,7 @@ from .hotkeys import (
     is_supported_hotkey,
     normalize_hotkey,
 )
-from .models import PaintMode
+from .models import PaintMode, SharpenMode
 
 
 # Rust's Windows client runs as RustClient.exe. On other platforms the
@@ -79,6 +79,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "logical_height": 128,
         "color_count": DEFAULT_COLOR_COUNT,
         "dithering": False,
+        # Put back the edge contrast the game's texture filtering softens;
+        # "light" suits nearly everything, "strong" is for line art.
+        "sharpen": SharpenMode.LIGHT.value,
         "background_mode": "unpainted",
         "background_color": "#FFFFFF",
         "transparent_pixels": "leave_unpainted",
@@ -302,6 +305,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         )
     if not isinstance(image.get("dithering"), bool):
         raise SettingsError("image.dithering must be true or false")
+    if image.get("sharpen") not in {mode.value for mode in SharpenMode}:
+        raise SettingsError("image.sharpen must be off, light, or strong")
     if not isinstance(image.get("background_mode"), str) or image.get(
         "background_mode"
     ) not in {"unpainted", "white", "black", "custom"}:

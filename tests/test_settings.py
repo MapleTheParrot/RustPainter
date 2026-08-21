@@ -54,6 +54,16 @@ def test_settings_store_deep_merges_new_defaults_and_persists_updates(tmp_path) 
     assert SettingsStore(path).get("safety.countdown_seconds") == 5
 
 
+def test_sharpen_defaults_to_light_and_rejects_unknown_modes(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"image": {"color_count": 64}}), encoding="utf-8")
+    assert SettingsStore(path).load()["image"]["sharpen"] == "light"
+
+    path.write_text(json.dumps({"image": {"sharpen": "extreme"}}), encoding="utf-8")
+    with pytest.raises(SettingsError):
+        SettingsStore(path).load()
+
+
 def test_default_settings_returns_independent_documents() -> None:
     first = default_settings()
     second = default_settings()

@@ -2643,6 +2643,23 @@ def test_paused_jobs_still_show_the_calibration_outlines(
     assert not window._calibration_preview.isVisible()
 
 
+def test_sharpen_choice_reaches_the_plan_and_survives_a_restart(
+    window: MainWindow,
+) -> None:
+    assert window.sharpen_combo.currentData() == "light"
+    assert window._processing_options().sharpen.value == "light"
+
+    window._set_combo_data(window.sharpen_combo, "strong")
+    assert window._processing_options().sharpen.value == "strong"
+    assert window._settings_document()["image"]["sharpen"] == "strong"
+
+    settings = window._settings_document()
+    settings["image"]["sharpen"] = "off"
+    window._apply_settings(settings)
+    assert window.sharpen_combo.currentData() == "off"
+    assert window._processing_options().sharpen.value == "off"
+
+
 def test_rust_preview_scaling_is_smooth_by_default_and_switchable(
     window: MainWindow,
 ) -> None:

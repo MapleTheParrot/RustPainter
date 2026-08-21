@@ -18,12 +18,19 @@ from app.image_processing import (
     calculate_fill_size,
     calculate_fit_size,
     detect_background_color,
+    is_reduction,
     process_image,
     quantize_image,
     remove_background,
     scale_image,
+    sharpen_image,
 )
-from app.models import BackgroundRemovalScope, ImageProcessOptions, ScreenRect
+from app.models import (
+    BackgroundRemovalScope,
+    ImageProcessOptions,
+    ScreenRect,
+    SharpenMode,
+)
 from app.paint_plan import generate_paint_plan, group_horizontal_runs
 
 
@@ -568,6 +575,86 @@ class UpscaleCrispnessTests(unittest.TestCase):
         reduced, _mask = scale_image(gradient, (60, 16), "stretch")
         reds = np.unique(np.asarray(reduced.convert("RGB"))[:, :, 0])
         self.assertGreater(len(reds), 30)
+
+
+class SharpenTests(unittest.TestCase):
+    """Sharpening restores edge contrast where a downscale softened it."""
+
+    @staticmethod
+    def _line_on_field() -> tuple["Image.Image", np.ndarray]:
+        from PIL import Image
+
+        field = np.full((20, 30, 4), (230, 200, 200, 255), dtype=np.uint8)
+        field[9, 4:26] = (120, 100, 100, 255)  # a softened line
+        field[10, 4:26] = (60, 50, 50, 255)  # its core
+        mask = np.ones((20, 30), dtype=np.bool_)
+        mask[:, 26:] = False  # letterboxed margin stays unpainted
+        field[~mask] = (0, 0, 0, 0)
+        return Image.fromarray(field, "RGBA"), mask
+
+    def test_sharpening_deepens_a_line_and_leaves_the_margin_alone(self) -> None:
+        image, mask = self._line_on_field()
+        sharpened = np.asarray(sharpen_image(image, mask, 0.6))
+        before = np.asarray(image)
+        # The line's core gets darker, the field beside it a touch lighter:
+        # more contrast across the edge than the downscale left.
+        self.assertLess(int(sharpened[10, 12, 0]), int(before[10, 12, 0]))
+        self.assertGreaterEqual(int(sharpened[7, 12, 0]), int(before[7, 12, 0]))
+        # Flat field far from any edge is untouched.
+        self.assertTrue((sharpened[2, 10] == before[2, 10]).all())
+        # Unpainted cells are neither changed nor allowed to darken the
+        # painted cells beside them: the last painted column of flat field
+        # stays the field color.
+        self.assertTrue((sharpened[:, 26:] == 0).all())
+        self.assertTrue((sharpened[2, 25] == before[2, 25]).all())
+
+    def test_zero_amount_is_the_identity(self) -> None:
+        image, mask = self._line_on_field()
+        self.assertIs(sharpen_image(image, mask, 0.0), image)
+
+    def test_reduction_is_judged_on_what_is_resampled(self) -> None:
+        self.assertTrue(is_reduction((640, 480), (320, 240), "stretch"))
+        self.assertFalse(is_reduction((100, 50), (320, 240), "fit"))
+        # Fill crops a 300x300 region and enlarges it: nothing was lost.
+        self.assertFalse(is_reduction((300, 600), (320, 320), "fill"))
+        self.assertTrue(is_reduction((640, 480), (320, 320), "fill"))
+
+    def test_process_image_sharpens_reductions_only(self) -> None:
+        from PIL import Image
+
+        rng = np.random.default_rng(3)
+        large = Image.fromarray(
+            np.dstack(
+                [
+                    rng.integers(0, 255, (96, 128, 3), dtype=np.uint8),
+                    np.full((96, 128, 1), 255, dtype=np.uint8),
+                ]
+            ),
+            "RGBA",
+        )
+        plain = process_image(
+            large, logical_width=32, logical_height=24, color_count=256,
+            sharpen=SharpenMode.OFF,
+        )
+        light = process_image(
+            large, logical_width=32, logical_height=24, color_count=256,
+            sharpen=SharpenMode.LIGHT,
+        )
+        self.assertFalse(
+            np.array_equal(np.asarray(plain.image), np.asarray(light.image))
+        )
+        tiny = large.resize((8, 6))
+        plain_up = process_image(
+            tiny, logical_width=32, logical_height=24, color_count=256,
+            sharpen=SharpenMode.OFF,
+        )
+        light_up = process_image(
+            tiny, logical_width=32, logical_height=24, color_count=256,
+            sharpen=SharpenMode.LIGHT,
+        )
+        self.assertTrue(
+            np.array_equal(np.asarray(plain_up.image), np.asarray(light_up.image))
+        )
 
 
 if __name__ == "__main__":

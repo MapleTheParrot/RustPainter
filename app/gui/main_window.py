@@ -98,6 +98,7 @@ from app.models import (
     PaintPlan,
     ProcessedImage,
     ScaleMode,
+    SharpenMode,
     ScreenRect,
     TransparencyMode,
 )
@@ -1089,7 +1090,22 @@ class MainWindow(QMainWindow):
             "Only Exact paint mode uses this setting. Quality, Balanced and\n"
             "Fast merge automatically through the optimizer."
         )
+        self.sharpen_combo = NoWheelComboBox()
+        self.sharpen_combo.addItem("Off", SharpenMode.OFF.value)
+        self.sharpen_combo.addItem("Light — recommended", SharpenMode.LIGHT.value)
+        self.sharpen_combo.addItem("Strong — for line art", SharpenMode.STRONG.value)
+        self._set_combo_data(self.sharpen_combo, SharpenMode.LIGHT.value)
+        self.sharpen_combo.setToolTip(
+            "Rust draws the sign's texture with a filter that softens every\n"
+            "edge, so an image shrunk to the sign looks blurrier in game than\n"
+            "it did on screen.  Sharpening before painting puts back about\n"
+            "the contrast that filter takes away.  Light suits nearly\n"
+            "everything; Strong makes line art bite at the price of a faint\n"
+            "halo beside dark lines.  Images that are enlarged rather than\n"
+            "shrunk are never sharpened."
+        )
         form.addRow("Maximum colors", self.color_count_combo)
+        form.addRow("Sharpen", self.sharpen_combo)
         form.addRow("Stroke merging", self.merge_combo)
         layout.addWidget(quality)
 
@@ -2384,6 +2400,7 @@ class MainWindow(QMainWindow):
         )
         self.color_count_combo.currentIndexChanged.connect(self._schedule_processing)
         self.dither_check.toggled.connect(self._schedule_processing)
+        self.sharpen_combo.currentIndexChanged.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._on_merge_mode_changed)
         self.paint_mode_combo.currentIndexChanged.connect(self._on_paint_mode_changed)
         self.add_text_button.clicked.connect(self._add_text_layer)
@@ -3801,6 +3818,7 @@ class MainWindow(QMainWindow):
             crop_focus=self._crop_focus,
             color_count=int(self.color_count_combo.currentData()),
             dither=self.dither_check.isChecked(),
+            sharpen=SharpenMode(self.sharpen_combo.currentData()),
             background_color=background,
             transparency_mode=transparency,
             transparent_fill_color=transparent_fill,
@@ -4336,6 +4354,7 @@ class MainWindow(QMainWindow):
             self.logical_height_spin,
             self.color_count_combo,
             self.dither_check,
+            self.sharpen_combo,
             self.merge_combo,
             self.show_calibration_check,
             self.background_color_button,
@@ -4430,6 +4449,9 @@ class MainWindow(QMainWindow):
                 int(image.get("color_count", DEFAULT_COLOR_COUNT)),
             )
             self.dither_check.setChecked(bool(image.get("dithering", False)))
+            self._set_combo_data(
+                self.sharpen_combo, str(image.get("sharpen", SharpenMode.LIGHT.value))
+            )
             self._set_combo_data(
                 self.background_combo, image.get("background_mode", "unpainted")
             )
@@ -4641,6 +4663,7 @@ class MainWindow(QMainWindow):
             "logical_height": self.logical_height_spin.value(),
             "color_count": int(self.color_count_combo.currentData()),
             "dithering": self.dither_check.isChecked(),
+            "sharpen": str(self.sharpen_combo.currentData() or SharpenMode.LIGHT.value),
             "background_mode": self.background_combo.currentData(),
             "background_color": self.background_color_button.color().name().upper(),
             "transparent_pixels": self.transparency_combo.currentData(),
@@ -5381,6 +5404,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.setCurrentText("Very Fast")
             self.color_count_combo.setCurrentText("32")
             self.dither_check.setChecked(False)
+            self._set_combo_data(self.sharpen_combo, SharpenMode.OFF.value)
             # The Optimization combo is deliberately left alone: while the
             # chart is the loaded image, _current_paint_mode() forces Exact,
             # and the user's saved mode survives for their next artwork.
@@ -5906,6 +5930,7 @@ class MainWindow(QMainWindow):
             self.logical_height_spin,
             self.color_count_combo,
             self.dither_check,
+            self.sharpen_combo,
             self.merge_combo,
             self.speed_preset_combo,
             self.pixel_spacing_spin,

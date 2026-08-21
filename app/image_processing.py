@@ -16,6 +16,7 @@ from .models import (
     ProcessedImage,
     RGBColor,
     ScaleMode,
+    SharpenMode,
     TransparencyMode,
 )
 
@@ -58,6 +59,19 @@ _SUBJECT_GROWTH = 1.5
 # of removed background is itself most of the evidence.
 _FRINGE_GROWTH = 3.0
 _FRINGE_PASSES = 2
+
+# Unsharp-mask strength per sharpen mode: how much of the difference between
+# a cell and its blurred surroundings is added back.  The game's bilinear
+# magnification of the sign is about a one-texel blur, so the mask uses a
+# one-cell radius, and Light at 0.6 restores roughly the contrast that blur
+# costs a line without ringing.  Strong goes past that for line art that
+# should bite, at the price of a faint light halo beside dark lines.
+SHARPEN_AMOUNTS: dict[SharpenMode, float] = {
+    SharpenMode.OFF: 0.0,
+    SharpenMode.LIGHT: 0.6,
+    SharpenMode.STRONG: 1.2,
+}
+_SHARPEN_RADIUS = 1.0
 
 # Where each Fill alignment anchors the kept region, as ``ImageOps.fit``
 # centering fractions.  Shared with the GUI so its canvas overlay and the
@@ -140,6 +154,13 @@ def _alignment(value: CropAlignment | str) -> CropAlignment:
         return CropAlignment(_enum_key(value))
     except ValueError as exc:
         raise ValueError(f"Unknown crop alignment: {value!r}") from exc
+
+
+def _sharpen_mode(value: SharpenMode | str) -> SharpenMode:
+    try:
+        return SharpenMode(_enum_key(value))
+    except ValueError as exc:
+        raise ValueError(f"Unknown sharpen mode: {value!r}") from exc
 
 
 def _transparency_mode(value: TransparencyMode | str) -> TransparencyMode:
@@ -844,6 +865,94 @@ def quantize_image(
     return Image.fromarray(output, mode="RGBA")
 
 
+def is_reduction(
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+    mode: ScaleMode | str,
+    centering: tuple[float, float] = (0.5, 0.5),
+) -> bool:
+    """Whether scaling the source onto the canvas throws detail away.
+
+    Mirrors the resampler's own choice between Lanczos and nearest: a source
+    that fits inside the canvas along both axes is enlarged pixel for pixel
+    and has nothing to sharpen, while one reduced along either axis has lost
+    contrast to the averaging.  Fill judges the cropped region rather than
+    the whole source, because that is all that gets resampled.
+    """
+
+    resolved = _scale_mode(mode)
+    if resolved is ScaleMode.FILL:
+        box = fill_crop_box(source_size, target_size, centering)
+        source_width, source_height = box[2] - box[0], box[3] - box[1]
+        size = target_size
+    elif resolved is ScaleMode.FIT:
+        source_width, source_height = source_size
+        size = calculate_fit_size(source_size, target_size)
+    else:
+        source_width, source_height = source_size
+        size = target_size
+    return not (size[0] >= source_width and size[1] >= source_height)
+
+
+def _gaussian_blur(plane: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur of a 2-D float plane with reflected edges."""
+
+    reach = max(1, int(ceil(3.0 * sigma)))
+    taps = np.exp(-0.5 * (np.arange(-reach, reach + 1, dtype=np.float32) / sigma) ** 2)
+    taps /= taps.sum()
+    padded = np.pad(plane, reach, mode="reflect")
+    rows = np.zeros((plane.shape[0] + 2 * reach, plane.shape[1]), dtype=np.float32)
+    for offset, tap in enumerate(taps):
+        rows += tap * padded[:, offset : offset + plane.shape[1]]
+    out = np.zeros(plane.shape, dtype=np.float32)
+    for offset, tap in enumerate(taps):
+        out += tap * rows[offset : offset + plane.shape[0], :]
+    return out
+
+
+def sharpen_image(
+    image: Image.Image,
+    paint_mask: np.ndarray | None,
+    amount: float,
+    radius: float = _SHARPEN_RADIUS,
+) -> Image.Image:
+    """Unsharp-mask the painted cells of a logical image.
+
+    Only painted cells are changed, and only painted cells contribute to the
+    blur each is compared against: the surroundings are averaged with the
+    mask as a weight, so a subject cut out of its background is sharpened
+    against itself rather than against the color that used to be behind it,
+    which would otherwise ring every edge of it with a halo of that color.
+    """
+
+    if amount <= 0:
+        return image
+    rgba = image.convert("RGBA")
+    array = np.asarray(rgba, dtype=np.uint8)
+    if paint_mask is None:
+        mask = array[:, :, 3] > 0
+    else:
+        mask = np.asarray(paint_mask, dtype=np.bool_)
+        if mask.shape != (rgba.height, rgba.width):
+            raise ValueError("Paint mask dimensions must match the image")
+    if not mask.any():
+        return rgba
+    weight = mask.astype(np.float32)
+    blurred_weight = _gaussian_blur(weight, radius)
+    rgb = array[:, :, :3].astype(np.float32)
+    sharpened = rgb.copy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for channel in range(3):
+            local = _gaussian_blur(rgb[:, :, channel] * weight, radius) / blurred_weight
+            local = np.where(blurred_weight > 0, local, rgb[:, :, channel])
+            sharpened[:, :, channel] = rgb[:, :, channel] + amount * (
+                rgb[:, :, channel] - local
+            )
+    output = array.copy()
+    output[mask, :3] = np.clip(np.rint(sharpened[mask]), 0, 255).astype(np.uint8)
+    return Image.fromarray(output, mode="RGBA")
+
+
 def process_image(
     source: ImageSource,
     options: ImageProcessOptions | None = None,
@@ -860,9 +969,13 @@ def process_image(
     elif option_overrides:
         raise TypeError("Pass an options object or keyword options, not both")
 
+    target_size = (options.logical_width, options.logical_height)
+    # Loaded once here so the reduction check below does not decode a large
+    # photo a second time; ``scale_image`` takes the image as it is.
+    loaded = load_image(source)
     scaled, paint_mask = scale_image(
-        source,
-        (options.logical_width, options.logical_height),
+        loaded,
+        target_size,
         options.scale_mode,
         alignment=options.crop_alignment,
         focus=options.crop_focus,
@@ -880,6 +993,16 @@ def process_image(
             tolerance=options.background_removal_tolerance,
             scope=options.background_removal_scope,
         )
+    # After background removal, so a cut-out subject is sharpened against
+    # itself and not against the backdrop that was just taken away.
+    sharpen_amount = SHARPEN_AMOUNTS[_sharpen_mode(options.sharpen)]
+    if sharpen_amount > 0 and is_reduction(
+        loaded.size,
+        target_size,
+        options.scale_mode,
+        crop_centering(options.crop_alignment, options.crop_focus),
+    ):
+        scaled = sharpen_image(scaled, paint_mask, sharpen_amount)
     quantized = quantize_image(
         scaled,
         options.color_count,
@@ -910,9 +1033,12 @@ __all__ = [
     "fill_size",
     "fit_size",
     "load_image",
+    "SHARPEN_AMOUNTS",
+    "is_reduction",
     "process_image",
     "quantize_image",
     "remove_background",
     "resize_image",
     "scale_image",
+    "sharpen_image",
 ]
