@@ -4167,3 +4167,109 @@ def test_an_automatic_pause_screenshots_the_screen_and_shows_it(
     window._show_offered_screenshot()
     qtbot.waitUntil(lambda: len(window._screenshot_viewers) == 1, timeout=2000)
     window._screenshot_viewers[0].close()
+
+
+def test_a_paused_job_lends_out_the_resume_slider_as_a_viewfinder(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """While paused, the slider shows the picture as far as any stroke.
+
+    It lands on the stroke the job stopped at, so the sign can be checked
+    against what it should show by now, and moving it changes only the
+    preview: the tick that would change where a job starts stays locked,
+    and the resume goes ahead from where the job stopped.  Once the job
+    is running again the slider and the preview are given back.
+    """
+
+    from types import SimpleNamespace
+
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    whole = window.paint_preview._source.toImage()
+    stopped_at = plan.stroke_count // 2
+
+    class _PausedPainter:
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+
+        def __init__(self) -> None:
+            self.state = PainterState.PAUSED
+            self.progress = SimpleNamespace(
+                completed_strokes=stopped_at, elapsed_seconds=12.0
+            )
+            self.resumed = 0
+
+        def seconds_until_anti_afk(self):
+            return None
+
+        def retune(self, settings) -> bool:
+            return True
+
+        def resume(self) -> bool:
+            self.resumed += 1
+            self.state = PainterState.RUNNING
+            return True
+
+    painter = _PausedPainter()
+    window._painter = painter
+    window._on_paint_state(window._paint_generation, PainterState.PAUSED, "user")
+
+    assert window.resume_slider.isEnabled()
+    assert window.resume_slider.value() == stopped_at
+    assert not window.resume_check.isEnabled()
+    assert not window.resume_check.isChecked()
+    assert "Paused" in window.resume_notice.text()
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    at_stop = window.paint_preview._source.toImage()
+    assert at_stop != whole, "the preview should stop at the paused stroke"
+
+    window.resume_slider.setValue(2)
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    earlier = window.paint_preview._source.toImage()
+    assert earlier != at_stop and earlier != whole
+    assert window.start_button.text().startswith("RESUME PAINTING")
+
+    window._start_or_resume()
+    assert painter.resumed == 1
+    window._on_paint_state(window._paint_generation, PainterState.RUNNING, "resumed")
+    assert not window.resume_slider.isEnabled()
+    assert window.resume_slider.value() == 0
+    assert "Paused" not in window.resume_notice.text()
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    assert window.paint_preview._source.toImage() == whole
+
+
+def test_the_progress_readout_counts_down_to_the_next_anti_afk_break(
+    window: MainWindow,
+) -> None:
+    """Next to the elapsed time sits when the job will next save and jump."""
+
+    from types import SimpleNamespace
+
+    class _Painter:
+        state = PainterState.RUNNING
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+        until = 95.0
+        progress = SimpleNamespace(elapsed_seconds=61.0)
+
+        def seconds_until_anti_afk(self):
+            return self.until
+
+    painter = _Painter()
+    window._painter = painter
+    window._active_detail = "Stroke 3 / 9"
+    window._refresh_active_detail()
+    assert window.active_detail_label.text() == (
+        "Stroke 3 / 9  •  1m 01s elapsed  •  anti-AFK in 1m 35s"
+    )
+    painter.until = 0.0
+    window._refresh_active_detail()
+    assert window.active_detail_label.text().endswith("anti-AFK break due now")
+    painter.until = None
+    window._refresh_active_detail()
+    assert window.active_detail_label.text() == "Stroke 3 / 9  •  1m 01s elapsed"

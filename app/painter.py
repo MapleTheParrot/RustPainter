@@ -571,6 +571,27 @@ class Painter:
         with self._condition:
             return self._thread is not None and self._thread.is_alive()
 
+    def seconds_until_anti_afk(self) -> float | None:
+        """How long until the running job's next anti-AFK break, or None.
+
+        None when there is no job, or the job will not take breaks: the
+        option is off, or the profile has no Save button to leave the sign
+        by.  The interval is counted on the clock,
+        pauses included, exactly as the break itself is: a player stood
+        still through a pause is as idle to the server as one the painter
+        kept still.
+        """
+
+        with self._condition:
+            job = self._job
+            if job is None or self._state not in self._ACTIVE_STATES:
+                return None
+            settings = job.settings
+            if not settings.anti_afk_enabled or job.target.save_button is None:
+                return None
+            due_at = self._last_anti_afk_at + settings.anti_afk_interval_seconds
+            return max(0.0, due_at - time.monotonic())
+
     def set_callbacks(
         self,
         *,

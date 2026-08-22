@@ -838,6 +838,18 @@ class MainWindow(QMainWindow):
         self._paint_job_snapshot: Any = None
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
+        # The readout under the progress bar counts down to the next
+        # anti-AFK break, which keeps running through a pause - when no
+        # progress updates arrive to move it - so it ticks on its own clock.
+        self._active_detail = ""
+        # While a job is paused the resume slider is lent out as a
+        # viewfinder; what the notice said and where the slider stood are
+        # kept so the resume offer comes back as it was.
+        self._paused_viewfinder_notice: str | None = None
+        self._resume_offer_value = 0
+        self._active_detail_timer = QTimer(self)
+        self._active_detail_timer.setInterval(1000)
+        self._active_detail_timer.timeout.connect(self._refresh_active_detail)
         self._timelapse_export_pool = QThreadPool(self)
         self._timelapse_export_pool.setMaxThreadCount(1)
         self._timelapse_export: _TimelapseExportWorker | None = None
@@ -1706,6 +1718,10 @@ class MainWindow(QMainWindow):
 
         self.plan_progress_stack.setCurrentIndex(1 if active else 0)
         self.progress_frame.setVisible(not active)
+        if active:
+            self._active_detail_timer.start()
+        else:
+            self._active_detail_timer.stop()
 
     def _build_profile_and_run_panel(self) -> QWidget:
         content = QWidget()
@@ -2446,6 +2462,8 @@ class MainWindow(QMainWindow):
         plan = self._plan
         total = int(getattr(plan, "stroke_count", 0) or 0)
         value = min(int(self.resume_slider.value()), total)
+        if self._paused_viewfinder_notice is None:
+            self._resume_offer_value = value
         percent = value * 100.0 / total if total else 0.0
         self.resume_position_label.setText(f"{value:,} of {total:,}  ({percent:.0f}%)")
         self._resume_preview_timer.start()
@@ -2459,10 +2477,18 @@ class MainWindow(QMainWindow):
         simulation = self._plan_simulation
         if plan is None or simulation is None:
             return
-        if not self.resume_check.isChecked():
+        paused = self._painter_is_paused()
+        if not paused and not self.resume_check.isChecked():
             self.paint_preview.set_source(self._pil_to_pixmap(simulation))
             return
-        count = self._resume_start_stroke()
+        # A paused job's slider is a viewfinder, not an instruction: it
+        # shows the picture as far as any stroke so the sign can be checked
+        # against it, and the job carries on from where it stopped.
+        count = (
+            max(0, min(int(self.resume_slider.value()), plan.stroke_count))
+            if paused
+            else self._resume_start_stroke()
+        )
         try:
             target = np.asarray(simulation.convert("RGB"), dtype=np.uint8)
             if target.shape[0] != plan.height or target.shape[1] != plan.width:
@@ -6952,6 +6978,17 @@ class MainWindow(QMainWindow):
         live = set(self._retunable_controls()) if retunable else set()
         for control in controls:
             control.setEnabled(not locked or control in live)
+        # A paused job lends out its slider alone - to compare the sign
+        # with the picture as far as a stroke - never the tick that would
+        # change where a job starts.
+        paused_viewfinder = locked and retunable and bool(
+            getattr(self._plan, "stroke_count", 0)
+        )
+        self.resume_check.setEnabled(not locked)
+        self.resume_screenshot_button.setEnabled(not locked)
+        self.resume_slider.setEnabled(not locked or paused_viewfinder)
+        if paused_viewfinder:
+            self.resume_panel.setEnabled(True)
         if not locked:
             is_fit = self.scale_mode_combo.currentData() == ScaleMode.FIT.value
             is_fill = self.scale_mode_combo.currentData() == ScaleMode.FILL.value
@@ -7486,8 +7523,8 @@ class MainWindow(QMainWindow):
             if progress.estimated_remaining_seconds is not None
             else "Estimating time left…"
         )
-        elapsed = self._format_duration(progress.elapsed_seconds)
-        self.active_detail_label.setText(f"{detail}  •  {elapsed} elapsed")
+        self._active_detail = detail
+        self._refresh_active_detail(progress)
         # Traced last, so the update that opens the report is itself the
         # trace's first row - which is what dates the start of the artwork.
         # Pauses are traced too: an unexplained gap in the timeline is the
@@ -7500,6 +7537,77 @@ class MainWindow(QMainWindow):
                 timelapse_frame=int(getattr(recorder, "frame_count", 0) or 0),
             )
         self._note_resume_progress(progress)
+
+    _PAUSED_VIEWFINDER_NOTICE = (
+        "Paused.  Slide to see the picture as far as any stroke and check "
+        "the sign against it; the job carries on from where it stopped "
+        "whatever the slider says."
+    )
+
+    def _offer_paused_viewfinder(self) -> None:
+        """Put the paused job's stroke on the slider and show the picture to there."""
+
+        painter = self._painter
+        plan = self._plan
+        if painter is None or not getattr(plan, "stroke_count", 0):
+            return
+        if self._paused_viewfinder_notice is None:
+            self._paused_viewfinder_notice = self.resume_notice.text()
+        try:
+            completed = int(painter.progress.completed_strokes)
+        except Exception:
+            completed = 0
+        slider = self.resume_slider
+        slider.blockSignals(True)
+        try:
+            slider.setRange(0, plan.stroke_count)
+            slider.setValue(max(0, min(completed, plan.stroke_count)))
+        finally:
+            slider.blockSignals(False)
+        self.resume_notice.setText(self._PAUSED_VIEWFINDER_NOTICE)
+        self._on_resume_controls_changed()
+
+    def _withdraw_paused_viewfinder(self) -> None:
+        """Give the slider and the preview back to the next job's resume offer."""
+
+        notice = self._paused_viewfinder_notice
+        if notice is None:
+            return
+        self._paused_viewfinder_notice = None
+        self.resume_notice.setText(notice)
+        plan = self._plan
+        slider = self.resume_slider
+        slider.blockSignals(True)
+        try:
+            slider.setValue(self._resume_offer_value)
+        finally:
+            slider.blockSignals(False)
+        if plan is not None:
+            self._on_resume_controls_changed()
+
+    @Slot()
+    def _refresh_active_detail(self, progress: Any = None) -> None:
+        """Write the line under the progress bar: stroke, elapsed, next break."""
+
+        painter = self._painter
+        if progress is None:
+            if painter is None:
+                return
+            progress = painter.progress
+        parts = [self._active_detail, f"{self._format_duration(progress.elapsed_seconds)} elapsed"]
+        until_break = None
+        if painter is not None:
+            try:
+                until_break = painter.seconds_until_anti_afk()
+            except Exception:
+                until_break = None
+        if until_break is not None:
+            parts.append(
+                "anti-AFK break due now"
+                if until_break <= 0
+                else f"anti-AFK in {self._format_duration(until_break)}"
+            )
+        self.active_detail_label.setText("  •  ".join(part for part in parts if part))
 
     @Slot(int, object, str)
     def _on_paint_state(self, generation: int, state: Any, reason: str) -> None:
@@ -7534,8 +7642,12 @@ class MainWindow(QMainWindow):
             self._write_resume_record(state="paused", reason=reason)
             if reason not in self._USER_PAUSE_REASONS:
                 self._capture_pause_screenshot(generation, reason)
+            self._offer_paused_viewfinder()
         elif value == "running":
             self.pause_screenshot_button.setVisible(False)
+            self._withdraw_paused_viewfinder()
+        if value in {"completed", "aborted", "error"}:
+            self._withdraw_paused_viewfinder()
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
             self._finish_run_report(value, reason)

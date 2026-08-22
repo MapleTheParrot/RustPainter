@@ -2421,3 +2421,41 @@ def test_a_resumed_job_estimates_only_the_work_ahead_of_it() -> None:
     assert seen[0][0] == 20
     painting = [percent for strokes, percent in seen if 20 < strokes < 30]
     assert painting and min(painting) > 60.0
+
+
+def test_seconds_until_anti_afk_counts_down_from_the_job_start_and_the_last_break() -> None:
+    """The readout knows when the next break is, and when there is none."""
+
+    input_controller = MockInputController()
+    painter = Painter(input_controller)
+    assert painter.seconds_until_anti_afk() is None
+
+    profile = _profile()
+    profile.save_button = ScreenRect(600, 300, 100, 30)
+    painter.start(
+        _dot_plan(30),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.02,
+            anti_afk_enabled=True,
+            anti_afk_interval_seconds=60.0,
+        ),
+    )
+    assert _wait_until(lambda: painter.progress.completed_strokes >= 1)
+    until = painter.seconds_until_anti_afk()
+    assert until is not None and 55.0 < until <= 60.0
+    # The clock keeps running through a pause, as the break's own does.
+    assert painter.pause()
+    time.sleep(0.05)
+    paused = painter.seconds_until_anti_afk()
+    assert paused is not None and paused < until
+    assert painter.resume()
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED
+    assert painter.seconds_until_anti_afk() is None
+
+    # With the option off there is nothing to count down to.
+    painter.start(_dot_plan(3), profile, _settings(anti_afk_enabled=False))
+    assert painter.seconds_until_anti_afk() is None
+    assert painter.wait(_t(5.0))
