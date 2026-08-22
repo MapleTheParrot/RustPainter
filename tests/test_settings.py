@@ -175,24 +175,12 @@ def test_settings_reject_values_the_gui_cannot_represent(
         SettingsStore(tmp_path / "settings.json").save(patch)
 
 
-def test_expected_process_default_is_platform_appropriate() -> None:
-    """A Windows executable name can never match on another platform.
-
-    Shipping "RustClient.exe" as the default on macOS made the foreground
-    guard pause the instant the user focused the game, which is the whole
-    point of the countdown. Regression test for that report.
-    """
-
-    import os
-
+def test_expected_process_defaults_to_the_rust_client() -> None:
     from app.settings import DEFAULT_SETTINGS
 
     safety = DEFAULT_SETTINGS["safety"]
     assert safety["expected_window_title_contains"] == "Rust"
-    if os.name == "nt":
-        assert safety["expected_process_name"] == "RustClient.exe"
-    else:
-        assert safety["expected_process_name"] == ""
+    assert safety["expected_process_name"] == "RustClient.exe"
 
 
 def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(

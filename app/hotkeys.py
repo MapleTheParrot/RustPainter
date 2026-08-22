@@ -1,12 +1,10 @@
-"""Configurable global hotkeys: ``RegisterHotKey`` on Windows, a Quartz
-listen-only event tap on macOS (requires the Accessibility permission)."""
+"""Configurable global hotkeys via ``RegisterHotKey`` on Windows."""
 
 from __future__ import annotations
 
 import ctypes
 import logging
 import os
-import sys
 import threading
 from dataclasses import dataclass
 from typing import Callable, Mapping
@@ -179,7 +177,6 @@ class GlobalHotkeyManager:
         self._on_error = on_error
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
-        self._darwin_runloop: object | None = None
         self._started = threading.Event()
         self._stop_requested = threading.Event()
         self._running = False
@@ -188,7 +185,7 @@ class GlobalHotkeyManager:
 
     @property
     def available(self) -> bool:
-        return os.name == "nt" or sys.platform == "darwin"
+        return os.name == "nt"
 
     @property
     def running(self) -> bool:
@@ -245,13 +242,6 @@ class GlobalHotkeyManager:
         with self._lock:
             thread = self._thread
             thread_id = self._thread_id
-        if sys.platform == "darwin":
-            with self._lock:
-                runloop = self._darwin_runloop
-            if runloop is not None:
-                import Quartz
-
-                Quartz.CFRunLoopStop(runloop)
         if os.name == "nt" and thread_id is not None:
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             post = user32.PostThreadMessageW
@@ -291,9 +281,6 @@ class GlobalHotkeyManager:
         )  # type: ignore[return-value]
 
     def _message_loop(self) -> None:
-        if sys.platform == "darwin":
-            self._message_loop_darwin()
-            return
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         register = user32.RegisterHotKey
@@ -380,145 +367,6 @@ class GlobalHotkeyManager:
             if unexpected_exit:
                 error = HotkeyRegistrationError(
                     "Global hotkey message loop exited unexpectedly"
-                )
-                self._startup_error = error
-                self._report_error(error)
-
-    _DARWIN_MODIFIER_MASKS = {
-        "ALT": 0x00080000,      # kCGEventFlagMaskAlternate (Option)
-        "CTRL": 0x00040000,     # kCGEventFlagMaskControl
-        "CONTROL": 0x00040000,
-        "SHIFT": 0x00020000,    # kCGEventFlagMaskShift
-        "WIN": 0x00100000,      # kCGEventFlagMaskCommand
-        "WINDOWS": 0x00100000,
-    }
-    _DARWIN_ALL_MODIFIERS = 0x00080000 | 0x00040000 | 0x00020000 | 0x00100000
-
-    def _darwin_bindings(self) -> tuple[tuple[str, int, int], ...]:
-        """Resolve (name, mac keycode, required modifier flags) triples."""
-
-        from .input_controller import mac_virtual_key_code
-
-        resolved = []
-        for name, spec in self._binding_items():
-            mask = 0
-            for modifier in spec.modifiers:
-                try:
-                    mask |= self._DARWIN_MODIFIER_MASKS[modifier.upper()]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"Unsupported hotkey modifier: {modifier!r}"
-                    ) from exc
-            resolved.append((name, mac_virtual_key_code(spec.key), mask))
-        return tuple(resolved)
-
-    def _message_loop_darwin(self) -> None:
-        """Watch key-down events with a listen-only Quartz event tap.
-
-        Mirrors the Windows loop's contract: publish ``running`` before
-        signalling ``_started``, fail closed when a callback raises, and
-        report an unexpected exit.  Creating the tap fails (returns ``None``)
-        until the user grants this app the Accessibility permission.
-        """
-
-        import Quartz
-
-        bindings = self._darwin_bindings()
-        failure: dict[str, BaseException] = {}
-        state: dict[str, object] = {"tap": None}
-
-        def handle_event(_proxy: object, event_type: int, event: object, _refcon: object) -> object:
-            if event_type in (
-                Quartz.kCGEventTapDisabledByTimeout,
-                Quartz.kCGEventTapDisabledByUserInput,
-            ):
-                tap = state["tap"]
-                if tap is not None:
-                    Quartz.CGEventTapEnable(tap, True)
-                return event
-            if event_type != Quartz.kCGEventKeyDown:
-                return event
-            if Quartz.CGEventGetIntegerValueField(
-                event, Quartz.kCGKeyboardEventAutorepeat
-            ):
-                return event  # parity with Windows MOD_NOREPEAT
-            keycode = Quartz.CGEventGetIntegerValueField(
-                event, Quartz.kCGKeyboardEventKeycode
-            )
-            flags = Quartz.CGEventGetFlags(event) & self._DARWIN_ALL_MODIFIERS
-            for name, wanted_code, wanted_mask in bindings:
-                if keycode != wanted_code or flags != wanted_mask:
-                    continue
-                with self._lock:
-                    callback = self._callbacks.get(name)
-                if callback is not None:
-                    try:
-                        callback()
-                    except Exception as exc:
-                        LOGGER.exception("%s hotkey callback failed", name)
-                        # A failed callback makes the emergency control path
-                        # untrustworthy; tear down and fail closed.
-                        failure["error"] = HotkeyRegistrationError(
-                            f"{name} hotkey callback failed"
-                        )
-                        failure["error"].__cause__ = exc
-                        Quartz.CFRunLoopStop(Quartz.CFRunLoopGetCurrent())
-                break
-            return event
-
-        try:
-            tap = Quartz.CGEventTapCreate(
-                Quartz.kCGSessionEventTap,
-                Quartz.kCGHeadInsertEventTap,
-                Quartz.kCGEventTapOptionListenOnly,
-                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
-                handle_event,
-                None,
-            )
-            if tap is None:
-                raise HotkeyRegistrationError(
-                    "Could not create the macOS key event tap. Grant this app "
-                    "the Accessibility permission under System Settings > "
-                    "Privacy & Security > Accessibility, then restart it."
-                )
-            state["tap"] = tap
-            source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            runloop = Quartz.CFRunLoopGetCurrent()
-            Quartz.CFRunLoopAddSource(runloop, source, Quartz.kCFRunLoopCommonModes)
-            Quartz.CGEventTapEnable(tap, True)
-            with self._lock:
-                self._darwin_runloop = runloop
-                self._running = True
-            LOGGER.info(
-                "Global hotkeys registered: start/resume=%s pause=%s abort=%s",
-                self.bindings.start_resume,
-                self.bindings.pause,
-                self.bindings.abort,
-            )
-            self._started.set()
-            Quartz.CFRunLoopRun()
-            if "error" in failure:
-                raise failure["error"]
-        except BaseException as exc:
-            self._startup_error = exc
-            with self._lock:
-                self._running = False
-            self._report_error(exc)
-            self._started.set()
-        finally:
-            unexpected_exit = (
-                not self._stop_requested.is_set() and self._startup_error is None
-            )
-            tap = state["tap"]
-            if tap is not None:
-                Quartz.CGEventTapEnable(tap, False)
-            with self._lock:
-                self._running = False
-                self._darwin_runloop = None
-            self._started.set()
-            if unexpected_exit:
-                error = HotkeyRegistrationError(
-                    "Global hotkey event tap exited unexpectedly"
                 )
                 self._startup_error = error
                 self._report_error(error)

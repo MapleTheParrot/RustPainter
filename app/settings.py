@@ -22,12 +22,9 @@ from .hotkeys import (
 from .models import PaintMode, SharpenMode
 
 
-# Rust's Windows client runs as RustClient.exe. On other platforms the
-# executable name differs, so a Windows name there can never match and would
-# make the foreground guard pause the moment the user focuses the game. The
-# window-title check governs instead, and the field stays editable for anyone
-# who wants the stricter two-part guard.
-DEFAULT_EXPECTED_PROCESS_NAME = "RustClient.exe" if os.name == "nt" else ""
+# Rust's client runs as RustClient.exe. The field stays editable for anyone
+# running a differently named build.
+DEFAULT_EXPECTED_PROCESS_NAME = "RustClient.exe"
 
 # 2: stroke merging defaults on.  Merging never changes the painted result,
 #    only how many strokes it takes, so a saved "off" from before that was

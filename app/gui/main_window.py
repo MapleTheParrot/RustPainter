@@ -4635,11 +4635,8 @@ class MainWindow(QMainWindow):
             root = Path(override).expanduser()
             root.mkdir(parents=True, exist_ok=True)
             return root
-        if sys.platform == "darwin":
-            root = Path.home() / "Library" / "Application Support" / "RustPainter"
-        else:
-            local = os.environ.get("LOCALAPPDATA")
-            root = Path(local) / "RustPainter" if local else Path.cwd() / "data"
+        local = os.environ.get("LOCALAPPDATA")
+        root = Path(local) / "RustPainter" if local else Path.cwd() / "data"
         root.mkdir(parents=True, exist_ok=True)
         return root
 

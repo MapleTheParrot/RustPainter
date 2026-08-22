@@ -11,11 +11,8 @@ from app.hotkeys import (
     HotkeyRegistrationError,
     HotkeySpec,
 )
-from app.input_controller import mac_virtual_key_code
-
 # These two exercise the Win32 message loop by patching ctypes.WinDLL, which
-# only exists on Windows. The darwin event-tap path is covered separately by
-# tests/test_macos_backends.py.
+# only exists on Windows.
 windows_only = pytest.mark.skipif(
     os.name != "nt", reason="Win32 hotkey message loop requires Windows"
 )
@@ -131,22 +128,8 @@ def test_stop_timeout_marks_emergency_hotkeys_unhealthy() -> None:
     assert errors == [manager.startup_error]
 
 
-def test_darwin_bindings_resolve_mac_keycodes_and_modifiers() -> None:
-    manager = GlobalHotkeyManager(
-        bindings={"start_resume": "F8", "pause": "CTRL+SHIFT+F9", "abort": "F10"}
-    )
-    resolved = dict(
-        (name, (keycode, mask)) for name, keycode, mask in manager._darwin_bindings()
-    )
-    assert resolved["start_resume"] == (0x64, 0)
-    assert resolved["abort"] == (0x6D, 0)
-    keycode, mask = resolved["pause"]
-    assert keycode == 0x65
-    assert mask == (0x00040000 | 0x00020000)  # Control | Shift
-
-
-def test_every_offered_hotkey_choice_resolves_on_both_platforms() -> None:
-    # The chooser, the settings validator, and both key-code tables must agree,
+def test_every_offered_hotkey_choice_resolves() -> None:
+    # The chooser, the settings validator, and the key-code table must agree,
     # or a selectable entry would fail to register at runtime.
     from app.hotkeys import SUPPORTED_HOTKEY_CHOICES, is_supported_hotkey
 
@@ -158,7 +141,6 @@ def test_every_offered_hotkey_choice_resolves_on_both_platforms() -> None:
         assert str(spec) == choice
         assert spec.virtual_key > 0
         assert spec.modifier_mask >= MOD_NOREPEAT
-        assert mac_virtual_key_code(spec.key) >= 0
 
 
 def test_registration_failure_explains_an_already_owned_hotkey() -> None:

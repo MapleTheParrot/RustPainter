@@ -7,7 +7,6 @@ import ctypes
 import logging
 import math
 import os
-import sys
 import threading
 import time
 from collections import deque
@@ -15,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, Callable, ClassVar, Iterator
+from typing import Any, Callable, ClassVar, Iterator, Sequence
 
 from .brush_calibration import (
     BRUSH_SIZE_MAX,
@@ -81,38 +80,19 @@ _MOUSE_DRIFT_WINDOW_SECONDS = 0.6
 
 @contextlib.contextmanager
 def _high_resolution_timer() -> Iterator[None]:
-    """Stop the OS from distorting paint timing, per platform.
+    """Request 1 ms timer resolution while painting.
 
-    Windows: default timer granularity rounds short waits up to ~15.6 ms,
+    The default Windows timer granularity rounds short waits up to ~15.6 ms,
     which silently inflates every configured inter-stroke and interpolation
-    delay, so request 1 ms resolution.
-
-    macOS: App Nap throttles timers and background threads once an app stops
-    being frontmost. Painting *requires* the game to be frontmost instead, so
-    without opting out the job would be throttled for its entire duration.
+    delay.
     """
 
     acquired = False
-    activity = None
     if os.name == "nt":
         try:
             acquired = ctypes.WinDLL("winmm").timeBeginPeriod(1) == 0
         except (AttributeError, OSError):
             acquired = False
-    elif sys.platform == "darwin":
-        try:
-            import Foundation
-
-            # Keeps timers running at full rate while the app is in the
-            # background. It does not keep the display awake. The literal is
-            # Apple's documented value, used only if the binding is absent.
-            options = getattr(Foundation, "NSActivityUserInitiated", 0x00FFFFFF)
-            activity = Foundation.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
-                options, "Painting a sign"
-            )
-        except Exception:
-            LOGGER.warning("Could not opt out of App Nap; painting may be throttled")
-            activity = None
     try:
         yield
     finally:
@@ -121,25 +101,6 @@ def _high_resolution_timer() -> Iterator[None]:
                 ctypes.WinDLL("winmm").timeEndPeriod(1)
             except (AttributeError, OSError):
                 LOGGER.warning("Could not restore the Windows timer resolution")
-        if activity is not None:
-            try:
-                import Foundation
-
-                Foundation.NSProcessInfo.processInfo().endActivity_(activity)
-            except Exception:
-                LOGGER.warning("Could not end the App Nap exemption")
-
-
-def _foreground_failure_reason(settings: "PainterSettings") -> str:
-    """Explain a foreground-guard failure the user can actually act on."""
-
-    name = str(settings.expected_process_name or "").strip()
-    if name and os.name != "nt" and name.casefold().endswith(".exe"):
-        return (
-            f"foreground guard can never match the Windows process name "
-            f"{name!r} on this platform - clear it under Settings > Safety"
-        )
-    return "foreground window lost"
 
 
 class PainterState(str, Enum):
@@ -3100,7 +3061,7 @@ class Painter:
                 executable=settings.expected_process_name or None,
             )
             if not self._foreground_checker(requirement):
-                self.pause(_foreground_failure_reason(settings))
+                self.pause("foreground window lost")
                 return True
 
         return self._check_cursor(settings, now)

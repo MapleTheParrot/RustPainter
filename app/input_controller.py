@@ -1,7 +1,7 @@
 """Small, auditable input backends for painting with ordinary OS input.
 
-``SendInputController`` (Windows) and ``QuartzInputController`` (macOS) are the
-only classes in this project that emit real input.
+``SendInputController`` is the only class in this project that emits real
+input.
 The painter depends on the ``InputController`` protocol instead, which keeps dry
 runs and unit tests completely isolated from the user's mouse.
 """
@@ -12,7 +12,6 @@ import ctypes
 import logging
 import math
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -191,53 +190,6 @@ def virtual_key_code(key: int | str) -> int:
             return 0x70 + number - 1
     try:
         return _NAMED_VIRTUAL_KEYS[name]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported key name: {key!r}") from exc
-
-
-# ANSI-layout macOS virtual keycodes (HIToolbox Events.h kVK_* values).
-_MAC_LETTER_KEYS = {
-    "A": 0x00, "B": 0x0B, "C": 0x08, "D": 0x02, "E": 0x0E, "F": 0x03,
-    "G": 0x05, "H": 0x04, "I": 0x22, "J": 0x26, "K": 0x28, "L": 0x25,
-    "M": 0x2E, "N": 0x2D, "O": 0x1F, "P": 0x23, "Q": 0x0C, "R": 0x0F,
-    "S": 0x01, "T": 0x11, "U": 0x20, "V": 0x09, "W": 0x0D, "X": 0x07,
-    "Y": 0x10, "Z": 0x06,
-    "0": 0x1D, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "5": 0x17,
-    "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19,
-}
-_MAC_FUNCTION_KEYS = {
-    1: 0x7A, 2: 0x78, 3: 0x63, 4: 0x76, 5: 0x60, 6: 0x61, 7: 0x62,
-    8: 0x64, 9: 0x65, 10: 0x6D, 11: 0x67, 12: 0x6F, 13: 0x69, 14: 0x6B,
-    15: 0x71, 16: 0x6A, 17: 0x40, 18: 0x4F, 19: 0x50, 20: 0x5A,
-}
-_MAC_NAMED_KEYS = {
-    "BACKSPACE": 0x33, "TAB": 0x30, "ENTER": 0x24, "SHIFT": 0x38,
-    "CTRL": 0x3B, "CONTROL": 0x3B, "ALT": 0x3A, "ESC": 0x35,
-    "ESCAPE": 0x35, "SPACE": 0x31, "LEFT": 0x7B, "UP": 0x7E,
-    "RIGHT": 0x7C, "DOWN": 0x7D, "DELETE": 0x75,
-}
-
-
-def mac_virtual_key_code(key: int | str) -> int:
-    """Convert a compact key name such as ``F8`` or ``A`` to a macOS keycode.
-
-    Integers pass through so callers may supply a raw kVK_* value directly;
-    they are NOT Windows VK codes and the two numbering schemes differ.
-    """
-
-    if isinstance(key, int):
-        if not 0 <= key <= 0x7F:
-            raise ValueError("A macOS virtual keycode must be in the range 0..127")
-        return key
-    name = str(key).strip().upper()
-    if name in _MAC_LETTER_KEYS:
-        return _MAC_LETTER_KEYS[name]
-    if name.startswith("F") and name[1:].isdigit():
-        number = int(name[1:])
-        if number in _MAC_FUNCTION_KEYS:
-            return _MAC_FUNCTION_KEYS[number]
-    try:
-        return _MAC_NAMED_KEYS[name]
     except KeyError as exc:
         raise ValueError(f"Unsupported key name: {key!r}") from exc
 
@@ -467,152 +419,12 @@ class SendInputController(BaseInputController):
         return int(point.x), int(point.y)
 
 
-class QuartzInputController(BaseInputController):
-    """Emit mouse and keyboard input through macOS Quartz ``CGEventPost``.
-
-    Coordinates are global display points with the origin at the top-left of
-    the primary display, matching Qt's global coordinate space on macOS, so
-    calibrated rectangles and synthesized input agree without conversion.
-    Posting events requires the Accessibility permission (System Settings >
-    Privacy & Security > Accessibility).
-    """
-
-    def __init__(self) -> None:
-        if sys.platform != "darwin":
-            raise OSError("QuartzInputController is available only on macOS")
-        import Quartz  # pyobjc-framework-Quartz
-
-        from .screen import get_virtual_screen
-
-        self._quartz = Quartz
-        self._get_virtual_screen = get_virtual_screen
-        self._buttons = {
-            MouseButton.LEFT: (
-                Quartz.kCGMouseButtonLeft,
-                Quartz.kCGEventLeftMouseDown,
-                Quartz.kCGEventLeftMouseUp,
-                Quartz.kCGEventLeftMouseDragged,
-            ),
-            MouseButton.RIGHT: (
-                Quartz.kCGMouseButtonRight,
-                Quartz.kCGEventRightMouseDown,
-                Quartz.kCGEventRightMouseUp,
-                Quartz.kCGEventRightMouseDragged,
-            ),
-            MouseButton.MIDDLE: (
-                Quartz.kCGMouseButtonCenter,
-                Quartz.kCGEventOtherMouseDown,
-                Quartz.kCGEventOtherMouseUp,
-                Quartz.kCGEventOtherMouseDragged,
-            ),
-        }
-        self._lock = threading.RLock()
-        self._held_buttons: set[MouseButton] = set()
-        self._position = self.get_cursor_position()
-
-    @property
-    def held_buttons(self) -> frozenset[MouseButton]:
-        with self._lock:
-            return frozenset(self._held_buttons)
-
-    def _post_mouse(self, event_type: int, x: float, y: float, cg_button: int) -> None:
-        event = self._quartz.CGEventCreateMouseEvent(None, event_type, (x, y), cg_button)
-        if event is None:
-            raise OSError("Quartz refused to create a mouse event")
-        self._quartz.CGEventPost(self._quartz.kCGHIDEventTap, event)
-
-    def move_mouse(self, x: float, y: float) -> None:
-        virtual = self._get_virtual_screen()
-        clamped_x = int(round(x))
-        clamped_y = int(round(y))
-        if not (
-            virtual.left <= clamped_x < virtual.right
-            and virtual.top <= clamped_y < virtual.bottom
-        ):
-            raise ValueError(
-                f"Input target ({clamped_x}, {clamped_y}) is outside the virtual desktop "
-                f"({virtual.left}, {virtual.top}, {virtual.width}, {virtual.height})"
-            )
-        with self._lock:
-            if self._held_buttons:
-                # While a button is down macOS expects Dragged events; plain
-                # MouseMoved during a hold is ignored by many applications.
-                button = next(iter(self._held_buttons))
-                cg_button, _down, _up, dragged = self._buttons[button]
-                self._post_mouse(dragged, clamped_x, clamped_y, cg_button)
-            else:
-                self._post_mouse(
-                    self._quartz.kCGEventMouseMoved,
-                    clamped_x,
-                    clamped_y,
-                    self._quartz.kCGMouseButtonLeft,
-                )
-            self._position = (clamped_x, clamped_y)
-
-    def mouse_down(self, button: MouseButton | str = MouseButton.LEFT) -> None:
-        resolved = _coerce_button(button)
-        with self._lock:
-            if resolved in self._held_buttons:
-                return
-            cg_button, down, _up, _dragged = self._buttons[resolved]
-            x, y = self._position
-            self._post_mouse(down, x, y, cg_button)
-            self._held_buttons.add(resolved)
-
-    def mouse_up(self, button: MouseButton | str = MouseButton.LEFT) -> None:
-        resolved = _coerce_button(button)
-        with self._lock:
-            if resolved not in self._held_buttons:
-                return
-            # Mirror SendInputController: keep tracking on failure so
-            # release_all() can retry rather than losing the held state.
-            cg_button, _down, up, _dragged = self._buttons[resolved]
-            x, y = self._position
-            self._post_mouse(up, x, y, cg_button)
-            self._held_buttons.discard(resolved)
-
-    def press_key(self, key: int | str, *, hold_seconds: float = 0.01) -> None:
-        if hold_seconds < 0:
-            raise ValueError("hold_seconds cannot be negative")
-        keycode = mac_virtual_key_code(key)
-        with self._lock:
-            key_down = self._quartz.CGEventCreateKeyboardEvent(None, keycode, True)
-            self._quartz.CGEventPost(self._quartz.kCGHIDEventTap, key_down)
-        try:
-            if hold_seconds:
-                time.sleep(hold_seconds)
-        finally:
-            with self._lock:
-                key_up = self._quartz.CGEventCreateKeyboardEvent(None, keycode, False)
-                self._quartz.CGEventPost(self._quartz.kCGHIDEventTap, key_up)
-
-    def release_all(self) -> None:
-        """Release every mouse button this controller believes it pressed."""
-
-        first_error: BaseException | None = None
-        for button in tuple(self.held_buttons):
-            try:
-                self.mouse_up(button)
-            except BaseException as exc:  # continue releasing the other buttons
-                first_error = first_error or exc
-                LOGGER.exception("Could not release %s mouse button", button.value)
-        if first_error is not None:
-            raise first_error
-
-    def get_cursor_position(self) -> tuple[int, int]:
-        event = self._quartz.CGEventCreate(None)
-        location = self._quartz.CGEventGetLocation(event)
-        return int(round(location.x)), int(round(location.y))
-
-
 def create_system_input_controller() -> BaseInputController:
     """Return the real input backend for the current operating system."""
 
     if os.name == "nt":
         return SendInputController()
-    if sys.platform == "darwin":
-        return QuartzInputController()
-    raise OSError("Real input synthesis is supported only on Windows and macOS")
+    raise OSError("Real input synthesis is supported only on Windows")
 
 
 class MockInputController(BaseInputController):
@@ -747,10 +559,8 @@ __all__ = [
     "MockInput",
     "MockInputController",
     "MouseButton",
-    "QuartzInputController",
     "SendInputController",
     "create_system_input_controller",
-    "mac_virtual_key_code",
     "WindowsInputController",
     "virtual_key_code",
 ]

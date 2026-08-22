@@ -1,17 +1,14 @@
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
 
-import os
-
 from app.input_controller import (
     MouseButton,
-    QuartzInputController,
     SendInputController,
     create_system_input_controller,
-    mac_virtual_key_code,
 )
 from app.screen import VirtualScreen
 
@@ -88,41 +85,9 @@ def test_absolute_move_rejects_targets_outside_virtual_desktop() -> None:
         assert (dy * 100) >> 16 == pixel_y
 
 
-def test_mac_virtual_key_codes_cover_hotkeys_letters_and_digits() -> None:
-    assert mac_virtual_key_code("F8") == 0x64
-    assert mac_virtual_key_code("F9") == 0x65
-    assert mac_virtual_key_code("F10") == 0x6D
-    assert mac_virtual_key_code("a") == 0x00
-    assert mac_virtual_key_code("Z") == 0x06
-    assert mac_virtual_key_code("0") == 0x1D
-    assert mac_virtual_key_code("SPACE") == 0x31
-    assert mac_virtual_key_code(0x64) == 0x64
-
-
-def test_mac_virtual_key_code_rejects_unknown_input() -> None:
-    import pytest
-
-    with pytest.raises(ValueError):
-        mac_virtual_key_code("F25")
-    with pytest.raises(ValueError):
-        mac_virtual_key_code("NOSUCHKEY")
-    with pytest.raises(ValueError):
-        mac_virtual_key_code(300)
-
-
 def test_create_system_input_controller_picks_platform_backend() -> None:
-    import sys
-
-    import pytest
-
     if os.name == "nt":
         assert isinstance(create_system_input_controller(), SendInputController)
-        with pytest.raises(OSError):
-            QuartzInputController()
-    elif sys.platform == "darwin":
-        assert isinstance(create_system_input_controller(), QuartzInputController)
-        with pytest.raises(OSError):
-            SendInputController()
     else:
         with pytest.raises(OSError):
             create_system_input_controller()

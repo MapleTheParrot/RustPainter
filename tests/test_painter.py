@@ -819,25 +819,6 @@ def test_brush_application_requires_a_way_to_clear_the_sign() -> None:
     painter.configure(_dot_plan(1), profile, _settings(apply_brush_size=True))
 
 
-def test_foreground_failure_reason_calls_out_an_impossible_windows_name() -> None:
-    """The generic message left macOS users with no idea what went wrong."""
-
-    from app.painter import _foreground_failure_reason
-
-    windows_name = _settings(
-        require_foreground=True, expected_process_name="RustClient.exe"
-    )
-    reason = _foreground_failure_reason(windows_name)
-    if os.name == "nt":
-        assert reason == "foreground window lost"
-    else:
-        assert "RustClient.exe" in reason
-        assert "Settings" in reason
-
-    posix_name = _settings(require_foreground=True, expected_process_name="RustClient")
-    assert _foreground_failure_reason(posix_name) == "foreground window lost"
-
-
 class _HandInput(MockInputController):
     """A real-input mock whose cursor can lag behind, or be moved by a hand."""
 
