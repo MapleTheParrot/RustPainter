@@ -293,7 +293,12 @@ class SendInputController(BaseInputController):
 
     _INPUT_MOUSE = 0
     _INPUT_KEYBOARD = 1
+    _KEYEVENTF_EXTENDEDKEY = 0x0001
     _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_SCANCODE = 0x0008
+    _MAPVK_VK_TO_VSC = 0
+    # Virtual keys whose scan code carries the 0xE0 prefix on a PC keyboard.
+    _EXTENDED_VIRTUAL_KEYS = frozenset({0x25, 0x26, 0x27, 0x28, 0x2E})
     _MOUSEEVENTF_MOVE = 0x0001
     _MOUSEEVENTF_LEFTDOWN = 0x0002
     _MOUSEEVENTF_LEFTUP = 0x0004
@@ -324,6 +329,9 @@ class SendInputController(BaseInputController):
         self._get_cursor_pos = self._user32.GetCursorPos
         self._get_cursor_pos.argtypes = (ctypes.POINTER(_POINT),)
         self._get_cursor_pos.restype = wintypes.BOOL
+        self._map_virtual_key = self._user32.MapVirtualKeyW
+        self._map_virtual_key.argtypes = (wintypes.UINT, wintypes.UINT)
+        self._map_virtual_key.restype = wintypes.UINT
         self._lock = threading.RLock()
         self._held_buttons: set[MouseButton] = set()
 
@@ -402,14 +410,34 @@ class SendInputController(BaseInputController):
             self._mouse_event(self._BUTTON_FLAGS[resolved][1])
             self._held_buttons.discard(resolved)
 
+    def _key_input(self, vk: int, *, up: bool) -> "_INPUT":
+        """Build a key event that a game will see as a real key.
+
+        A keyboard event carrying only a virtual key reaches ordinary windows
+        and text boxes through the message queue, but a game reading the
+        keyboard through raw input or DirectInput looks at the hardware scan
+        code and sees nothing.  Rust takes digits typed into its Size box
+        either way, yet ignored Space and E sent this way.  The scan code is
+        looked up from the layout and sent alongside the virtual key, with the
+        extended-key flag for the keys whose scan code carries it.
+        """
+
+        scan = self._map_virtual_key(vk, self._MAPVK_VK_TO_VSC)
+        flags = self._KEYEVENTF_KEYUP if up else 0
+        if scan:
+            flags |= self._KEYEVENTF_SCANCODE
+            if vk in self._EXTENDED_VIRTUAL_KEYS:
+                flags |= self._KEYEVENTF_EXTENDEDKEY
+        native_input = _INPUT(type=self._INPUT_KEYBOARD)
+        native_input.ki = _KEYBDINPUT(vk, scan, flags, 0, 0)
+        return native_input
+
     def press_key(self, key: int | str, *, hold_seconds: float = 0.01) -> None:
         if hold_seconds < 0:
             raise ValueError("hold_seconds cannot be negative")
         vk = virtual_key_code(key)
-        key_down = _INPUT(type=self._INPUT_KEYBOARD)
-        key_down.ki = _KEYBDINPUT(vk, 0, 0, 0, 0)
-        key_up = _INPUT(type=self._INPUT_KEYBOARD)
-        key_up.ki = _KEYBDINPUT(vk, 0, self._KEYEVENTF_KEYUP, 0, 0)
+        key_down = self._key_input(vk, up=False)
+        key_up = self._key_input(vk, up=True)
         with self._lock:
             self._send(key_down)
         try:

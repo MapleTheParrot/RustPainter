@@ -34,6 +34,38 @@ def test_failed_mouse_up_remains_tracked_for_retry() -> None:
     assert not controller.held_buttons
 
 
+def test_press_key_sends_the_scan_code_games_listen_for() -> None:
+    """A game reads the hardware scan code, not the virtual key.
+
+    Rust ignored a Space or E sent as a bare virtual key; the same events
+    with the layout's scan code and the scan-code flag register as real
+    presses.  Arrow and Delete keys additionally carry the extended flag.
+    """
+
+    controller = object.__new__(SendInputController)
+    controller._lock = threading.RLock()
+    scan_codes = {0x20: 0x39, ord("E"): 0x12, 0x25: 0x4B}
+    controller._map_virtual_key = lambda vk, _kind: scan_codes.get(vk, 0)
+    sent: list[tuple[int, int, int]] = []
+    controller._send = lambda native: sent.append(
+        (native.ki.wVk, native.ki.wScan, native.ki.dwFlags)
+    )
+
+    controller.press_key("SPACE", hold_seconds=0)
+    controller.press_key("E", hold_seconds=0)
+    controller.press_key("LEFT", hold_seconds=0)
+
+    scancode, keyup, extended = 0x0008, 0x0002, 0x0001
+    assert sent == [
+        (0x20, 0x39, scancode),
+        (0x20, 0x39, scancode | keyup),
+        (ord("E"), 0x12, scancode),
+        (ord("E"), 0x12, scancode | keyup),
+        (0x25, 0x4B, scancode | extended),
+        (0x25, 0x4B, scancode | extended | keyup),
+    ]
+
+
 def test_absolute_move_rejects_targets_outside_virtual_desktop() -> None:
     controller = object.__new__(SendInputController)
     controller._lock = threading.RLock()
