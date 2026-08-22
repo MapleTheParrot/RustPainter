@@ -178,6 +178,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # that kicks idle players sees one moving.
         "anti_afk_enabled": False,
         "anti_afk_interval_minutes": 30,
+        # Pause when the painting UI's calibrated widgets leave the screen:
+        # a kick, a server restart, or the sign closed by hand.
+        "ui_guard_enabled": True,
     },
     "execution": {
         "dry_run": False,
@@ -534,6 +537,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         "require_rust_foreground",
         "verify_calibrated_ui",
         "anti_afk_enabled",
+        "ui_guard_enabled",
     ):
         if not isinstance(safety.get(key), bool):
             raise SettingsError(f"safety.{key} must be true or false")

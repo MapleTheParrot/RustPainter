@@ -1989,3 +1989,244 @@ def test_a_sign_that_is_not_bare_before_painting_gives_no_bare_reference() -> No
     assert painter.wait(_t(30.0))
     assert painter.state is PainterState.COMPLETED, painter.state_reason
     assert len(_press_points_on(controller, canvas)) == 32
+
+
+# ------------------------------------------------------------------ UI guard
+
+
+def _ui_screen(profile):
+    """A screen showing Rust's painting UI at the profile's rectangles."""
+
+    from test_ui_guard import FakeScreen
+
+    return FakeScreen(profile)
+
+
+def _quick_ui_guard(painter: Painter) -> Painter:
+    """Look for the UI every few milliseconds instead of every second."""
+
+    painter._UI_GUARD_INTERVAL_SECONDS = 0.02  # type: ignore[misc]
+    painter._UI_GUARD_RECHECK_SECONDS = 0.01  # type: ignore[misc]
+    return painter
+
+
+def test_the_ui_guard_pauses_when_the_painting_ui_disappears() -> None:
+    """A server restart or a kick takes the sign off the screen mid-job.
+
+    The Rust window is still in front and the cursor still goes where it is
+    sent, so neither existing guard notices.  The calibrated widgets no
+    longer being on the screen is what does, and the job pauses - it never
+    aborts - and carries on from the same stroke once the sign is back.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    screen = _ui_screen(profile)
+    painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+    painter.start(
+        _dot_plan(40),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.02,
+            ui_guard_enabled=True,
+        ),
+    )
+    assert _wait_until(lambda: painter.progress.completed_strokes >= 3)
+    assert painter.state is PainterState.RUNNING
+
+    screen.open = False
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert "painting UI not found" in painter.state_reason
+    paused_at = painter.progress.completed_strokes
+    assert paused_at < 40
+    event_count = len(controller.events)
+    time.sleep(0.06)
+    assert len(controller.events) == event_count
+
+    # Resumed with the sign still closed: the guard looks before the next
+    # stroke and pauses again without any input going out.
+    assert painter.resume()
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert len(controller.events) == event_count
+
+    screen.open = True
+    assert painter.resume()
+    assert painter.wait(_t(5.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 40
+    assert not controller.held_buttons
+
+
+def test_a_job_started_without_the_painting_ui_pauses_before_any_input() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    screen = _ui_screen(profile)
+    screen.open = False
+    painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+    painter.start(_dot_plan(3), profile, _settings(ui_guard_enabled=True))
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert "painting UI not found" in painter.state_reason
+    assert controller.events == []
+
+    screen.open = True
+    assert painter.resume()
+    assert painter.wait(_t(3.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 3
+
+
+def test_turning_the_ui_guard_off_during_its_pause_lets_the_job_go_on() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    screen = _ui_screen(profile)
+    screen.open = False
+    painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+    painter.start(_dot_plan(3), profile, _settings(ui_guard_enabled=True))
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+
+    assert painter.retune(_settings(ui_guard_enabled=False))
+    assert painter.resume()
+    assert painter.wait(_t(3.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+
+def test_the_ui_guard_is_off_for_dry_runs_and_when_disabled() -> None:
+    profile = _profile()
+    for controller in (DryRunInputController(), MockInputController()):
+        screen = _ui_screen(profile)
+        screen.open = False
+        painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+        painter.start(_dot_plan(2), profile, _settings(ui_guard_enabled=True))
+        assert painter.wait(_t(3.0))
+        assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    screen = _ui_screen(profile)
+    screen.open = False
+    painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+    painter.start(_dot_plan(2), profile, _settings(ui_guard_enabled=False))
+    assert painter.wait(_t(3.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+
+class _SignInput(MockInputController):
+    """Real input whose Save click closes the sign and whose E reopens it."""
+
+    emits_real_input = True
+
+    def __init__(self, screen, save_centre: tuple[int, int], *, reopens: bool = True) -> None:
+        super().__init__()
+        self.screen = screen
+        self.save_centre = save_centre
+        self.reopens = reopens
+        self._last_move: tuple[int, int] | None = None
+
+    def move_mouse(self, x: float, y: float) -> None:
+        super().move_mouse(x, y)
+        self._last_move = (int(round(x)), int(round(y)))
+
+    def mouse_down(self, button) -> None:
+        super().mouse_down(button)
+        if self._last_move == self.save_centre:
+            self.screen.open = False
+
+    def press_key(self, key: str, *, hold_seconds: float = 0.0) -> None:
+        super().press_key(key, hold_seconds=hold_seconds)
+        if key == "E" and self.reopens:
+            self.screen.open = True
+
+
+def test_the_anti_afk_break_closing_the_sign_does_not_trip_the_ui_guard() -> None:
+    """The break leaves the painting UI on purpose, and the guard lets it.
+
+    Between Save and the reopen the widgets are off the screen exactly as
+    they would be after a kick; the difference is that the job did it, and
+    knows to look away until it has pressed E.
+    """
+
+    profile = _profile()
+    profile.save_button = ScreenRect(600, 300, 100, 30)
+    screen = _ui_screen(profile)
+    controller = _SignInput(screen, (650, 314))
+    states: list[PainterState] = []
+    painter = _quick_ui_guard(
+        Painter(
+            controller,
+            screen_capture=screen,
+            on_state_change=lambda state, _reason: states.append(state),
+        )
+    )
+    painter._AFK_REOPEN_GRACE_SECONDS = 0.3  # type: ignore[misc]
+    painter._AFK_REOPEN_POLL_SECONDS = 0.02  # type: ignore[misc]
+    painter.start(
+        _dot_plan(4),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.3,
+            anti_afk_enabled=True,
+            anti_afk_interval_seconds=0.5,
+            ui_guard_enabled=True,
+        ),
+    )
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 4
+    assert PainterState.PAUSED not in states, states
+    # Real input runs every wait at the game's frame floor, so a stroke and
+    # its gap outrun the half-second interval and the break recurs; each one
+    # closed the sign and the guard let every one of them.
+    keys = [event.value for event in controller.events if event.kind == "key_down"]
+    assert keys and keys == ["SPACE", "E"] * (len(keys) // 2), keys
+
+
+def test_a_sign_that_does_not_reopen_after_the_break_pauses_the_job() -> None:
+    """E pressed, and no painting UI came back: the job waits for a hand.
+
+    Without the guard the next stroke would be a click in the game world.
+    The break still counts as taken - the user reopening the sign is proof
+    enough of a player who is not idle - so resuming paints straight away.
+    """
+
+    profile = _profile()
+    profile.save_button = ScreenRect(600, 300, 100, 30)
+    screen = _ui_screen(profile)
+    controller = _SignInput(screen, (650, 314), reopens=False)
+    painter = _quick_ui_guard(Painter(controller, screen_capture=screen))
+    painter._AFK_REOPEN_GRACE_SECONDS = 0.3  # type: ignore[misc]
+    painter._AFK_REOPEN_POLL_SECONDS = 0.02  # type: ignore[misc]
+    painter.start(
+        _dot_plan(4),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.3,
+            anti_afk_enabled=True,
+            anti_afk_interval_seconds=0.5,
+            ui_guard_enabled=True,
+        ),
+    )
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED, timeout=10.0)
+    assert "did not reopen" in painter.state_reason
+    keys = [event.value for event in controller.events if event.kind == "key_down"]
+    assert keys == ["SPACE", "E"], keys
+    events_at_pause = len(controller.events)
+
+    # The player opens the sign and resumes: the job paints on, and does
+    # not take another break before it has painted a stroke.
+    screen.open = True
+    controller.reopens = True
+    assert painter.resume()
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 4
+    later = [
+        event.kind for event in controller.events[events_at_pause:]
+        if event.kind in {"mouse_down", "key_down"}
+    ]
+    assert later and later[0] == "mouse_down", later

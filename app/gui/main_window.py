@@ -2305,6 +2305,16 @@ class MainWindow(QMainWindow):
             "accidental nudge never costs the whole run."
         )
         self.verify_ui_check = QCheckBox("Compare calibration reference before start")
+        self.ui_guard_check = QCheckBox("Pause when the painting UI disappears")
+        self.ui_guard_check.setChecked(True)
+        self.ui_guard_check.setToolTip(
+            "Once a second the painter looks at the calibrated colour box, hue\n"
+            "bar, and Clear and Save buttons.  When they are no longer on the\n"
+            "screen - a server restart, a kick, or the sign closed by hand -\n"
+            "it pauses instead of painting into the game world, and carries\n"
+            "on from the same stroke once you open the sign and resume.\n"
+            "The anti-AFK break closes the sign on purpose and is exempt."
+        )
         self.start_hotkey_combo = self._hotkey_combo("F8")
         self.pause_hotkey_combo = self._hotkey_combo("F9")
         self.abort_hotkey_combo = self._hotkey_combo("F10")
@@ -2314,6 +2324,7 @@ class MainWindow(QMainWindow):
         safety_form.addRow("Expected process", self.expected_process_edit)
         safety_form.addRow("Mouse guard", self.mouse_pause_check)
         safety_form.addRow("UI check", self.verify_ui_check)
+        safety_form.addRow("UI guard", self.ui_guard_check)
         safety_form.addRow("Start / resume", self.start_hotkey_combo)
         safety_form.addRow("Pause", self.pause_hotkey_combo)
         safety_form.addRow("Stop", self.abort_hotkey_combo)
@@ -4789,6 +4800,7 @@ class MainWindow(QMainWindow):
             self.expected_process_edit,
             self.mouse_pause_check,
             self.verify_ui_check,
+            self.ui_guard_check,
             self.anti_afk_check,
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
@@ -5035,6 +5047,7 @@ class MainWindow(QMainWindow):
                 str(safety.get("expected_process_name", "") or "")
             )
             self.verify_ui_check.setChecked(bool(safety.get("verify_calibrated_ui", False)))
+            self.ui_guard_check.setChecked(bool(safety.get("ui_guard_enabled", True)))
             self.anti_afk_check.setChecked(bool(safety.get("anti_afk_enabled", False)))
             self.anti_afk_interval_spin.setValue(
                 int(safety.get("anti_afk_interval_minutes", 30))
@@ -5150,6 +5163,7 @@ class MainWindow(QMainWindow):
             "expected_window_title_contains": self.expected_window_edit.text().strip(),
             "expected_process_name": self.expected_process_edit.text().strip(),
             "verify_calibrated_ui": self.verify_ui_check.isChecked(),
+            "ui_guard_enabled": self.ui_guard_check.isChecked(),
             "anti_afk_enabled": self.anti_afk_check.isChecked(),
             "anti_afk_interval_minutes": self.anti_afk_interval_spin.value(),
         }
@@ -6411,6 +6425,7 @@ class MainWindow(QMainWindow):
             self.expected_window_edit,
             self.expected_process_edit,
             self.mouse_pause_check,
+            self.ui_guard_check,
             self.anti_afk_check,
             self.anti_afk_interval_spin,
         )
@@ -6469,6 +6484,7 @@ class MainWindow(QMainWindow):
             self.expected_process_edit,
             self.mouse_pause_check,
             self.verify_ui_check,
+            self.ui_guard_check,
             self.anti_afk_check,
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,

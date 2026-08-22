@@ -62,6 +62,7 @@ from .screen import (
     capture_region,
     foreground_window_matches,
 )
+from .ui_guard import PaintingUiGuard
 
 
 LOGGER = logging.getLogger("rust_painter.painter")
@@ -226,6 +227,11 @@ class PainterSettings:
     # that kicks idle players sees one moving.  Needs the Save button.
     anti_afk_enabled: bool = False
     anti_afk_interval_seconds: float = 1800.0
+    # Pause when the painting UI's calibrated widgets are no longer on the
+    # screen - a kick, a server restart, or a sign closed by hand.  The
+    # anti-AFK break closes the UI on purpose and suspends the guard while
+    # it does.
+    ui_guard_enabled: bool = False
 
     # The fields a paused job may take new values for.  Everything else
     # shaped the job - which brush it measured, how its strokes were laid
@@ -252,6 +258,7 @@ class PainterSettings:
         "progress_callback_interval_seconds",
         "anti_afk_enabled",
         "anti_afk_interval_seconds",
+        "ui_guard_enabled",
     )
 
     def retuned(self, other: "PainterSettings") -> "PainterSettings":
@@ -377,6 +384,7 @@ class PainterSettings:
                 float(pick(safety, "anti_afk_interval_seconds", 0.0))
                 or float(pick(safety, "anti_afk_interval_minutes", 30.0)) * 60.0
             ),
+            ui_guard_enabled=bool(pick(safety, "ui_guard_enabled", True)),
         )
 
 
@@ -525,6 +533,12 @@ class Painter:
         # When the job last proved to the server it was not idle: the start
         # of the job, and then every anti-AFK break.
         self._last_anti_afk_at = 0.0
+        # The painting UI's fingerprint, taken as the job reaches the sign.
+        # Suspended through the anti-AFK break, which closes the UI itself.
+        self._ui_guard: PaintingUiGuard | None = None
+        self._ui_guard_suspended = False
+        self._last_ui_check = 0.0
+        self._ui_missing_checks = 0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -749,6 +763,10 @@ class Painter:
             self._paint_phase_timing = None
             self._timing_retuned = False
             self._last_anti_afk_at = self._started_at
+            self._ui_guard = None
+            self._ui_guard_suspended = False
+            self._last_ui_check = 0.0
+            self._ui_missing_checks = 0
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -826,6 +844,10 @@ class Painter:
             self._state_reason = "resumed"
             # Force the worker to verify focus again before its very next input.
             self._last_focus_check = 0.0
+            # Likewise the painting UI: a pause is when the sign gets closed
+            # and reopened, so its next look must not wait out the interval.
+            self._last_ui_check = 0.0
+            self._ui_missing_checks = 0
             # The cursor is wherever the user left it, so there is no commanded
             # point it should currently match. Without re-baselining, the first
             # sample after resuming would read as movement and pause again.
@@ -1068,6 +1090,7 @@ class Painter:
             # RUNNING is set before the first guard so a zero-second countdown
             # can still enter the ordinary PAUSED state when focus is wrong.
             self._checkpoint(check_focus=True)
+            self._confirm_painting_ui(job)
             job.target = self._measured_picker_target(job.target)
             if job.mode == "measure_brush":
                 measured = self._measure_brush_size_model(job)
@@ -2528,35 +2551,223 @@ class Painter:
         self._checkpoint(epoch=epoch, check_focus=True)
         with self._condition:
             self._reset_mouse_movement_baseline()
-        self._mouse_down(epoch)
+        # The UI guard would read the break as the UI being lost, which is
+        # exactly what the break does on purpose; it is told to look away
+        # until the sign is open again, and then to look first thing.
+        self._ui_guard_suspended = True
         try:
+            self._mouse_down(epoch)
+            try:
+                self._interruptible_sleep(
+                    self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+                )
+            finally:
+                self.input.mouse_up(MouseButton.LEFT)
             self._interruptible_sleep(
-                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+                self._AFK_SAVE_SETTLE_SECONDS, epoch=epoch, check_focus=True
             )
+            self._checkpoint(epoch=epoch, check_focus=True)
+            self.input.press_key("SPACE", hold_seconds=self._AFK_JUMP_HOLD_SECONDS)
+            self._interruptible_sleep(
+                self._AFK_JUMP_SETTLE_SECONDS, epoch=epoch, check_focus=True
+            )
+            self._checkpoint(epoch=epoch, check_focus=True)
+            self.input.press_key(
+                self._AFK_INTERACT_KEY, hold_seconds=self._AFK_JUMP_HOLD_SECONDS
+            )
+            self._interruptible_sleep(
+                self._AFK_REOPEN_SETTLE_SECONDS, epoch=epoch, check_focus=True
+            )
+            reopened = self._await_painting_ui(job, epoch)
         finally:
-            self.input.mouse_up(MouseButton.LEFT)
-        self._interruptible_sleep(
-            self._AFK_SAVE_SETTLE_SECONDS, epoch=epoch, check_focus=True
-        )
-        self._checkpoint(epoch=epoch, check_focus=True)
-        self.input.press_key("SPACE", hold_seconds=self._AFK_JUMP_HOLD_SECONDS)
-        self._interruptible_sleep(
-            self._AFK_JUMP_SETTLE_SECONDS, epoch=epoch, check_focus=True
-        )
-        self._checkpoint(epoch=epoch, check_focus=True)
-        self.input.press_key(
-            self._AFK_INTERACT_KEY, hold_seconds=self._AFK_JUMP_HOLD_SECONDS
-        )
-        self._interruptible_sleep(
-            self._AFK_REOPEN_SETTLE_SECONDS, epoch=epoch, check_focus=True
-        )
+            self._ui_guard_suspended = False
         with self._condition:
             self._reset_mouse_movement_baseline()
             self._last_anti_afk_at = time.monotonic()
             # A new epoch: the sign was left and re-entered, so the next
             # stroke re-selects its color and re-applies its brush size.
             self._pause_generation += 1
+        if not reopened:
+            # The player is awake - they will be the one reopening the sign
+            # - so the break counts as taken, and the job waits for them
+            # rather than painting strokes into the game world.
+            self.pause(self._UI_NOT_REOPENED_REASON)
+            self._checkpoint(check_focus=True)
         self._update_progress_state(PainterState.RUNNING, "Painting")
+
+    # How long after the interact key the painting UI may take to be drawn
+    # again before the break gives up waiting for it, and how often it looks.
+    _AFK_REOPEN_GRACE_SECONDS = 4.0
+    _AFK_REOPEN_POLL_SECONDS = 0.5
+
+    def _await_painting_ui(self, job: _Job, epoch: int) -> bool:
+        """Wait for the reopened sign's UI to be drawn again after the break.
+
+        True when it is there, or when nothing is watching for it; False
+        when the grace period runs out without it.  An unarmed guard - the
+        job started with it off and a pause turned it on - is armed here
+        from the reopened UI, which is as good a first look as any.
+        """
+
+        guard = self._ui_guard
+        if guard is None or not self._ui_guard_wanted(job.settings):
+            return True
+        deadline = time.monotonic() + self._AFK_REOPEN_GRACE_SECONDS
+        while True:
+            try:
+                if guard.armed:
+                    present = guard.check(self._screen_capture).present
+                else:
+                    present = guard.arm(self._screen_capture)
+            except Exception:
+                LOGGER.warning(
+                    "Could not look for the painting UI after the anti-AFK break",
+                    exc_info=True,
+                )
+                return True
+            if present:
+                self._ui_missing_checks = 0
+                self._last_ui_check = time.monotonic()
+                return True
+            if time.monotonic() >= deadline:
+                LOGGER.warning(
+                    "The painting UI did not come back within %.0fs of pressing %s",
+                    self._AFK_REOPEN_GRACE_SECONDS,
+                    self._AFK_INTERACT_KEY,
+                )
+                guard.disarm()
+                return False
+            self._interruptible_sleep(
+                self._AFK_REOPEN_POLL_SECONDS, epoch=epoch, check_focus=True
+            )
+
+    # ------------------------------------------------------------ UI guard
+
+    _UI_NOT_FOUND_REASON = "painting UI not found - open the sign again and resume"
+    _UI_NOT_REOPENED_REASON = (
+        "the sign did not reopen after the anti-AFK break - open it and resume"
+    )
+    # Looks at the screen this often while painting, and this much sooner
+    # again after a look that found nothing: one failed look can be a frame
+    # of something drawn over the UI, two half a second apart are the UI gone.
+    _UI_GUARD_INTERVAL_SECONDS = 1.0
+    _UI_GUARD_RECHECK_SECONDS = 0.5
+    _UI_GUARD_MISSING_CHECKS_TO_PAUSE = 2
+
+    def _ui_guard_wanted(self, settings: PainterSettings) -> bool:
+        return bool(
+            settings.ui_guard_enabled
+            and getattr(self.input, "emits_real_input", True)
+        )
+
+    def _confirm_painting_ui(self, job: _Job) -> None:
+        """Fingerprint the painting UI before the job's first input.
+
+        The fingerprint has to come from the painting UI, and the hue bar is
+        what proves it did.  A screen without one - the countdown ran out
+        before the sign was opened, say - pauses the job until the user
+        opens the sign and resumes, when it is fingerprinted afresh.  That
+        is the same mistake the guard exists to catch, caught a stroke
+        earlier.  Turning the guard off during the pause lets the job go
+        on without it.
+        """
+
+        self._ui_guard = None
+        if not getattr(self.input, "emits_real_input", True):
+            return
+        guard = PaintingUiGuard.for_target(job.target)
+        if guard is None:
+            return
+        self._ui_guard = guard
+        while self._ui_guard_wanted(job.settings) and not guard.armed:
+            if self._arm_ui_guard(guard):
+                return
+            self.pause(self._UI_NOT_FOUND_REASON)
+            # Waits out the pause.  The safety check the wait ends on arms
+            # the guard itself when the UI is back, or pauses again.
+            self._checkpoint(check_focus=True)
+
+    def _arm_ui_guard(self, guard: PaintingUiGuard) -> bool:
+        """Fingerprint the UI now; True when the screen showed it.
+
+        A capture that fails outright switches the guard off for the job:
+        a screen that cannot be read is not one the guard can watch, and
+        the job should not stall on it.
+        """
+
+        try:
+            armed = guard.arm(self._screen_capture)
+        except Exception:
+            LOGGER.warning(
+                "Could not fingerprint the painting UI; the UI guard is off "
+                "for this job",
+                exc_info=True,
+            )
+            self._ui_guard = None
+            return True
+        if armed:
+            self._ui_missing_checks = 0
+            self._last_ui_check = time.monotonic()
+            LOGGER.info(
+                "UI guard armed on %s",
+                ", ".join(region.name for region in guard.regions),
+            )
+            return True
+        LOGGER.warning(
+            "The painting UI was not recognised on the screen: the hue bar is "
+            "not where it was calibrated"
+        )
+        return False
+
+    def _check_painting_ui(self, settings: PainterSettings, now: float) -> bool:
+        """Pause when the painting UI's widgets have gone from the screen.
+
+        Returns True when the job just paused and the caller must re-evaluate
+        its state.  A guard a pause turned on, or one a pause for a missing
+        UI disarmed, is armed from the screen here - when the hue bar is on
+        it, and with a pause when it is not.
+        """
+
+        guard = self._ui_guard
+        if (
+            guard is None
+            or self._ui_guard_suspended
+            or not self._ui_guard_wanted(settings)
+        ):
+            return False
+        interval = (
+            self._UI_GUARD_RECHECK_SECONDS
+            if self._ui_missing_checks
+            else self._UI_GUARD_INTERVAL_SECONDS
+        )
+        if now - self._last_ui_check < interval:
+            return False
+        self._last_ui_check = now
+        if not guard.armed:
+            if self._arm_ui_guard(guard):
+                return False
+            self.pause(self._UI_NOT_FOUND_REASON)
+            return True
+        try:
+            verdict = guard.check(self._screen_capture)
+        except Exception:
+            LOGGER.warning("Could not look for the painting UI", exc_info=True)
+            return False
+        if verdict.present:
+            self._ui_missing_checks = 0
+            return False
+        self._ui_missing_checks += 1
+        if self._ui_missing_checks < self._UI_GUARD_MISSING_CHECKS_TO_PAUSE:
+            return False
+        self._ui_missing_checks = 0
+        LOGGER.warning(
+            "The painting UI is no longer on the screen (%s); pausing",
+            verdict.describe(),
+        )
+        # Fingerprinted again once the user has the sign open and resumes.
+        guard.disarm()
+        self.pause(self._UI_NOT_FOUND_REASON)
+        return True
 
     def _verify_and_touch_up(self, job: _Job) -> None:
         """Read the sign back and repaint the cells that missed their color.
@@ -3063,6 +3274,8 @@ class Painter:
             if not self._foreground_checker(requirement):
                 self.pause("foreground window lost")
                 return True
+        if check_focus and self._check_painting_ui(settings, now):
+            return True
 
         return self._check_cursor(settings, now)
 

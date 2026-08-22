@@ -3706,3 +3706,47 @@ def test_the_resolution_boxes_apply_on_enter_not_per_keystroke(window: MainWindo
     assert spin.text() == "1024"
     QTest.keyClick(spin, Qt.Key_Return)
     assert (spin.value(), window.logical_height_spin.value()) == (1024, 512)
+
+
+def test_the_ui_guard_is_a_live_safety_setting_that_reaches_the_painter(
+    window: MainWindow,
+) -> None:
+    """On by default, saved with the safety settings, editable in a pause."""
+
+    from types import SimpleNamespace
+
+    assert window.ui_guard_check.isChecked()
+    document = window._settings_document()
+    assert document["safety"]["ui_guard_enabled"] is True
+    assert window._painter_settings(document, False).ui_guard_enabled is True
+
+    window.ui_guard_check.setChecked(False)
+    document = window._settings_document()
+    assert document["safety"]["ui_guard_enabled"] is False
+    assert window._painter_settings(document, False).ui_guard_enabled is False
+
+    class _PausedPainter:
+        state = PainterState.PAUSED
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+
+        def __init__(self) -> None:
+            self.retuned: list = []
+
+        def retune(self, settings) -> bool:
+            self.retuned.append(settings)
+            return True
+
+        def resume(self) -> bool:
+            return True
+
+    painter = _PausedPainter()
+    window._painter = painter
+    window._update_start_availability()
+    assert window.ui_guard_check.isEnabled()
+    window.ui_guard_check.setChecked(True)
+    window._start_or_resume()
+    assert painter.retuned and painter.retuned[0].ui_guard_enabled is True
+    window._painter = None
+    window._update_start_availability()
