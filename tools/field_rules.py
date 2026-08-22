@@ -8,7 +8,6 @@ range questions in a few seconds: does 1.35 hold, or only halves?  What do
 from __future__ import annotations
 
 import argparse
-import ctypes
 import sys
 import time
 from pathlib import Path
@@ -20,9 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.input_controller import create_system_input_controller  # noqa: E402
 from app.models import ScreenRect  # noqa: E402
 from app.profiles import ProfileStore  # noqa: E402
-from app.screen import capture_region, foreground_window_matches  # noqa: E402
-from tools._safety import Aborted, Guard, RUST  # noqa: E402
-from tools.decimal_probe2 import _data_directory, _focus_rust  # noqa: E402
+from app.screen import capture_region  # noqa: E402
+from tools._safety import Guard  # noqa: E402
+from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 
 
 VK_OEM_PERIOD = 0xBE

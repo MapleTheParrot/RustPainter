@@ -223,8 +223,6 @@ def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:
     transform, fitted from the capture itself, absorbs exactly that.
     """
 
-    from app.verification import normalize_capture_lighting
-
     rng = np.random.default_rng(7)
     # As tight as the real sign's palette: dark purples a few units apart.
     palette = np.array(
@@ -238,7 +236,7 @@ def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:
     captured[..., 0] += truth[..., 2] * 0.35
     captured[..., 2] -= truth[..., 1] * 0.2
 
-    from app.verification import classify_cells
+    from app.verification import classify_cells, normalize_capture_lighting
 
     raw_wrong = mismatched_cells(captured, indices, palette).sum()
     corrected = normalize_capture_lighting(captured, indices, palette)
@@ -254,8 +252,6 @@ def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:
 
 def test_lighting_normalization_cannot_hide_genuinely_wrong_cells() -> None:
     """Twelve parameters cannot bend individual cells onto their targets."""
-
-    from app.verification import normalize_capture_lighting
 
     rng = np.random.default_rng(11)
     palette = np.array(

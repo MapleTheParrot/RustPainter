@@ -33,7 +33,7 @@ from app.painter import Painter, PainterSettings, PainterState  # noqa: E402
 from app.profiles import ProfileStore  # noqa: E402
 from app.screen import capture_region  # noqa: E402
 from app.settings import SettingsStore  # noqa: E402
-from tools.decimal_probe2 import _data_directory, _focus_rust  # noqa: E402
+from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 
 
 VK_F7 = 0x76

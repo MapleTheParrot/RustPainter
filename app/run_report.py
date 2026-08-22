@@ -26,7 +26,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 LOGGER = logging.getLogger("rust_painter.run_report")
 

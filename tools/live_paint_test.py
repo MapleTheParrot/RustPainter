@@ -43,7 +43,7 @@ from app.verification import (  # noqa: E402
     sample_cell_colors,
 )
 from tools._safety import Guard  # noqa: E402
-from tools.decimal_probe2 import _data_directory, _focus_rust  # noqa: E402
+from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 
 
 TRASH_BUTTON = (80, 80)

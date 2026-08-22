@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 from PIL import Image
 
 from app.input_controller import MockInputController

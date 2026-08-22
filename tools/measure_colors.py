@@ -28,7 +28,7 @@ from app.painter import Painter, PainterState  # noqa: E402
 from app.profiles import ProfileStore  # noqa: E402
 from app.screen import capture_region  # noqa: E402
 from tools._safety import Guard  # noqa: E402
-from tools.decimal_probe2 import _data_directory, _focus_rust  # noqa: E402
+from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 from tools.live_paint_test import _settings, _wait, clear_canvas  # noqa: E402
 
 

@@ -21,7 +21,7 @@ from app.profiles import ProfileStore  # noqa: E402
 from app.screen import capture_region  # noqa: E402
 from app.picker_calibration import trim_to_widget  # noqa: E402
 from tools._safety import Guard  # noqa: E402
-from tools.decimal_probe2 import _data_directory, _focus_rust  # noqa: E402
+from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 
 
 def main() -> None:
@@ -61,7 +61,6 @@ def main() -> None:
         shots.append((name, shot))
         print(f"  clicked {name} at ({x},{y})")
 
-    scale = 1
     w = max(s.width for _, s in shots) + 260
     h = sum(s.height + 6 for _, s in shots)
     sheet = Image.new("RGB", (w, h), (28, 28, 28))
