@@ -2534,11 +2534,12 @@ class Painter:
 
     # The break's own waits: for the painting UI to close after Save, for the
     # jump to land (and the server to have seen it), and for the UI to be
-    # open again after the click that reopens the sign.
+    # open again after the interact key reopens the sign.
     _AFK_SAVE_SETTLE_SECONDS = 0.5
-    _AFK_JUMP_SETTLE_SECONDS = 1.0
+    _AFK_JUMP_SETTLE_SECONDS = 2.0
     _AFK_REOPEN_SETTLE_SECONDS = 1.0
     _AFK_JUMP_HOLD_SECONDS = 0.1
+    _AFK_INTERACT_KEY = "E"
 
     def _anti_afk_due(self, job: _Job) -> bool:
         settings = job.settings
@@ -2555,10 +2556,14 @@ class Painter:
         A server that kicks idle players watches for movement, and a player
         stood at a sign for an hour has made none.  The break leaves the
         painting UI through its Save button (the server keeps the work so
-        far), jumps, and clicks to reopen the sign - which works because the
-        player is still looking at it: they were when the job started, and
-        an idle camera does not turn.  The painter then carries on from the
-        stroke it was about to make.
+        far), jumps, and presses the interact key to reopen the sign - which
+        works because the player is still looking at it: they were when the
+        job started, and an idle camera does not turn.  The painter then
+        carries on from the stroke it was about to make.
+
+        Nothing touches the mouse between Save and the reopen: with the
+        painting UI closed the game owns the cursor, so a click would swing
+        the held item and a move would turn the camera.
 
         The cursor is the game's, not the painter's, from the moment the UI
         closes, so the mouse guard's baseline is dropped until the next
@@ -2570,7 +2575,7 @@ class Painter:
         button = job.target.save_button
         assert button is not None
         epoch = self._pause_generation_value()
-        LOGGER.info("Anti-AFK break: saving the sign, jumping, and reopening it")
+        LOGGER.info("Anti-AFK break: saving the sign, jumping, and reopening it with E")
         self._update_progress_state(
             PainterState.RUNNING, "Keeping the player awake: saving and jumping"
         )
@@ -2589,15 +2594,10 @@ class Painter:
         self._interruptible_sleep(
             self._AFK_JUMP_SETTLE_SECONDS, epoch=epoch, check_focus=True
         )
-        # The click goes wherever the game has the cursor - in first person
-        # that is the crosshair, on the sign - so the mouse is not moved.
-        self._mouse_down(epoch)
-        try:
-            self._interruptible_sleep(
-                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
-            )
-        finally:
-            self.input.mouse_up(MouseButton.LEFT)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self.input.press_key(
+            self._AFK_INTERACT_KEY, hold_seconds=self._AFK_JUMP_HOLD_SECONDS
+        )
         self._interruptible_sleep(
             self._AFK_REOPEN_SETTLE_SECONDS, epoch=epoch, check_focus=True
         )

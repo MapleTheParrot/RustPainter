@@ -470,9 +470,10 @@ def test_a_paused_job_takes_new_timing_and_keeps_its_shape() -> None:
 def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
     """Every interval the job leaves the sign, jumps, and comes back.
 
-    The break is Save, Space, a click where the game has the cursor, and then
-    the color selected again before the next stroke, since the painting UI
-    was closed and reopened in between.
+    The break is Save, Space, the interact key (E) to reopen the sign, and
+    then the color selected again before the next stroke, since the painting
+    UI was closed and reopened in between.  The mouse is not touched between
+    Save and the reopen: the game owns the cursor while the UI is closed.
     """
 
     input_controller = MockInputController()
@@ -497,10 +498,9 @@ def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
 
     events = input_controller.events
     kinds = [(event.kind, event.x, event.y, event.value) for event in events]
-    jumps = [index for index, event in enumerate(events) if event.kind == "key_down"]
-    assert len(jumps) == 1, kinds
-    assert all(events[index].value == "SPACE" for index in jumps)
-    for index in jumps:
+    keys = [index for index, event in enumerate(events) if event.kind == "key_down"]
+    assert [events[index].value for index in keys] == ["SPACE", "E"], kinds
+    for index in keys[:1]:
         # Save was clicked, at its centre, before the jump ...
         before = events[:index]
         save_moves = [
@@ -509,12 +509,13 @@ def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
             if event.kind == "move" and (event.x, event.y) == (650, 314)
         ]
         assert save_moves, kinds
-        # ... and after it the sign was reopened with a click that did not
-        # move the mouse, then the color was picked again (a move into the
-        # hue bar) before the next stroke.
+        # ... and after it the sign was reopened with E, with no mouse event
+        # in between, then the color was picked again (a move into the hue
+        # bar) before the next stroke.
         after = events[index + 1 :]
-        assert after[1].kind == "mouse_down", kinds
-        assert after[2].kind == "mouse_up", kinds
+        assert after[0].kind == "key_up", kinds
+        assert (after[1].kind, after[1].value) == ("key_down", "E"), kinds
+        assert after[2].kind == "key_up", kinds
         reselect = next(event for event in after[3:] if event.kind == "move")
         assert 720 <= reselect.x < 732, kinds
     assert not input_controller.held_buttons
