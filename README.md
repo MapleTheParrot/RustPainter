@@ -597,7 +597,15 @@ landed, every ladder rung a whole number of texels out, the grid sitting on
 the calibrated rectangle - is used. Anything else is logged and the job falls
 back to the older inference: the brush measurement's texel size, snapped to
 the nearest known texture size and anchored at the rectangle's corner, with
-the brush probes' measured rendering bias aimed out. ``painting.measure_texel_grid``
+the brush probes' measured rendering bias aimed out. For the resolution
+ceiling the brush count is read against Rust's own sign-size table
+(`tools/sign_sizes.json`): a Size unit is about 0.8 of a texel, so the raw
+count runs a quarter high, but corrected and paired with the rectangle's
+shape it names the sign's exact entry - the XXL artist canvas reads ~649
+units and is 1024x512 - where the plain snap had called it 640 rows and
+Max planned a quarter more cells than the sign can show. Typing a table
+edge into a Custom resolution derives the other edge from the table too, so
+1024 on a hand-dragged 1.997:1 rectangle gives 512 rows, not 513. ``painting.measure_texel_grid``
 in settings.json turns the probe off outright if it ever needs to be.
 
 Probe colours are chosen against what is already on the sign where each

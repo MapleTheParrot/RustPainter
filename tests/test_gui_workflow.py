@@ -1098,9 +1098,9 @@ def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> No
         [(size, size / 128.0) for size in (60, 30, 12)]
     ).to_dict()
     window._refresh_profile_ui()
-    # The derived row count is the number a user can sanity-check against the
-    # sign they are actually looking at.
-    assert "128-row texture" in window.brush_model_status.text()
+    # A 2:1 rectangle and a ~128-unit brush count name the 256x128 sign
+    # outright - the number a user can sanity-check against the sign.
+    assert "256×128-texel texture, by Rust's sign data" in window.brush_model_status.text()
 
     window.apply_brush_check.setChecked(False)
     assert "Automatic brush sizing is off" in window.brush_model_status.text()
@@ -1237,8 +1237,8 @@ def test_a_measured_texel_grid_outranks_the_brush_inference(
 ) -> None:
     """A grid counted on the sign is the ceiling; the brush only guesses it.
 
-    The brush measurement here implies a 320-ish row texture, which the
-    canonical snap makes 640x320 on this 2:1 canvas.  The grid says the sign
+    The brush measurement here reads ~315 Size units, which Rust's sign table
+    makes a 512x256 texture on this 2:1 canvas.  The grid says the sign
     is really 300x150 - a
     size no table lists - and Max has to plan exactly that, because a cell
     planned on a texel that is not there fights its neighbour for one that is.
@@ -1260,13 +1260,14 @@ def test_a_measured_texel_grid_outranks_the_brush_inference(
     assert window.logical_width_spin.value() == 300
     assert window.logical_height_spin.value() == 150
 
-    # A re-framed sign of another shape forgets the grid with the brush.
+    # A re-framed sign of another shape forgets the grid with the brush; the
+    # brush's ~315 units are about 252 texels, which on a 2:1 sign is 512x256.
     window._current_profile.metadata.pop("texel_grid")
     window._refresh_profile_ui()
     window.quality_combo.setCurrentText("Balanced")
     window.quality_combo.setCurrentText("Max")
-    assert window.logical_height_spin.value() == 320
-    assert window.logical_width_spin.value() == 640
+    assert window.logical_height_spin.value() == 256
+    assert window.logical_width_spin.value() == 512
 
 
 def test_max_quality_without_a_measurement_plans_the_screen_grid(
@@ -3656,3 +3657,56 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     window._refresh_profile_ui()
     assert window.save_button_status._value.text() == "Optional"
     assert window.start_button.isEnabled()
+
+
+def test_the_resolution_cap_comes_from_rusts_sign_table_when_the_grid_is_unread(
+    window: MainWindow,
+) -> None:
+    """Live: the brush read ~649 rows on the 1024x512 XXL canvas (its grid
+    probe failed at two pixels per texel), the snap made that 640, the cap
+    came out 1278x640 and Max planned a quarter more cells than the sign
+    shows.  The brush count plus the rectangle's shape name the sign's
+    table entry, which is exact; and typing that entry's width derives its
+    height rather than the rectangle's rounding of it."""
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(69, 200, 2079, 1041)
+    window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 649.0) for size in (24, 5.25, 2.5, 1.25, 1)]
+    ).to_dict()
+    window._refresh_profile_ui()
+
+    assert window._sign_resolution_cap() == (1024, 512)
+    window.quality_combo.setCurrentText("Max")
+    assert (window.logical_width_spin.value(), window.logical_height_spin.value()) == (1024, 512)
+    assert "Rust's own sign data" in window.resolution_cap_panel.toolTip()
+
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(1024)
+    assert window.logical_height_spin.value() == 512
+    assert "1024×512" in window.resolution_cap_label.text()
+    # A size that is nobody's texture is left as the rectangle derives it.
+    window.logical_width_spin.setValue(500)
+    assert window.logical_height_spin.value() == 250
+
+
+def test_the_resolution_boxes_apply_on_enter_not_per_keystroke(window: MainWindow) -> None:
+    """Typing "1024" used to be rewritten after "10": the derived height
+    clamped, both boxes were written back, and the user's next digits landed
+    on "16" - ending at the cap, never at 1024."""
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    assert window._current_profile is not None
+    window._current_profile.canvas = ScreenRect(69, 200, 2079, 1041)
+    window._refresh_profile_ui()
+    window.quality_combo.setCurrentText("Custom")
+    spin = window.logical_width_spin
+    spin.setFocus()
+    spin.selectAll()
+    for char in "1024":
+        QTest.keyClick(spin, char)
+    assert spin.text() == "1024"
+    QTest.keyClick(spin, Qt.Key_Return)
+    assert (spin.value(), window.logical_height_spin.value()) == (1024, 512)

@@ -1837,12 +1837,18 @@ class MainWindow(QMainWindow):
         self.logical_width_spin = NoWheelSpinBox()
         self.logical_width_spin.setRange(8, 2048)
         self.logical_width_spin.setValue(256)
+        # Applied on Enter or focus-out, not per keystroke: the other axis is
+        # re-derived from whatever is applied and written back into both
+        # boxes, and doing that after the second digit of "1024" rewrote the
+        # box under the user's fingers.
+        self.logical_width_spin.setKeyboardTracking(False)
         self.logical_width_spin.setToolTip(
             "Logical width. Height follows the calibrated canvas aspect ratio."
         )
         self.logical_height_spin = NoWheelSpinBox()
         self.logical_height_spin.setRange(8, 2048)
         self.logical_height_spin.setValue(128)
+        self.logical_height_spin.setKeyboardTracking(False)
         self.logical_height_spin.setToolTip(
             "Logical height. Width follows the calibrated canvas aspect ratio."
         )
@@ -3714,6 +3720,7 @@ class MainWindow(QMainWindow):
             if height < 8 or height > 2048:
                 height = max(8, min(2048, height))
                 width = round(height * aspect)
+        width, height = self._snap_to_sign_texture(width, height, source_axis)
         width, height = self._cap_to_sign_resolution(width, height)
         width = max(8, min(2048, width))
         height = max(8, min(2048, height))
@@ -3723,6 +3730,49 @@ class MainWindow(QMainWindow):
         self.logical_height_spin.setValue(height)
         self.logical_width_spin.blockSignals(False)
         self.logical_height_spin.blockSignals(False)
+
+    @staticmethod
+    def _snap_to_sign_texture(
+        width: int, height: int, source_axis: str
+    ) -> tuple[int, int]:
+        """Let a typed texture size land on the texture, not a pixel off it.
+
+        The derived axis comes from the rectangle's shape, which is hand
+        dragged: 1024 typed on a 1.997 rectangle derives 513 rows, and a
+        513-row plan on a 512-row sign puts two rows on one texel somewhere.
+        When the typed number is an edge of a real sign texture and the
+        derived one is within a hair of that texture's other edge, the plan
+        is for that texture.
+        """
+
+        from app.brush_calibration import SIGN_TEXTURE_SIZES
+
+        typed, derived = (width, height) if source_axis == "width" else (height, width)
+        candidates = [
+            size[1] if source_axis == "width" else size[0]
+            for size in SIGN_TEXTURE_SIZES
+            if (size[0] if source_axis == "width" else size[1]) == typed
+        ]
+        if not candidates:
+            return width, height
+        nearest = min(candidates, key=lambda edge: abs(edge - derived))
+        if abs(nearest - derived) > max(1, round(0.02 * nearest)):
+            return width, height
+        return (typed, nearest) if source_axis == "width" else (nearest, typed)
+
+    def _sign_resolution_cap_source(self) -> str:
+        """Where the cap comes from: "grid", "table", "brush" or "" for none."""
+
+        if self._texel_grid() is not None:
+            return "grid"
+        model = self._brush_size_model()
+        if model is None:
+            return ""
+        from app.brush_calibration import sign_texture_size
+
+        if sign_texture_size(model.sign_pixel_rows, self._canvas_aspect_ratio()):
+            return "table"
+        return "brush"
 
     def _sign_resolution_cap(self) -> tuple[int, int] | None:
         """The largest logical size this sign's texture actually resolves.
@@ -3745,8 +3795,20 @@ class MainWindow(QMainWindow):
         model = self._brush_size_model()
         if model is None:
             return None
-        from app.brush_calibration import canonical_texture_rows
+        from app.brush_calibration import canonical_texture_rows, sign_texture_size
 
+        # The brush's row count is rough - a Size unit is about 0.8 of a
+        # texel, and at two screen pixels per texel the smallest probe is a
+        # one-pixel reading - but with the rectangle's shape it picks out
+        # the sign's entry in Rust's own size table, which is exact.  Live,
+        # the count alone said 640 rows of a 512-row XXL canvas, and Max
+        # planned a quarter more cells than the sign could show.
+        from_table = sign_texture_size(model.sign_pixel_rows, self._canvas_aspect_ratio())
+        if from_table is not None:
+            return (
+                max(8, min(2048, from_table[0])),
+                max(8, min(2048, from_table[1])),
+            )
         # Rust's sign textures come in canonical sizes (powers of two and the
         # 4:3 family measured in game), and the measured count carries a little
         # noise: 527 measured rows on a 512-row sign is normal.  Snapping to
@@ -3886,7 +3948,8 @@ class MainWindow(QMainWindow):
             self.resolution_cap_panel.setVisible(False)
             return
         cap_width, cap_height = cap
-        if self._texel_grid() is not None:
+        source = self._sign_resolution_cap_source()
+        if source == "grid":
             self.resolution_cap_panel.setToolTip(
                 f"The last paint job measured this sign's texture at "
                 f"{cap_width}×{cap_height} texels by stamping its grid, so this "
@@ -3894,11 +3957,19 @@ class MainWindow(QMainWindow):
                 "with more cells than that cannot add detail: neighbouring "
                 "cells would land on the same texel and overpaint each other."
             )
+        elif source == "table":
+            self.resolution_cap_panel.setToolTip(
+                f"{cap_width}×{cap_height} is the texture size Rust's own sign "
+                "data declares for a sign of this shape, picked by the brush "
+                "measurement.  The next paint job measures the sign's grid "
+                "directly and confirms it."
+            )
         else:
             self.resolution_cap_panel.setToolTip(
                 f"Estimated from the brush measurement at about "
-                f"{cap_width}×{cap_height} texels.  The next paint job measures "
-                "the sign's grid directly and may refine this."
+                f"{cap_width}×{cap_height} texels; no sign in Rust's size data "
+                "matches, so this is rough.  The next paint job measures the "
+                "sign's grid directly and may refine this."
             )
         if self.quality_combo.currentText() == "Custom":
             requested = (
@@ -3908,9 +3979,15 @@ class MainWindow(QMainWindow):
             if requested[0] < cap_width or requested[1] < cap_height:
                 self.resolution_cap_panel.setVisible(False)
                 return
+            basis = {
+                "grid": "",
+                "table": " (Rust's own sign data)",
+                "brush": " (estimated from the brush)",
+            }[source]
+            about = "about " if source == "brush" else ""
             self.resolution_cap_label.setText(
-                f"This sign holds {cap_width}×{cap_height} texels — as fine as "
-                "a custom resolution can go here."
+                f"This sign holds {about}{cap_width}×{cap_height} texels{basis} — "
+                "as fine as a custom resolution can go here."
             )
             self.resolution_cap_panel.setVisible(True)
             return
@@ -5950,6 +6027,8 @@ class MainWindow(QMainWindow):
             texture = (
                 f"a {grid.columns}×{grid.rows}-texel texture, counted on the sign"
             )
+        elif (cap := self._sign_resolution_cap()) and self._sign_resolution_cap_source() == "table":
+            texture = f"a {cap[0]}×{cap[1]}-texel texture, by Rust's sign data"
         else:
             texture = f"about a {rows}-row texture, inferred from the brush"
         self.brush_model_status.setText(

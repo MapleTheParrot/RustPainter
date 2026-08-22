@@ -386,3 +386,24 @@ def test_canonical_sizes_include_rusts_four_by_three_textures() -> None:
     # Nearest candidate wins where families sit close together.
     assert canonical_texture_rows(250.0) == 256
     assert canonical_texture_rows(243.0) == 240
+
+
+def test_the_sign_table_names_the_texture_a_brush_count_points_to() -> None:
+    """A Size unit is about 0.8 of a texel, so the brush's raw row count runs
+    a quarter high; with the rectangle's shape it still picks the one entry
+    of Rust's own size table the sign can be.  The three cases are the three
+    signs measured live: an XXL canvas the count alone called 640 rows."""
+
+    from app.brush_calibration import sign_texture_size
+
+    assert sign_texture_size(649.0, 2079 / 1041) == (1024, 512)
+    assert sign_texture_size(294.0, 1299 / 1085) == (320, 240)
+    # A rectangle dragged well inside a 4:3 sign still finds it, and the
+    # correction is what separates it from the 320x256 frame next door.
+    assert sign_texture_size(294.0, 1.20) == (320, 240)
+    assert sign_texture_size(330.0, 0.75) == (192, 256)
+    # No sign of that shape, or a count far from every one of that shape:
+    # the caller keeps the plain snap.
+    assert sign_texture_size(649.0, 3.0) is None
+    assert sign_texture_size(5000.0, 2.0) is None
+    assert sign_texture_size(float("nan"), 2.0) is None

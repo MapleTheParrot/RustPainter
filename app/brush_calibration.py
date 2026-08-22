@@ -16,6 +16,8 @@ be a guess.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -76,6 +78,59 @@ _CANONICAL_TEXTURE_SIZES = (
     128, 170, 175, 192, 205, 240, 256, 267, 320, 384, 512, 640, 1024,
 )
 _CANONICAL_TOLERANCE = 0.08
+
+
+# Every distinct texture size those prefabs declare, as (columns, rows).
+# Where a brush measurement has to stand in for a grid count, the sign's
+# true size is one of these: the brush gives the rows only roughly, but the
+# calibrated rectangle's shape and the rows together pick out one entry.
+SIGN_TEXTURE_SIZES: tuple[tuple[int, int], ...] = (
+    (128, 128), (128, 175), (128, 320), (128, 512), (170, 320), (192, 256),
+    (205, 256), (256, 128), (256, 192), (256, 256), (256, 512), (256, 640),
+    (256, 1024), (267, 320), (320, 240), (320, 256), (320, 384), (512, 256),
+    (512, 512), (800, 160), (850, 300), (1024, 256), (1024, 512),
+    (1200, 280), (1200, 360), (1320, 280),
+)
+
+# One Size unit is not quite one texel.  Read on three signs against their
+# grid counts: 294 units for 240 rows (0.82), 330 for 256 (0.78), 649 for
+# 512 (0.79).  The table lookup corrects the brush's row count by this
+# before comparing, which is what separates 320x240 from 320x256 on a
+# rectangle that fits either; nothing that lays out a stroke uses it.
+TEXELS_PER_SIZE_UNIT = 0.8
+
+# A rectangle is hand-dragged and a texture can sit under a frame, so the
+# rectangle's shape matches the texture's only loosely (live: a 320x240
+# texture under a rectangle of 1.20); and the corrected row count is trusted
+# to within this factor either way.
+_TABLE_ASPECT_TOLERANCE = 0.12
+_TABLE_ROWS_TOLERANCE = 1.35
+
+
+def sign_texture_size(measured_rows: float, aspect: float) -> tuple[int, int] | None:
+    """The sign-table size a brush measurement and a rectangle shape point to.
+
+    ``measured_rows`` is the brush model's row count in Size units; ``aspect``
+    the calibrated rectangle's width over height.  Of the table entries
+    shaped like the rectangle, the one whose rows are nearest the corrected
+    count wins, provided it is within a plausible factor; ``None`` leaves the
+    caller to the plain canonical snap.
+    """
+
+    if not np.isfinite(measured_rows) or measured_rows <= 0 or aspect <= 0:
+        return None
+    rows = measured_rows * TEXELS_PER_SIZE_UNIT
+    shaped = [
+        size
+        for size in SIGN_TEXTURE_SIZES
+        if abs(size[0] / size[1] / aspect - 1.0) <= _TABLE_ASPECT_TOLERANCE
+    ]
+    if not shaped:
+        return None
+    best = min(shaped, key=lambda size: abs(math.log(rows / size[1])))
+    if abs(math.log(rows / best[1])) > math.log(_TABLE_ROWS_TOLERANCE):
+        return None
+    return best
 
 
 def canonical_texture_rows(measured: float) -> int:
