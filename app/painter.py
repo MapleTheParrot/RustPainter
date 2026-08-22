@@ -441,6 +441,10 @@ class _Job:
     # describes where the sign sat on screen the day it was measured and is
     # only trusted while it still sits on the calibrated rectangle.
     texel_grid: TexelGridModel | None = None
+    # The plan's first ``start_stroke`` strokes are taken as already on the
+    # sign.  A resumed job paints on a sign it did not clear and measures
+    # nothing on it, trusting the profile's stored grid and brush model.
+    start_stroke: int = 0
 
 
 def _describe_seconds(seconds: float) -> str:
@@ -597,8 +601,15 @@ class Painter:
         clear_button: RectangleLike | None = None,
         brush_size_model: BrushSizeModel | None = None,
         picker_directions: PickerDirections | None = None,
+        start_stroke: int = 0,
     ) -> None:
-        """Prepare a job without starting it, suitable for an F8 callback."""
+        """Prepare a job without starting it, suitable for an F8 callback.
+
+        ``start_stroke`` resumes a plan partway: that many strokes, in plan
+        order, are taken as already on the sign.  The sign is neither
+        cleared nor probed - both would destroy what is there - and the
+        brush and grid come from the profile's stored measurements.
+        """
 
         if target is None:
             if profile is not None:
@@ -622,12 +633,21 @@ class Painter:
         )
         self._validate_job(plan, target, resolved_settings)
         total_strokes = sum(len(group.strokes) for group in plan.color_groups)
+        if (
+            isinstance(start_stroke, bool)
+            or not isinstance(start_stroke, int)
+            or not 0 <= start_stroke <= total_strokes
+        ):
+            raise ValueError(
+                f"start_stroke must be an integer from 0 to {total_strokes}, "
+                f"the plan's stroke count"
+            )
         with self._condition:
             if self._state in self._ACTIVE_STATES or (
                 self._thread is not None and self._thread.is_alive()
             ):
                 raise RuntimeError("Cannot replace a paint job while one is active")
-            self._job = _Job(plan, target, resolved_settings)
+            self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -639,7 +659,7 @@ class Painter:
                 len(plan.color_groups),
                 0,
                 0,
-                0,
+                start_stroke,
                 total_strokes,
                 0.0,
                 0.0,
@@ -776,7 +796,7 @@ class Painter:
                 len(self._job.plan.color_groups),
                 0,
                 0,
-                0,
+                self._job.start_stroke,
                 total_strokes,
                 0.0,
                 0.0,
@@ -1101,7 +1121,10 @@ class Painter:
                 with self._condition:
                     self._measured_texel_grid = grid
             else:
-                self._calibrate_brush_for_plan(job)
+                if job.start_stroke > 0:
+                    self._prepare_resumed_sign(job)
+                else:
+                    self._calibrate_brush_for_plan(job)
                 self._update_progress_state(
                     PainterState.RUNNING, "Painting", phase="paint"
                 )
@@ -1689,6 +1712,59 @@ class Painter:
             )
         # Checked against the model that will actually be typed, so a sign the
         # plan cannot be painted on is refused before any artwork goes down.
+        self._validate_brush_reach(job.plan, job.target, settings, model)
+
+    def _prepare_resumed_sign(self, job: _Job) -> None:
+        """Take a half-painted sign as it is: no clear, no probe.
+
+        A resumed job's sign already carries hours of strokes.  The probe
+        would paint over them and the clear would wipe them, so neither
+        runs; the job paints on the texel grid and with the brush model the
+        profile stored from an earlier job on this sign - the same trust the
+        sizing-off path extends - and says so when either is missing, since
+        then the strokes are aimed by the hand-dragged rectangle and the
+        brush is whatever Rust has set.  The touch-up pass at the end reads
+        the sign without a bare reference, which is how it reads any sign
+        it did not see cleared.
+        """
+
+        settings = job.settings
+        if not self.input.emits_real_input:
+            return
+        self._update_progress_state(
+            PainterState.RUNNING,
+            f"Resuming from stroke {job.start_stroke:,} on the sign as it is",
+            phase="calibrate",
+        )
+        LOGGER.info(
+            "Resuming at stroke %d of %d: the sign is neither cleared nor "
+            "probed, so the stored grid and brush model are used as they are",
+            job.start_stroke,
+            sum(len(group.strokes) for group in job.plan.color_groups),
+        )
+        if job.target.texel_grid is not None:
+            self._adopt_stored_texel_grid(job)
+        else:
+            LOGGER.warning(
+                "No texel grid is stored for this profile, so the resumed "
+                "strokes are laid out on the calibration rectangle - good to "
+                "about half a texel, which can leave whole rows bare. A fresh "
+                "job with automatic brush sizing on measures and stores one."
+            )
+        if not settings.apply_brush_size:
+            return
+        model = job.target.brush_size_model
+        if model is None:
+            LOGGER.warning(
+                "No brush model is stored for this profile, so no Size value "
+                "is typed on resume: the brush is whatever Rust has set now. "
+                "A fresh job with automatic brush sizing on measures and "
+                "stores one."
+            )
+            return
+        LOGGER.info(
+            "Resuming with the brush model stored %s", model.captured_at or "earlier"
+        )
         self._validate_brush_reach(job.plan, job.target, settings, model)
 
     @staticmethod
@@ -2301,17 +2377,40 @@ class Painter:
         if job.mode != "paint":
             return None
         try:
-            total = self._work_schedule(job.plan, job.target, job.settings).total
+            schedule = self._work_schedule(job.plan, job.target, job.settings)
+            total = schedule.total - self._skipped_work(
+                schedule, job.plan, job.start_stroke
+            )
         except Exception:  # an estimate must never stop a job from starting
             LOGGER.debug("Initial time estimate failed", exc_info=True)
             return None
         if (
-            job.settings.apply_brush_size
+            job.start_stroke == 0
+            and job.settings.apply_brush_size
             and getattr(self.input, "emits_real_input", True)
             and job.target.brush_size_box is not None
         ):
             total += BRUSH_CALIBRATION_SECONDS
         return total
+
+    @staticmethod
+    def _skipped_work(
+        schedule: PlanWorkSchedule, plan: PaintPlan, start_stroke: int
+    ) -> float:
+        """Predicted seconds of the plan's first ``start_stroke`` strokes."""
+
+        skipped = 0.0
+        remaining = start_stroke
+        for group_index, group in enumerate(plan.color_groups):
+            if remaining <= 0:
+                break
+            skipped += schedule.group_cost(group_index)
+            taken = min(remaining, len(group.strokes))
+            skipped += sum(
+                schedule.stroke_cost(group_index, index) for index in range(taken)
+            )
+            remaining -= taken
+        return skipped
 
     @property
     def paint_phase_timing(self) -> PhaseTiming | None:
@@ -2331,7 +2430,12 @@ class Painter:
         main_plan = plan is None
         plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
+        # Strokes before the offset are already on the sign.  They count in
+        # the progress shown - the sign really is that far along - but not
+        # in the pace, which is measured on what this run paints.
+        skip = job.start_stroke if main_plan else 0
         completed = 0
+        painted = 0
         total = sum(len(group.strokes) for group in plan.color_groups)
         total_colors = len(plan.color_groups)
         # Progress advances in predicted seconds, priced from the same timing
@@ -2341,6 +2445,7 @@ class Painter:
         schedule = self._work_schedule(plan, target, settings, job.texel_grid)
         total_work = schedule.total
         completed_work = 0.0
+        skipped_work = 0.0
         # Each plan gets its own clock.  A touch-up pass re-enters here after
         # the artwork is done; timed against the whole run's elapsed it would
         # claim hours left for a few minutes of repainting.
@@ -2411,6 +2516,21 @@ class Painter:
         applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
         for color_index, group in enumerate(plan.color_groups, start=1):
+            if skip > completed and skip - completed >= len(group.strokes):
+                # The whole group is behind the offset.
+                skipped_work += schedule.group_cost(color_index - 1) + sum(
+                    schedule.stroke_cost(color_index - 1, index)
+                    for index in range(len(group.strokes))
+                )
+                completed += len(group.strokes)
+                continue
+            first_index = skip - completed
+            if first_index > 0:
+                skipped_work += sum(
+                    schedule.stroke_cost(color_index - 1, index)
+                    for index in range(first_index)
+                )
+                completed += first_index
             completed_work += schedule.group_cost(color_index - 1)
             diameter = max(1, int(group.brush_diameter))
             extension = (
@@ -2426,6 +2546,8 @@ class Painter:
                 else 0.0
             )
             for index_in_group, stroke in enumerate(group.strokes, start=1):
+                if index_in_group <= first_index:
+                    continue
                 while True:
                     self._checkpoint(check_focus=True)
                     # A pause may have retuned the job, so every stroke is
@@ -2466,6 +2588,7 @@ class Painter:
                         selected = None
                         continue
                 completed += 1
+                painted += 1
                 completed_work += schedule.stroke_cost(color_index - 1, index_in_group - 1)
                 phase_elapsed = self._active_elapsed() - phase_started
                 if main_plan:
@@ -2473,7 +2596,7 @@ class Painter:
                         self._paint_phase_timing = PhaseTiming(
                             predicted_seconds=completed_work,
                             actual_seconds=phase_elapsed,
-                            strokes=completed,
+                            strokes=painted,
                         )
                 self._set_progress(
                     color_index=color_index,
@@ -2484,6 +2607,7 @@ class Painter:
                     total_strokes=total,
                     completed_work=completed_work,
                     total_work=total_work,
+                    skipped_work=skipped_work,
                     phase_elapsed=phase_elapsed,
                     message="Painting",
                 )
@@ -2646,6 +2770,12 @@ class Painter:
     _UI_NOT_FOUND_REASON = "painting UI not found - open the sign again and resume"
     _UI_NOT_REOPENED_REASON = (
         "the sign did not reopen after the anti-AFK break - open it and resume"
+    )
+    # The pause reasons that mean the sign itself went away - the ones a
+    # "resume from here" record is stamped with, since the strokes up to
+    # the pause are on a sign the game had been saving all along.
+    UI_LOSS_REASONS: ClassVar[frozenset[str]] = frozenset(
+        {_UI_NOT_FOUND_REASON, _UI_NOT_REOPENED_REASON}
     )
     # Looks at the screen this often while painting, and this much sooner
     # again after a look that found nothing: one failed look can be a frame
@@ -3419,24 +3549,34 @@ class Painter:
         total_strokes: int,
         completed_work: float | None = None,
         total_work: float | None = None,
+        skipped_work: float = 0.0,
         phase_elapsed: float | None = None,
         message: str,
     ) -> None:
+        """Publish progress.
+
+        ``skipped_work`` is the predicted cost of strokes a resumed job took
+        as already painted: it counts toward the percent, since the sign is
+        that far along, and not toward the pace, which this run's own
+        strokes set.
+        """
+
         elapsed = self._active_elapsed()
         if completed_work is None or not total_work:
             completed_work = float(completed_strokes)
             total_work = float(total_strokes)
+            skipped_work = 0.0
         percent = (
             100.0
             if total_work <= 0 or completed_strokes >= total_strokes
-            else min(100.0, completed_work * 100.0 / total_work)
+            else min(100.0, (skipped_work + completed_work) * 100.0 / total_work)
         )
         remaining = None
         if completed_strokes < total_strokes:
             remaining = remaining_seconds(
                 elapsed if phase_elapsed is None else phase_elapsed,
                 completed_work,
-                total_work,
+                max(0.0, total_work - skipped_work),
             )
         with self._condition:
             self._progress = PaintProgress(

@@ -2230,3 +2230,194 @@ def test_a_sign_that_does_not_reopen_after_the_break_pauses_the_job() -> None:
         if event.kind in {"mouse_down", "key_down"}
     ]
     assert later and later[0] == "mouse_down", later
+
+
+# ------------------------------------------------------------ resume offset
+
+
+def _two_color_plan() -> PaintPlan:
+    """Six strokes in two colors on a 64x32 grid."""
+
+    first = tuple(Stroke(x, 0, x, 0) for x in (0, 10, 20, 30))
+    second = tuple(Stroke(x, 8, x, 8) for x in (5, 15))
+    return PaintPlan(
+        64,
+        32,
+        (ColorGroup((40, 80, 160), first, 4), ColorGroup((200, 40, 40), second, 2)),
+    )
+
+
+def _canvas_clicks(controller: MockInputController, canvas: ScreenRect) -> list[tuple[int, int]]:
+    return [
+        _position_at(controller, index)
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down" and canvas.contains(*_position_at(controller, index))
+    ]
+
+
+def test_a_resumed_job_skips_the_clear_and_probe_and_paints_from_its_offset() -> None:
+    """Picking a half-painted sign up again must not wipe or probe it.
+
+    Everything the interrupted job painted is on the sign, so the resumed
+    one neither clears it nor stamps probes on it; it types the stored
+    brush for the group it resumes into, selects that group's color, and
+    paints from the offset stroke to the end.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Resumable")
+    assert profile.canvas is not None and profile.clear_button is not None
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(size, size / 320.0) for size in (60, 30, 12)]
+    ).to_dict()
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller, profile.canvas, profile.clear_button, sign_rows=320
+            ),
+        )
+    )
+    plan = _two_color_plan()
+    progress: list[int] = []
+    painter.set_callbacks(on_progress=lambda p: progress.append(p.completed_strokes))
+    assert painter.start(
+        plan,
+        profile,
+        _settings(apply_brush_size=True, verify_passes=0),
+        start_stroke=5,
+    )
+    assert painter.wait(_t(10.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 6
+    assert painter.progress.total_strokes == 6
+    # Progress never reads below the offset.
+    assert progress and min(progress) >= 5
+
+    # The clear control was never clicked and no probe went down: the only
+    # canvas click is the one remaining stroke, at the last stroke's cell.
+    clicks = [
+        _position_at(controller, index)
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down"
+    ]
+    assert not any(profile.clear_button.contains(*click) for click in clicks)
+    on_canvas = _canvas_clicks(controller, profile.canvas)
+    assert len(on_canvas) == 1, on_canvas
+    cell_width = profile.canvas.width / plan.width
+    cell_height = profile.canvas.height / plan.height
+    x, y = on_canvas[0]
+    assert abs(x - (profile.canvas.left + 15.5 * cell_width)) < cell_width
+    assert abs(y - (profile.canvas.top + 8.5 * cell_height)) < cell_height
+    # The stored brush was typed once, for the group resumed into; the
+    # probes a fresh job types first are absent.
+    typed = _typed_values(controller)
+    assert typed == ["10.5"], typed
+    # The job measured nothing, so the profile's stored model stays as is.
+    assert painter.measured_brush_size_model is None
+    assert not controller.held_buttons
+
+
+def test_resuming_at_the_end_paints_nothing_and_goes_straight_to_touch_up() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Resumable")
+    assert profile.canvas is not None and profile.clear_button is not None
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller, profile.canvas, profile.clear_button, sign_rows=320
+            ),
+        )
+    )
+    plan = _two_color_plan()
+    assert painter.start(
+        plan, profile, _settings(apply_brush_size=False, verify_passes=1), start_stroke=6
+    )
+    assert painter.wait(_t(10.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 6
+    # No artwork stroke went down before the verification pass looked.
+    assert _canvas_clicks(controller, profile.canvas) == []
+
+
+def test_a_start_offset_past_the_plan_is_refused() -> None:
+    painter = Painter(MockInputController())
+    with pytest.raises(ValueError, match="start_stroke"):
+        painter.configure(_two_color_plan(), _profile(), _settings(), start_stroke=7)
+    with pytest.raises(ValueError, match="start_stroke"):
+        painter.configure(_two_color_plan(), _profile(), _settings(), start_stroke=-1)
+    painter.configure(_two_color_plan(), _profile(), _settings(), start_stroke=6)
+    assert painter.progress.completed_strokes == 6
+
+
+def test_a_resumed_job_without_stored_measurements_warns_and_paints_on(caplog) -> None:
+    """No grid and no brush model on file: the job says so and carries on.
+
+    The strokes are aimed by the calibration rectangle and the brush is
+    whatever Rust has set - worse than a measured sign, far better than a
+    probe through the picture.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Unmeasured")
+    assert profile.canvas is not None and profile.clear_button is not None
+    painter = _impatient(
+        Painter(
+            controller,
+            screen_capture=_clearable_sign(
+                controller, profile.canvas, profile.clear_button, sign_rows=320
+            ),
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="rust_painter.painter"):
+        assert painter.start(
+            _two_color_plan(),
+            profile,
+            _settings(apply_brush_size=True, verify_passes=0),
+            start_stroke=2,
+        )
+        assert painter.wait(_t(10.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any("No texel grid is stored" in message for message in warnings), warnings
+    assert any("No brush model is stored" in message for message in warnings), warnings
+    assert _typed_values(controller) == []
+    assert len(_canvas_clicks(controller, profile.canvas)) == 4
+
+
+def test_a_resumed_job_estimates_only_the_work_ahead_of_it() -> None:
+    """The first time-left is for the strokes left, not the whole plan.
+
+    And the percent starts where the sign is: a job resumed two thirds in
+    reports itself two thirds done before its first stroke, not at zero.
+    """
+
+    controller = MockInputController()
+    profile = _profile()
+    plan = _dot_plan(30)
+    fresh = Painter(controller)
+    fresh.configure(plan, profile, _settings(delay_between_strokes_seconds=0.1))
+    resumed = Painter(MockInputController())
+    resumed.configure(
+        plan, profile, _settings(delay_between_strokes_seconds=0.1), start_stroke=20
+    )
+    whole = fresh._initial_estimate(fresh._job)
+    part = resumed._initial_estimate(resumed._job)
+    assert whole is not None and part is not None
+    assert 0 < part < whole
+    assert part == pytest.approx(whole / 3, rel=0.2)
+
+    seen: list[tuple[int, float]] = []
+    resumed.set_callbacks(
+        on_progress=lambda p: seen.append((p.completed_strokes, p.percent))
+    )
+    assert resumed.start()
+    assert resumed.wait(_t(10.0))
+    assert resumed.state is PainterState.COMPLETED
+    assert seen[0][0] == 20
+    painting = [percent for strokes, percent in seen if 20 < strokes < 30]
+    assert painting and min(painting) > 60.0
