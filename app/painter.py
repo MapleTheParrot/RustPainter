@@ -2546,8 +2546,10 @@ class Painter:
         the held item and a move would turn the camera.
 
         The cursor is the game's, not the painter's, from the moment the UI
-        closes, so the mouse guard's baseline is dropped until the next
-        stroke lays a new one.
+        closes - and Rust closes it on the press of Save, not the release,
+        recentring the cursor while the button is still held.  The mouse
+        guard's baseline is therefore dropped before the press, not after the
+        click, and stays dropped until the next stroke lays a new one.
         """
 
         if not self._anti_afk_due(job):
@@ -2559,13 +2561,19 @@ class Painter:
         self._update_progress_state(
             PainterState.RUNNING, "Keeping the player awake: saving and jumping"
         )
-        self._safe_click(
-            normalized_point(button, 0.5, 0.5),
-            epoch,
-            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
-        )
+        target = normalized_point(button, 0.5, 0.5)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self._move((int(round(target[0])), int(round(target[1]))), epoch)
+        self._checkpoint(epoch=epoch, check_focus=True)
         with self._condition:
             self._reset_mouse_movement_baseline()
+        self._mouse_down(epoch)
+        try:
+            self._interruptible_sleep(
+                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+            )
+        finally:
+            self.input.mouse_up(MouseButton.LEFT)
         self._interruptible_sleep(
             self._AFK_SAVE_SETTLE_SECONDS, epoch=epoch, check_focus=True
         )

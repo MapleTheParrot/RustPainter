@@ -517,6 +517,50 @@ def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
     assert not input_controller.held_buttons
 
 
+def test_anti_afk_save_click_does_not_trip_the_mouse_guard() -> None:
+    """Rust recentres the cursor the moment Save is pressed.
+
+    The painting UI closes on the press, the game takes the cursor back and
+    puts it at the screen centre while the button is still held.  That jump
+    is the game's, not a hand's, so the break must not read it as movement
+    and pause itself.
+    """
+
+    class SignInput(_HandInput):
+        def mouse_down(self, button) -> None:
+            super().mouse_down(button)
+            # Pressed on Save: the UI closes and the cursor is recentred.
+            if self._history and self._history[-1] == (650, 314):
+                self.absolute_cursor = (960, 540)
+
+        def move_mouse(self, x: float, y: float) -> None:
+            super().move_mouse(x, y)
+            # The painter's next move (the reopened sign) takes the cursor back.
+            self.absolute_cursor = None
+
+    input_controller = SignInput()
+    painter = Painter(input_controller, screen_capture=_panel_capture)
+    profile = _profile()
+    profile.save_button = ScreenRect(600, 300, 100, 30)
+    painter.start(
+        _dot_plan(4),
+        profile,
+        _settings(
+            mouse_down_duration_seconds=0.004,
+            delay_between_strokes_seconds=0.3,
+            pause_on_mouse_move=True,
+            mouse_move_pause_threshold_pixels=24,
+            anti_afk_enabled=True,
+            anti_afk_interval_seconds=1.0,
+        ),
+    )
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.progress.completed_strokes == 4
+    keys = [e.value for e in input_controller.events if e.kind == "key_down"]
+    assert keys and keys == ["SPACE", "E"] * (len(keys) // 2), keys
+
+
 def test_anti_afk_needs_the_save_button_only_for_real_input() -> None:
     class RealInput(MockInputController):
         emits_real_input = True
