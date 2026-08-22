@@ -35,7 +35,6 @@ def _settings(**overrides: object) -> PainterSettings:
         "delay_between_colors_seconds": 0.0,
         "stroke_speed_pixels_per_second": 20_000.0,
         "stroke_interpolation_step_pixels": 4.0,
-        "corner_abort_enabled": False,
         "progress_callback_interval_seconds": 0.0,
         "safety_poll_interval_seconds": 0.002,
         "apply_brush_size": True,

@@ -187,7 +187,6 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
         delay_after_brush_seconds=0.0,
         stroke_speed_pixels_per_second=1_000_000.0,
         stroke_interpolation_step_pixels=4096.0,
-        corner_abort_enabled=False,
         progress_callback_interval_seconds=0.0,
         safety_poll_interval_seconds=0.002,
         # The capture stub never changes, so a second pass would repaint the

@@ -165,7 +165,6 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
             {"painting": {"stroke_speed_pixels_per_second": float("nan")}},
             "stroke_speed",
         ),
-        ({"safety": {"corner_abort_margin_pixels": -1}}, "corner_abort_margin"),
         ({"hotkeys": {"start_resume": "Ctrl+F8"}}, "start_resume"),
     ],
 )

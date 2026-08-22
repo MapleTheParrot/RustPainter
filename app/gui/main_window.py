@@ -2297,8 +2297,6 @@ class MainWindow(QMainWindow):
         self.expected_window_edit.setPlaceholderText("Window title contains, e.g. Rust")
         self.expected_process_edit = QLineEdit("RustClient.exe")
         self.expected_process_edit.setPlaceholderText("Executable name (optional)")
-        self.corner_abort_check = QCheckBox("Rapid move to a screen corner aborts")
-        self.corner_abort_check.setChecked(True)
         self.mouse_pause_check = QCheckBox("Moving the mouse pauses instead of painting over it")
         self.mouse_pause_check.setChecked(True)
         self.mouse_pause_check.setToolTip(
@@ -2314,7 +2312,6 @@ class MainWindow(QMainWindow):
         safety_form.addRow("Focus guard", self.focus_guard_check)
         safety_form.addRow("Expected window", self.expected_window_edit)
         safety_form.addRow("Expected process", self.expected_process_edit)
-        safety_form.addRow("Corner stop", self.corner_abort_check)
         safety_form.addRow("Mouse guard", self.mouse_pause_check)
         safety_form.addRow("UI check", self.verify_ui_check)
         safety_form.addRow("Start / resume", self.start_hotkey_combo)
@@ -4793,7 +4790,6 @@ class MainWindow(QMainWindow):
             self.focus_guard_check,
             self.expected_window_edit,
             self.expected_process_edit,
-            self.corner_abort_check,
             self.mouse_pause_check,
             self.verify_ui_check,
             self.anti_afk_check,
@@ -5031,7 +5027,6 @@ class MainWindow(QMainWindow):
             self.paint_preview.set_smooth(self.smooth_preview_check.isChecked())
 
             self.countdown_spin.setValue(int(safety.get("countdown_seconds", 3)))
-            self.corner_abort_check.setChecked(bool(safety.get("corner_abort_enabled", True)))
             self.mouse_pause_check.setChecked(bool(safety.get("pause_on_mouse_move", True)))
             self.focus_guard_check.setChecked(
                 bool(safety.get("require_rust_foreground", True))
@@ -5153,7 +5148,6 @@ class MainWindow(QMainWindow):
         current["safety"] = {
             **current.get("safety", {}),
             "countdown_seconds": self.countdown_spin.value(),
-            "corner_abort_enabled": self.corner_abort_check.isChecked(),
             "pause_on_mouse_move": self.mouse_pause_check.isChecked(),
             "require_rust_foreground": self.focus_guard_check.isChecked(),
             "expected_window_title_contains": self.expected_window_edit.text().strip(),
@@ -6419,7 +6413,6 @@ class MainWindow(QMainWindow):
             self.focus_guard_check,
             self.expected_window_edit,
             self.expected_process_edit,
-            self.corner_abort_check,
             self.mouse_pause_check,
             self.anti_afk_check,
             self.anti_afk_interval_spin,
@@ -6477,7 +6470,6 @@ class MainWindow(QMainWindow):
             self.focus_guard_check,
             self.expected_window_edit,
             self.expected_process_edit,
-            self.corner_abort_check,
             self.mouse_pause_check,
             self.verify_ui_check,
             self.anti_afk_check,
@@ -6883,7 +6875,6 @@ class MainWindow(QMainWindow):
                 apply_brush_size=False,
             )
             settings_document["safety"]["require_rust_foreground"] = False
-            settings_document["safety"]["corner_abort_enabled"] = False
             settings_document["safety"]["anti_afk_enabled"] = False
         return PainterSettings.from_mapping(settings_document)
 
@@ -7757,7 +7748,7 @@ class MainWindow(QMainWindow):
                 DryRunInputController,
                 create_system_input_controller,
             )
-            from app.screen import foreground_window_matches, get_virtual_screen
+            from app.screen import foreground_window_matches
 
             dry_run = self.dry_run_check.isChecked()
             if not dry_run and not self._emergency_hotkey_available():
@@ -7823,12 +7814,6 @@ class MainWindow(QMainWindow):
             hold_seconds = self.dot_duration_spin.value() / 1000.0
             speed = max(1.0, self.stroke_speed_spin.value())
             step_pixels = self.interpolation_spin.value()
-            corner_enabled = not dry_run and self.corner_abort_check.isChecked()
-            safety = self._settings_document().get("safety", {})
-            corner_margin = int(safety.get("corner_abort_margin_pixels", 3))
-            corner_distance = float(
-                safety.get("corner_abort_minimum_distance_pixels", 80.0)
-            )
             detailed_logging = bool(
                 self._settings_document()
                 .get("execution", {})
@@ -7853,8 +7838,6 @@ class MainWindow(QMainWindow):
             self._update_start_availability()
 
             def run_debug() -> None:
-                last_commanded: list[tuple[float, float] | None] = [None]
-
                 def checkpoint() -> None:
                     if self._debug_abort_event.is_set() or self._closing:
                         raise _DebugCancelled("emergency stop requested")
@@ -7864,33 +7847,11 @@ class MainWindow(QMainWindow):
                     ):
                         self._debug_abort_event.set()
                         raise _DebugCancelled("expected Rust window lost foreground")
-                    if not corner_enabled:
-                        return
-                    cursor = controller.get_cursor_position()
-                    desktop = get_virtual_screen()
-                    near_x = (
-                        cursor[0] <= desktop.left + corner_margin
-                        or cursor[0] >= desktop.right - 1 - corner_margin
-                    )
-                    near_y = (
-                        cursor[1] <= desktop.top + corner_margin
-                        or cursor[1] >= desktop.bottom - 1 - corner_margin
-                    )
-                    prior = last_commanded[0]
-                    displacement = (
-                        math.inf
-                        if prior is None
-                        else math.hypot(cursor[0] - prior[0], cursor[1] - prior[1])
-                    )
-                    if near_x and near_y and displacement >= corner_distance:
-                        self._debug_abort_event.set()
-                        raise _DebugCancelled("mouse moved to emergency corner")
 
                 def guarded_move(point: tuple[float, float]) -> None:
                     with self._debug_input_gate:
                         checkpoint()
                         controller.move_mouse(*point)
-                        last_commanded[0] = point
 
                 def guarded_down() -> None:
                     with self._debug_input_gate:

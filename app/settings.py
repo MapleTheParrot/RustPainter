@@ -171,8 +171,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "safety": {
         "countdown_seconds": 3,
-        "corner_abort_enabled": True,
-        "corner_abort_margin_pixels": 3,
         "pause_on_mouse_move": True,
         "mouse_move_pause_threshold_pixels": 24,
         "require_rust_foreground": True,
@@ -535,7 +533,6 @@ def _validate(settings: Mapping[str, Any]) -> None:
     if isinstance(countdown, bool) or not isinstance(countdown, int) or countdown < 0:
         raise SettingsError("safety.countdown_seconds must be a non-negative integer")
     for key in (
-        "corner_abort_enabled",
         "pause_on_mouse_move",
         "require_rust_foreground",
         "verify_calibrated_ui",
@@ -549,18 +546,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
     for key in ("expected_process_name", "expected_window_title_contains"):
         if safety.get(key) is not None and not isinstance(safety.get(key), str):
             raise SettingsError(f"safety.{key} must be a string or null")
-    corner_margin = safety.get("corner_abort_margin_pixels")
-    if (
-        isinstance(corner_margin, bool)
-        or not isinstance(corner_margin, int)
-        or corner_margin < 0
-    ):
-        raise SettingsError(
-            "safety.corner_abort_margin_pixels must be a non-negative integer"
-        )
-    may_be_zero = {"corner_abort_minimum_distance_pixels", "mouse_move_tolerance_pixels"}
+    may_be_zero = {"mouse_move_tolerance_pixels"}
     for key in (
-        "corner_abort_minimum_distance_pixels",
         "focus_check_interval_seconds",
         "safety_poll_interval_seconds",
         "mouse_move_pause_threshold_pixels",

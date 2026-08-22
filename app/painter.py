@@ -60,10 +60,8 @@ from .texel_grid import (
 )
 from .screen import (
     ForegroundRequirement,
-    VirtualScreen,
     capture_region,
     foreground_window_matches,
-    get_virtual_screen,
 )
 
 
@@ -258,9 +256,6 @@ class PainterSettings:
     expected_window_title_contains: str | None = "Rust"
     expected_process_name: str | None = "RustClient.exe"
     focus_check_interval_seconds: float = 0.05
-    corner_abort_enabled: bool = True
-    corner_abort_margin_pixels: int = 3
-    corner_abort_minimum_distance_pixels: float = 80.0
     pause_on_mouse_move: bool = True
     mouse_move_pause_threshold_pixels: float = 24.0
     mouse_move_tolerance_pixels: float = 3.0
@@ -289,9 +284,6 @@ class PainterSettings:
         "expected_window_title_contains",
         "expected_process_name",
         "focus_check_interval_seconds",
-        "corner_abort_enabled",
-        "corner_abort_margin_pixels",
-        "corner_abort_minimum_distance_pixels",
         "pause_on_mouse_move",
         "mouse_move_pause_threshold_pixels",
         "mouse_move_tolerance_pixels",
@@ -329,15 +321,12 @@ class PainterSettings:
             "delay_between_colors_seconds": self.delay_between_colors_seconds,
             "delay_after_brush_seconds": self.delay_after_brush_seconds,
             "countdown_seconds": self.countdown_seconds,
-            "corner_abort_minimum_distance_pixels": self.corner_abort_minimum_distance_pixels,
             "mouse_move_tolerance_pixels": self.mouse_move_tolerance_pixels,
             "progress_callback_interval_seconds": self.progress_callback_interval_seconds,
         }
         for name, value in nonnegative.items():
             if value < 0 or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite non-negative number")
-        if self.corner_abort_margin_pixels < 0:
-            raise ValueError("corner_abort_margin_pixels cannot be negative")
         if isinstance(self.verify_passes, bool) or not isinstance(
             self.verify_passes, int
         ) or not 0 <= self.verify_passes <= 5:
@@ -408,13 +397,6 @@ class PainterSettings:
             expected_process_name=pick(safety, "expected_process_name", "RustClient.exe"),
             focus_check_interval_seconds=float(
                 pick(safety, "focus_check_interval_seconds", 0.05)
-            ),
-            corner_abort_enabled=bool(pick(safety, "corner_abort_enabled", True)),
-            corner_abort_margin_pixels=int(
-                pick(safety, "corner_abort_margin_pixels", 3)
-            ),
-            corner_abort_minimum_distance_pixels=float(
-                pick(safety, "corner_abort_minimum_distance_pixels", 80.0)
             ),
             pause_on_mouse_move=bool(pick(safety, "pause_on_mouse_move", True)),
             mouse_move_pause_threshold_pixels=float(
@@ -532,7 +514,6 @@ class Painter:
         on_error: Callable[[BaseException], None] | None = None,
         on_countdown: Callable[[int], None] | None = None,
         foreground_checker: Callable[[ForegroundRequirement], bool] | None = None,
-        virtual_screen_provider: Callable[[], VirtualScreen] | None = None,
         screen_capture: Callable[[RectangleLike], Any] | None = None,
         stroke_overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS,
     ) -> None:
@@ -545,7 +526,6 @@ class Painter:
         self._foreground_checker = foreground_checker or (
             lambda requirement: foreground_window_matches(requirement)
         )
-        self._virtual_screen_provider = virtual_screen_provider or get_virtual_screen
         self._screen_capture = screen_capture or capture_region
 
         self._condition = threading.Condition(threading.RLock())
@@ -562,7 +542,7 @@ class Painter:
         self._paused_at: float | None = None
         self._paused_seconds = 0.0
         self._last_focus_check = 0.0
-        self._last_corner_check = 0.0
+        self._last_cursor_check = 0.0
         self._last_commanded_point: tuple[int, int] | None = None
         self._commanded_history: deque[tuple[int, int]] = deque(
             maxlen=_COMMANDED_POINT_HISTORY
@@ -802,7 +782,7 @@ class Painter:
             self._paused_at = None
             self._paused_seconds = 0.0
             self._last_focus_check = 0.0
-            self._last_corner_check = 0.0
+            self._last_cursor_check = 0.0
             self._reset_mouse_movement_baseline()
             self._last_progress_emit = 0.0
             self._paint_phase_timing = None
@@ -3084,13 +3064,6 @@ class Painter:
                 if paused:
                     self._condition.wait(timeout=0.05)
             if paused:
-                # Keep watching the corner while paused. The corner gesture is
-                # exactly what a user reaches for once the mouse has already
-                # interrupted the job and they want it gone rather than held,
-                # and a paused worker is the only thread still polling.
-                job = self._job
-                if job is not None:
-                    self._check_cursor(job.settings, time.monotonic(), allow_pause=False)
                 continue
             if self._check_safety(check_focus=check_focus):
                 continue
@@ -3122,21 +3095,18 @@ class Painter:
                 self.pause(_foreground_failure_reason(settings))
                 return True
 
-        return self._check_cursor(settings, now, allow_pause=True)
+        return self._check_cursor(settings, now)
 
-    def _check_cursor(
-        self, settings: PainterSettings, now: float, *, allow_pause: bool
-    ) -> bool:
-        """Sample the real cursor for the corner stop and for user movement.
+    def _check_cursor(self, settings: PainterSettings, now: float) -> bool:
+        """Sample the real cursor for user movement.
 
-        ``allow_pause`` is False when the job is already paused: the corner
-        emergency stop still has to work there, but there is nothing left to
-        pause. Returns True when the job just paused and the caller must
+        Movement only ever pauses; nothing but the user's Stop button or
+        abort hotkey aborts a job, so a stray cursor can never throw away the
+        work.  Returns True when the job just paused and the caller must
         re-evaluate its state.
         """
 
-        watch_movement = allow_pause and settings.pause_on_mouse_move
-        if not settings.corner_abort_enabled and not watch_movement:
+        if not settings.pause_on_mouse_move:
             return False
         if not getattr(self.input, "emits_real_input", True):
             return False
@@ -3147,22 +3117,13 @@ class Painter:
             history = tuple(self._commanded_history)
         if expected is None or not history:
             return False
-        if now - self._last_corner_check < settings.safety_poll_interval_seconds:
+        if now - self._last_cursor_check < settings.safety_poll_interval_seconds:
             return False
-        self._last_corner_check = now
+        self._last_cursor_check = now
         try:
             cursor = self.input.get_cursor_position()
-            if settings.corner_abort_enabled and self._is_manual_corner_stop(
-                cursor, expected, settings
-            ):
-                self.abort("mouse moved to emergency corner")
-                raise _AbortRequested
-        except _AbortRequested:
-            raise
         except Exception:
             LOGGER.warning("Could not read the cursor for safety checks", exc_info=True)
-            return False
-        if not watch_movement:
             return False
         return self._check_mouse_movement(cursor, history, settings, now)
 
@@ -3220,22 +3181,6 @@ class Painter:
         self._last_commanded_point = None
         self._commanded_history.clear()
         self._reset_mouse_drift()
-
-    def _is_manual_corner_stop(
-        self,
-        cursor: tuple[int, int],
-        expected: tuple[int, int],
-        settings: PainterSettings,
-    ) -> bool:
-        screen = self._virtual_screen_provider()
-        margin = settings.corner_abort_margin_pixels
-        near_left = cursor[0] <= screen.left + margin
-        near_right = cursor[0] >= screen.right - 1 - margin
-        near_top = cursor[1] <= screen.top + margin
-        near_bottom = cursor[1] >= screen.bottom - 1 - margin
-        at_corner = (near_left or near_right) and (near_top or near_bottom)
-        displacement = math.hypot(cursor[0] - expected[0], cursor[1] - expected[1])
-        return at_corner and displacement >= settings.corner_abort_minimum_distance_pixels
 
     def _interruptible_sleep(
         self,

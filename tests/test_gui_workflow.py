@@ -1432,7 +1432,6 @@ def test_live_debug_stroke_is_immediately_abortable(
     window._hotkeys_ready = True
     window._hotkeys = type("LiveHotkeys", (), {"running": True})()
     window.focus_guard_check.setChecked(False)
-    window.corner_abort_check.setChecked(False)
     window.stroke_speed_spin.setValue(10.0)
     window._pending_start_cancelled = False
     window._debug_abort_event.clear()
@@ -3569,7 +3568,6 @@ def test_a_paused_job_leaves_the_timing_controls_live_and_retunes_on_resume(
 
     assert window.speed_preset_combo.isEnabled()
     assert window.stroke_delay_spin.isEnabled()
-    assert window.corner_abort_check.isEnabled()
     assert window.verify_passes_spin.isEnabled()
     assert not window.quality_combo.isEnabled()
     assert not window.pixel_spacing_spin.isEnabled()
@@ -3578,14 +3576,12 @@ def test_a_paused_job_leaves_the_timing_controls_live_and_retunes_on_resume(
     assert not window.abort_hotkey_combo.isEnabled()
 
     window.stroke_delay_spin.setValue(250)
-    window.corner_abort_check.setChecked(False)
     window._start_or_resume()
 
     assert painter.resumed == 1
     assert len(painter.retuned) == 1
     settings = painter.retuned[0]
     assert settings.delay_between_strokes_seconds == pytest.approx(0.25)
-    assert settings.corner_abort_enabled is False
     # The worker's own countdown never runs again after a resume.
     assert settings.countdown_seconds == 0
 

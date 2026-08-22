@@ -18,7 +18,6 @@ from app.paint_timing import (
     STROKE_GAP_FLOOR_SECONDS,
 )
 from app.painter import Painter, PainterSettings, PainterState, PaintingTarget
-from app.screen import VirtualScreen
 from app.brush_calibration import fit_brush_size_model
 from app.profiles import CalibrationProfile
 
@@ -42,7 +41,6 @@ def _settings(**overrides: object) -> PainterSettings:
         "delay_between_colors_seconds": 0.0,
         "stroke_speed_pixels_per_second": 20_000.0,
         "stroke_interpolation_step_pixels": 4.0,
-        "corner_abort_enabled": False,
         "progress_callback_interval_seconds": 0.0,
         "safety_poll_interval_seconds": 0.002,
     }
@@ -435,7 +433,6 @@ def test_a_paused_job_takes_new_timing_and_keeps_its_shape() -> None:
         mouse_down_duration_seconds=0.004,
         delay_between_strokes_seconds=0.05,
         delay_between_colors_seconds=0.2,
-        corner_abort_enabled=True,
         logical_pixel_spacing=2.0,
         apply_brush_size=True,
     )
@@ -450,7 +447,6 @@ def test_a_paused_job_takes_new_timing_and_keeps_its_shape() -> None:
     live = painter._job.settings
     assert live.delay_between_strokes_seconds == 0.05
     assert live.delay_between_colors_seconds == 0.2
-    assert live.corner_abort_enabled is True
     assert live.logical_pixel_spacing == 1.0
     assert live.apply_brush_size is False
     # The run's pace no longer says anything about the machine's overhead.
@@ -627,7 +623,15 @@ def test_focus_guard_pauses_before_any_input_and_rechecks_on_resume() -> None:
     assert input_controller.events
 
 
-def test_corner_emergency_stop_aborts_before_next_click() -> None:
+def test_a_cursor_flung_to_a_screen_corner_only_pauses() -> None:
+    """Nothing the mouse does aborts a job; only the user's Stop does.
+
+    A cursor found in a screen corner used to be an emergency-stop gesture.
+    A game recentring its cursor can land there too, and an abort throws
+    away every unsaved stroke, so the corner is now just more movement: the
+    job pauses and resumes from the same stroke.
+    """
+
     class CornerInput(MockInputController):
         emits_real_input = True
 
@@ -635,22 +639,17 @@ def test_corner_emergency_stop_aborts_before_next_click() -> None:
             return (0, 0)
 
     input_controller = CornerInput()
-    painter = Painter(
-        input_controller,
-        virtual_screen_provider=lambda: VirtualScreen(0, 0, 1200, 900),
-    )
+    painter = Painter(input_controller)
     painter.start(
         _dot_plan(3),
         _profile(),
-        _settings(
-            corner_abort_enabled=True,
-            corner_abort_margin_pixels=2,
-            corner_abort_minimum_distance_pixels=50,
-        ),
+        _settings(pause_on_mouse_move=True, mouse_move_pause_threshold_pixels=10),
     )
-    assert painter.wait(_t(2.0))
-    assert painter.state is PainterState.ABORTED
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert painter.state_reason.startswith("mouse moved")
     assert not input_controller.held_buttons
+    assert painter.abort("user")
+    assert painter.wait(_t(2.0))
 
 
 def test_dry_run_skips_real_time_delays_and_focus_guard() -> None:
@@ -873,36 +872,6 @@ def test_queued_input_lag_is_not_mistaken_for_mouse_movement() -> None:
     assert painter.wait(_t(3.0))
     assert painter.state is PainterState.COMPLETED
     assert painter.progress.completed_strokes == 12
-
-
-def test_corner_emergency_stop_still_aborts_while_paused() -> None:
-    input_controller = _HandInput()
-    painter = Painter(
-        input_controller,
-        virtual_screen_provider=lambda: VirtualScreen(0, 0, 1200, 900),
-        screen_capture=_panel_capture,
-    )
-    painter.start(
-        _dot_plan(400),
-        _profile(),
-        _settings(
-            delay_between_strokes_seconds=0.02,
-            corner_abort_enabled=True,
-            corner_abort_margin_pixels=2,
-            corner_abort_minimum_distance_pixels=50,
-            pause_on_mouse_move=False,
-        ),
-    )
-    assert _wait_until(lambda: painter.state is PainterState.RUNNING)
-    assert painter.pause("user")
-    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
-
-    # The corner gesture is what a user reaches for once painting is already
-    # interrupted, so a paused job must still honour it.
-    input_controller.absolute_cursor = (0, 0)
-    assert _wait_until(lambda: painter.state is PainterState.ABORTED)
-    assert painter.wait(_t(2.0))
-    assert not input_controller.held_buttons
 
 
 def _sign_simulator(controller: MockInputController, canvas: ScreenRect, sign_rows: int):
