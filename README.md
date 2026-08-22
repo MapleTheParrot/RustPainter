@@ -573,8 +573,24 @@ What comes out is the texture's size in texels (no table of sign sizes is
 consulted, so a sign of a size no table lists is counted just the same),
 exactly where each texel is drawn, and exactly where to click for each.
 Max quality plans one cell per counted texel. The measurement is absolute
-screen pixels, so it is never reused from a stored profile for painting -
-only its texel count is kept, to size the next plan.
+screen pixels, so a job that can measure never reuses a stored one: it
+describes where the sign sat on screen the day it was taken.
+
+With **Automatic brush sizing** off the probe cannot run - it types the
+smallest brush and needs the sign wiped afterwards - so the job paints on the
+grid the profile's last measurement stored, as long as that grid still sits
+on the calibrated rectangle; without one it falls back to the rectangle,
+whose hand-dragged edges are good to about half a texel. Live, that half
+texel was the difference between a clean sign and one with every other row
+bare through the middle: the rectangle's row pitch was 0.0077 px longer than
+the texture's, which walked the aim onto a texel boundary by row 60 and
+across it by row 110, so alternate rows landed on their neighbours. Leave
+sizing on for native-resolution work, or at least run one sizing-on job on
+the sign first so there is a grid to reuse. The same job also captures the
+sign before its first stroke and, if that capture is one bare surface rather
+than an earlier picture, keeps it as the touch-up pass's bare reference -
+otherwise a dropped row reads as "some other color" and, past a few hundred
+such cells, is set aside as a capture that cannot resolve cells.
 
 Only a measurement that snaps - stamps within one texel agreeing on where they
 landed, every ladder rung a whole number of texels out, the grid sitting on

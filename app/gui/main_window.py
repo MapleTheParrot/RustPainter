@@ -5909,9 +5909,22 @@ class MainWindow(QMainWindow):
         """Say what automatic sizing will do on the next run, or what it needs."""
 
         if not self.apply_brush_check.isChecked():
+            grid = self._texel_grid()
+            canvas = self._profile_rect("canvas")
+            if grid is not None and canvas is not None and grid.agrees_with(canvas):
+                aim = (
+                    f"strokes are aimed by the {grid.columns}×{grid.rows}-texel "
+                    "grid the last measurement counted on this sign"
+                )
+            else:
+                aim = (
+                    "without a measured grid, strokes are laid out on the "
+                    "calibration rectangle, good to about half a texel - turn "
+                    "sizing on to measure the sign"
+                )
             self.brush_model_status.setText(
                 "Automatic brush sizing is off - Rust keeps whatever brush size "
-                "you set by hand"
+                f"you set by hand; {aim}"
             )
             return
         missing = self._missing_sizing_rectangles()

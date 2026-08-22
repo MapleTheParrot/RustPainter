@@ -69,6 +69,14 @@ SPREAD_MULTIPLIER = 5.0
 # fewer and it comes from the capture of the freshly cleared sign instead.
 BARE_REFERENCE_MIN_CELLS = 16
 
+# A capture of the sign taken before painting stands in for the cleared one
+# only if it looks bare: nine cells in ten within this distance of the
+# median color.  A bare artist canvas reads about 6 on this measure and a
+# painted one 40 and up, so the threshold sits well clear of both; the odd
+# speck or dab left on a cleared sign lands in the tenth that is ignored.
+BARE_CAPTURE_SPREAD_DELTA_E = 12.0
+BARE_CAPTURE_SPREAD_PERCENTILE = 90.0
+
 # Below this many screen pixels per logical cell the capture cannot tell one
 # cell's color from its neighbours', so recoloring single cells is guesswork
 # and only holes are repaired.
@@ -342,6 +350,30 @@ def bare_reference_lab(
     return None
 
 
+def capture_looks_bare(
+    sampled: np.ndarray,
+    *,
+    max_spread: float = BARE_CAPTURE_SPREAD_DELTA_E,
+    percentile: float = BARE_CAPTURE_SPREAD_PERCENTILE,
+) -> bool:
+    """Whether per-cell readings of a sign describe one unpainted surface.
+
+    ``sampled`` is the per-cell RGB reading of a capture (see
+    :func:`sample_cell_colors`).  A sign that still carries an earlier
+    artwork spreads its cells across many colors; a bare one is a single
+    color with grain, a vignette, and perhaps a few specks, so nearly every
+    cell sits close to the median.
+    """
+
+    cells = np.asarray(sampled, dtype=np.float32).reshape(-1, 3)
+    if len(cells) < BARE_REFERENCE_MIN_CELLS:
+        return False
+    lab = _srgb_to_lab(cells)
+    median = np.median(lab, axis=0)
+    distance = np.sqrt(((lab - median.reshape(1, 3)) ** 2).sum(axis=1))
+    return bool(np.percentile(distance, percentile) <= max_spread)
+
+
 def classify_cells(
     sampled: np.ndarray,
     indices: np.ndarray,
@@ -552,6 +584,8 @@ def touch_up_plan(
 
 
 __all__ = [
+    "BARE_CAPTURE_SPREAD_DELTA_E",
+    "BARE_CAPTURE_SPREAD_PERCENTILE",
     "BARE_REFERENCE_MIN_CELLS",
     "CLASSIFICATION_MARGIN_DELTA_E",
     "Mismatch",
@@ -565,6 +599,7 @@ __all__ = [
     "WRONG_COLOR_GROUP_FRACTION",
     "apply_capture_lighting",
     "bare_reference_lab",
+    "capture_looks_bare",
     "classify_cells",
     "fit_capture_lighting",
     "mismatched_cells",

@@ -332,3 +332,106 @@ def test_a_sign_of_no_canonical_size_is_painted_exactly_only_with_the_grid() -> 
     painted, expected, painter = _paint_non_canonical_sign(False)
     assert painter.measured_texel_grid is None
     assert len(painted & expected) < len(expected) // 2
+
+
+def _measure_grid_on(sign_kwargs: dict) -> dict:
+    """Run one sizing-on job so a profile can carry the grid it measured."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(controller, profile, **sign_kwargs)
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128, 64, (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),)
+    )
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    grid = painter.measured_texel_grid
+    assert grid is not None
+    return grid.to_dict()
+
+
+def test_with_sizing_off_a_job_paints_on_the_grid_the_profile_stores() -> None:
+    """Automatic sizing off means nothing is typed into the Size field and no
+    probe is stamped - but the job still aims by the grid an earlier job
+    measured, not by the hand-dragged rectangle, whose half-texel error
+    leaves rows bare at native resolution."""
+
+    sign_kwargs = dict(
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    stored = _measure_grid_on(sign_kwargs)
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    profile.metadata["texel_grid"] = stored
+    sign = ReplayingTexelSign(controller, profile, **sign_kwargs)
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup((40, 80, 160), (Stroke(10, 10, 30, 10), Stroke(0, 0, 0, 0)), 1),
+            ColorGroup((200, 40, 40), (Stroke(64, 40, 64, 40), Stroke(127, 63, 127, 63)), 1),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings(apply_brush_size=False))
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    # Adopted, not measured: the Size field and clear control were never touched.
+    assert painter.measured_texel_grid is not None
+    assert painter.measured_texel_grid.to_dict() == stored
+    assert not any(event.kind == "key_down" for event in controller.events)
+    positions = []
+    position = (0, 0)
+    for event in controller.events:
+        if event.kind == "move" and event.x is not None and event.y is not None:
+            position = (event.x, event.y)
+        elif event.kind == "mouse_down":
+            positions.append(position)
+    assert profile.clear_button is not None
+    assert not any(profile.clear_button.contains(*p) for p in positions)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, 10) for x in range(10, 31)} | {(0, 0), (64, 40), (127, 63)}
+    assert set(sign.painted) == expected
+    assert not controller.held_buttons
+
+
+def test_a_stored_grid_off_the_rectangle_is_not_painted_on() -> None:
+    """A grid measured with the sign framed elsewhere is stale: the rectangle
+    re-dragged around the new framing no longer holds it, and the job falls
+    back to the rectangle rather than aim at where the sign used to be."""
+
+    from app.texel_grid import TexelGridModel
+
+    controller = MockInputController()
+    profile = _profile()
+    assert profile.canvas is not None
+    stale = TexelGridModel(
+        columns=128,
+        rows=64,
+        pitch_x=5.0,
+        pitch_y=5.0,
+        origin_x=profile.canvas.left + 0.2 * profile.canvas.width,
+        origin_y=profile.canvas.top,
+    )
+    profile.metadata["texel_grid"] = stale.to_dict()
+    painter = Painter(controller)
+    plan = PaintPlan(128, 64, (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),))
+    painter.configure(plan, profile, _settings(apply_brush_size=False))
+    job = painter._job
+    assert job is not None
+    assert job.target.texel_grid is not None
+    painter._adopt_stored_texel_grid(job)
+    assert job.texel_grid is None
+    assert painter.measured_texel_grid is None

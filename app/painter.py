@@ -173,6 +173,11 @@ class PaintingTarget:
     picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
     brush_size_model: BrushSizeModel | None = None
+    # The texel grid an earlier job measured on this profile's sign.  A paint
+    # job that measures its own grid ignores it; one that cannot - automatic
+    # sizing off, which is what types the probe's brush - paints on it when it
+    # still sits on the calibrated rectangle.
+    texel_grid: TexelGridModel | None = None
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -199,6 +204,13 @@ class PaintingTarget:
             if isinstance(sizing_value, Mapping)
             else None
         )
+        grid_value = metadata.get("texel_grid") if isinstance(metadata, Mapping) else None
+        texel_grid = None
+        if isinstance(grid_value, Mapping):
+            try:
+                texel_grid = TexelGridModel.from_dict(grid_value)
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning("The profile's stored texel grid is invalid", exc_info=True)
         return cls(
             canvas=canvas,
             color_box=color_box,
@@ -213,6 +225,7 @@ class PaintingTarget:
             ),
             color_correction=correction,
             brush_size_model=brush_size_model,
+            texel_grid=texel_grid,
         )
 
 
@@ -471,9 +484,11 @@ class _Job:
     # stroke the game dropped is recognised as a hole rather than only when
     # the wood happens to resemble some other palette entry.
     bare_canvas: Any = None
-    # The texel grid this job measured on this sign, if the probe could read
-    # one.  Only a grid measured by the job itself is ever painted on: a
-    # stored one describes where the sign sat on screen some other day.
+    # The texel grid this job paints on: the one it measured on this sign if
+    # the probe could read one, or - when automatic sizing is off, so the
+    # probe's brush is never typed - the profile's stored grid, which
+    # describes where the sign sat on screen the day it was measured and is
+    # only trusted while it still sits on the calibrated rectangle.
     texel_grid: TexelGridModel | None = None
 
 
@@ -746,7 +761,11 @@ class Painter:
 
     @property
     def measured_texel_grid(self) -> TexelGridModel | None:
-        """The texel grid the last job measured on its sign, if it could."""
+        """The texel grid the last job painted on, if it had one.
+
+        Measured on the sign by the job itself, or - with automatic sizing
+        off - the profile's stored grid it adopted.
+        """
 
         with self._condition:
             return self._measured_texel_grid
@@ -1166,6 +1185,148 @@ class Painter:
             # the user's focus countdown.
             remaining -= slice_seconds
 
+    def _adopt_stored_texel_grid(self, job: _Job) -> None:
+        """Paint on the grid an earlier job measured, if it still fits.
+
+        With automatic sizing off the probe cannot run - it types the
+        smallest brush and needs the sign wiped afterwards - so the choice is
+        between the stored grid and the calibrated rectangle.  The rectangle
+        is hand-dragged: live it missed the texture's cursor lattice by a
+        couple of texels across and walked a fraction of a texel down the
+        sign, which at native resolution put every other row on a texel
+        boundary and left it bare.  The stored grid was counted on the sign,
+        and as long as it still sits on the rectangle it is the better aim.
+        A sign re-framed since would need the rectangle re-dragged, which
+        moves the grid off it and back onto the rectangle's own layout.
+        """
+
+        settings = job.settings
+        grid = job.target.texel_grid
+        if not settings.measure_texel_grid or grid is None:
+            if self._plan_is_finer_than_rectangle_aim(job):
+                LOGGER.warning(
+                    "Automatic brush sizing is off and no texel grid has been "
+                    "measured on this sign, so strokes are laid out on the "
+                    "calibration rectangle - good to about half a texel, which "
+                    "at this resolution can leave whole rows bare. Turn "
+                    "automatic brush sizing on to measure the sign's grid."
+                )
+            return
+        if not grid.agrees_with(job.target.canvas):
+            LOGGER.warning(
+                "The stored texel grid (%dx%d texels from %.0f, %.0f, measured %s) "
+                "no longer sits on the calibrated rectangle, so strokes are laid "
+                "out on the rectangle instead; turn automatic brush sizing on to "
+                "measure the sign again",
+                grid.columns,
+                grid.rows,
+                grid.origin_x,
+                grid.origin_y,
+                grid.captured_at or "earlier",
+            )
+            return
+        job.texel_grid = grid
+        with self._condition:
+            self._measured_texel_grid = grid
+        LOGGER.info(
+            "Automatic brush sizing is off; painting on the texel grid measured "
+            "%s: %dx%d texels, %.4f x %.4f px each from %.2f, %.2f",
+            grid.captured_at or "earlier",
+            grid.columns,
+            grid.rows,
+            grid.pitch_x,
+            grid.pitch_y,
+            grid.origin_x,
+            grid.origin_y,
+        )
+
+    @staticmethod
+    def _plan_is_finer_than_rectangle_aim(job: _Job) -> bool:
+        """Whether half-texel aim would visibly cost this plan rows or columns.
+
+        The rectangle's layout errs by a fraction of a texel; a cell several
+        texels wide absorbs that, a cell one or two texels wide does not.
+        Without a measurement the texel count is taken from the brush model
+        when there is one, else the plan is assumed fine enough to matter.
+        """
+
+        model = job.target.brush_size_model
+        plan = job.plan
+        if model is None:
+            return True
+        rows = model.sign_pixel_rows
+        if not math.isfinite(rows) or rows <= 0:
+            return True
+        return plan.height * 2.0 >= rows
+
+    def _reference_bare_sign(self, job: _Job) -> None:
+        """Capture the sign before painting as the touch-up pass's bare reference.
+
+        The calibration step wipes the sign and keeps that capture; without it
+        a dropped stroke reads as "some other color" rather than as bare sign,
+        and when the capture cannot resolve single cells those verdicts are
+        set aside - live, thirty bare rows went unrepaired that way.  The sign
+        as it stands before the first stroke is nearly always the cleared sign
+        the user is painting over, so it serves, after a check that it really
+        is one surface and not an earlier artwork.
+        """
+
+        import numpy as np
+
+        from .verification import capture_looks_bare, sample_cell_colors
+
+        if job.bare_canvas is not None or job.settings.verify_passes <= 0:
+            return
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        for _attempt in range(self._CALIBRATION_ATTEMPTS):
+            # A pause hands the mouse back partway through; the capture is
+            # simply taken again once painting resumes.
+            epoch = self._pause_generation_value()
+            try:
+                capture = self._capture_parked(canvas, park, epoch)
+                sampled = sample_cell_colors(
+                    np.asarray(capture.convert("RGB"), dtype=np.float32),
+                    job.plan.width,
+                    job.plan.height,
+                    centers=self._grid_cell_centers(job, job.plan, canvas),
+                )
+                bare = capture_looks_bare(sampled)
+                break
+            except _RetryAction:
+                continue
+            except _AbortRequested:
+                raise
+            except Exception:
+                LOGGER.exception("The sign could not be captured before painting")
+                return
+        else:
+            LOGGER.info(
+                "The sign was not captured before painting (paused every time "
+                "it was tried), so the touch-up pass has no bare reference"
+            )
+            return
+        if bare:
+            job.bare_canvas = capture
+            LOGGER.info(
+                "The sign looks bare before painting; the touch-up pass will "
+                "read holes against this capture"
+            )
+        else:
+            LOGGER.info(
+                "The sign is not bare before painting, so the touch-up pass has "
+                "no bare reference and can only repaint cells that match no color"
+            )
+
     @staticmethod
     def _brush_target_fraction(
         target: PaintingTarget,
@@ -1515,7 +1676,16 @@ class Painter:
         """
 
         settings = job.settings
-        if not settings.apply_brush_size or not self.input.emits_real_input:
+        if not self.input.emits_real_input:
+            return
+        if not settings.apply_brush_size:
+            # Nothing is typed into Rust's Size field and nothing is stamped:
+            # the brush is whatever the user set by hand, and so is the sign.
+            # The aim still needs a grid, and the sign needs a bare reference
+            # for the touch-up pass to tell a dropped stroke from a wrong
+            # color - both come from what is already at hand.
+            self._adopt_stored_texel_grid(job)
+            self._reference_bare_sign(job)
             return
         if job.target.brush_size_box is None or job.target.clear_button is None:
             # ``_validate_job`` refuses this combination up front; a job that

@@ -516,3 +516,27 @@ def test_a_few_scattered_wrong_cells_are_still_repainted() -> None:
     assert verdict.wrong_color == 8
     assert verdict.discarded == 0
     assert verdict.count == 8
+
+
+def test_a_bare_sign_looks_bare_and_a_painted_one_does_not() -> None:
+    """A sign before painting stands in for the cleared one only if it is one
+    surface: grain, a vignette and a few specks pass, an earlier artwork
+    does not.  Measured live, a bare artist canvas reads about 6 and a
+    painted one 40-60 on the percentile the check uses."""
+
+    from app.verification import capture_looks_bare
+
+    rng = np.random.default_rng(7)
+    bare = np.array([214, 204, 186], dtype=np.float32) + rng.normal(0.0, 6.0, (64, 96, 3))
+    bare = np.clip(bare, 0, 255).astype(np.float32)
+    assert capture_looks_bare(bare)
+
+    specked = bare.copy()
+    specked[::9, ::7] = (30, 90, 230)  # dabs left on the sign, well under a tenth
+    assert capture_looks_bare(specked)
+
+    painted = bare.copy()
+    painted[:, :48] = (40, 40, 40)  # half the sign carries an earlier picture
+    assert not capture_looks_bare(painted)
+
+    assert not capture_looks_bare(bare[:2, :4])  # too few cells to say

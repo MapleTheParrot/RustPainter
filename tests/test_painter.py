@@ -1881,3 +1881,116 @@ def test_a_later_pass_is_timed_against_its_own_clock() -> None:
     # Ninety-nine seconds of predicted work left, paced by one second done.
     assert 90.0 < remaining < 110.0
     assert painter.progress.elapsed_seconds >= 3600.0
+
+
+def _sign_with_bare_rows(
+    controller: MockInputController,
+    canvas: ScreenRect,
+    *,
+    before: Image.Image,
+    hole_rows: range,
+):
+    """A 64x32-cell sign that shows ``before`` until the first artwork stroke,
+    then the artwork with ``hole_rows`` of the dark color never registered."""
+
+    dark, near_bare, bare = (40, 40, 40), (104, 104, 104), (96, 96, 96)
+
+    def capture(rect) -> Image.Image:
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            return _panel_capture(rect)
+        position = (0, 0)
+        artwork_strokes = 0
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+            elif event.kind == "mouse_down" and canvas.contains(*position):
+                artwork_strokes += 1
+        if not artwork_strokes:
+            return before.copy()
+        image = Image.new("RGB", (rect.width, rect.height), dark)
+        image.paste(near_bare, (0, 280, rect.width, rect.height))
+        for y in hole_rows:
+            image.paste(bare, (0, y * 10, rect.width, y * 10 + 10))
+        return image
+
+    return capture, dark, near_bare
+
+
+def _bare_rows_plan(dark, near_bare) -> PaintPlan:
+    return PaintPlan(
+        64,
+        32,
+        (
+            ColorGroup(dark, tuple(Stroke(0, y, 63, y) for y in range(28)), 64 * 28),
+            ColorGroup(near_bare, tuple(Stroke(0, y, 63, y) for y in range(28, 32)), 64 * 4),
+        ),
+    )
+
+
+def _press_points_on(controller: MockInputController, canvas: ScreenRect) -> list[tuple[int, int]]:
+    return [
+        _position_at(controller, index)
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down" and canvas.contains(*_position_at(controller, index))
+    ]
+
+
+def test_with_sizing_off_the_sign_before_painting_is_the_bare_reference() -> None:
+    """Live: sizing off, so nothing cleared the sign and nothing captured it
+    bare; thirty rows the game never registered read as bare canvas, which
+    without a bare reference is "some other color, scattered" - set aside.
+    The sign as it stands before the first stroke is captured instead, and
+    once it is known to be bare those rows are holes and are repainted."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Bare before")
+    assert profile.canvas is not None
+    canvas = profile.canvas
+    hole_rows = range(10, 18)  # 512 cells: past the scattered-verdict allowance
+    capture, dark, near_bare = _sign_with_bare_rows(
+        controller,
+        canvas,
+        before=Image.new("RGB", (canvas.width, canvas.height), (96, 96, 96)),
+        hole_rows=hole_rows,
+    )
+    painter = _impatient(Painter(controller, screen_capture=capture))
+    assert painter.start(
+        _bare_rows_plan(dark, near_bare),
+        profile,
+        _settings(apply_brush_size=False, verify_passes=1),
+    )
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    presses = _press_points_on(controller, canvas)
+    touch_ups = presses[32:]
+    assert len(presses) == 32 + len(hole_rows), presses
+    rows_repainted = sorted((y - canvas.top) // 10 for _, y in touch_ups)
+    assert rows_repainted == list(hole_rows)
+
+
+def test_a_sign_that_is_not_bare_before_painting_gives_no_bare_reference() -> None:
+    """The same holes over an earlier artwork: its capture is no bare sign,
+    so it is not used as one, and the verdicts stay what they were."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _calibrating_profile("Painted before")
+    assert profile.canvas is not None
+    canvas = profile.canvas
+    earlier = Image.new("RGB", (canvas.width, canvas.height), (96, 96, 96))
+    for index, color in enumerate(((220, 30, 30), (30, 200, 60), (40, 60, 230), (250, 220, 20))):
+        earlier.paste(color, (index * 160, 0, index * 160 + 160, canvas.height))
+    capture, dark, near_bare = _sign_with_bare_rows(
+        controller, canvas, before=earlier, hole_rows=range(10, 18)
+    )
+    painter = _impatient(Painter(controller, screen_capture=capture))
+    assert painter.start(
+        _bare_rows_plan(dark, near_bare),
+        profile,
+        _settings(apply_brush_size=False, verify_passes=1),
+    )
+    assert painter.wait(_t(30.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert len(_press_points_on(controller, canvas)) == 32
