@@ -74,6 +74,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Per-profile color correction measured from a painted 32-swatch chart
 - A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required, and playback speed is a slider that says how much of the paint job one second of video covers
 - Safety throughout: countdown, foreground-window guard, auto-pause when you move the mouse, corner abort, pause/resume, and an abort that always releases the mouse
+- Resume from here: a painting interrupted by a server restart, a kick, or a stop picks up at the stroke it was on instead of being redone - the app records its place every few seconds, and a slider with a live preview sets the place by eye when there is no record
 - Plans already computed are kept, so stepping back to a preset you already tried comes back instantly instead of being recalculated, and any recalculation that does run covers the preview with what it is working on
 - Local JSON profiles/settings and rotating logs; nothing leaves your PC
 
@@ -619,6 +620,41 @@ a 512-wide sign read at two screen pixels per cell sent 21% of its cells back
 for "recoloring" - 35,000 strokes and most of an hour to repaint a sign that
 was already right.
 
+## Resume from here
+
+Rust saves the sign while the painting UI is open, so a job interrupted hours
+in - a server restart, a kick, a crash, a Stop - leaves nearly everything it
+painted on the sign. What is lost is the painter's place, and the **Resume
+from stroke** control in the Paint step puts it back.
+
+While a job paints, its place is written every few seconds to a small record
+under the app's data folder (`runs\resume\`), and stamped the moment the job
+stops with the painter's reason - a pause the UI guard called, a Stop, an
+error. The record is tied to the plan by a fingerprint of the plan's strokes
+and colours, because a stroke number only means something in its own plan's
+order: the same image at another resolution, palette, or optimization is a
+different plan, and its numbers do not carry over.
+
+When the loaded image produces a plan with a record, the control ticks itself
+and puts the slider at the recorded stroke; the Start button reads **Resume
+from stroke N**. The Rust preview shows the picture as far as the slider -
+drag it and match the preview against the sign. Precision is not needed:
+resuming early only repaints strokes that are already there, and the touch-up
+pass at the end repairs anything missed. When there is no record - a job run
+before this feature existed, or a plan rebuilt differently - the slider starts
+at zero and the notice says so (and names the last interrupted job if it was
+planned differently); slide to roughly where the picture stops on the sign and
+tick Resume.
+
+A resumed job runs the countdown, arms the guards, re-selects its colour and
+types its brush size for the group it resumes into, and finishes with the
+normal touch-up pass. It does **not** clear the sign or measure the brush on
+it - both would destroy what is there - so it paints on the texel grid and
+with the brush model the profile stored from an earlier job on that sign, the
+same way a job with automatic brush sizing off does, and warns in the log when
+either is missing. Resuming at the very last stroke paints nothing and goes
+straight to the touch-up pass, which is a way to repair a finished sign.
+
 ## Timelapse
 
 The **Timelapse** tab, next to Workspace in the header, captures the calibrated
@@ -777,7 +813,7 @@ skipped: a missing diagnostic is a nuisance and a lost paint job is hours.
 
 ## Local data and logs
 
-Profiles, settings, calibration reference captures, timelapse frames, run reports, and logs are stored under `%LOCALAPPDATA%\RustPainter` when available. Deleting that folder resets the application; exporting or copying its JSON files is enough to back up calibration data.
+Profiles, settings, calibration reference captures, timelapse frames, run reports, resume records, and logs are stored under `%LOCALAPPDATA%\RustPainter` when available. Deleting that folder resets the application; exporting or copying its JSON files is enough to back up calibration data.
 
 ## Known limitations
 

@@ -3847,3 +3847,207 @@ def test_the_ui_guard_is_a_live_safety_setting_that_reaches_the_painter(
     assert painter.retuned and painter.retuned[0].ui_guard_enabled is True
     window._painter = None
     window._update_start_availability()
+
+
+# --------------------------------------------------------------- resume from here
+
+
+def _load_small_plan(window: MainWindow, tmp_path: Path, qtbot) -> None:
+    source_path = tmp_path / "two-tone.png"
+    source = Image.new("RGB", (16, 8), (50, 180, 90))
+    for x in range(8, 16):
+        for y in range(8):
+            source.putpixel((x, y), (200, 40, 40))
+    source.save(source_path)
+    window.quality_combo.setCurrentText("Custom")
+    window.logical_width_spin.setValue(16)
+    window.logical_height_spin.setValue(8)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+
+
+def test_the_resume_slider_offers_a_record_only_to_the_plan_it_was_written_for(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A stroke number means something only in its own plan's order.
+
+    A record for this plan puts the slider at its stroke and ticks Resume;
+    a record for another plan is named as such and not offered; no record
+    leaves the slider at zero for the user to set by eye.
+    """
+
+    from app.resume_record import advanced, plan_fingerprint, record_for_job
+
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None and plan.stroke_count >= 4
+    store = window._resume_store
+
+    # No record: nothing offered, but the control is there to set by hand.
+    assert window.resume_panel.isEnabled()
+    assert not window.resume_check.isChecked()
+    assert window.resume_slider.maximum() == plan.stroke_count
+    assert window.resume_slider.value() == 0
+    assert "No record for this plan" in window.resume_notice.text()
+    assert window.start_button.text().startswith("START PAINTING")
+
+    # A record for a different plan is warned about, not offered.
+    other = PaintPlan(4, 4, (ColorGroup((1, 2, 3), (Stroke(0, 0, 3, 0), Stroke(0, 1, 3, 1)), 8),))
+    store.save(advanced(record_for_job(other, image_path="elsewhere.png"), completed_strokes=1, color_index=1))
+    window._refresh_resume_offer()
+    assert not window.resume_check.isChecked()
+    assert window.resume_slider.value() == 0
+    assert "planned differently" in window.resume_notice.text()
+    assert "elsewhere.png" in window.resume_notice.text()
+
+    # A record for this very plan is offered at its stroke.
+    mine = advanced(
+        record_for_job(plan),
+        completed_strokes=3,
+        color_index=1,
+        state="paused",
+        reason="painting UI not found - open the sign again and resume",
+        interrupted_by_ui_loss=True,
+    )
+    store.save(mine)
+    assert mine.fingerprint == plan_fingerprint(plan)
+    window._refresh_resume_offer()
+    assert window.resume_check.isChecked()
+    assert window.resume_slider.value() == 3
+    assert "the sign went away" in window.resume_notice.text()
+    assert window._resume_start_stroke() == 3
+    assert window.start_button.text().startswith("RESUME FROM STROKE 3")
+    assert "3 of" in window.resume_position_label.text()
+
+    # A finished record is history, not an offer.
+    store.save(advanced(mine, completed_strokes=plan.stroke_count, color_index=1, state="completed", finished=True))
+    window._refresh_resume_offer()
+    assert not window.resume_check.isChecked()
+    assert window.resume_slider.value() == 0
+
+
+def test_the_resume_slider_previews_the_first_strokes_and_starts_the_job_there(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None
+    whole = window.paint_preview._source.toImage()
+
+    window.resume_check.setChecked(True)
+    window.resume_slider.setValue(plan.stroke_count // 2)
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    partial = window.paint_preview._source.toImage()
+    assert partial.size() == whole.size()
+    assert partial != whole, "the preview should show only the first strokes"
+    assert window.start_button.text().startswith(
+        f"RESUME FROM STROKE {plan.stroke_count // 2:,}"
+    )
+
+    # Unticked, the whole picture is back.
+    window.resume_check.setChecked(False)
+    qtbot.waitUntil(lambda: not window._resume_preview_timer.isActive(), timeout=2000)
+    assert window.paint_preview._source.toImage() == whole
+    assert window.start_button.text().startswith("START PAINTING")
+
+    # Ticked again, the job starts at the slider's stroke and paints the rest.
+    window.resume_check.setChecked(True)
+    offset = plan.stroke_count // 2
+    window.dry_run_check.setChecked(True)
+    window.countdown_spin.setValue(0)
+    window._start_or_resume()
+    assert window._countdown is not None
+    assert window._pending_paint is not None
+    assert window._pending_paint.start_stroke == offset
+    # The control locks with the rest of the job's shape.
+    assert not window.resume_panel.isEnabled()
+    window._countdown._tick()
+    qtbot.waitUntil(
+        lambda: window._painter is not None
+        and getattr(window._painter.state, "value", "") == "completed",
+        timeout=5000,
+    )
+    assert window._painter._job.start_stroke == offset
+    assert window._painter.progress.completed_strokes == plan.stroke_count
+    qtbot.waitUntil(lambda: window.resume_panel.isEnabled(), timeout=2000)
+
+
+def test_resume_records_follow_a_real_job_and_stamp_why_it_stopped(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """Every few seconds while painting, at once when it stops, finished at the end."""
+
+    from types import SimpleNamespace
+
+    from app.resume_record import plan_fingerprint
+
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None
+    store = window._resume_store
+    fingerprint = plan_fingerprint(plan)
+
+    class _Painter:
+        state = PainterState.RUNNING
+        input = SimpleNamespace(emits_real_input=True)
+        progress = PaintProgress(PainterState.RUNNING, 0, 1, 0, 1, 0, 1, 0.0, 0.0, None)
+        measured_brush_size_model = None
+        measured_texel_grid = None
+        paint_phase_timing = None
+
+    painter = _Painter()
+    window._painter = painter
+    generation = window._paint_generation
+    pending = _PendingPaint(
+        plan=plan,
+        profile=window._current_profile,
+        settings=window._settings_document(),
+        dry_run=False,
+        start_stroke=2,
+    )
+    window._open_resume_record(pending)
+    assert window._resume_record is not None
+    assert window._resume_record.completed_strokes == 2
+    # Nothing on disk until the artwork is going down.
+    assert store.load(fingerprint) is None
+
+    def progress(completed: int, phase: str, state: PainterState = PainterState.RUNNING) -> PaintProgress:
+        return PaintProgress(state, 1, 2, completed, plan.stroke_count, completed, plan.stroke_count, 0.0, 0.0, None, "", phase)
+
+    window._on_paint_progress(generation, progress(2, "calibrate"))
+    assert store.load(fingerprint) is None
+    window._on_paint_progress(generation, progress(5, "paint"))
+    first = store.load(fingerprint)
+    assert first is not None and first.completed_strokes == 5 and first.color_index == 1
+    assert first.state == "running" and first.resumable
+    # Throttled: the next update within the interval is held in memory ...
+    window._on_paint_progress(generation, progress(6, "paint"))
+    assert store.load(fingerprint).completed_strokes == 5
+    # ... and written the moment the job stops, with the painter's reason.
+    painter.state = PainterState.PAUSED
+    window._on_paint_state(
+        generation,
+        PainterState.PAUSED,
+        "painting UI not found - open the sign again and resume",
+    )
+    stopped = store.load(fingerprint)
+    assert stopped is not None
+    assert stopped.completed_strokes == 6
+    assert stopped.state == "paused" and stopped.interrupted_by_ui_loss
+    assert "painting UI not found" in stopped.reason
+    # While the job is paused the offer is not refreshed under it; the
+    # record is what a restart of the app would find.
+
+    # The touch-up phase means the artwork is complete.
+    painter.state = PainterState.RUNNING
+    window._on_paint_progress(generation, progress(1, "verify"))
+    assert store.load(fingerprint).completed_strokes == plan.stroke_count
+
+    painter.state = PainterState.COMPLETED
+    window._on_paint_state(generation, PainterState.COMPLETED, "")
+    done = store.load(fingerprint)
+    assert done is not None and done.finished and done.state == "completed"
+    assert window._resume_record is None
+    # And the panel no longer offers it.
+    assert not window.resume_check.isChecked()
+    window._painter = None

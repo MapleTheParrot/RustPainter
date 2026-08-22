@@ -120,6 +120,14 @@ from app.paint_optimizer import (
 )
 from app.hotkeys import SUPPORTED_HOTKEY_CHOICES
 from app.profiles import Profile, ProfileStore
+from app.resume_record import (
+    ResumeRecord,
+    ResumeRecordStore,
+    advanced as advanced_record,
+    plan_fingerprint,
+    plan_prefix_labels,
+    record_for_job,
+)
 from app.settings import DEFAULT_COLOR_COUNT, SettingsStore, default_settings
 from app.timelapse_export import (
     DEFAULT_FRAME_RATE,
@@ -361,6 +369,9 @@ class _PendingPaint:
     settings: dict[str, Any]
     dry_run: bool
     display_snapshot: Any = None
+    # Strokes already on the sign, taken as painted: a job picked up where
+    # an interrupted one left off starts here instead of at zero.
+    start_stroke: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,6 +814,20 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
         self._timelapse_recorder: Any = None
         self._run_report: Any = None
+        # Where the running job has got to, on disk, so the job can be
+        # picked up again after a server restart takes the sign away.
+        self._resume_store: Any = None
+        self._resume_record: ResumeRecord | None = None
+        self._resume_record_written_at = 0.0
+        self._resume_position: tuple[int, int] = (0, 0)
+        # The plan on screen, fingerprinted once, and the simulation it
+        # came with: the resume slider paints the first N strokes of it.
+        self._plan_fingerprint: str | None = None
+        self._plan_simulation: Image.Image | None = None
+        self._resume_preview_timer = QTimer(self)
+        self._resume_preview_timer.setSingleShot(True)
+        self._resume_preview_timer.setInterval(60)
+        self._resume_preview_timer.timeout.connect(self._refresh_resume_preview)
         self._paint_job_snapshot: Any = None
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
@@ -2230,6 +2255,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(profile_group)
 
         run_group, run_layout = self._step_panel(3, "Paint")
+        run_layout.addWidget(self._build_resume_panel())
         self.start_button = QPushButton("START PAINTING  •  F8")
         self.start_button.setObjectName("accent")
         self.start_button.setMinimumHeight(44)
@@ -2247,6 +2273,270 @@ class MainWindow(QMainWindow):
         layout.addWidget(run_group)
         layout.addStretch(1)
         return content
+
+    # A tooltip shared by the resume controls: the one thing to know is that
+    # the slider does not need to be exact.
+    _RESUME_TOOLTIP = (
+        "Carry on painting a sign that already has most of the picture on it\n"
+        "- after a server restart, a kick, or a stop.  Rust saves the sign\n"
+        "while the painting UI is open, so what was painted is still there;\n"
+        "only the painter's place is lost, and this is where it is set.\n\n"
+        "The Rust preview shows the picture as far as the slider: match it\n"
+        "against the sign.  Precision is not needed - resuming early only\n"
+        "repaints strokes that are already there, and the touch-up pass at\n"
+        "the end repairs anything missed.  A resumed job paints on the sign\n"
+        "as it is: no clear, no brush probe."
+    )
+
+    def _build_resume_panel(self) -> QWidget:
+        """The "resume from here" controls: a tick, a slider, and a status line."""
+
+        self.resume_panel = QFrame()
+        self.resume_panel.setObjectName("inlinePanel")
+        self.resume_panel.setToolTip(self._RESUME_TOOLTIP)
+        layout = QVBoxLayout(self.resume_panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        heading = QHBoxLayout()
+        heading.setSpacing(8)
+        self.resume_check = QCheckBox("Resume from stroke")
+        self.resume_check.setToolTip(self._RESUME_TOOLTIP)
+        self.resume_position_label = QLabel("0 of 0")
+        self.resume_position_label.setObjectName("muted")
+        self.resume_position_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        heading.addWidget(self.resume_check)
+        heading.addStretch(1)
+        heading.addWidget(self.resume_position_label)
+        layout.addLayout(heading)
+        self.resume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.resume_slider.setRange(0, 0)
+        self.resume_slider.setToolTip(self._RESUME_TOOLTIP)
+        layout.addWidget(self.resume_slider)
+        self.resume_notice = QLabel("Load an image to see its plan")
+        self.resume_notice.setObjectName("muted")
+        self.resume_notice.setWordWrap(True)
+        layout.addWidget(self.resume_notice)
+        self.resume_check.toggled.connect(self._on_resume_controls_changed)
+        self.resume_slider.valueChanged.connect(self._on_resume_controls_changed)
+        self.resume_panel.setEnabled(False)
+        return self.resume_panel
+
+    # ---------------------------------------------------------- resume offer
+
+    def _resume_start_stroke(self) -> int:
+        """The stroke the next job starts at: 0 unless resuming is ticked."""
+
+        plan = self._plan
+        if plan is None or not self.resume_check.isChecked():
+            return 0
+        return max(0, min(int(self.resume_slider.value()), plan.stroke_count))
+
+    def _refresh_resume_offer(self) -> None:
+        """Offer the plan on screen its record, if one was written for it.
+
+        A record is offered only to the plan it was written against - the
+        stroke numbers index that plan's order and no other - so a plan
+        with no record starts the slider at zero, and says so when the last
+        interrupted job was planned differently.
+        """
+
+        plan = self._plan
+        store = self._resume_store
+        slider, check = self.resume_slider, self.resume_check
+        slider.blockSignals(True)
+        check.blockSignals(True)
+        try:
+            if plan is None or plan.stroke_count == 0:
+                self._plan_fingerprint = None
+                slider.setRange(0, 0)
+                slider.setValue(0)
+                check.setChecked(False)
+                self.resume_notice.setText("Load an image to see its plan")
+                self.resume_panel.setEnabled(False)
+                return
+            fingerprint = plan_fingerprint(plan)
+            self._plan_fingerprint = fingerprint
+            record = store.load(fingerprint) if store is not None else None
+            slider.setRange(0, plan.stroke_count)
+            if record is not None and record.resumable:
+                slider.setValue(min(record.completed_strokes, plan.stroke_count))
+                check.setChecked(True)
+                how = (
+                    "the sign went away while painting" if record.interrupted_by_ui_loss
+                    else record.state
+                )
+                self.resume_notice.setText(
+                    f"This plan was interrupted - {how} - at stroke "
+                    f"{record.completed_strokes:,} of {record.total_strokes:,} "
+                    f"({record.percent:.0f}%) on {record.updated_at}.  Tick to "
+                    "carry on from there, or slide to where the sign really is."
+                )
+            else:
+                slider.setValue(0)
+                check.setChecked(False)
+                notice = (
+                    "No record for this plan.  To carry on a sign painted "
+                    "earlier, slide to roughly where the picture stops on it "
+                    "and tick Resume."
+                )
+                other = (
+                    store.latest_resumable(excluding=(fingerprint,))
+                    if store is not None
+                    else None
+                )
+                if other is not None:
+                    image = Path(other.image_path).name if other.image_path else "an image"
+                    notice += (
+                        f"  The last interrupted job ({image}, {other.describe()}) "
+                        "was planned differently - its stroke numbers do not "
+                        "apply to this plan."
+                    )
+                self.resume_notice.setText(notice)
+            self.resume_panel.setEnabled(
+                not self._painter_is_active() and not self._countdown_callback_running
+            )
+        finally:
+            slider.blockSignals(False)
+            check.blockSignals(False)
+        self._on_resume_controls_changed()
+
+    @Slot()
+    def _on_resume_controls_changed(self, *_args: Any) -> None:
+        plan = self._plan
+        total = plan.stroke_count if plan is not None else 0
+        value = min(int(self.resume_slider.value()), total)
+        percent = value * 100.0 / total if total else 0.0
+        self.resume_position_label.setText(f"{value:,} of {total:,}  ({percent:.0f}%)")
+        self._resume_preview_timer.start()
+        self._update_start_availability()
+
+    @Slot()
+    def _refresh_resume_preview(self) -> None:
+        """Show the picture as far as the slider, or all of it when not resuming."""
+
+        plan = self._plan
+        simulation = self._plan_simulation
+        if plan is None or simulation is None:
+            return
+        if not self.resume_check.isChecked():
+            self.paint_preview.set_source(self._pil_to_pixmap(simulation))
+            return
+        count = self._resume_start_stroke()
+        try:
+            target = np.asarray(simulation.convert("RGB"), dtype=np.uint8)
+            if target.shape[0] != plan.height or target.shape[1] != plan.width:
+                self.paint_preview.set_source(self._pil_to_pixmap(simulation))
+                return
+            painted = plan_prefix_labels(plan, count) > 0
+            backdrop = _compose_checker_backdrop(
+                target, np.zeros(painted.shape, dtype=np.bool_)
+            )
+            partial = np.asarray(backdrop, dtype=np.uint8).copy()
+            partial[painted] = target[painted]
+            self.paint_preview.set_source(
+                self._pil_to_pixmap(Image.fromarray(partial, mode="RGB"))
+            )
+        except Exception:
+            LOGGER.exception("Could not render the resume preview")
+            self.paint_preview.set_source(self._pil_to_pixmap(simulation))
+
+    # --------------------------------------------------------- resume record
+
+    def _open_resume_record(self, pending: _PendingPaint) -> None:
+        """Start this job's record; written once the artwork is going down."""
+
+        self._resume_record = None
+        self._resume_record_written_at = 0.0
+        self._resume_position = (pending.start_stroke, 0)
+        if pending.dry_run or self._resume_store is None:
+            return
+        try:
+            self._resume_record = record_for_job(
+                pending.plan,
+                profile=pending.profile,
+                image_path=self._image_path,
+                settings=pending.settings,
+                completed_strokes=pending.start_stroke,
+            )
+        except Exception:
+            LOGGER.exception("Could not prepare the resume record")
+
+    # The record is refreshed this often while the artwork goes down: close
+    # enough that a crash loses a few strokes, far enough that the disk is
+    # not written on every stroke.
+    _RESUME_RECORD_INTERVAL_SECONDS = 3.0
+
+    def _note_resume_progress(self, progress: Any) -> None:
+        """Keep the record at the job's current stroke while it paints."""
+
+        record = self._resume_record
+        if record is None:
+            return
+        phase = getattr(progress, "phase", "paint")
+        state = getattr(getattr(progress, "state", None), "value", "")
+        if phase == "paint":
+            if state != "running":
+                return
+            self._resume_position = (
+                int(progress.completed_strokes),
+                int(progress.color_index),
+            )
+            now = time.monotonic()
+            if now - self._resume_record_written_at < self._RESUME_RECORD_INTERVAL_SECONDS:
+                return
+        elif phase == "verify":
+            # The artwork is all down; only the touch-up is left.  A job
+            # interrupted now resumes at the end, which is the touch-up.
+            if self._resume_position[0] >= record.total_strokes:
+                return
+            self._resume_position = (record.total_strokes, record.total_colors)
+        else:
+            return
+        self._write_resume_record(state="running")
+
+    def _write_resume_record(
+        self, *, state: str, reason: str = "", finished: bool = False
+    ) -> None:
+        record = self._resume_record
+        store = self._resume_store
+        if record is None or store is None:
+            return
+        completed, color_index = self._resume_position
+        from app.painter import Painter
+
+        ui_loss_reasons = Painter.UI_LOSS_REASONS
+        record = advanced_record(
+            record,
+            completed_strokes=completed,
+            color_index=color_index,
+            state=state,
+            reason=reason,
+            interrupted_by_ui_loss=reason in ui_loss_reasons,
+            finished=finished,
+        )
+        self._resume_record = record
+        self._resume_record_written_at = time.monotonic()
+        try:
+            store.save(record)
+        except OSError:
+            LOGGER.warning("Could not write the resume record", exc_info=True)
+
+    def _close_resume_record(self, outcome: str, reason: str) -> None:
+        """Stamp the record with how the job ended and re-offer it."""
+
+        if self._resume_record is not None:
+            if outcome == "completed":
+                self._resume_position = (
+                    self._resume_record.total_strokes,
+                    self._resume_record.total_colors,
+                )
+            self._write_resume_record(
+                state=outcome, reason=reason, finished=outcome == "completed"
+            )
+            self._resume_record = None
+        self._refresh_resume_offer()
 
     def _build_settings_page(self) -> QWidget:
         content = QWidget()
@@ -4423,7 +4713,11 @@ class MainWindow(QMainWindow):
         self._plan = result.plan
         self._plan_metric_source = result.plan
         self._plan_timing_profile = result.timing_profile
+        self._plan_simulation = result.simulation
         self.paint_preview.set_source(self._pil_to_pixmap(result.simulation))
+        # Re-offered per plan: the record, if any, belongs to this plan's
+        # stroke order and no other; and the preview follows the slider.
+        self._refresh_resume_offer()
         if not (
             self.original_preview.is_interacting
             or self.original_preview.is_panning_crop
@@ -4492,6 +4786,8 @@ class MainWindow(QMainWindow):
         self._plan = None
         self._processed = None
         self._plan_metric_source = None
+        self._plan_simulation = None
+        self._refresh_resume_offer()
         self._refresh_statistics()
         self._update_start_availability()
 
@@ -4655,6 +4951,7 @@ class MainWindow(QMainWindow):
         data = self._local_data_directory()
         self._profile_store = ProfileStore(data / "profiles")
         self._settings_store = SettingsStore(data / "settings.json")
+        self._resume_store = ResumeRecordStore(data / "runs" / "resume")
         try:
             self._settings = self._settings_store.load()
         except Exception as exc:
@@ -6317,9 +6614,12 @@ class MainWindow(QMainWindow):
         self.start_button.setToolTip(
             "" if enabled else self._start_blocked_reason(profile_ready, paused)
         )
+        resume_at = 0 if active or paused else self._resume_start_stroke()
         self.start_button.setText(
             f"RESUME PAINTING  •  {self.start_hotkey_combo.currentText()}"
             if paused
+            else f"RESUME FROM STROKE {resume_at:,}  •  {self.start_hotkey_combo.currentText()}"
+            if resume_at
             else f"START PAINTING  •  {self.start_hotkey_combo.currentText()}"
         )
         self.pause_button.setEnabled(active and not paused)
@@ -6499,6 +6799,7 @@ class MainWindow(QMainWindow):
             self.prepare_color_chart_button,
             self.measure_color_chart_button,
             self.clear_color_correction_button,
+            self.resume_panel,
             *self.debug_buttons.values(),
         )
         live = set(self._retunable_controls()) if retunable else set()
@@ -6525,6 +6826,9 @@ class MainWindow(QMainWindow):
             self.logical_width_spin.setEnabled(custom)
             self.logical_height_spin.setEnabled(custom)
             self._sync_paint_mode_dependent_controls()
+            self.resume_panel.setEnabled(
+                self._plan is not None and self._plan.stroke_count > 0
+            )
             has_profile = self._current_profile is not None
             self.rename_profile_button.setEnabled(has_profile)
             self.delete_profile_button.setEnabled(has_profile)
@@ -6662,6 +6966,7 @@ class MainWindow(QMainWindow):
                 settings=self._settings_document(),
                 dry_run=dry_run,
                 display_snapshot=(capture_display_metadata() if not dry_run else None),
+                start_stroke=self._resume_start_stroke(),
             )
             self._pending_start_cancelled = False
         except Exception as exc:
@@ -6845,13 +7150,19 @@ class MainWindow(QMainWindow):
             )
             # Publish only a configured READY painter. The hotkey thread can
             # then abort it atomically even before its worker thread starts.
-            painter.configure(pending.plan, pending.profile, settings)
+            painter.configure(
+                pending.plan,
+                pending.profile,
+                settings,
+                start_stroke=pending.start_stroke,
+            )
             if self._pending_start_cancelled:
                 painter.shutdown(timeout=0.5)
                 self._set_idle_ui("Start cancelled")
                 return
             self._paint_generation = generation
             self._painter = painter
+            self._open_resume_record(pending)
             if self._pending_start_cancelled:
                 painter.shutdown(timeout=0.5)
                 self._set_idle_ui("Start cancelled")
@@ -6862,10 +7173,15 @@ class MainWindow(QMainWindow):
                     return
                 raise RuntimeError("The configured paint worker could not be started")
             LOGGER.info(
-                "%s started: %d colors, %d strokes",
+                "%s started: %d colors, %d strokes%s",
                 "Dry run" if dry_run else "Painting",
                 len(pending.plan.color_groups),
                 pending.plan.stroke_count,
+                (
+                    f", resuming from stroke {pending.start_stroke:,}"
+                    if pending.start_stroke
+                    else ""
+                ),
             )
             self._update_start_availability()
         except Exception as exc:
@@ -7036,6 +7352,7 @@ class MainWindow(QMainWindow):
                 progress,
                 timelapse_frame=int(getattr(recorder, "frame_count", 0) or 0),
             )
+        self._note_resume_progress(progress)
 
     @Slot(int, object, str)
     def _on_paint_state(self, generation: int, state: Any, reason: str) -> None:
@@ -7063,9 +7380,15 @@ class MainWindow(QMainWindow):
             self.active_progress_title.setText(
                 {"countdown": "GET READY", "paused": "PAUSED"}.get(value, "PAINTING")
             )
+        if value == "paused":
+            # Where the job stopped, and why, written the moment it does:
+            # a pause the UI guard called is the one a resume is for, and
+            # the app may well be closed before the job is resumed.
+            self._write_resume_record(state="paused", reason=reason)
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
             self._finish_run_report(value, reason)
+            self._close_resume_record(value, reason)
             self._learn_timing()
             # The run measured this sign whatever its outcome, and that
             # measurement is what stops the next plan from asking for a
