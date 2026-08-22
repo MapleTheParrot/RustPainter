@@ -467,16 +467,130 @@ def _bbox(rect: RectangleLike) -> tuple[int, int, int, int]:
 
 
 def capture_region(rect: RectangleLike) -> "Image":
-    """Capture a calibrated physical-screen rectangle using Pillow."""
+    """Capture a calibrated physical-screen rectangle.
 
-    from PIL import ImageGrab
+    On Windows the rectangle is copied straight from the screen with GDI.
+    Pillow's grab copies the whole virtual desktop and crops afterwards,
+    which on a two-monitor desktop costs around a hundred milliseconds per
+    call however small the rectangle - too slow for anything that watches
+    the screen while strokes are going down.  Pillow stays as the fallback.
+    """
 
     set_dpi_awareness()
+    left, top, right, bottom = _bbox(rect)
+    if os.name == "nt":
+        try:
+            return _capture_region_gdi(left, top, right - left, bottom - top)
+        except Exception:
+            LOGGER.debug("GDI capture failed; falling back to Pillow", exc_info=True)
+    from PIL import ImageGrab
+
     try:
-        return ImageGrab.grab(bbox=_bbox(rect), all_screens=True).convert("RGB")
+        return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
     except TypeError:
         # Older Pillow/non-Windows implementations may not accept all_screens.
-        return ImageGrab.grab(bbox=_bbox(rect)).convert("RGB")
+        return ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
+
+
+_SRCCOPY = 0x00CC0020
+_DIB_RGB_COLORS = 0
+_BI_RGB = 0
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_int32),
+        ("biHeight", ctypes.c_int32),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", ctypes.c_uint32 * 3)]
+
+
+def _capture_region_gdi(left: int, top: int, width: int, height: int) -> "Image":
+    """BitBlt one rectangle of the virtual desktop into a Pillow image."""
+
+    from PIL import Image as PillowImage
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    for name, restype in (
+        ("GetDC", ctypes.c_void_p),
+        ("ReleaseDC", ctypes.c_int),
+    ):
+        getattr(user32, name).restype = restype
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.BitBlt.restype = ctypes.c_int
+    gdi32.BitBlt.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.GetDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+    ]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+
+    screen = user32.GetDC(None)
+    if not screen:
+        raise OSError("GetDC failed")
+    memory = None
+    bitmap = None
+    try:
+        memory = gdi32.CreateCompatibleDC(screen)
+        bitmap = gdi32.CreateCompatibleBitmap(screen, width, height)
+        if not memory or not bitmap:
+            raise OSError("Could not create a capture bitmap")
+        previous = gdi32.SelectObject(memory, bitmap)
+        try:
+            # Plain SRCCOPY, as Pillow's grab does it, so what this sees is
+            # what every capture before it saw.
+            if not gdi32.BitBlt(memory, 0, 0, width, height, screen, left, top, _SRCCOPY):
+                raise OSError("BitBlt failed")
+        finally:
+            gdi32.SelectObject(memory, previous)
+        info = _BITMAPINFO()
+        info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        info.bmiHeader.biWidth = width
+        # Negative height: rows top-down, so the buffer is the image as is.
+        info.bmiHeader.biHeight = -height
+        info.bmiHeader.biPlanes = 1
+        info.bmiHeader.biBitCount = 32
+        info.bmiHeader.biCompression = _BI_RGB
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        rows = gdi32.GetDIBits(
+            memory, bitmap, 0, height, buffer, ctypes.byref(info), _DIB_RGB_COLORS
+        )
+        if rows != height:
+            raise OSError("GetDIBits failed")
+        return PillowImage.frombuffer(
+            "RGB", (width, height), buffer.raw, "raw", "BGRX", 0, 1
+        ).copy()
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory:
+            gdi32.DeleteDC(memory)
+        user32.ReleaseDC(None, screen)
 
 
 def save_reference(rect: RectangleLike, path: str | Path) -> Path:

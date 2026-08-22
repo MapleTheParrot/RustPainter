@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 from app.screen import (
@@ -100,3 +102,52 @@ def test_rect_mapping_scales_between_different_resolutions() -> None:
     moved = map_rect_between_monitors(rect, source, target)
 
     assert moved == ScreenRect(-2560 + 256, -100 + 144, 1280, 720)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="GDI capture is Windows-only")
+def test_gdi_capture_matches_pillow_pixel_for_pixel() -> None:
+    """The fast path must see exactly what Pillow's grab saw.
+
+    Everything that reads the screen - the verifier, the grid probe, the UI
+    guard - goes through ``capture_region``, so a capture that differed from
+    the old one by a channel order or a row flip would quietly break them
+    all.  The desktop is live, so a region is compared only when two Pillow
+    grabs of it agree with each other.
+    """
+
+    from PIL import ImageGrab
+
+    from app.models import ScreenRect
+    from app.screen import _capture_region_gdi, capture_region
+
+    import numpy as np
+
+    def pixels(image: Image.Image) -> np.ndarray:
+        return np.asarray(image.convert("RGB"), dtype=np.int16)
+
+    # The middle of the primary screen: the corners hold clocks and blinking
+    # cursors, and a live region cannot be compared across grabs.
+    rect = ScreenRect(1100, 600, 96, 64)
+    bbox = (rect.left, rect.top, rect.right, rect.bottom)
+    for _attempt in range(8):
+        try:
+            before = ImageGrab.grab(bbox=bbox, all_screens=True)
+            ours = _capture_region_gdi(rect.left, rect.top, rect.width, rect.height)
+            after = ImageGrab.grab(bbox=bbox, all_screens=True)
+        except OSError as exc:  # a session with no desktop to read
+            pytest.skip(f"no screen to capture: {exc}")
+        assert ours.mode == "RGB" and ours.size == (rect.width, rect.height)
+        if np.array_equal(pixels(before), pixels(after)):
+            break
+    else:
+        pytest.skip("the screen kept changing between grabs")
+    assert np.array_equal(pixels(ours), pixels(before))
+    # And the public function takes the fast path to the same answer.
+    assert capture_region(rect).size == (rect.width, rect.height)
+
+
+def test_capture_region_refuses_an_empty_rectangle() -> None:
+    from app.screen import capture_region
+
+    with pytest.raises(ValueError):
+        capture_region(SimpleNamespace(left=0, top=0, width=0, height=10))
