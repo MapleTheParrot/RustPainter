@@ -4051,3 +4051,119 @@ def test_resume_records_follow_a_real_job_and_stamp_why_it_stopped(
     # And the panel no longer offers it.
     assert not window.resume_check.isChecked()
     window._painter = None
+
+
+def test_an_automatic_pause_screenshots_the_screen_and_shows_it(
+    window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What tripped a guard is on the screen for a moment; the app keeps it.
+
+    A pause the painter called on its own comes with a screenshot of the
+    whole screen, offered from the progress panel while the job is paused
+    and from the resume control afterwards; a pause the user asked for
+    does not.
+    """
+
+    from types import SimpleNamespace
+
+    import app.screen as screen_module
+    from app.gui.widgets import ScreenshotViewer
+    from app.resume_record import plan_fingerprint
+
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None
+    captured: list[object] = []
+    monkeypatch.setattr(
+        screen_module, "get_virtual_screen_rect", lambda: ScreenRect(0, 0, 48, 24)
+    )
+    monkeypatch.setattr(
+        screen_module,
+        "capture_region",
+        lambda rect: captured.append(rect)
+        or Image.new("RGB", (rect.width, rect.height), (200, 30, 30)),
+    )
+
+    class _Painter:
+        state = PainterState.RUNNING
+        input = SimpleNamespace(emits_real_input=True, release_all=lambda: None)
+        progress = PaintProgress(PainterState.RUNNING, 0, 1, 0, 1, 0, 1, 0.0, 0.0, None)
+        measured_brush_size_model = None
+        measured_texel_grid = None
+        paint_phase_timing = None
+
+        def shutdown(self, timeout: float = 0.0) -> None:
+            pass
+
+    painter = _Painter()
+    window._painter = painter
+    generation = window._paint_generation
+    window._open_resume_record(
+        _PendingPaint(
+            plan=plan,
+            profile=window._current_profile,
+            settings=window._settings_document(),
+            dry_run=False,
+        )
+    )
+    window._on_paint_progress(
+        generation,
+        PaintProgress(PainterState.RUNNING, 1, 2, 3, plan.stroke_count, 3, plan.stroke_count, 0.0, 0.0, None, "", "paint"),
+    )
+
+    # The run report takes its own picture of the screen as the artwork
+    # starts, on a worker; let it land before counting the pause's.
+    qtbot.waitUntil(lambda: len(captured) == 1, timeout=5000)
+    captured.clear()
+
+    # The user's own pause needs no explaining.
+    painter.state = PainterState.PAUSED
+    window._on_paint_state(generation, PainterState.PAUSED, "user hotkey/button")
+    qtbot.wait(50)
+    assert captured == []
+    assert window.pause_screenshot_button.isHidden()
+
+    painter.state = PainterState.RUNNING
+    window._on_paint_state(generation, PainterState.RUNNING, "resumed")
+    painter.state = PainterState.PAUSED
+    reason = "painting UI not found - open the sign again and resume"
+    window._on_paint_state(generation, PainterState.PAUSED, reason)
+    qtbot.waitUntil(lambda: window._pause_screenshot is not None, timeout=5000)
+    assert captured == [ScreenRect(0, 0, 48, 24)]
+    path, shown_reason, taken_at = window._pause_screenshot
+    assert path.exists() and path.suffix == ".png"
+    assert path.parent == window._pause_screenshot_directory()
+    assert "painting-ui-not-found" in path.name
+    assert shown_reason == reason and taken_at
+    assert not window.pause_screenshot_button.isHidden()
+    assert Image.open(path).size == (48, 24)
+
+    # The record carries the screenshot for a later session.
+    record = window._resume_store.load(plan_fingerprint(plan))
+    assert record is not None
+    assert record.screenshot_path == str(path)
+    assert record.interrupted_by_ui_loss and record.completed_strokes == 3
+
+    window._show_pause_screenshot()
+    assert len(window._screenshot_viewers) == 1
+    viewer = window._screenshot_viewers[0]
+    assert isinstance(viewer, ScreenshotViewer)
+    assert not viewer._pixmap.isNull()
+    viewer.close()
+
+    # Resumed, the button goes; the file stays.
+    painter.state = PainterState.RUNNING
+    window._on_paint_state(generation, PainterState.RUNNING, "resumed")
+    assert window.pause_screenshot_button.isHidden()
+    assert path.exists()
+
+    # The job is abandoned; the next session's resume offer shows it.
+    painter.state = PainterState.ABORTED
+    window._on_paint_state(generation, PainterState.ABORTED, "emergency stop")
+    window._painter = None
+    window._refresh_resume_offer()
+    assert window.resume_check.isChecked()
+    assert not window.resume_screenshot_button.isHidden()
+    window._show_offered_screenshot()
+    qtbot.waitUntil(lambda: len(window._screenshot_viewers) == 1, timeout=2000)
+    window._screenshot_viewers[0].close()

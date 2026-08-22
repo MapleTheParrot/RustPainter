@@ -151,6 +151,7 @@ from .text_render import (
     text_size,
 )
 from .widgets import (
+    ScreenshotViewer,
     BusyOverlay,
     CalibrationStatus,
     ColorButton,
@@ -752,6 +753,7 @@ class _PainterBridge(QObject):
     state = Signal(int, object, str)
     completed = Signal(int)
     error = Signal(int, str)
+    pause_screenshot = Signal(int, str, str, str)
     start_requested = Signal()
     pause_requested = Signal()
     abort_requested = Signal()
@@ -828,6 +830,11 @@ class MainWindow(QMainWindow):
         self._resume_preview_timer.setSingleShot(True)
         self._resume_preview_timer.setInterval(60)
         self._resume_preview_timer.timeout.connect(self._refresh_resume_preview)
+        # The screen as it was when a guard last paused the job: path,
+        # reason, and time; and the viewers open on such screenshots.
+        self._pause_screenshot: tuple[Path, str, str] | None = None
+        self._offered_record: ResumeRecord | None = None
+        self._screenshot_viewers: list[Any] = []
         self._paint_job_snapshot: Any = None
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
@@ -898,6 +905,7 @@ class MainWindow(QMainWindow):
         self._painter_bridge.completed.connect(self._on_paint_complete)
         self._painter_bridge.error.connect(self._on_paint_error)
         self._painter_bridge.start_requested.connect(self._start_or_resume)
+        self._painter_bridge.pause_screenshot.connect(self._on_pause_screenshot)
         self._painter_bridge.pause_requested.connect(self._pause_painting)
         self._painter_bridge.abort_requested.connect(self._abort_painting)
         self._painter_bridge.hotkey_error.connect(self._on_hotkey_error)
@@ -1610,6 +1618,19 @@ class MainWindow(QMainWindow):
         self.active_detail_label = QLabel("")
         self.active_detail_label.setObjectName("muted")
         active_layout.addWidget(self.active_detail_label)
+        # A pause the painter called on its own comes with a screenshot of
+        # the screen at that moment; this opens it.
+        self.pause_screenshot_button = QPushButton("See what stopped it")
+        self.pause_screenshot_button.setObjectName("compactButton")
+        self.pause_screenshot_button.setToolTip(
+            "Open the screenshot the app took of the whole screen the moment\n"
+            "a guard paused the job, with the painter's reason above it."
+        )
+        self.pause_screenshot_button.setVisible(False)
+        self.pause_screenshot_button.clicked.connect(self._show_pause_screenshot)
+        active_layout.addWidget(
+            self.pause_screenshot_button, 0, Qt.AlignmentFlag.AlignLeft
+        )
 
         self.plan_progress_stack = QStackedWidget()
         self.plan_progress_stack.addWidget(analysis)
@@ -2308,6 +2329,15 @@ class MainWindow(QMainWindow):
         )
         heading.addWidget(self.resume_check)
         heading.addStretch(1)
+        self.resume_screenshot_button = QPushButton("See what stopped it")
+        self.resume_screenshot_button.setObjectName("compactButton")
+        self.resume_screenshot_button.setToolTip(
+            "Open the screenshot the app took of the whole screen when the\n"
+            "recorded job was paused."
+        )
+        self.resume_screenshot_button.setVisible(False)
+        self.resume_screenshot_button.clicked.connect(self._show_offered_screenshot)
+        heading.addWidget(self.resume_screenshot_button)
         heading.addWidget(self.resume_position_label)
         layout.addLayout(heading)
         self.resume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -2331,7 +2361,8 @@ class MainWindow(QMainWindow):
         plan = self._plan
         if plan is None or not self.resume_check.isChecked():
             return 0
-        return max(0, min(int(self.resume_slider.value()), plan.stroke_count))
+        total = int(getattr(plan, "stroke_count", 0) or 0)
+        return max(0, min(int(self.resume_slider.value()), total))
 
     def _refresh_resume_offer(self) -> None:
         """Offer the plan on screen its record, if one was written for it.
@@ -2348,8 +2379,10 @@ class MainWindow(QMainWindow):
         slider.blockSignals(True)
         check.blockSignals(True)
         try:
-            if plan is None or plan.stroke_count == 0:
+            if not getattr(plan, "stroke_count", 0):
                 self._plan_fingerprint = None
+                self._offered_record = None
+                self.resume_screenshot_button.setVisible(False)
                 slider.setRange(0, 0)
                 slider.setValue(0)
                 check.setChecked(False)
@@ -2360,6 +2393,12 @@ class MainWindow(QMainWindow):
             self._plan_fingerprint = fingerprint
             record = store.load(fingerprint) if store is not None else None
             slider.setRange(0, plan.stroke_count)
+            self._offered_record = record if record is not None and record.resumable else None
+            self.resume_screenshot_button.setVisible(
+                self._offered_record is not None
+                and bool(self._offered_record.screenshot_path)
+                and Path(self._offered_record.screenshot_path).exists()
+            )
             if record is not None and record.resumable:
                 slider.setValue(min(record.completed_strokes, plan.stroke_count))
                 check.setChecked(True)
@@ -2405,7 +2444,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_resume_controls_changed(self, *_args: Any) -> None:
         plan = self._plan
-        total = plan.stroke_count if plan is not None else 0
+        total = int(getattr(plan, "stroke_count", 0) or 0)
         value = min(int(self.resume_slider.value()), total)
         percent = value * 100.0 / total if total else 0.0
         self.resume_position_label.setText(f"{value:,} of {total:,}  ({percent:.0f}%)")
@@ -2441,6 +2480,114 @@ class MainWindow(QMainWindow):
         except Exception:
             LOGGER.exception("Could not render the resume preview")
             self.paint_preview.set_source(self._pil_to_pixmap(simulation))
+
+    # ------------------------------------------------------ pause screenshots
+
+    # Pauses the user asked for, which need no explaining.  Anything else -
+    # the UI guard, the focus guard, the mouse guard, a sign that did not
+    # reopen - is the painter stopping on its own, and comes with a picture.
+    _USER_PAUSE_REASONS = frozenset({"user hotkey/button", "global hotkey", "user"})
+
+    def _pause_screenshot_directory(self) -> Path:
+        return self._local_data_directory() / "runs" / "pauses"
+
+    def _capture_pause_screenshot(self, generation: int, reason: str) -> None:
+        """Keep the whole screen as it is now, off the GUI thread.
+
+        The job has just paused on its own, and whatever tripped it - a
+        disconnect screen, a menu, the desktop - is on the screen at this
+        moment and may be gone by the time anyone looks.  The capture and
+        the PNG encode take a few hundred milliseconds for two monitors, so
+        they run on a worker and the result arrives as a signal.
+        """
+
+        if self._closing:
+            return
+        directory = self._pause_screenshot_directory()
+        taken_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        slug = "".join(
+            character if character.isalnum() else "-" for character in reason.lower()
+        ).strip("-")[:40] or "paused"
+        path = directory / f"{stamp}-{slug}.png"
+        bridge = self._painter_bridge
+
+        def capture() -> None:
+            try:
+                from app.screen import capture_region, get_virtual_screen_rect
+
+                directory.mkdir(parents=True, exist_ok=True)
+                image = capture_region(get_virtual_screen_rect())
+                image.save(path, format="PNG", compress_level=1)
+            except Exception:
+                LOGGER.exception("Could not screenshot the screen at the pause")
+                return
+            LOGGER.info("Screenshot of the screen at the pause saved to %s", path)
+            bridge.pause_screenshot.emit(generation, str(path), reason, taken_at)
+
+        threading.Thread(
+            target=capture, name="RustPainterPauseScreenshot", daemon=True
+        ).start()
+
+    @Slot(int, str, str, str)
+    def _on_pause_screenshot(
+        self, generation: int, path: str, reason: str, taken_at: str
+    ) -> None:
+        if generation != self._paint_generation or self._closing:
+            return
+        screenshot = Path(path)
+        self._pause_screenshot = (screenshot, reason, taken_at)
+        painter = self._painter
+        state = getattr(getattr(painter, "state", None), "value", None)
+        self.pause_screenshot_button.setVisible(state == "paused")
+        self.statusBar().showMessage(
+            f"Screenshot of what stopped the painting saved to {screenshot.name}", 8000
+        )
+        # The record carries it too, so a restart of the app can still show
+        # what the sign looked like when the job stopped.
+        record = self._resume_record
+        store = self._resume_store
+        if record is not None and store is not None:
+            record = replace(record, screenshot_path=str(screenshot))
+            self._resume_record = record
+            try:
+                store.save(record)
+            except OSError:
+                LOGGER.warning("Could not attach the screenshot to the resume record", exc_info=True)
+
+    @Slot()
+    def _show_pause_screenshot(self) -> None:
+        if self._pause_screenshot is None:
+            return
+        path, reason, taken_at = self._pause_screenshot
+        self._show_screenshot(path, reason=reason, taken_at=taken_at)
+
+    @Slot()
+    def _show_offered_screenshot(self) -> None:
+        record = self._offered_record
+        if record is None or not record.screenshot_path:
+            return
+        self._show_screenshot(
+            Path(record.screenshot_path),
+            reason=record.reason or record.state,
+            taken_at=record.updated_at,
+        )
+
+    def _show_screenshot(self, path: Path, *, reason: str, taken_at: str) -> None:
+        try:
+            viewer = ScreenshotViewer(path, reason=reason, taken_at=taken_at, parent=self)
+        except Exception:
+            LOGGER.exception("Could not open the pause screenshot")
+            QMessageBox.warning(self, "Screenshot", f"Could not open {path}")
+            return
+        viewer.setWindowModality(Qt.WindowModality.NonModal)
+        viewer.destroyed.connect(
+            lambda _obj=None, ref=viewer: self._screenshot_viewers.remove(ref)
+            if ref in self._screenshot_viewers
+            else None
+        )
+        self._screenshot_viewers.append(viewer)
+        viewer.show()
 
     # --------------------------------------------------------- resume record
 
@@ -6827,7 +6974,7 @@ class MainWindow(QMainWindow):
             self.logical_height_spin.setEnabled(custom)
             self._sync_paint_mode_dependent_controls()
             self.resume_panel.setEnabled(
-                self._plan is not None and self._plan.stroke_count > 0
+                bool(getattr(self._plan, "stroke_count", 0))
             )
             has_profile = self._current_profile is not None
             self.rename_profile_button.setEnabled(has_profile)
@@ -7385,6 +7532,10 @@ class MainWindow(QMainWindow):
             # a pause the UI guard called is the one a resume is for, and
             # the app may well be closed before the job is resumed.
             self._write_resume_record(state="paused", reason=reason)
+            if reason not in self._USER_PAUSE_REASONS:
+                self._capture_pause_screenshot(generation, reason)
+        elif value == "running":
+            self.pause_screenshot_button.setVisible(False)
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
             self._finish_run_report(value, reason)

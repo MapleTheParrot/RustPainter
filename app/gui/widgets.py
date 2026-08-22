@@ -1781,3 +1781,77 @@ class QtLogHandler(logging.Handler):
             self.emitter.message.emit(self.format(record))
         except Exception:
             self.handleError(record)
+
+
+class ScreenshotViewer(QDialog):
+    """The screen as it was when a guard paused the job, to look at.
+
+    A pause the painter called on its own - the sign gone, the window
+    lost, the mouse moved - is explained by what was on the screen at that
+    moment, and the app keeps a screenshot of it.  This shows the picture
+    scaled to the window, with the painter's reason and the time above it,
+    so what tripped the guard can be seen rather than guessed.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        reason: str,
+        taken_at: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("What stopped the painting")
+        self.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setSizeGripEnabled(True)
+        self.path = Path(path)
+        self._pixmap = QPixmap(str(self.path))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        caption = QLabel(
+            f"Paused: {reason}" + (f"  •  {taken_at}" if taken_at else "")
+        )
+        caption.setWordWrap(True)
+        caption.setStyleSheet("font-weight: 600;")
+        layout.addWidget(caption)
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(320, 180)
+        self.image_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        if self._pixmap.isNull():
+            self.image_label.setText(f"The screenshot could not be opened:\n{self.path}")
+        layout.addWidget(self.image_label, 1)
+        buttons = QHBoxLayout()
+        where = QLabel(str(self.path))
+        where.setObjectName("muted")
+        where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        buttons.addWidget(where, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self.resize(960, 600)
+        self._rescale()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._pixmap.isNull():
+            return
+        size = self.image_label.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        self.image_label.setPixmap(
+            self._pixmap.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )

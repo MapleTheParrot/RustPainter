@@ -96,6 +96,9 @@ class ResumeRecord:
     state: str = "running"
     reason: str = ""
     interrupted_by_ui_loss: bool = False
+    # The screen as it was when a guard paused the job, if one was taken:
+    # what tripped the guard, to look at rather than guess.
+    screenshot_path: str | None = None
     # A finished job's record is kept for the run's history but is never
     # offered as a place to resume from.
     finished: bool = False
@@ -249,12 +252,14 @@ def advanced(
     reason: str = "",
     interrupted_by_ui_loss: bool = False,
     finished: bool = False,
+    screenshot_path: str | None = None,
 ) -> ResumeRecord:
     """The record moved on to where the job is now.
 
     ``interrupted_by_ui_loss`` marks a stop the painter's UI guard called -
     the sign went away - as opposed to a hand on the mouse or a window in
-    front; the record is the same either way, the label is not.
+    front; the record is the same either way, the label is not.  A
+    screenshot, once attached, stays attached until a new one replaces it.
     """
 
     return replace(
@@ -265,6 +270,7 @@ def advanced(
         reason=reason,
         interrupted_by_ui_loss=bool(interrupted_by_ui_loss),
         finished=finished,
+        screenshot_path=screenshot_path or record.screenshot_path,
         updated_at=_timestamp(),
     )
 
