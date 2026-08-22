@@ -6406,9 +6406,11 @@ class MainWindow(QMainWindow):
         return "Painting is unavailable right now."
 
     # The controls a paused job may still take new values from: the holds
-    # and speeds every remaining stroke is run with, and the guards that
-    # decide when to stop.  The painter applies them on resume.  Everything
-    # that shaped the plan or the job stays locked until the job is over.
+    # and speeds every remaining stroke is run with, the guards that decide
+    # when to stop, and whether a timelapse is being recorded.  The painter
+    # applies its share on resume; the recording follows the controls then
+    # too.  Everything that shaped the plan or the job stays locked until
+    # the job is over.
     def _retunable_controls(self) -> tuple[QWidget, ...]:
         return (
             self.speed_preset_combo,
@@ -6428,6 +6430,9 @@ class MainWindow(QMainWindow):
             self.ui_guard_check,
             self.anti_afk_check,
             self.anti_afk_interval_spin,
+            self.timelapse_check,
+            self.timelapse_interval_spin,
+            self.timelapse_final_check,
         )
 
     def _set_job_controls_locked(self, locked: bool, *, retunable: bool = False) -> None:
@@ -6583,6 +6588,7 @@ class MainWindow(QMainWindow):
 
                 if self._painter.state == PainterState.PAUSED:
                     self._retune_paused_painter()
+                    self._sync_timelapse_with_controls()
                     self._painter.resume()
                     return
                 if self._painter_is_active():
@@ -7226,6 +7232,36 @@ class MainWindow(QMainWindow):
             recorder.directory,
             interval,
         )
+
+    def _sync_timelapse_with_controls(self) -> None:
+        """Make the recording match the timelapse controls as a pause ends.
+
+        The controls stay live through a pause so a job that started without
+        a recording can get one from here on - the wish to keep a run tends
+        to arrive once it is plainly going well - and so one that has a
+        recording can change its pace or stop it.  A job still measuring its
+        brush is left to the painting-phase progress update that starts
+        every recording, so the video opens on the artwork and not on the
+        probe strokes.
+        """
+
+        recorder = self._timelapse_recorder
+        if not self.timelapse_check.isChecked():
+            if recorder is not None:
+                LOGGER.info("Timelapse recording stopped from the paused job")
+                self._finish_timelapse(final=False)
+            return
+        interval = max(1, self.timelapse_interval_spin.value()) * 1000
+        if recorder is None:
+            progress = getattr(self._painter, "progress", None)
+            if getattr(progress, "phase", "paint") != "calibrate":
+                self._maybe_start_timelapse()
+            return
+        if self._timelapse_timer.interval() != interval:
+            # Setting the interval restarts a running timer at the new pace.
+            self._timelapse_timer.setInterval(interval)
+            LOGGER.info("Timelapse interval changed to %ds", interval // 1000)
+            self._update_timelapse_status()
 
     @Slot()
     def _capture_timelapse_frame(self) -> None:

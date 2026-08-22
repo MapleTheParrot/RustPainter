@@ -631,6 +631,12 @@ the job completes.
 Recording starts when the artwork does, so a video opens on a blank sign
 rather than on the brush-calibration strokes the job wipes off first.
 
+The recording controls stay live while a job is paused, so a run started
+without one can be recorded from the pause onwards: pause, tick **Record
+while painting**, resume. The interval and the final frame can be changed the
+same way, and unticking it during a pause stops the recording and keeps the
+frames saved so far.
+
 The tab lists every recording newest first with its frame count and size, and
 shows what the current job is recording. Select one and:
 
@@ -684,7 +690,7 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 
 - Starting uses a visible countdown so you can focus Rust.
 - With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. The expected process defaults to `RustClient.exe`. Loss of focus pauses and releases the mouse.
-- F9 pauses at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, touch-up passes, and the safety guards stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
+- F9 pauses at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, touch-up passes, the safety guards, and the timelapse controls stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
 - F10 aborts, clears pending work, and releases the mouse.
 - **Anti-AFK** (off by default, Settings > Safety): every N minutes (adjustable, 30 by default) the job clicks Rust's **Save changes** button to leave the painting UI, presses Space to jump, waits a second, clicks to open the sign again, and continues from the same stroke - re-selecting its color and brush size first. It relies on your character still facing the sign, which it is if you were looking at it when the job started and have not touched the mouse since. Turning it on makes the **Save button** calibration needed (drag just inside Rust's Save changes button), and Start says so until it is set. Closing the UI with Save keeps everything painted so far.
 - **UI guard** (on by default, Settings > Safety): once a second the job looks at the calibrated **colour box**, **hue bar**, and - when calibrated - the **Clear** and **Save** buttons, and pauses when they are no longer on the screen: a server restart, a kick, a disconnect, or the sign closed by hand, none of which the other guards notice because the Rust window is still in front and the cursor still goes where it is sent. Each widget is fingerprinted as the job starts (the colour box on saturation and value only, since its hue follows the colour being painted) and recognised by structure, so a highlight or a tint does not count and a dark wall where a dark button was does not pass. The UI counts as gone when more of the widgets are missing than present, and only after two looks half a second apart. The job also refuses to start painting unless the hue bar is where it was calibrated, which catches a countdown that ran out before the sign was open. Open the sign again and resume to continue from the same stroke; the anti-AFK break closes the sign on purpose and is exempt, but if the sign has not reopened a few seconds after its E press the job pauses instead of painting into the game world.

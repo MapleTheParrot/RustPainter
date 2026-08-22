@@ -3708,6 +3708,103 @@ def test_the_resolution_boxes_apply_on_enter_not_per_keystroke(window: MainWindo
     assert (spin.value(), window.logical_height_spin.value()) == (1024, 512)
 
 
+def test_a_timelapse_can_be_switched_on_during_a_pause(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    """The wish to keep a run arrives once it is plainly going well.
+
+    The timelapse controls stay live through a pause, and a recording that
+    was never started opens as the job resumes - on the artwork as it is
+    now, never on the probe strokes of a job still measuring its brush.
+    The same live controls change a running recording's pace or stop it.
+    """
+
+    from types import SimpleNamespace
+
+    import app.timelapse as timelapse_module
+
+    monkeypatch.setattr(
+        timelapse_module,
+        "capture_region",
+        lambda region: Image.new("RGB", (region.width, region.height)),
+    )
+    window._current_profile.canvas = ScreenRect(0, 0, 64, 32)
+
+    class _PausedPainter:
+        state = PainterState.PAUSED
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+
+        def __init__(self, phase: str) -> None:
+            self.progress = PaintProgress(
+                PainterState.PAUSED, 0, 1, 0, 1, 0, 1, 0.0, 0.0, None, "", phase
+            )
+            self.resumed = 0
+
+        def retune(self, settings) -> bool:
+            return True
+
+        def resume(self) -> bool:
+            self.resumed += 1
+            return True
+
+    window.timelapse_check.setChecked(False)
+    painter = _PausedPainter("paint")
+    window._painter = painter
+    window._update_start_availability()
+    assert window.timelapse_check.isEnabled()
+    assert window.timelapse_interval_spin.isEnabled()
+    assert window.timelapse_final_check.isEnabled()
+    assert not window.quality_combo.isEnabled()
+
+    # Left off, a resume records nothing.
+    window._start_or_resume()
+    assert painter.resumed == 1
+    assert window._timelapse_recorder is None
+
+    # Switched on during the pause, the resume starts the recording.
+    window.timelapse_check.setChecked(True)
+    window.timelapse_interval_spin.setValue(7)
+    window._start_or_resume()
+    assert painter.resumed == 2
+    recorder = window._timelapse_recorder
+    assert recorder is not None
+    assert window._timelapse_timer.isActive()
+    assert window._timelapse_timer.interval() == 7000
+
+    # A slower pace set during the next pause reaches the running timer.
+    window.timelapse_interval_spin.setValue(9)
+    window._start_or_resume()
+    assert window._timelapse_recorder is recorder
+    assert window._timelapse_timer.interval() == 9000
+
+    # And switching it off stops the recording without ending the job.
+    window.timelapse_check.setChecked(False)
+    window._start_or_resume()
+    assert painter.resumed == 4
+    assert window._timelapse_recorder is None
+    assert not window._timelapse_timer.isActive()
+
+    # A job paused while still measuring its brush waits for the artwork:
+    # the painting-phase progress update opens the recording, as always.
+    window.timelapse_check.setChecked(True)
+    calibrating = _PausedPainter("calibrate")
+    window._painter = calibrating
+    window._start_or_resume()
+    assert calibrating.resumed == 1
+    assert window._timelapse_recorder is None
+    calibrating.state = PainterState.RUNNING
+    window._on_paint_progress(
+        window._paint_generation,
+        PaintProgress(PainterState.RUNNING, 0, 1, 0, 1, 0, 1, 0.0, 0.0, None, "", "paint"),
+    )
+    assert window._timelapse_recorder is not None
+    window._finish_timelapse(final=False)
+    window._painter = None
+    window._update_start_availability()
+
+
 def test_the_ui_guard_is_a_live_safety_setting_that_reaches_the_painter(
     window: MainWindow,
 ) -> None:
