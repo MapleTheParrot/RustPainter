@@ -190,7 +190,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "selected_profile_id": None,
         "last_image_path": None,
         "window_geometry": None,
-        "show_calibration_overlay": False,
+        "show_calibration_overlay": True,
+        "show_status_overlay": True,
         "smooth_rust_preview": True,
     },
 }

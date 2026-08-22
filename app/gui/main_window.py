@@ -842,6 +842,10 @@ class MainWindow(QMainWindow):
         # anti-AFK break, which keeps running through a pause - when no
         # progress updates arrive to move it - so it ticks on its own clock.
         self._active_detail = ""
+        self._status_overlay_linger = QTimer(self)
+        self._status_overlay_linger.setSingleShot(True)
+        self._status_overlay_linger.setInterval(self._STATUS_OVERLAY_LINGER_MS)
+        self._status_overlay_linger.timeout.connect(self._update_calibration_overlay)
         # While a job is paused the resume slider is lent out as a
         # viewfinder; what the notice said and where the slider stood are
         # kept so the resume offer comes back as it was.
@@ -2270,6 +2274,15 @@ class MainWindow(QMainWindow):
         self.brush_model_status.setWordWrap(True)
         profile_layout.addWidget(self.brush_model_status)
         profile_layout.addWidget(self.show_calibration_check)
+        self.show_status_check = QCheckBox("Show status on screen")
+        self.show_status_check.setToolTip(
+            "Writes the job's state - PAINTING, PAUSED, ABORTED - in big\n"
+            "letters across the sign while a job is on, so you can see at a\n"
+            "glance that it is the app moving the mouse.  The text is seen\n"
+            "only by you: the app's own screen captures look straight\n"
+            "through it, so it never reaches a verification or a timelapse."
+        )
+        profile_layout.addWidget(self.show_status_check)
         self.canvas_geometry_label = QLabel("Canvas: not calibrated  •  Aspect: —")
         self.canvas_geometry_label.setObjectName("muted")
         profile_layout.addWidget(self.canvas_geometry_label)
@@ -5195,6 +5208,7 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, action=name: self._run_debug_action(action))
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
+        self.show_status_check.toggled.connect(self._on_show_calibration_toggled)
         self.move_to_rust_button.clicked.connect(self._move_calibration_to_rust_monitor)
         self.timelapse_speed_slider.valueChanged.connect(
             self._refresh_timelapse_speed_label
@@ -5241,6 +5255,7 @@ class MainWindow(QMainWindow):
             self.sharpen_combo,
             self.merge_combo,
             self.show_calibration_check,
+            self.show_status_check,
             self.background_color_button,
             self.remove_background_check,
             self.removal_source_combo,
@@ -5495,8 +5510,11 @@ class MainWindow(QMainWindow):
             self.merge_combo.setCurrentIndex(self.merge_combo.findData(merge_mode))
             self.speed_preset_combo.setCurrentText(self._detect_speed_preset())
             ui = settings.get("ui", {})
+            self.show_status_check.setChecked(
+                bool(ui.get("show_status_overlay", True))
+            )
             self.show_calibration_check.setChecked(
-                bool(ui.get("show_calibration_overlay", False))
+                bool(ui.get("show_calibration_overlay", True))
             )
             self.smooth_preview_check.setChecked(
                 bool(ui.get("smooth_rust_preview", True))
@@ -5646,6 +5664,7 @@ class MainWindow(QMainWindow):
             "selected_profile_id": self._current_profile.id if self._current_profile else None,
             "last_image_path": str(self._image_path) if self._image_path else None,
             "show_calibration_overlay": self.show_calibration_check.isChecked(),
+            "show_status_overlay": self.show_status_check.isChecked(),
             "smooth_rust_preview": self.smooth_preview_check.isChecked(),
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
         }
@@ -6150,24 +6169,57 @@ class MainWindow(QMainWindow):
             or self._countdown_callback_running
             or bool(self._countdown and self._countdown.isVisible())
         )
-        show = (
-            not self._closing
-            and self.show_calibration_check.isChecked()
-            and bool(entries)
-            and not busy
+        show_boxes = (
+            self.show_calibration_check.isChecked() and bool(entries) and not busy
         )
-        if not show:
+        status = self._status_overlay_text()
+        canvas = getattr(profile, "canvas", None) if profile is not None else None
+        show_status = (
+            self.show_status_check.isChecked()
+            and status is not None
+            and canvas is not None
+        )
+        if self._closing or not (show_boxes or show_status):
             if self._calibration_preview is not None and self._calibration_preview.isVisible():
                 self._calibration_preview.hide()
             return
         try:
             if self._calibration_preview is None:
                 self._calibration_preview = CalibrationPreviewOverlay()
-            self._calibration_preview.set_rectangles(entries)
+            self._calibration_preview.set_rectangles(entries if show_boxes else [])
+            self._calibration_preview.set_status(
+                (status, canvas) if show_status else None
+            )
             if not self._calibration_preview.isVisible():
                 self._calibration_preview.show_overlay()
         except Exception:
             LOGGER.exception("Could not display the calibration overlay")
+
+    # What the banner over the sign says for each state the job can be in.
+    # A job's last word - stopped, done, failed - stays up a moment after
+    # the job, long enough to be read, then the sign is left alone.
+    _STATUS_OVERLAY_WORDS = {
+        "countdown": "GET READY",
+        "running": "PAINTING…",
+        "paused": "PAUSED",
+        "aborted": "ABORTED",
+        "completed": "COMPLETE",
+        "error": "ERROR",
+    }
+    _STATUS_OVERLAY_LINGER_MS = 4000
+
+    def _status_overlay_text(self) -> str | None:
+        painter = self._painter
+        if self._countdown is not None and self._countdown.isVisible():
+            return self._STATUS_OVERLAY_WORDS["countdown"]
+        if painter is None:
+            return None
+        value = getattr(getattr(painter, "state", None), "value", "")
+        if value in {"countdown", "running", "paused"}:
+            return self._STATUS_OVERLAY_WORDS[value]
+        if value in self._STATUS_OVERLAY_WORDS and self._status_overlay_linger.isActive():
+            return self._STATUS_OVERLAY_WORDS[value]
+        return None
 
     @staticmethod
     def _union_rect(*rectangles: ScreenRect) -> ScreenRect:
@@ -7648,6 +7700,7 @@ class MainWindow(QMainWindow):
             self._withdraw_paused_viewfinder()
         if value in {"completed", "aborted", "error"}:
             self._withdraw_paused_viewfinder()
+            self._status_overlay_linger.start()
         if value in {"completed", "aborted", "error"}:
             self._finish_timelapse(final=value == "completed")
             self._finish_run_report(value, reason)

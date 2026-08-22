@@ -2731,6 +2731,9 @@ def test_paused_jobs_still_show_the_calibration_outlines(
         def set_rectangles(self, entries) -> None:
             self.entries = list(entries)
 
+        def set_status(self, status) -> None:
+            self.status = status
+
         def show_overlay(self) -> None:
             self.visible = True
 
@@ -2742,6 +2745,7 @@ def test_paused_jobs_still_show_the_calibration_outlines(
 
     monkeypatch.setattr(main_window_module, "CalibrationPreviewOverlay", _FakeOverlay)
     window.show_calibration_check.setChecked(True)
+    window.show_status_check.setChecked(False)
     window._current_profile.canvas = ScreenRect(0, 0, 200, 100)
     window._update_calibration_overlay()
     assert window._calibration_preview.isVisible()
@@ -2759,6 +2763,84 @@ def test_paused_jobs_still_show_the_calibration_outlines(
     window._painter.state = PainterState.RUNNING
     window._update_calibration_overlay()
     assert not window._calibration_preview.isVisible()
+
+
+def test_the_status_banner_follows_the_job_across_the_sign(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With Show status on, the job's state is written across the canvas.
+
+    It says PAINTING while strokes go down - with the boxes kept off the
+    screen, as they are for any running job - PAUSED through a pause, and
+    the job's last word for a moment after it ends.  Both switches are on
+    by default and both are saved.
+    """
+
+    from types import SimpleNamespace
+
+    class _FakeOverlay:
+        def __init__(self) -> None:
+            self.visible = False
+            self.entries: list = []
+            self.status = None
+
+        def set_rectangles(self, entries) -> None:
+            self.entries = list(entries)
+
+        def set_status(self, status) -> None:
+            self.status = status
+
+        def show_overlay(self) -> None:
+            self.visible = True
+
+        def hide(self) -> None:
+            self.visible = False
+
+        def isVisible(self) -> bool:  # noqa: N802 - mirrors the QWidget API
+            return self.visible
+
+    monkeypatch.setattr(main_window_module, "CalibrationPreviewOverlay", _FakeOverlay)
+    assert window.show_calibration_check.isChecked()
+    assert window.show_status_check.isChecked()
+    canvas = ScreenRect(0, 0, 200, 100)
+    window._current_profile.canvas = canvas
+    window._update_calibration_overlay()
+    overlay = window._calibration_preview
+    assert overlay.isVisible()
+    assert overlay.status is None
+
+    window._painter = SimpleNamespace(
+        state=PainterState.RUNNING, is_active=True, is_alive=True
+    )
+    window._update_calibration_overlay()
+    assert overlay.isVisible()
+    assert overlay.status == ("PAINTING…", canvas)
+    assert overlay.entries == []
+
+    window._painter.state = PainterState.PAUSED
+    window._update_calibration_overlay()
+    assert overlay.status == ("PAUSED", canvas)
+    assert overlay.entries, "the boxes come back while paused"
+
+    # Stopped: the word stays up for a moment, then the sign is left alone.
+    window._painter.state = PainterState.ABORTED
+    window._painter.is_active = False
+    window._status_overlay_linger.start()
+    window._update_calibration_overlay()
+    assert overlay.status == ("ABORTED", canvas)
+    window._status_overlay_linger.stop()
+    window._update_calibration_overlay()
+    assert overlay.status is None
+    assert overlay.isVisible(), "the boxes are back once the job is over"
+    window._painter = None
+
+    window.show_status_check.setChecked(False)
+    window.show_calibration_check.setChecked(False)
+    assert not overlay.isVisible()
+    window._save_settings()
+    ui = window._settings_document()["ui"]
+    assert ui["show_status_overlay"] is False
+    assert ui["show_calibration_overlay"] is False
 
 
 def test_sharpen_choice_reaches_the_plan_and_survives_a_restart(

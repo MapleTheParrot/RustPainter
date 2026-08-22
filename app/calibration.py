@@ -533,6 +533,36 @@ class CalibrationOverlay(QWidget):
         return round(position.x()), round(position.y())
 
 
+# SetWindowDisplayAffinity: the window shows on the monitor and nowhere
+# else - screen captures, GDI BitBlt included, see what is behind it.
+_WDA_EXCLUDEFROMCAPTURE = 0x11
+
+
+def exclude_window_from_capture(widget: QWidget) -> bool:
+    """Keep ``widget`` out of every screen capture, the app's own included.
+
+    The painter reads the sign back off the screen - to verify strokes, to
+    watch for the painting UI going away, to record the timelapse - and an
+    overlay drawn over the sign would be read back with it.  With this
+    affinity the overlay is seen by the player alone.  Returns False where
+    the call is unavailable (not Windows, or older than 10 2004), in which
+    case the caller must not draw over anything the painter captures.
+    """
+
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(widget.winId())
+        return bool(
+            ctypes.windll.user32.SetWindowDisplayAffinity(
+                wintypes.HWND(hwnd), wintypes.DWORD(_WDA_EXCLUDEFROMCAPTURE)
+            )
+        )
+    except Exception:
+        log.warning("Could not exclude the overlay from screen capture", exc_info=True)
+        return False
+
+
 class _CalibrationPreviewWindow(QWidget):
     """One monitor's click-through window of labeled calibration outlines."""
 
@@ -553,17 +583,34 @@ class _CalibrationPreviewWindow(QWidget):
         self.setGeometry(screen.geometry())
         self._monitor = monitor
         self._entries: list[tuple[str, Rect]] = []
+        self._status: tuple[str, Rect] | None = None
+        self._capture_excluded = False
 
-    def set_entries(self, entries: list[tuple[str, Rect]]) -> None:
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        self._capture_excluded = exclude_window_from_capture(self)
+
+    def _on_monitor(self, rect: Rect) -> bool:
         physical = self._monitor.rect
-        self._entries = [
-            (label, rect)
-            for label, rect in entries
-            if rect.left < physical.right
+        return (
+            rect.left < physical.right
             and rect.right > physical.left
             and rect.top < physical.bottom
             and rect.bottom > physical.top
+        )
+
+    def set_entries(self, entries: list[tuple[str, Rect]]) -> None:
+        self._entries = [
+            (label, rect) for label, rect in entries if self._on_monitor(rect)
         ]
+        self.update()
+
+    def set_status(self, status: tuple[str, Rect] | None) -> None:
+        """Show ``status`` - a word and the canvas to write it across - or nothing."""
+
+        self._status = (
+            status if status is not None and self._on_monitor(status[1]) else None
+        )
         self.update()
 
     def _map_physical_rect(self, rect: Rect) -> QRectF:
@@ -610,7 +657,47 @@ class _CalibrationPreviewWindow(QWidget):
             painter.drawRoundedRect(tag, 5, 5)
             painter.setPen(QColor(255, 112, 102))
             painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, label)
+        # Without the capture exclusion the status would be read back off
+        # the sign by the painter's own captures, so it is not drawn at all.
+        if self._status is not None and self._capture_excluded:
+            self._paint_status(painter, *self._status)
         painter.end()
+
+    # The job's state written across the sign in the app's orange, big
+    # enough to read from across the room: the reassurance that the app is
+    # the one moving the mouse, and what it is doing with it.
+    _STATUS_COLOR = QColor(255, 147, 54)
+    _STATUS_BACKDROP = QColor(24, 8, 6, 190)
+
+    def _paint_status(self, painter: QPainter, text: str, canvas: Rect) -> None:
+        box = self._map_physical_rect(canvas)
+        if box.width() <= 0 or box.height() <= 0 or not text:
+            return
+        font = painter.font()
+        font.setBold(True)
+        # Sized to the canvas, then shrunk until the word fits inside it.
+        pixel_size = max(18, min(120, int(box.height() * 0.22)))
+        while pixel_size > 12:
+            font.setPixelSize(pixel_size)
+            painter.setFont(font)
+            width = painter.fontMetrics().horizontalAdvance(text)
+            if width <= box.width() * 0.9:
+                break
+            pixel_size = int(pixel_size * 0.85)
+        metrics = painter.fontMetrics()
+        pad_x, pad_y = pixel_size * 0.5, pixel_size * 0.2
+        pill = QRectF(
+            0.0,
+            0.0,
+            metrics.horizontalAdvance(text) + pad_x * 2,
+            metrics.height() + pad_y * 2,
+        )
+        pill.moveCenter(box.center())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._STATUS_BACKDROP)
+        painter.drawRoundedRect(pill, pixel_size * 0.3, pixel_size * 0.3)
+        painter.setPen(self._STATUS_COLOR)
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
 
 
 class CalibrationPreviewOverlay:
@@ -625,12 +712,21 @@ class CalibrationPreviewOverlay:
         self._windows: list[_CalibrationPreviewWindow] = []
         self._entries: list[tuple[str, Rect]] = []
 
+        self._status: tuple[str, Rect] | None = None
+
     def set_rectangles(self, entries: list[tuple[str, Rect | None]]) -> None:
         self._entries = [
             (str(label), rect) for label, rect in entries if rect is not None
         ]
         for window in self._windows:
             window.set_entries(self._entries)
+
+    def set_status(self, status: tuple[str, Rect] | None) -> None:
+        """Write a job's state across the canvas, or wipe it with None."""
+
+        self._status = status
+        for window in self._windows:
+            window.set_status(status)
 
     def show_overlay(self) -> None:
         # Rebuild from the live monitor layout every time the overlay comes
@@ -655,6 +751,7 @@ class CalibrationPreviewOverlay:
                 monitor = SimpleNamespace(rect=fallback, logical_rect=fallback)
             window = _CalibrationPreviewWindow(screen, monitor)
             window.set_entries(self._entries)
+            window.set_status(self._status)
             self._windows.append(window)
             window.show()
             window.raise_()
