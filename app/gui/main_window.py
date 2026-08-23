@@ -450,6 +450,17 @@ def _rgb(color: QColor) -> tuple[int, int, int]:
     return (color.red(), color.green(), color.blue())
 
 
+@dataclass(frozen=True)
+class _PickerGeometry:
+    """The color panel's widgets, for quantizing plans to selectable colors."""
+
+    hue_bar: Any
+    color_box: Any
+    hue_direction: str
+    saturation_direction: str
+    value_direction: str
+
+
 def _predicted_sign_colors(
     rgb: np.ndarray, mask: np.ndarray, correction: ColorCorrectionModel
 ) -> np.ndarray:
@@ -478,6 +489,52 @@ def _predicted_sign_colors(
     result = rgb.copy()
     result[mask] = predicted[inverse.reshape(-1)]
     return result
+
+
+def _snap_processed_to_picker(
+    processed: ProcessedImage, picker: "_PickerGeometry"
+) -> ProcessedImage:
+    """Replace every palette color with the one the picker can actually select.
+
+    The color picker is clicked on whole pixels of finite widgets, so not
+    every RGB is selectable: hues quantize to the bar's pixel rows and the
+    extreme reds beyond its top row do not exist on it at all.  Quantizing
+    the plan to the selectable palette makes plan, preview, and painted sign
+    agree - the murica run's flag reds were promised at hue 359.7 and painted
+    at 351.4 because nothing in the plan knew the difference.
+    """
+
+    from app.color_mapping import reachable_color
+
+    rgb = np.asarray(processed.image.convert("RGB"), dtype=np.uint8)
+    mask = np.asarray(processed.paint_mask, dtype=np.bool_)
+    painted = rgb[mask]
+    if painted.size == 0:
+        return processed
+    unique, inverse = np.unique(painted.reshape(-1, 3), axis=0, return_inverse=True)
+    snapped = np.array(
+        [
+            reachable_color(
+                tuple(int(v) for v in color),
+                picker.hue_bar,
+                picker.color_box,
+                hue_direction=picker.hue_direction,
+                saturation_direction=picker.saturation_direction,
+                value_direction=picker.value_direction,
+            )
+            for color in unique
+        ],
+        dtype=np.uint8,
+    )
+    if np.array_equal(snapped, unique):
+        return processed
+    result = rgb.copy()
+    result[mask] = snapped[inverse.reshape(-1)]
+    return ProcessedImage(
+        Image.fromarray(result, mode="RGB"),
+        processed.paint_mask,
+        processed.requested_colors,
+    )
 
 
 def _compose_checker_backdrop(
@@ -570,6 +627,7 @@ class _ImageWorker(QRunnable):
         color_correction: ColorCorrectionModel | None = None,
         paint_mode: str = PaintMode.EXACT.value,
         capabilities: BrushCapabilities | None = None,
+        picker: "_PickerGeometry | None" = None,
     ) -> None:
         super().__init__()
         self.serial = serial
@@ -580,6 +638,7 @@ class _ImageWorker(QRunnable):
         self.color_correction = color_correction
         self.paint_mode = paint_mode
         self.capabilities = capabilities
+        self.picker = picker
         self.signals = _WorkerSignals()
 
     @Slot()
@@ -587,6 +646,11 @@ class _ImageWorker(QRunnable):
         try:
             base_processed = process_image(self.image, self.options)
             processed = _apply_text_overlays(base_processed, self.text_overlays)
+            if self.picker is not None:
+                # Quantize the palette to colors the picker can select, so
+                # the plan asks for - and the preview promises - only colors
+                # the sign can actually receive.
+                processed = _snap_processed_to_picker(processed, self.picker)
             mode = PaintMode(self.paint_mode)
             optimization = None
             if mode is PaintMode.EXACT:
@@ -4316,11 +4380,22 @@ class MainWindow(QMainWindow):
 
         grid = self._texel_grid()
         if grid is not None:
-            # Counted on the sign itself, texel by texel: nothing to snap and
-            # nothing to infer from the brush.
+            # Counted on the sign itself, texel by texel - but a probe on a
+            # fine sign can still miss a frame-covered edge texel or, on a
+            # stored grid from an older build, miscount outright (a 1024x512
+            # XXL was stored as 1025x515, and Max planned cells that fought
+            # over texels all run long).  A count within a few texels of the
+            # game's own texture table IS that entry.
+            from app.brush_calibration import SIGN_TEXTURE_SIZES
+
+            columns, rows = grid.columns, grid.rows
+            for width, height in SIGN_TEXTURE_SIZES:
+                if abs(columns - width) <= 5 and abs(rows - height) <= 5:
+                    columns, rows = width, height
+                    break
             return (
-                max(8, min(2048, grid.columns)),
-                max(8, min(2048, grid.rows)),
+                max(8, min(2048, columns)),
+                max(8, min(2048, rows)),
             )
         model = self._brush_size_model()
         if model is None:
@@ -4876,6 +4951,26 @@ class MainWindow(QMainWindow):
             and self._image_path == self._color_chart_path
         )
 
+    def _picker_geometry(self) -> _PickerGeometry | None:
+        """The active profile's color panel widgets, for palette snapping.
+
+        Skipped while painting the calibration chart: the chart measures the
+        raw picker response, so its colors must not be pre-snapped.
+        """
+
+        if self._painting_calibration_chart():
+            return None
+        profile = self._current_profile
+        if profile is None or profile.hue_bar is None or profile.color_box is None:
+            return None
+        return _PickerGeometry(
+            hue_bar=profile.hue_bar,
+            color_box=profile.color_box,
+            hue_direction=profile.hue_direction,
+            saturation_direction=profile.saturation_direction,
+            value_direction=profile.value_direction,
+        )
+
     def _color_correction_model(self) -> ColorCorrectionModel | None:
         """The active profile's measured sign response, when it is usable."""
 
@@ -4917,6 +5012,7 @@ class MainWindow(QMainWindow):
             self._color_correction_model(),
             self._current_paint_mode(),
             self._brush_capabilities(),
+            self._picker_geometry(),
         )
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)

@@ -77,6 +77,17 @@ _NOISE_SAFETY = 1.5
 # unambiguously.  Half a texel is the cliff; a quarter leaves room for noise.
 _LADDER_TARGET_ERROR = 0.25
 
+# The most rungs a ladder plans.  The growth floor in ``ladder_offsets``
+# makes rung reach multiply by at least 1.35 per rung, so sixteen rungs span
+# any sign the game has.
+_MAX_LADDER_RUNGS = 16
+# Rows across the sign reserved for rung stamps.  A ladder that needs more
+# rungs than this wraps back over the same rows: a late rung sits tens to
+# hundreds of texels along the axis from the early rung whose row it
+# borrows, so their search windows can never overlap - the same sharing the
+# staircase flights in one band have always used.
+_LADDER_RUNG_ROWS = 8
+
 # A dab now and then lands a whole texel from where the cursor was - seen
 # live as one staircase stamp a texel behind its neighbours, most likely the
 # game sampling the press a frame before the move.  Centroid noise is tiny
@@ -261,7 +272,10 @@ class Staircase:
 
 
 def fit_staircase(
-    cursor: Sequence[float], centres: Sequence[float | None]
+    cursor: Sequence[float],
+    centres: Sequence[float | None],
+    pitch_hint: float | None = None,
+    forced_pitch: float | None = None,
 ) -> Staircase:
     """Read the texel pitch and the cursor-to-texel boundaries off a staircase.
 
@@ -287,10 +301,52 @@ def fit_staircase(
     # that clear the centroid noise is a first reading of the pitch, good
     # enough to give every stamp a texel index.
     steps = np.abs(np.diff(measured))
-    if steps.max() < 4.0 * _CENTROID_SIGMA_PIXELS:
+    # A single-texel jump has to clear the centroid noise to be seen at all.
+    # The fixed multiple of sigma is right for coarse signs, but on a fine
+    # pitch it can sit above the pitch itself: at 1.77 px per texel the 1.8 px
+    # gate read genuine one-texel jumps as "never moved" and threw whole
+    # staircases away.  When the caller knows roughly how big a texel is, the
+    # gate never exceeds most of that.
+    jump_gate = 4.0 * _CENTROID_SIGMA_PIXELS
+    if pitch_hint is not None and pitch_hint > 0:
+        jump_gate = min(jump_gate, 0.8 * pitch_hint)
+    if steps.max() < jump_gate:
         raise ValueError("The stamps never moved: no texel boundary was crossed")
-    jump_here = steps > 3.0 * _CENTROID_SIGMA_PIXELS
-    first_pitch = float(np.median(steps[jump_here]))
+    jump_here = steps > 0.75 * jump_gate
+    # On a DPI-scaled display the game's cursor map quantizes in steps
+    # larger than a pixel, so a one-pixel slide sometimes crosses TWO texel
+    # boundaries at once: the visible jumps are then a mixture of one- and
+    # two-texel moves, and a plain median can land on the double, halving
+    # every index.  Instead, candidate pitches are scored by how well they
+    # explain every jump as a whole number of texels, worst fifth dropped
+    # for strays, and the LARGEST candidate that explains the jumps wins -
+    # any sub-multiple of the truth also "explains" them, a multiple never
+    # does.
+    moved = np.sort(steps[jump_here].astype(float))
+    candidates = {float(np.median(moved)), float(np.median(moved)) / 2.0, float(moved[0])}
+    if pitch_hint is not None and pitch_hint > 0:
+        candidates.add(float(pitch_hint))
+    candidates = {c for c in candidates if c > 0.3}
+
+    def unexplained(candidate: float) -> float:
+        counts = np.maximum(np.rint(moved / candidate), 1.0)
+        residuals = np.sort(np.abs(moved / candidate - counts))
+        kept = residuals[: max(1, int(np.ceil(0.8 * len(residuals))))]
+        return float(kept.mean())
+
+    if forced_pitch is not None and forced_pitch > 0:
+        # A sibling staircase already read the pitch; indexing with it is
+        # unambiguous even when this flight's own jumps are too confused by
+        # the cursor quantization to bootstrap from.
+        first_pitch = float(forced_pitch)
+    else:
+        first_pitch = None
+        for candidate in sorted(candidates, reverse=True):
+            if unexplained(candidate) <= 0.12:
+                first_pitch = candidate
+                break
+        if first_pitch is None:
+            first_pitch = min(candidates, key=unexplained)
     index = np.rint((measured - measured.min()) / first_pitch).astype(int)
     # A stamp whose texel disagrees with both neighbours is a stray dab.
     stray = np.zeros(len(index), dtype=bool)
@@ -306,24 +362,56 @@ def fit_staircase(
         raise ValueError("Too few clean stamps left to read a staircase")
     if np.any(np.diff(index) < 0):
         raise ValueError("Stamps moved backwards along the axis")
-    # Stairs: maximal groups sharing a texel index, in cursor order.
-    boundaries = np.flatnonzero(np.diff(index) != 0) + 1
-    runs = np.split(np.arange(len(measured)), boundaries)
+    def group() -> tuple[np.ndarray, list[np.ndarray], list[float], list[int]]:
+        stair_breaks = np.flatnonzero(np.diff(index) != 0) + 1
+        stair_runs = np.split(np.arange(len(measured)), stair_breaks)
+        return (
+            stair_breaks,
+            stair_runs,
+            [float(measured[run].mean()) for run in stair_runs],
+            [int(index[run[0]]) for run in stair_runs],
+        )
+
+    boundaries, runs, levels, texels = group()
     if len(runs) < 2:
         raise ValueError("The stamps never moved: no texel boundary was crossed")
-    levels = [float(measured[run].mean()) for run in runs]
-    texels = [int(index[run[0]]) for run in runs]
-    if not any(len(run) > 1 for run in runs):
-        raise ValueError(
-            "Every stamp landed on a new texel: the cursor step is too coarse "
-            "to see the grid"
-        )
     per_texel = [
         (levels[i + 1] - levels[i]) / (texels[i + 1] - texels[i]) for i in range(len(runs) - 1)
     ]
     coarse_pitch = float(np.median(per_texel))
     if coarse_pitch <= 0.0:
         raise ValueError("Stamps moved backwards along the axis")
+    # A sub-texel stamp near a boundary sometimes paints both texels and its
+    # centroid sits between their centres; the stair it forms is off the
+    # lattice and used to fail the whole staircase as "jumped by unequal
+    # amounts".  Drop stairs that sit off the robust lattice and regroup.
+    intercepts = [level - texel * coarse_pitch for level, texel in zip(levels, texels)]
+    lattice_base = float(np.median(intercepts))
+    off_lattice = [
+        stair
+        for stair, (level, texel) in enumerate(zip(levels, texels))
+        if abs(level - (lattice_base + texel * coarse_pitch)) > 0.35 * coarse_pitch
+    ]
+    if off_lattice:
+        bad = np.zeros(len(measured), dtype=bool)
+        for stair in off_lattice:
+            bad[runs[stair]] = True
+        positions, measured, index = positions[~bad], measured[~bad], index[~bad]
+        if len(measured) < 4:
+            raise ValueError("Too few clean stamps left to read a staircase")
+        boundaries, runs, levels, texels = group()
+        if len(runs) < 2:
+            raise ValueError("The stamps never moved: no texel boundary was crossed")
+        per_texel = [
+            (levels[i + 1] - levels[i]) / (texels[i + 1] - texels[i])
+            for i in range(len(runs) - 1)
+        ]
+        coarse_pitch = float(np.median(per_texel))
+    if not any(len(run) > 1 for run in runs):
+        raise ValueError(
+            "Every stamp landed on a new texel: the cursor step is too coarse "
+            "to see the grid"
+        )
     if max(per_texel) > 1.5 * min(per_texel):
         raise ValueError(
             "Stamps jumped by unequal amounts: the cursor step skipped texels"
@@ -368,6 +456,7 @@ def ladder_offsets(
     relative_error: float,
     max_texels: int,
     sigma: float = _CENTROID_SIGMA_PIXELS,
+    copies: int = 1,
 ) -> tuple[int, ...]:
     """Texel offsets for the ladder, each rung countable from the one before.
 
@@ -375,9 +464,26 @@ def ladder_offsets(
     can be counted exactly while ``relative_error * d`` stays under the target;
     locating it then tightens the error to the centroid noise over its span.
     The rungs grow geometrically until one reaches ``max_texels``.
+
+    ``copies`` is how many stamps the caller will average per rung: the noise
+    of a located rung shrinks with the square root of the copies.  On a fine
+    pitch that factor decides whether the ladder grows at all: at 1.77 px per
+    texel a single-stamp rung can only be trusted one texel further out than
+    the last (the growth ratio ``target * pitch / sigma`` drops under one),
+    and the murica XXL run's ladder stalled at 14 texels, extrapolating the
+    pitch of a 1810 px sign from a 25 px lever - 0.5% low, which miscounted
+    1024 texels as 1026.  A floor on the growth ratio keeps the ladder moving
+    regardless; the per-rung counting error it allows stays well under the
+    ``_MAX_LADDER_RESIDUAL`` gate that would call the count ambiguous.
     """
 
     offsets: list[int] = []
+    effective_sigma = max(sigma / np.sqrt(max(copies, 1)), 1e-6)
+    # How much further out the next rung may sit, as a multiple of the last:
+    # the error a rung carries is ``growth * effective_sigma / pitch`` texels,
+    # so even the floored growth keeps it under the target at any pitch the
+    # staircase can read at all.
+    growth = max(1.35, _LADDER_TARGET_ERROR * coarse_pitch / effective_sigma)
     error = max(relative_error, 1e-6)
     while True:
         reach = int(_LADDER_TARGET_ERROR / error)
@@ -387,11 +493,16 @@ def ladder_offsets(
             if not offsets or offsets[-1] < max_texels:
                 offsets.append(max_texels)
             break
+        if offsets and reach < int(np.ceil(offsets[-1] * growth)):
+            reach = int(np.ceil(offsets[-1] * growth))
+            if reach >= max_texels:
+                offsets.append(max_texels)
+                break
         if offsets and reach <= offsets[-1]:
             reach = offsets[-1] + 1
         offsets.append(reach)
-        error = sigma / (reach * coarse_pitch)
-        if len(offsets) > 12:
+        error = effective_sigma / (reach * coarse_pitch)
+        if len(offsets) >= _MAX_LADDER_RUNGS:
             break
     return tuple(offsets)
 
@@ -424,6 +535,7 @@ def refine_pitch(
     pitch = float(coarse_pitch)
     worst = 0.0
     counted = 0
+    skipped = 0
     far_span = 0.0
     far_count = 0
     for intended, copies in rungs:
@@ -456,10 +568,20 @@ def refine_pitch(
             span / count if count else float("nan"),
         )
         if count < 1 or residual > _MAX_LADDER_RESIDUAL:
-            raise ValueError(
-                f"A ladder stamp landed {texels:.2f} texels out, too far from a "
-                "whole number to count"
+            # On a fine pitch the sub-texel stamp sometimes straddles two
+            # texels and its centroid sits between their centres - seen live
+            # at 1.77 px per texel, where one straddled rung used to abort
+            # the whole measurement.  A rung that cannot be counted cleanly
+            # is evidence about nothing; the rungs that can be still tighten
+            # the pitch, and the sign-table snap has the final say on the
+            # count.
+            LOGGER.info(
+                "  rung %d texels out: %.2f texels from a whole count - skipped",
+                intended,
+                residual,
             )
+            skipped += 1
+            continue
         worst = max(worst, residual)
         pitch = span / count
         counted += 1
@@ -467,6 +589,11 @@ def refine_pitch(
             far_span, far_count = span, count
     if counted == 0:
         raise ValueError("No ladder stamp landed")
+    if skipped > counted:
+        raise ValueError(
+            f"Only {counted} ladder rungs of {counted + skipped} could be "
+            "counted; the stamps are not resolving the grid"
+        )
     return Ladder(pitch=pitch, worst_residual=worst, far_span=far_span, far_count=far_count)
 
 
@@ -602,15 +729,26 @@ def fit_axis(
         # 2.6 px under the frame, painted but invisible in the UI - and on
         # the sign in the world.)  An edge on a lattice line is the texture's
         # own edge, and nothing lies beyond it.
-        def cut_through(texel: int, edge: float) -> bool:
-            return (
-                line(texel) + _EDGE_CUT_MARGIN < edge < line(texel + 1) - _EDGE_CUT_MARGIN
-            )
-
-        if edge_low is not None and cut_through(first - 1, edge_low):
-            first -= 1
-        if edge_high is not None and cut_through(last + 1, edge_high):
-            last += 1
+        # The quad edge is where the visible texture stops.  Every whole
+        # texel between the outermost stamps and that edge exists, whether
+        # or not a stamp could reach it (the cursor map can put an edge
+        # texel's click outside the calibrated rectangle): extend while the
+        # edge reaches at least a margin into the next texel out.  An edge
+        # within the margin of a lattice line is that texel's own boundary -
+        # noise in the edge detector must not conjure a texel - and the
+        # margin scales with the pitch so a fine sign is not frozen by a
+        # fixed 0.75 px (0.26 px window at 1.76 px per texel).
+        margin = min(_EDGE_CUT_MARGIN, 0.2 * pitch)
+        for _ in range(3):
+            if edge_low is not None and edge_low < line(first) - margin:
+                first -= 1
+            else:
+                break
+        for _ in range(3):
+            if edge_high is not None and edge_high > line(last + 1) + margin:
+                last += 1
+            else:
+                break
         if last > first:
             origin = line(first)
             count = last - first + 1
@@ -719,6 +857,10 @@ def fit_cursor_map(
     c = float(coefficients[2]) if spread_across else 0.0
     d = float(coefficients[3]) if twist else 0.0
     fitted = design @ coefficients
+    # The cursor lattice's pitch is deliberately fitted free rather than tied
+    # to the rendered pitch: measured live, the game's cursor mapping runs a
+    # slightly different scale from the rendered quad (0.1-0.2%), and the
+    # staircase positions span most of the sign, which is lever enough.
     return (a, b, c, d), float(np.sqrt(np.mean((texels - fitted) ** 2)))
 
 
@@ -999,6 +1141,120 @@ class GridProbePlan:
     label: str
 
 
+def _snap_axis_to_count(
+    fit: AxisFit,
+    true_count: int,
+    edge_low: float | None,
+    edge_high: float | None,
+    name: str,
+) -> AxisFit:
+    """Re-label ``fit`` so it spans exactly ``true_count`` texels.
+
+    The probe counts the texels it can SEE, but the sign's frame is drawn
+    over the texture's outer pixels, so one or two edge texels can be
+    invisible however well the probe works - and a probe whose ladder was
+    starved (fine pitch, old builds) could also miscount outright.  When the
+    sign's true texture size is known, the missing (or surplus) texels are
+    assigned to the low and high ends so that the frame overhang each end
+    implies stays physically small, and the lattice keeps its measured pitch
+    and phase - only the labelling moves.
+    """
+
+    hidden = true_count - fit.count
+    if hidden == 0:
+        return fit
+    span_low = min(0, hidden)
+    span_high = max(0, hidden)
+    best_low = hidden // 2
+    best_score = None
+    for hidden_low in range(span_low, span_high + 1):
+        if (hidden_low < 0) != (hidden < 0) and hidden_low != 0:
+            continue
+        hidden_high = hidden - hidden_low
+        if (hidden_high < 0) != (hidden < 0) and hidden_high != 0:
+            continue
+        origin = fit.origin - hidden_low * fit.pitch
+        end = origin + true_count * fit.pitch
+        # Frame overhang each end would have: texture edge to visible edge.
+        overhang_low = None if edge_low is None else edge_low - origin
+        overhang_high = None if edge_high is None else end - edge_high
+        score = 0.0
+        for overhang in (overhang_low, overhang_high):
+            if overhang is None:
+                continue
+            if overhang < -0.75:
+                score += 100.0 + (-overhang)
+            elif overhang > 4.5:
+                score += 100.0 + overhang
+            else:
+                score += abs(overhang)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_low = hidden_low
+    hidden_low = best_low
+    LOGGER.warning(
+        "%s: probe counted %d texels but the sign's texture has %d - snapping, "
+        "%+d texel(s) at the low edge, %+d at the high (frame-hidden or "
+        "miscounted)",
+        name,
+        fit.count,
+        true_count,
+        hidden_low,
+        hidden - hidden_low,
+    )
+    return AxisFit(
+        pitch=fit.pitch,
+        origin=fit.origin - hidden_low * fit.pitch,
+        count=true_count,
+        aim_origin=fit.aim_origin - hidden_low * fit.aim_pitch,
+        aim_pitch=fit.aim_pitch,
+        aim_shear=fit.aim_shear,
+        # ``k = a + b x + c y + d x y`` labels move with the texels:
+        # texel zero moves ``hidden_low`` outward, so every index grows.
+        aim_coefficients=(
+            fit.aim_coefficients[0] + hidden_low,
+            fit.aim_coefficients[1],
+            fit.aim_coefficients[2],
+            fit.aim_coefficients[3],
+        ),
+        residual=fit.residual,
+        from_edges=fit.from_edges,
+    )
+
+
+def snap_to_texture_sizes(
+    columns: AxisFit,
+    rows: AxisFit,
+    texture_sizes: Sequence[tuple[int, int]],
+    edges: tuple[float | None, float | None, float | None, float | None],
+    tolerance_texels: int = 5,
+) -> tuple[AxisFit, AxisFit, tuple[int, int] | None]:
+    """Snap both axes to the nearest known sign texture size, if one is near.
+
+    ``texture_sizes`` are (columns, rows) entries read from the game's own
+    bundles.  A measured count within ``tolerance_texels`` of an entry on
+    both axes is taken to BE that entry: sign textures only come in those
+    sizes, and the probe can miss a frame-covered edge texel or two however
+    carefully it stamps.  Farther than that, the measurement is left alone -
+    a modded or unknown sign is not forced into the table.
+    """
+
+    edge_left, edge_top, edge_right, edge_bottom = edges
+    best: tuple[int, tuple[int, int]] | None = None
+    for width, height in texture_sizes:
+        miss = max(abs(columns.count - width), abs(rows.count - height))
+        if miss <= tolerance_texels and (best is None or miss < best[0]):
+            best = (miss, (width, height))
+    if best is None:
+        return columns, rows, None
+    width, height = best[1]
+    return (
+        _snap_axis_to_count(columns, width, edge_left, edge_right, "columns"),
+        _snap_axis_to_count(rows, height, edge_top, edge_bottom, "rows"),
+        (width, height),
+    )
+
+
 def measure_grid(
     canvas: Any,
     stamp_batch: "Callable[[GridProbePlan], np.ndarray]",
@@ -1006,6 +1262,7 @@ def measure_grid(
     pitch_hint: float,
     stamp_hint: float,
     edges: tuple[float | None, float | None, float | None, float | None] | None = None,
+    texture_sizes: "Sequence[tuple[int, int]] | None" = None,
 ) -> TexelGridModel:
     """Measure both axes of the sign's texel grid.
 
@@ -1063,7 +1320,7 @@ def measure_grid(
         def rows(self) -> int:
             return (
                 self.stamps
-                + 8 * self.rung_copies
+                + _LADDER_RUNG_ROWS * self.rung_copies
                 + _EXTENT_DABS * self.extent_copies
                 + self.extra_bands * self.short
             )
@@ -1134,7 +1391,7 @@ def measure_grid(
         # The first band, the ladder and the extent rows come first; the
         # extra bands spread over whatever is left, the last one as far
         # across the sign as it will go, for the longest lever on the shear.
-        probe_rows = stamps + 8 * copies_per_rung + _EXTENT_DABS * extent_copies
+        probe_rows = stamps + _LADDER_RUNG_ROWS * copies_per_rung + _EXTENT_DABS * extent_copies
         band_starts = [across_start]
         across_free = across_start + probe_rows * spacing
         across_last = across_high - 2.0 * stamp - short * spacing
@@ -1159,17 +1416,53 @@ def measure_grid(
             for c in centres
         ]
         staircases: list[tuple[Staircase, float]] = []
+        first_flight_fit: Staircase | None = None
+        first_flight_error: ValueError | None = None
         consumed = 0
-        for flight_index, (cursor, across_mean) in enumerate(flights):
+        flight_data: list[tuple[list[float], list[float | None], float]] = []
+        for cursor, across_mean in flights:
             flight_centres = along_all[consumed : consumed + len(cursor)]
             consumed += len(cursor)
+            flight_data.append((cursor, flight_centres, across_mean))
+        for flight_index, (cursor, flight_centres, across_mean) in enumerate(flight_data):
             try:
-                staircases.append((fit_staircase(cursor, flight_centres), across_mean))
+                fit = fit_staircase(cursor, flight_centres, pitch_hint=texel_guess)
             except ValueError as exc:
                 if flight_index == 0:
-                    raise
-                LOGGER.info("%s staircase %d unusable: %s", name, flight_index + 1, exc)
-        staircase = staircases[0][0]
+                    first_flight_error = exc
+                else:
+                    LOGGER.info("%s staircase %d unusable: %s", name, flight_index + 1, exc)
+                continue
+            if flight_index == 0:
+                first_flight_fit = fit
+            staircases.append((fit, across_mean))
+        if first_flight_fit is None:
+            # The long flight could not bootstrap itself - on a fine pitch a
+            # DPI-quantized cursor sometimes confuses its jump mixture - but
+            # a sibling flight's pitch can index it unambiguously.
+            if not staircases:
+                raise first_flight_error or ValueError("No staircase was usable")
+            sibling_pitch = float(np.median([s.coarse_pitch for s, _ in staircases]))
+            cursor, flight_centres, across_mean = flight_data[0]
+            try:
+                first_flight_fit = fit_staircase(
+                    cursor,
+                    flight_centres,
+                    pitch_hint=texel_guess,
+                    forced_pitch=sibling_pitch,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"the long staircase failed ({first_flight_error}) and could "
+                    f"not be indexed with the sibling pitch either ({exc})"
+                ) from exc
+            LOGGER.info(
+                "%s staircase 1 re-read with the sibling flights' pitch %.3f px",
+                name,
+                sibling_pitch,
+            )
+            staircases.insert(0, (first_flight_fit, across_mean))
+        staircase = first_flight_fit
         cursor = flights[0][0]
         coarse = staircase.coarse_pitch
         jumps = max(1, len(staircase.jumps))
@@ -1193,7 +1486,9 @@ def measure_grid(
         reach = int((along_high - _EDGE_MARGIN_TEXELS * coarse - base) / coarse)
         if reach < 2:
             raise ValueError(f"The sign is too narrow along its {name} to ladder")
-        offsets = ladder_offsets(coarse, coarse_error, reach, sigma=sigma)
+        offsets = ladder_offsets(
+            coarse, coarse_error, reach, sigma=sigma, copies=copies_per_rung
+        )
         LOGGER.info(
             "%s ladder: rungs at %s texels, %d stamps each",
             name,
@@ -1204,10 +1499,12 @@ def measure_grid(
         # ``base``; the count is read against ``base`` itself.  Each rung is
         # stamped several times on its own rows and read as their median, so
         # a dab that lands a texel astray cannot miscount the ladder.
+        rung_slots = _LADDER_RUNG_ROWS * copies_per_rung
         rung_points = tuple(
             make_point(
                 cursor[0] + offset * coarse,
-                across_start + (stamps + index * copies_per_rung + copy) * spacing,
+                across_start
+                + (stamps + (index * copies_per_rung + copy) % rung_slots) * spacing,
             )
             for index, offset in enumerate(offsets)
             for copy in range(copies_per_rung)
@@ -1271,7 +1568,9 @@ def measure_grid(
             plane_rms,
         )
         # Where the extent row sits across the axis, for aiming on it.
-        extent_across = across_start + (stamps + len(offsets) * copies_per_rung) * spacing
+        extent_across = across_start + (
+            stamps + min(len(offsets) * copies_per_rung, _LADDER_RUNG_ROWS * copies_per_rung)
+        ) * spacing
 
         # Texels known to exist: the first stair's and the ladder's far rung's.
         known_low = min(texel_of(base), texel_of(base + ladder.far_span))
@@ -1401,6 +1700,19 @@ def measure_grid(
         edge_low=edge_top,
         edge_high=edge_bottom,
     )
+    if texture_sizes:
+        columns, rows, snapped = snap_to_texture_sizes(
+            columns,
+            rows,
+            texture_sizes,
+            (edge_left, edge_top, edge_right, edge_bottom),
+        )
+        if snapped is not None:
+            LOGGER.info(
+                "Texel grid snapped to the sign table: %dx%d texels",
+                snapped[0],
+                snapped[1],
+            )
     return TexelGridModel(
         columns=columns.count,
         rows=rows.count,

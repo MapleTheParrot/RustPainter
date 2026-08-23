@@ -76,16 +76,15 @@ def main() -> int:
         raise SystemExit("The profile needs the Size box and clear control calibrated")
     document = SettingsStore(data / "settings.json").load()
     settings = PainterSettings.from_mapping(document)
-    settings = PainterSettings(
-        **{
-            **{f: getattr(settings, f) for f in settings.__dataclass_fields__},
-            "countdown_seconds": args.countdown,
-            "require_foreground": True,
-            "apply_brush_size": True,
-            "measure_texel_grid": True,
-            "pause_on_mouse_move": True,
-            "corner_abort_enabled": True,
-        }
+    from dataclasses import replace as _replace
+
+    settings = _replace(
+        settings,
+        countdown_seconds=args.countdown,
+        require_foreground=True,
+        apply_brush_size=True,
+        measure_texel_grid=True,
+        pause_on_mouse_move=True,
     )
     canvas = ScreenRect(profile.canvas.left, profile.canvas.top, profile.canvas.width, profile.canvas.height)
     print(f"profile {profile.name}: canvas {canvas}", flush=True)

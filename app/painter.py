@@ -19,6 +19,7 @@ from typing import Any, Callable, ClassVar, Iterator, Sequence
 from .brush_calibration import (
     BRUSH_SIZE_MAX,
     BRUSH_SIZE_MIN,
+    SIGN_TEXTURE_SIZES,
     BrushSizeModel,
     StrokeBand,
     canonical_texture_rows,
@@ -27,7 +28,7 @@ from .brush_calibration import (
     measure_stroke_band,
 )
 from .color_calibration import ColorCorrectionModel
-from .color_mapping import map_rgb_to_picker, picker_points_to_rgb
+from .color_mapping import picker_click_plan
 from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
@@ -1667,7 +1668,8 @@ class Painter:
         if (
             diameter_cells <= 1
             and grid is not None
-            and (job.plan.width, job.plan.height) == (grid.columns, grid.rows)
+            and abs(job.plan.width - grid.columns) <= 2
+            and abs(job.plan.height - grid.rows) <= 2
         ):
             # Native resolution on a measured grid: every cell is one texel
             # and sits exactly on it, so the brush is the smallest the game
@@ -1676,7 +1678,11 @@ class Painter:
             # and on an exact grid it does the opposite: a 1.1-texel stamp
             # spills into the neighbour whenever the cursor sits in the
             # outer part of its texel (live: a tenth of the dots of a test
-            # lattice landed a texel over for exactly that reason).
+            # lattice landed a texel over for exactly that reason).  A plan
+            # a texel or two off the grid still counts as native: requiring
+            # exact equality let a one-column probe miscount silently swap
+            # this one-texel dot for a 1.24-texel one, which chewed fine
+            # detail across a whole 5.6-hour run.
             size = BRUSH_SIZE_MIN
         else:
             size = self._brush_plan_size(
@@ -1860,6 +1866,25 @@ class Painter:
                 job.texel_grid = self._measure_texel_grid_safely(job)
                 with self._condition:
                     self._measured_texel_grid = job.texel_grid
+                if job.texel_grid is None and job.target.texel_grid is not None:
+                    # The probe is allowed to fail on a hard sign (live: the
+                    # fine-pitch XXL probe succeeds most runs, not all); a
+                    # grid an earlier run measured on this same sign is a far
+                    # better aim than the brush-model fallback, which at
+                    # native resolution scatters detail by half a texel.
+                    stored = job.target.texel_grid
+                    if stored.agrees_with(job.target.canvas):
+                        job.texel_grid = stored
+                        with self._condition:
+                            self._measured_texel_grid = stored
+                        LOGGER.warning(
+                            "Painting on the texel grid measured %s (%dx%d "
+                            "texels): this run's own probe failed and the "
+                            "stored grid still sits on the rectangle",
+                            stored.captured_at or "earlier",
+                            stored.columns,
+                            stored.rows,
+                        )
                 self._clear_canvas(job)
                 break
             except _RetryAction:
@@ -2353,7 +2378,11 @@ class Painter:
             last_batch_color = color
             self._select_color(color, target, settings, batch_epoch, apply_correction=False)
             for x, y in plan.points:
-                point = (math.floor(x), math.floor(y))
+                # Round half-up, the same convention painting uses, so the
+                # cursor map is measured through the same rounding it will be
+                # used through - flooring here while painting rounds costs a
+                # systematic half pixel, a quarter texel on a fine sign.
+                point = (math.floor(x + 0.5), math.floor(y + 0.5))
                 point = (
                     min(max(point[0], canvas.left), canvas.left + canvas.width - 1),
                     min(max(point[1], canvas.top), canvas.top + canvas.height - 1),
@@ -2374,6 +2403,7 @@ class Painter:
             pitch_hint=stamp_hint,
             stamp_hint=stamp_hint,
             edges=edges,
+            texture_sizes=SIGN_TEXTURE_SIZES,
         )
         if not grid.agrees_with(canvas):
             raise ValueError(
@@ -2733,16 +2763,50 @@ class Painter:
             # The mouse stays on the texture, where the game takes clicks.
             bias = (0.0, 0.0)
             clamp_canvas = grid.clamp_rect(target.canvas)
-            scale_u = grid.columns / plan.width
-            scale_v = grid.rows / plan.height
+            # The plan and the grid should agree exactly; when a stale plan
+            # is a texel or two off the freshly measured grid, cells map onto
+            # texels one to one rather than being stretched - a uniform
+            # rescale turns a one-column disagreement into a half-texel
+            # misplacement by mid-sign (measured live on the murica run:
+            # scale 1026/1025 displaced fine detail across the whole sign).
+            if (plan.width, plan.height) != (grid.columns, grid.rows):
+                if (
+                    abs(plan.width - grid.columns) <= 2
+                    and abs(plan.height - grid.rows) <= 2
+                ):
+                    scale_u = 1.0
+                    scale_v = 1.0
+                    LOGGER.warning(
+                        "Plan is %dx%d but the measured grid is %dx%d: aiming "
+                        "cells one-to-one on texels; re-plan to use the full "
+                        "sign",
+                        plan.width,
+                        plan.height,
+                        grid.columns,
+                        grid.rows,
+                    )
+                else:
+                    scale_u = grid.columns / plan.width
+                    scale_v = grid.rows / plan.height
+                    LOGGER.warning(
+                        "Plan is %dx%d but the measured grid is %dx%d: "
+                        "stretching to fit - detail will land off its texels; "
+                        "re-plan at the measured size",
+                        plan.width,
+                        plan.height,
+                        grid.columns,
+                        grid.rows,
+                    )
+            else:
+                scale_u = 1.0
+                scale_v = 1.0
 
             def mapper(cell_x: float, cell_y: float) -> tuple[float, float]:
-                # Rounded to the nearest pixel here, because the stroke
-                # floors its coordinates: rounding keeps the cursor within
-                # half a pixel of the middle of the texel's cursor window,
-                # flooring would pull it up to a pixel toward one edge.
+                # Returned unrounded: the stroke applies its extension in
+                # float and rounds once at the end, so a sub-pixel hedge can
+                # never knock an endpoint a whole pixel sideways.
                 x, y = grid.cursor_point((cell_x + 0.5) * scale_u, (cell_y + 0.5) * scale_v)
-                return math.floor(x + 0.5), math.floor(y + 0.5)
+                return x, y
         texel_pitch = self._texel_pitch_pixels(plan, paint_canvas, model, grid)
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
@@ -3697,58 +3761,44 @@ class Painter:
         after repeated rounds pauses the job for the user to look.
         """
 
-        directions = target.picker_directions
         picker_color = (
             target.color_correction.correct(color)
             if apply_correction and target.color_correction is not None
             else color
         )
-        coordinates = map_rgb_to_picker(
-            picker_color,
-            target.hue_bar,
-            target.color_box,
-            hue_direction=directions.hue,
-            saturation_direction=directions.saturation,
-            value_direction=directions.value,
-        )
-        hue_point = self._inset_into(coordinates.hue, target.hue_bar)
-        sv_point = self._inset_into(coordinates.saturation_value, target.color_box)
         if self._swatch is None:
+            # No read-back to catch a swallowed edge click, so stay a couple
+            # of pixels inside the widgets rather than on their exact edge.
+            hue_point, sv_point, _expected = self._picker_plan(
+                picker_color, target, self._PICKER_BLIND_MARGIN_PIXELS
+            )
             self._click_picker(hue_point, sv_point, settings, epoch)
             return
-        # The inset and clamped clicks select a color a shade off the one
-        # asked for; the panel shows that one.
-        expected = picker_points_to_rgb(
-            hue_point,
-            sv_point,
-            target.hue_bar,
-            target.color_box,
-            hue_direction=directions.hue,
-            saturation_direction=directions.saturation,
-            value_direction=directions.value,
-        )
         reading = self._pick_until_shown(
-            hue_point, sv_point, expected, settings, epoch, self._PICK_ATTEMPTS
+            picker_color, target, settings, epoch, self._PICK_ATTEMPTS
         )
         if reading is None or self._swatch is None:
             return
         # The block may have moved, or be covered: look for it again, then
         # give the color a couple more rounds.
         LOGGER.warning(
-            "The panel still shows %s, not %s; looking for its color block again",
+            "The panel still shows %s after selecting #%02X%02X%02X; looking "
+            "for its color block again",
             reading.hex,
-            "#%02X%02X%02X" % expected,
+            *picker_color,
         )
         if not self._find_swatch(target, settings, epoch):
             self._stop_reading_picks(
                 "the color block was lost at color %d" % (self._color_pick_summary.picks + 1)
             )
+            hue_point, sv_point, _expected = self._picker_plan(
+                picker_color, target, self._PICKER_BLIND_MARGIN_PIXELS
+            )
             self._click_picker(hue_point, sv_point, settings, epoch)
             return
         reading = self._pick_until_shown(
-            hue_point,
-            sv_point,
-            expected,
+            picker_color,
+            target,
             settings,
             epoch,
             self._PICK_ATTEMPTS_AFTER_RELOCATE,
@@ -3761,40 +3811,75 @@ class Painter:
                 self._color_pick_summary, failed=self._color_pick_summary.failed + 1
             )
         LOGGER.warning(
-            "The color picker did not take %s after %d rounds of clicks (the panel "
-            "shows %s); pausing",
-            "#%02X%02X%02X" % expected,
+            "The color picker did not take #%02X%02X%02X after %d rounds of "
+            "clicks (the panel shows %s); pausing",
+            *picker_color,
             self._PICK_ATTEMPTS + self._PICK_ATTEMPTS_AFTER_RELOCATE,
             reading.hex,
         )
         self.pause(
             "the color picker did not take #%02X%02X%02X (the panel shows %s) - "
-            "check the sign's color panel and resume" % (*expected, reading.hex)
+            "check the sign's color panel and resume" % (*picker_color, reading.hex)
         )
         # Waits out the pause; resuming starts a new epoch, and the caller
         # picks the color again under it.
         self._checkpoint(epoch=epoch, check_focus=True)
 
+    def _picker_plan(
+        self, picker_color: RGBColor, target: PaintingTarget, margin_pixels: float
+    ) -> tuple[tuple[int, int], tuple[int, int], RGBColor]:
+        """Click points and the color they select, at one edge margin."""
+
+        directions = target.picker_directions
+        return picker_click_plan(
+            picker_color,
+            target.hue_bar,
+            target.color_box,
+            hue_direction=directions.hue,
+            saturation_direction=directions.saturation,
+            value_direction=directions.value,
+            margin_pixels=margin_pixels,
+        )
+
+    def _pick_margin_for_attempt(self, attempt: int) -> float:
+        """The edge margin an attempt clicks with.
+
+        The first attempts click the exact computed point - measured live,
+        the widgets take clicks at their very edges almost everywhere, and
+        the exact point is what colors at the gamut's rim (pure reds, pure
+        white) need.  Later attempts assume the click died in a dead edge
+        pixel (the hue bar's bottom two, live) and pull inward, trading a
+        shade of accuracy for a click that lands.
+        """
+
+        schedule = self._PICK_MARGIN_SCHEDULE_PIXELS
+        return schedule[min(attempt - 1, len(schedule) - 1)]
+
     def _pick_until_shown(
         self,
-        hue_point: tuple[float, float],
-        sv_point: tuple[float, float],
-        expected: RGBColor,
+        picker_color: RGBColor,
+        target: PaintingTarget,
         settings: PainterSettings,
         epoch: int,
         attempts: int,
         *,
         first_attempt: int = 1,
     ) -> SwatchReading | None:
-        """Click the picker until the panel shows ``expected``, up to ``attempts`` times.
+        """Click the picker until the panel shows the selected color.
 
-        Returns None once it does (or once the panel stopped being read),
-        else the last reading.
+        Each attempt recomputes its click points at that attempt's edge
+        margin - the exact point first, then progressively inside the
+        widgets - and verifies the panel against the color THOSE points
+        select.  Returns None once the panel agrees (or once it stopped
+        being read), else the last reading.
         """
 
         reading: SwatchReading | None = None
         for attempt in range(first_attempt, first_attempt + attempts):
             retry = attempt > 1
+            hue_point, sv_point, expected = self._picker_plan(
+                picker_color, target, self._pick_margin_for_attempt(attempt)
+            )
             self._click_picker(hue_point, sv_point, settings, epoch, retry=retry)
             if self._swatch is None:
                 return None
@@ -3905,25 +3990,8 @@ class Painter:
     def _find_swatch(self, target: PaintingTarget, settings: PainterSettings, epoch: int) -> bool:
         """Select the locator color and look for the block showing it."""
 
-        directions = target.picker_directions
-        coordinates = map_rgb_to_picker(
-            LOCATOR_COLOR,
-            target.hue_bar,
-            target.color_box,
-            hue_direction=directions.hue,
-            saturation_direction=directions.saturation,
-            value_direction=directions.value,
-        )
-        hue_point = self._inset_into(coordinates.hue, target.hue_bar)
-        sv_point = self._inset_into(coordinates.saturation_value, target.color_box)
-        shown = picker_points_to_rgb(
-            hue_point,
-            sv_point,
-            target.hue_bar,
-            target.color_box,
-            hue_direction=directions.hue,
-            saturation_direction=directions.saturation,
-            value_direction=directions.value,
+        hue_point, sv_point, shown = self._picker_plan(
+            LOCATOR_COLOR, target, self._PICKER_BLIND_MARGIN_PIXELS
         )
         hue_bar = ScreenRect(
             target.hue_bar.left, target.hue_bar.top, target.hue_bar.width, target.hue_bar.height
@@ -3969,6 +4037,23 @@ class Painter:
             # only bounds the mouse.
             start = mapper(stroke.start_x, stroke.start_y)  # type: ignore[attr-defined]
             end = mapper(stroke.end_x, stroke.end_y)  # type: ignore[attr-defined]
+            # A stroke the plan lays along one row (or one column) must be
+            # commanded along one row on screen too.  The cursor map's shear
+            # makes the two endpoints' ideal ys differ by a fraction of a
+            # pixel, and rounding them separately can split them across a
+            # pixel boundary - the whole drag then rides half a texel off
+            # its row (the murica run's dominant fine-detail error).  One
+            # shared coordinate, from the stroke's middle, keeps the drag on
+            # its row; the sub-pixel shear across one stroke's length is far
+            # smaller than the half-texel the split costs.
+            if stroke.start_y == stroke.end_y:  # type: ignore[attr-defined]
+                shared_y = (start[1] + end[1]) / 2.0
+                start = (start[0], shared_y)
+                end = (end[0], shared_y)
+            if stroke.start_x == stroke.end_x:  # type: ignore[attr-defined]
+                shared_x = (start[0] + end[0]) / 2.0
+                start = (shared_x, start[1])
+                end = (shared_x, end[1])
         else:
             start, end = logical_stroke_to_screen(stroke, plan.width, plan.height, canvas)  # type: ignore[arg-type]
         if extension > 0.0:
@@ -3987,10 +4072,20 @@ class Painter:
         bounds = clamp_rect if clamp_rect is not None else canvas
         start = self._space_and_clamp(start, bounds, settings.logical_pixel_spacing)
         end = self._space_and_clamp(end, bounds, settings.logical_pixel_spacing)
-        # Cell centers such as 0.5 must use floor, not Python's ties-to-even
-        # round(), or adjacent logical pixels can collapse onto one coordinate.
-        start_int = math.floor(start[0]), math.floor(start[1])
-        end_int = math.floor(end[0]), math.floor(end[1])
+        if mapper is not None:
+            # Round half-up, ONCE, after every sub-pixel adjustment: the old
+            # order rounded inside the cursor map and floored here, so a
+            # 0.14 px extension pulled every dab's left end a whole pixel
+            # (0.57 texel) left of its aim.  The map's outputs are
+            # continuous, so half-up is the unbiased choice.
+            start_int = math.floor(start[0] + 0.5), math.floor(start[1] + 0.5)
+            end_int = math.floor(end[0] + 0.5), math.floor(end[1] + 0.5)
+        else:
+            # Cell centers such as 0.5 must use floor, not round: on a
+            # one-pixel-per-cell canvas half-up would push every center into
+            # the next cell over.
+            start_int = math.floor(start[0]), math.floor(start[1])
+            end_int = math.floor(end[0]), math.floor(end[1])
         self._screen_stroke(start_int, end_int, settings, epoch, texel_pitch=texel_pitch)
 
     @staticmethod
@@ -4080,9 +4175,13 @@ class Painter:
             for step in range(1, steps + 1):
                 self._checkpoint(epoch=epoch, check_focus=True)
                 ratio = step / steps
+                # Waypoints round half-up: flooring biased every intermediate
+                # point down-left, so a drag whose endpoints straddled a pixel
+                # boundary in y rode the shifted row for its whole length
+                # instead of splitting near its middle.
                 point = (
-                    math.floor(start_int[0] + (end_int[0] - start_int[0]) * ratio),
-                    math.floor(start_int[1] + (end_int[1] - start_int[1]) * ratio),
+                    math.floor(start_int[0] + (end_int[0] - start_int[0]) * ratio + 0.5),
+                    math.floor(start_int[1] + (end_int[1] - start_int[1]) * ratio + 0.5),
                 )
                 self._move(point, epoch)
                 self._interruptible_sleep(delay, epoch=epoch, check_focus=True)
@@ -4099,10 +4198,17 @@ class Painter:
             # costs nothing on the long strokes that already spend frames
             # moving.  The hold is measured from the press rather than summed
             # from the nominal delays so the scheduler's own slack counts.
+            # Long drags dwell a frame at the far end too: their travel time
+            # exceeds the press floor, but the last inter-frame segment of a
+            # capped drag - up to ~16 texels at 15 FPS - otherwise exists
+            # only between two samples the game may never take together.
             if self.input.emits_real_input:
-                remaining = self._press_hold_seconds(settings) - (
-                    time.monotonic() - pressed_at
-                )
+                elapsed = time.monotonic() - pressed_at
+                hold = self._press_hold_seconds(settings)
+                if pace.move_seconds >= hold:
+                    remaining = hold
+                else:
+                    remaining = hold - elapsed
                 if remaining > 0:
                     self._interruptible_sleep(remaining, epoch=epoch, check_focus=True)
         finally:
@@ -4121,13 +4227,18 @@ class Painter:
             )
         return clamp_to_rect(point[0], point[1], canvas)
 
-    # Picker widgets ignore clicks at their outermost pixels - photographed in
-    # game: a click on the color box's exact corner leaves the cursor where it
-    # was, while the same click 2% inside lands.  Every picker click is pulled
-    # this fraction inward; the color cost is at most 2% of one axis, far under
-    # the sign material's own response, while a dropped click paints entire
-    # color groups with the previous group's color.
-    _PICKER_EDGE_INSET = 0.02
+    # Some picker-widget edge pixels ignore clicks (measured live: the hue
+    # bar's bottom two; its top edge and the S/V corner take clicks fine).
+    # The old answer was to pull every click 2% of the widget inward, which
+    # on a wrapping 360-degree hue bar silently cost 7.2 degrees of red at
+    # each end - the murica sign's flag reds all painted at 351 degrees.
+    # Now the first attempts click the exact computed point and the panel
+    # read-back decides: a swallowed click is retried progressively deeper.
+    _PICK_MARGIN_SCHEDULE_PIXELS: tuple[float, ...] = (0.0, 0.0, 2.0, 2.0, 4.0)
+    # Without a readable panel there is no way to see a swallowed click, so
+    # blind picks stay this far inside the widgets - past every dead edge
+    # pixel seen live, at a color cost of ~2 degrees of hue at the ends.
+    _PICKER_BLIND_MARGIN_PIXELS = 2.0
 
     # Rust has been observed running its paint UI at 15 FPS, where a click held
     # shorter than one 67 ms frame can be sampled as nothing.  Picker clicks are
@@ -4151,19 +4262,6 @@ class Painter:
     _STROKE_GAP_FLOOR_SECONDS = STROKE_GAP_FLOOR_SECONDS
     _LONG_DRAG_MAX_TEXELS_PER_SECOND = LONG_DRAG_MAX_TEXELS_PER_SECOND
     _LONG_DRAG_MAX_STEP_TEXELS = LONG_DRAG_MAX_STEP_TEXELS
-
-    @classmethod
-    def _inset_into(
-        cls, point: tuple[float, float], rect: RectangleLike
-    ) -> tuple[float, float]:
-        """Clamp a click target into ``rect`` shrunk by the edge inset."""
-
-        margin_x = rect.width * cls._PICKER_EDGE_INSET
-        margin_y = rect.height * cls._PICKER_EDGE_INSET
-        return (
-            min(max(point[0], rect.left + margin_x), rect.left + rect.width - 1 - margin_x),
-            min(max(point[1], rect.top + margin_y), rect.top + rect.height - 1 - margin_y),
-        )
 
     def _safe_click(
         self,

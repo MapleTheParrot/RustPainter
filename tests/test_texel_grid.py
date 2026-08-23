@@ -197,9 +197,13 @@ def test_a_stamp_offset_and_cursor_shift_are_measured_into_the_aim() -> None:
     canvas = ScreenRect(398, 299, 1412, 706)
     grid = _probe(sign, canvas)
     # With stamps landing a texel left of the cursor, the texture's last
-    # column can only be reached from outside the sign, so the paintable
-    # extent - what the image is laid out on - is one column short.
-    assert (grid.columns, grid.rows) == (255, 128)
+    # column can only be reached from outside the calibrated rectangle - but
+    # the column exists, and the count is the texture's true extent: the
+    # quad edge proves the texel, and counting it is what lets a measured
+    # grid snap onto the game's own texture table (1024 must read as 1024,
+    # not as however many texels the frame and the cursor map left visible).
+    # The painter clamps the unreachable column's clicks at paint time.
+    assert (grid.columns, grid.rows) == (256, 128)
     assert abs(grid.pitch_x - 5.5) < 0.002
     assert grid.from_edges
     _assert_aim_lands(sign, grid)

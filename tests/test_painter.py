@@ -1638,8 +1638,15 @@ def test_a_short_drag_is_held_as_long_as_a_dab() -> None:
     assert drag_tail >= Painter._MIN_PRESS_SECONDS * 0.5
 
 
-def test_a_long_drag_is_not_held_at_its_end() -> None:
-    """Strokes that already spend frames moving pay nothing extra."""
+def test_a_long_drag_dwells_one_frame_at_its_end() -> None:
+    """The far end of a long drag is held across a frame before release.
+
+    The game paints between cursor samples taken at ~15 FPS, so the last
+    inter-sample stretch of a drag - up to sixteen texels of it - exists
+    only if the game gets a frame with the cursor resting at the far end.
+    Short strokes have always been held for this reason; the murica XXL
+    post-mortem extended the same dwell to long drags, one frame each.
+    """
 
     controller = _TimedInput()
     painter = Painter(controller, screen_capture=_panel_capture)
@@ -1651,8 +1658,9 @@ def test_a_long_drag_is_not_held_at_its_end() -> None:
 
     ((drag, tail),) = _canvas_presses(controller)
     assert drag >= 0.18
-    # The button comes up as soon as the cursor arrives.
-    assert tail < 0.03 * _TIMEOUT_SCALE
+    # The button stays down for one press-floor at the far end, no longer.
+    assert tail >= Painter._MIN_PRESS_SECONDS * 0.8
+    assert tail < Painter._MIN_PRESS_SECONDS * 2.0 + 0.03 * _TIMEOUT_SCALE
 
 
 def _turbo(**overrides: object) -> PainterSettings:

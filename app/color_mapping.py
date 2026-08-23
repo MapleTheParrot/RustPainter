@@ -240,16 +240,106 @@ def picker_points_to_rgb(
 map_rgb_to_picker = rgb_to_picker_coordinates
 
 
+def inset_click_point(
+    point: ScreenPoint, rect: RectangleLike, margin_pixels: float
+) -> tuple[int, int]:
+    """A picker click target held ``margin_pixels`` inside ``rect``, rounded.
+
+    The picker widgets ignore clicks on a couple of their outermost pixels
+    (measured live: the hue bar's bottom two, nothing at its top, nothing at
+    the S/V corner), so the painter clicks the exact computed point first
+    and only pulls inward when the panel's read-back says the click was
+    swallowed.  Fractional-of-the-widget insets are how every hue above
+    352 degrees was lost on the murica sign: 2% of a 313 px bar is 6.3 px,
+    which on a wrapping 360-degree axis is 7.2 degrees of red at EACH end.
+    """
+
+    margin_x = min(float(margin_pixels), rect.width * 0.10)
+    margin_y = min(float(margin_pixels), rect.height * 0.10)
+    x = min(max(point[0], rect.left + margin_x), rect.left + rect.width - 1 - margin_x)
+    y = min(max(point[1], rect.top + margin_y), rect.top + rect.height - 1 - margin_y)
+    return int(round(x)), int(round(y))
+
+
+def picker_click_plan(
+    rgb: RGBColor | Iterable[int],
+    hue_bar: RectangleLike,
+    color_box: RectangleLike,
+    *,
+    hue_direction: HueDirection | str = HueDirection.TOP_TO_BOTTOM,
+    saturation_direction: SaturationDirection | str = SaturationDirection.LEFT_LOW,
+    value_direction: ValueDirection | str = ValueDirection.TOP_BRIGHT,
+    margin_pixels: float = 0.0,
+) -> tuple[tuple[int, int], tuple[int, int], RGBColor]:
+    """Click points for ``rgb`` at one edge inset, and the color they select.
+
+    Returns ``(hue_point, sv_point, expected)``: the rounded click targets
+    and the color the picker will actually show for them - the single source
+    both the painter (to click and verify) and the planner/preview (to
+    promise only reachable colors) share.
+    """
+
+    coordinates = rgb_to_picker_coordinates(
+        rgb,
+        hue_bar,
+        color_box,
+        hue_direction=hue_direction,
+        saturation_direction=saturation_direction,
+        value_direction=value_direction,
+    )
+    hue_point = inset_click_point(coordinates.hue, hue_bar, margin_pixels)
+    sv_point = inset_click_point(coordinates.saturation_value, color_box, margin_pixels)
+    expected = picker_points_to_rgb(
+        hue_point,
+        sv_point,
+        hue_bar,
+        color_box,
+        hue_direction=hue_direction,
+        saturation_direction=saturation_direction,
+        value_direction=value_direction,
+    )
+    return hue_point, sv_point, expected
+
+
+def reachable_color(
+    rgb: RGBColor | Iterable[int],
+    hue_bar: RectangleLike,
+    color_box: RectangleLike,
+    *,
+    hue_direction: HueDirection | str = HueDirection.TOP_TO_BOTTOM,
+    saturation_direction: SaturationDirection | str = SaturationDirection.LEFT_LOW,
+    value_direction: ValueDirection | str = ValueDirection.TOP_BRIGHT,
+) -> RGBColor:
+    """The nearest color the picker can actually select for ``rgb``.
+
+    What ``picker_click_plan`` expects at the painter's first-attempt inset:
+    quantized to the widgets' pixel rasters.  Running the plan's palette
+    through this is what makes the preview honest about color.
+    """
+
+    return picker_click_plan(
+        rgb,
+        hue_bar,
+        color_box,
+        hue_direction=hue_direction,
+        saturation_direction=saturation_direction,
+        value_direction=value_direction,
+    )[2]
+
+
 __all__ = [
     "HueDirection",
     "PickerCoordinates",
     "SaturationDirection",
     "ValueDirection",
     "hsv_to_picker_coordinates",
+    "inset_click_point",
     "map_hue_to_screen",
     "map_rgb_to_picker",
     "map_sv_to_screen",
+    "picker_click_plan",
     "picker_points_to_rgb",
+    "reachable_color",
     "rgb_to_hsv",
     "rgb_to_picker_coordinates",
 ]
