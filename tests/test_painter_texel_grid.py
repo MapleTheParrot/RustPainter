@@ -38,6 +38,9 @@ def _settings(**overrides: object) -> PainterSettings:
         "safety_poll_interval_seconds": 0.002,
         "apply_brush_size": True,
         "verify_passes": 0,
+        # Checking each color as it goes down captures the screen; the tests
+        # that exercise it turn it on against a simulated sign.
+        "confirm_strokes": False,
     }
     values.update(overrides)
     return PainterSettings(**values)  # type: ignore[arg-type]
@@ -146,6 +149,7 @@ class ReplayingTexelSign(SimulatedSign):
 
 def _impatient(painter: Painter) -> Painter:
     painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._CONFIRM_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
@@ -209,6 +213,7 @@ def _frameless(painter: Painter) -> Painter:
     """
 
     painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._CONFIRM_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]

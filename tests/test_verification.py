@@ -192,6 +192,7 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
         # The capture stub never changes, so a second pass would repaint the
         # same three cells again; one pass is what this test is counting.
         verify_passes=1,
+        confirm_strokes=False,
     )
 
     assert painter.start(plan, profile, settings)
@@ -535,3 +536,218 @@ def test_a_bare_sign_looks_bare_and_a_painted_one_does_not() -> None:
     assert not capture_looks_bare(painted)
 
     assert not capture_looks_bare(bare[:2, :4])  # too few cells to say
+
+
+# ------------------------------------------------ checking colors as they land
+
+
+def test_plan_layers_record_what_each_final_stroke_painted_over() -> None:
+    """On a gap-merged plan the first color runs under the later ones, so a
+    dropped final stroke leaves that color showing, not the sign."""
+
+    from app.verification import plan_layers
+
+    plan = PaintPlan(
+        6,
+        1,
+        (
+            ColorGroup(RED, (Stroke(0, 0, 5, 0),), 6),
+            ColorGroup(BLUE, (Stroke(2, 0, 3, 0),), 2),
+            # Red again over a cell already red: its last real change stays
+            # the first stroke, with bare sign under it.
+            ColorGroup(RED, (Stroke(5, 0, 5, 0),), 1),
+        ),
+    )
+    indices, underpaint, palette = plan_layers(plan)
+    assert [tuple(color) for color in palette] == [RED, BLUE]
+    assert indices.tolist() == [[0, 0, 1, 1, 0, 0]]
+    assert underpaint.tolist() == [[-1, -1, 0, 0, -1, -1]]
+
+
+def test_a_cell_reading_as_its_underpaint_is_a_hole_not_capture_noise() -> None:
+    """A missed stroke on a merged plan shows the color that ran under it.
+    Read against the final colors alone that is a "wrong color", which at
+    scale is discarded as noise; read against the underpaint it is the hole
+    it is, and is repainted."""
+
+    from app.verification import (
+        SCATTERED_WRONG_COLOR_MIN_CELLS,
+        classify_cells,
+        plan_layers,
+    )
+
+    black, navy, cream = (0, 0, 0), (8, 12, 40), (240, 225, 200)
+    width = height = 60
+    strokes_black = tuple(Stroke(0, y, width - 1, y) for y in range(height))
+    strokes_navy = tuple(Stroke(0, y, width - 1, y) for y in range(10, 50))
+    strokes_cream = tuple(Stroke(0, y, width - 1, y) for y in range(50, 60))
+    plan = PaintPlan(
+        width,
+        height,
+        (
+            ColorGroup(black, strokes_black, width * height),
+            ColorGroup(navy, strokes_navy, width * 40),
+            ColorGroup(cream, strokes_cream, width * 10),
+        ),
+    )
+    indices, underpaint, palette = plan_layers(plan)
+    sampled = _render(indices, palette)
+    # Every fifth navy cell and every fifth cream cell lost its stroke and
+    # shows the black underneath - far more than the scattered allowance.
+    rng = np.random.default_rng(3)
+    lost = (rng.random(indices.shape) < 0.2) & (indices > 0)
+    sampled[lost] = black
+    assert int(lost.sum()) > SCATTERED_WRONG_COLOR_MIN_CELLS
+
+    without = classify_cells(sampled, indices, palette)
+    assert without.count == 0 and without.discarded == int(lost.sum())
+
+    with_layers = classify_cells(sampled, indices, palette, underpaint=underpaint)
+    assert with_layers.discarded == 0
+    assert with_layers.blank == int(lost.sum())
+    assert np.array_equal(with_layers.cells, lost)
+
+
+def test_confirm_cells_tells_hits_from_misses_and_skips_the_invisible() -> None:
+    from app.verification import MIN_CONFIRM_DISTANCE, confirm_cells
+
+    wood = np.array(WOOD, dtype=np.float32)
+    before = np.broadcast_to(wood, (1, 4, 3)).copy()
+    expected = np.array(RED, dtype=np.float32)
+    after = before.copy()
+    after[0, 0] = RED  # took the color
+    after[0, 1] = WOOD  # stayed bare
+    after[0, 2] = (RED[0] - 20, RED[1] + 15, RED[2] + 10)  # near enough
+    judge = np.array([[True, True, True, False]])
+    hit, judged = confirm_cells(before, after, expected, judge)
+    assert judged.tolist() == [[True, True, True, False]]
+    assert hit.tolist() == [[True, False, True, False]]
+
+    # A color the sign already shows within the visibility floor is not
+    # judged at all: its absence would be as invisible as its presence.
+    near = np.array(RED, dtype=np.float32) + 5.0
+    assert np.linalg.norm(near - expected) < MIN_CONFIRM_DISTANCE
+    before_near = np.broadcast_to(near, (1, 1, 3)).copy()
+    _hit, judged = confirm_cells(before_near, before_near, expected, np.array([[True]]))
+    assert not judged.any()
+
+
+def test_confirm_cells_sees_through_the_bilinear_blend_of_a_fine_sign() -> None:
+    """At under two pixels per texel the sampled pixel carries up to half of
+    a neighbour.  A lost texel whose neighbours all took the color moves
+    almost halfway toward it and would pass a plain "did it move" test;
+    modelled as a blend it is still a miss, and a painted texel whose pixel
+    leans the same way is still a hit."""
+
+    from app.verification import CellBlend, confirm_cells
+
+    pitch = 2.0
+    width, height = 7, 7
+    # Every cell's centre sits 0.45 px before its sampled pixel's centre on
+    # both axes, so the pixel reads over a fifth of the next cell along
+    # each and the cell's own share is not much over a half.
+    centers = np.arange(width) * pitch + 0.05
+    blend = CellBlend.from_centers(centers, centers, pitch, pitch)
+    assert np.allclose(blend.fraction_x, 0.45 / pitch, atol=0.01)
+    assert (blend.step_x == 1).all()
+    own, _mixed = blend.neighbour_share(np.zeros((height, width, 3)))
+    assert 0.5 < float(own[3, 3, 0]) < 0.65
+
+    wood = np.array(WOOD, dtype=np.float64)
+    red = np.array(RED, dtype=np.float64)
+    texels = np.broadcast_to(wood, (height, width, 3)).copy()
+    texels[:] = red  # every texel painted...
+    texels[3, 3] = wood  # ...but one, lost in the middle
+
+    def rendered(cells: np.ndarray) -> np.ndarray:
+        """What the capture reads: each pixel a bilinear mix per the blend."""
+
+        own, mixed = blend.neighbour_share(cells)
+        return own * cells + mixed
+
+    before = rendered(np.broadcast_to(wood, (height, width, 3)).copy())
+    after = rendered(texels)
+    # The lost texel's pixel still moved most of the way a naive "did it
+    # move toward the color" threshold would ask for.
+    moved = np.linalg.norm(after[3, 3] - before[3, 3])
+    assert moved > 0.35 * np.linalg.norm(red - wood)
+
+    judge = np.ones((height, width), dtype=bool)
+    hit, judged = confirm_cells(before, after, red, judge, blend=blend)
+    assert judged.all()
+    assert not hit[3, 3]
+    assert hit.sum() == height * width - 1
+
+
+def test_repaint_runs_bridge_own_and_later_cells_but_never_earlier_ones() -> None:
+    from app.verification import repaint_runs
+
+    # Row: own own EARLIER own own BARE own LATER own
+    indices = np.array([[1, 1, 0, 1, 1, -1, 1, 2, 1]], dtype=np.int32)
+    missed = np.array([[True, False, False, True, True, False, True, False, True]])
+    runs = repaint_runs(missed, indices, 1, max_gap=2)
+    spans = sorted((run.start_x, run.end_x) for run in runs)
+    # Cell 0 cannot reach cell 3 across the earlier color; 3-4 stand alone
+    # from 6 across bare sign; 6 reaches 8 across the later color.
+    assert spans == [(0, 0), (3, 4), (6, 8)]
+
+
+def test_sign_rendering_fit_maps_nominal_colors_to_what_the_capture_shows() -> None:
+    from app.verification import apply_capture_lighting, fit_sign_rendering
+
+    palette = np.array(
+        [(0, 0, 0), (255, 255, 255), (200, 30, 30), (30, 60, 200), (30, 180, 60)],
+        dtype=np.uint8,
+    )
+    indices = np.repeat(np.arange(5, dtype=np.int32), 10).reshape(5, 10)
+    # The sign darkens and warms everything by one affine transform.
+    sampled = _render(indices, palette) * 0.8 + np.array([20, 10, 0], dtype=np.float32)
+    coefficients = fit_sign_rendering(sampled, indices, palette)
+    assert coefficients is not None
+    predicted = apply_capture_lighting(
+        np.array([[200, 30, 30]], dtype=np.float32), coefficients
+    )
+    assert np.allclose(predicted[0], (200 * 0.8 + 20, 30 * 0.8 + 10, 30 * 0.8), atol=1.0)
+    # Too few colors to fit on: nothing, and the caller uses the nominal value.
+    assert fit_sign_rendering(sampled[:3], indices[:3], palette) is None
+
+
+def test_a_band_brush_is_repainted_along_its_own_planned_strokes() -> None:
+    """A three-row band laid on another row would reach rows the planner
+    never cleared for it, so the strokes that covered a missed cell go
+    down again whole instead."""
+
+    from app.verification import repaint_runs
+
+    indices = np.full((7, 10), 1, dtype=np.int32)
+    strokes = (Stroke(0, 1, 9, 1), Stroke(0, 4, 9, 4))  # bands over rows 0-2 and 3-5
+    missed = np.zeros((7, 10), dtype=bool)
+    missed[5, 3] = True  # in the second band's bottom row
+    again = repaint_runs(missed, indices, 1, strokes=strokes, radius=1)
+    assert again == [Stroke(0, 4, 9, 4)]
+    assert repaint_runs(np.zeros((7, 10), dtype=bool), indices, 1, strokes=strokes, radius=1) == []
+
+
+def test_confirm_cells_learns_the_sign_rendering_from_the_cells_that_took() -> None:
+    """Nominal dark red over a black underpaint: the sign renders the red
+    warmer and lighter than its nominal value, close enough to the
+    underpaint's rendering that the nominal prediction would call the real
+    hits misses.  Enough cells that plainly took it redefine the expected
+    color and the close calls are decided right."""
+
+    from app.verification import confirm_cells
+
+    underpaint = np.array((35, 30, 25), dtype=np.float32)  # black, as rendered
+    nominal = np.array((48, 6, 7), dtype=np.float32)
+    rendered = np.array((60, 28, 20), dtype=np.float32)  # what the sign shows
+    # Nearer the underpaint than the nominal: the naive call would be "miss".
+    assert np.linalg.norm(rendered - underpaint) < np.linalg.norm(rendered - nominal)
+    before = np.broadcast_to(underpaint, (4, 10, 3)).copy()
+    after = before.copy()
+    took = np.zeros((4, 10), dtype=bool)
+    took[:3] = True  # thirty cells took the color, ten did not
+    after[took] = rendered
+    judge = np.ones((4, 10), dtype=bool)
+    hit, judged = confirm_cells(before, after, nominal, judge)
+    assert judged.all()
+    assert np.array_equal(hit, took)

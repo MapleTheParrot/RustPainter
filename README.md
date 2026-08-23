@@ -70,6 +70,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Brush sizing measured from the sign itself at the start of every job: a few probe strokes fit what Rust's Size numbers really cover, the sign is wiped clean again, and only then does the artwork go down
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
+- Every color checked against a screen capture as soon as it is painted, its dropped strokes repainted while the color is still selected, and the press hold lengthened while the game keeps dropping them - Rust loses a third of all presses on its largest sign, and this is what closes the holes it leaves
 - Speed presets (Relaxed / Standard / Fast / Turbo) over fully adjustable timing, with 1 ms Windows timer resolution while painting - every hold and settle floored at a frame of the game's paint UI, and long drags paced by the sign's own texel pitch, so the fastest preset is also an accurate one
 - Per-profile color correction measured from a painted 32-swatch chart
 - A Timelapse tab that captures a PNG frame of the sign at a set interval while painting, plays a recording back inside the app, and saves it as a video file - no external encoder required, and playback speed is a slider that says how much of the paint job one second of video covers
@@ -348,7 +349,7 @@ Rust brush behavior can vary with sign type, selected in-game brush, frame rate,
 - Picker and inter-stroke delays
 - Canvas inset and logical resolution
 
-Start with a low-resolution 8-color test. If adjacent rows bleed together, reduce the in-game brush size, increase logical spacing, or lower the logical resolution. The speed presets differ in how much margin they leave above the game's frame floors (see *Speed and accuracy* below), not in whether the paint lands; if strokes still have gaps, raise the touch-up passes before slowing anything.
+Start with a low-resolution 8-color test. If adjacent rows bleed together, reduce the in-game brush size, increase logical spacing, or lower the logical resolution. The speed presets differ in how much margin they leave above the game's frame floors (see *Speed and accuracy* below), not in whether the paint lands; gaps are the game dropping presses, which the per-color check described under *Strokes the game never sees* puts back on its own - read its lines in the log before slowing anything.
 
 **Stroke merging** exploits painting order: colors are painted from most to least frequent, so an earlier color may paint across pixels that a later color repaints anyway. The final image is identical, but fragmented regions (text backgrounds, dithered gradients) need far fewer mouse strokes. *Balanced* merges across gaps of up to 6 logical pixels and is the default; *Maximum* produces the fewest strokes but can spend extra time traveling across very long overpainted spans. *Off* exists for comparing against exact strokes and is never faster. The paint-plan panel reports how many strokes merging removed. Only **Exact** paint mode reads this setting - Quality, Balanced and Fast merge automatically as part of the optimizer, and the box shows *Automatic* while one of them is selected.
 
@@ -573,35 +574,75 @@ artist canvases run 192x256, 320x240, 256x640, 512x512 and 1024x512, and the
 DLC frames 128x175, 320x240, 320x256, 128x320. That table is what the
 fallback snapping uses; the probe itself never consults it.
 
-### Strokes the game never sees, and the touch-up that repairs them
+### Strokes the game never sees, and the checks that repair them
 
 Rust samples the mouse a frame at a time, and its paint UI has been measured
 running at about 15 FPS. A press and release that both fall inside one frame
 can be sampled as nothing, and the painter has no way of knowing: it pushes
 synthetic input into Windows and never hears back from the game. Dabs were
-protected against this early on by being held for most of a frame. Reading a
-finished five-hour sign back showed the same thing happening to *short drags*:
-at a fine painting resolution a run of a few cells is only a few screen
-pixels, over in under ten milliseconds, and every hole in that sign was such a
-run missing from the middle of a stroke. Every stroke's press now lasts at
-least as long as a dab's hold, with a short drag keeping the button down at
-its far end until it has; long strokes already spend frames moving and are not
-slowed at all.
+protected against this early on by being held for most of a frame, and every
+stroke's press now lasts at least as long as a dab's hold.
 
-What the game dropped anyway is caught by the **touch-up** passes under
-**Settings → Painting**. After the artwork is down, the sign is captured and
-each cell compared with the plan, and the cells that came out wrong are
-repainted. The comparison is relative, so the sign's lighting and material
-never count against it, and it measures each color against *what that color
-actually looks like on this sign*, read off the capture itself - two palette
-entries the sign renders identically can therefore never be mistaken for one
-another, which is what used to send a quarter of a 256-color sign back for
-repainting. A cell is repainted when it reads as bare sign (the job captures
-the freshly cleared sign for exactly this reference, and any area the plan
-leaves unpainted serves as well), when it looks like nothing the plan painted,
-or when it decisively took another color. The default is two passes: the
-touch-up strokes are short and can be dropped by the game exactly as the
-originals were, and the second capture is what catches that.
+That hold is sized for 15 FPS, and on a large sign the game does not keep
+15 FPS while it is being painted on. Reading a 1024x512 sign back after a
+nine-hour Exact run showed that **a third of all presses had painted
+nothing**: single-cell dabs were lost 35% of the time, twenty-cell drags
+about 10%, short runs went missing whole rather than in part, and the rate
+swung between 7% and 70% from one quarter-hour to the next while the
+painter's own pace never moved off 100 ms a stroke. That is the signature of
+the game's frames stretching past the hold - to around 110 ms on average,
+and to a quarter of a second in its worst stretches - so that a 70 ms press
+falls between two samples. The same timing on a 320x240 sign lost one dab
+in 250. The gaps were not aiming (they are spread evenly across the texel,
+and the lost strokes do not turn up a row over), and the 1.8 px texels of a
+sign that size make a lost dab look like a speck rather than a hole, which
+is why the finished sign reads as "grainy" instead of "unpainted".
+
+Two things answer it, both on by default under **Settings → Painting →
+Touch-up**:
+
+- **Check each color as it goes down.** After a color's strokes are
+  painted the cursor is parked, the sign is captured, and every cell the
+  color was to leave behind is read against the capture taken *before* the
+  color: a cell either moved to where the color's stamp would put it or it
+  stayed where it was. No palette or lighting model has to be right for
+  that, and on a sign drawn at under three screen pixels per texel the
+  reading allows for the bilinear blend a pixel carries from its
+  neighbours, so a single lost texel among painted ones is still told from
+  a painted one. The misses are repainted in short runs while the color is
+  still selected and the sign is captured again, up to the set number of
+  **rounds per color** (four by default; each round is under a second plus
+  the repaint). Cells whose change would be invisible - the color is within
+  a few units of what is already there - are not chased. The log carries
+  one line per color that missed, and the run report (`runs\<stamp>\run.json`,
+  under `confirmation`) the totals.
+- **The press hold adapts.** A color that comes out with more than a tenth
+  of its cells missing is the game running slow, and every press after it is
+  held 20 ms longer, up to 180 ms over the floor; three clean colors in a row
+  let it back down a step. The hold therefore settles where the game
+  actually is on this sign today, and the repaint rounds carry what it still
+  drops. Expect an Exact run on the largest canvas to take longer than the
+  estimate on its first checked color - the per-stroke overhead the
+  estimator learns from completed runs absorbs the average afterwards.
+
+What remains is caught by the **touch-up** passes at the end. After the
+artwork is down, the sign is captured and each cell compared with the plan,
+and the cells that came out wrong are repainted. The comparison is relative,
+so the sign's lighting and material never count against it, and it measures
+each color against *what that color actually looks like on this sign*, read
+off the capture itself - two palette entries the sign renders identically can
+therefore never be mistaken for one another, which is what used to send a
+quarter of a 256-color sign back for repainting. A cell is repainted when it
+reads as bare sign (the job captures the freshly cleared sign for exactly
+this reference, and any area the plan leaves unpainted serves as well), when
+it reads as the color that ran *under* its final stroke - on a plan that
+merges runs across later colors a dropped stroke shows the first, darkest
+color rather than the wood, and the nine-hour sign above had 35,000 such
+cells that an earlier version set aside as capture noise - when it looks like
+nothing the plan painted, or when it decisively took another color. The
+default is two passes: the touch-up strokes are short and can be dropped by
+the game exactly as the originals were, and the second capture is what
+catches that; the touch-up's own colors are checked as they go down too.
 
 On a plan finer than the game can paint - cells narrower than Rust's smallest
 brush, or under two screen pixels across - the touch-up fills holes only. A
@@ -618,7 +659,8 @@ the sign (and at least 500 cells) they are taken as the capture failing to
 resolve cells and are left alone, with a warning in the log. Before this rule
 a 512-wide sign read at two screen pixels per cell sent 21% of its cells back
 for "recoloring" - 35,000 strokes and most of an hour to repaint a sign that
-was already right.
+was already right. A cell that reads as its own underpaint is never in that
+set: it is a hole, whatever its neighbours read as.
 
 ## Resume from here
 
@@ -726,7 +768,7 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 
 - Starting uses a visible countdown so you can focus Rust.
 - With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. The expected process defaults to `RustClient.exe`. Loss of focus pauses and releases the mouse.
-- F9 pauses at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, touch-up passes, the safety guards, and the timelapse controls stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
+- F9 pauses at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, the per-color check and touch-up passes, the safety guards, and the timelapse controls stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
 - F10 aborts, clears pending work, and releases the mouse.
 - **Anti-AFK** (off by default, Settings > Safety): every N minutes (adjustable, 30 by default) the job clicks Rust's **Save changes** button to leave the painting UI, presses Space to jump, waits a second, clicks to open the sign again, and continues from the same stroke - re-selecting its color and brush size first. It relies on your character still facing the sign, which it is if you were looking at it when the job started and have not touched the mouse since. Turning it on makes the **Save button** calibration needed (drag just inside Rust's Save changes button), and Start says so until it is set. Closing the UI with Save keeps everything painted so far.
 - **UI guard** (on by default, Settings > Safety): once a second the job looks at the calibrated **colour box**, **hue bar**, and - when calibrated - the **Clear** and **Save** buttons, and pauses when they are no longer on the screen: a server restart, a kick, a disconnect, or the sign closed by hand, none of which the other guards notice because the Rust window is still in front and the cursor still goes where it is sent. Each widget is fingerprinted as the job starts (the colour box on saturation and value only, since its hue follows the colour being painted) and recognised by structure, so a highlight or a tint does not count and a dark wall where a dark button was does not pass. The UI counts as gone when more of the widgets are missing than present, and only after two looks half a second apart. The job also refuses to start painting unless the hue bar is where it was calibrated, which catches a countdown that ran out before the sign was open. Open the sign again and resume to continue from the same stroke; the anti-AFK break closes the sign on purpose and is exempt, but if the sign has not reopened a few seconds after its E press the job pauses instead of painting into the game world.

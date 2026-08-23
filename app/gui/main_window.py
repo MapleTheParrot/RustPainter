@@ -1252,6 +1252,24 @@ class MainWindow(QMainWindow):
 
         touch_up = QGroupBox("Touch-up")
         touch_up_form = QFormLayout(touch_up)
+        self.confirm_strokes_check = QCheckBox("Check each color as it goes down")
+        self.confirm_strokes_check.setChecked(True)
+        self.confirm_strokes_check.setToolTip(
+            "After a color's strokes are painted, the sign is captured and the\n"
+            "cells that did not take the color are repainted while it is still\n"
+            "selected.  Rust drops presses outright when its frames run long -\n"
+            "a third of them on a 1024x512 sign - and this is what puts them\n"
+            "back.  The press hold is lengthened while colors keep missing."
+        )
+        self.confirm_rounds_spin = self._int_spin(1, 8, 4, "")
+        self.confirm_rounds_spin.setToolTip(
+            "How many times one color may be captured and its misses\n"
+            "repainted before the job moves on.  Each round costs under a\n"
+            "second plus the repaint; what is left goes to the touch-up pass."
+        )
+        touch_up_form.addRow("", self.confirm_strokes_check)
+        touch_up_form.addRow("Rounds per color", self.confirm_rounds_spin)
+        self.confirm_strokes_check.toggled.connect(self.confirm_rounds_spin.setEnabled)
         self.verify_passes_spin = self._int_spin(0, 5, 2, "")
         self.verify_passes_spin.setToolTip(
             "After the artwork is down, the sign is captured and compared with\n"
@@ -1260,10 +1278,12 @@ class MainWindow(QMainWindow):
             "checks the previous one, since the game can drop a touch-up\n"
             "stroke exactly as it dropped the original.  0 turns it off."
         )
-        touch_up_form.addRow("Passes", self.verify_passes_spin)
+        touch_up_form.addRow("Passes at the end", self.verify_passes_spin)
         touch_up_note = QLabel(
-            "Two passes catch a stroke the game dropped and the repaint of it. "
-            "On a plan finer than Rust's smallest brush, only holes are filled."
+            "Checking each color catches the presses the game never saw, while "
+            "the color is still selected.  The passes at the end read the whole "
+            "sign back once more; on a plan finer than Rust's smallest brush "
+            "they fill holes only."
         )
         touch_up_note.setWordWrap(True)
         touch_up_note.setObjectName("muted")
@@ -5010,6 +5030,11 @@ class MainWindow(QMainWindow):
         # cannot be known before the sign exists - so the estimate names the
         # extra pass instead of quietly overrunning it.
         verify_note = " + touch-up" if self.verify_passes_spin.value() > 0 else ""
+        if self.confirm_strokes_check.isChecked():
+            # Repaints cost whatever the game drops, which is not known
+            # before the sign exists; the learned per-stroke overhead
+            # carries the average, the note says the rest.
+            verify_note = " + checks" + verify_note
         self.analysis_time.value_label.setText(  # type: ignore[attr-defined]
             f"{self._format_duration(seconds)}{verify_note}"
         )
@@ -5067,19 +5092,23 @@ class MainWindow(QMainWindow):
         if getattr(getattr(painter, "input", None), "emits_real_input", True) is False:
             return  # a dry run skips the holds the estimate is about
         before = self._learned_timing.overhead_seconds
+        # Time spent checking colors and repainting the game's dropped
+        # presses is this sign's, not this machine's per-stroke cost.
+        checking = float(getattr(measured, "checking_seconds", 0.0) or 0.0)
         learned = self._learned_timing.observe(
             predicted_seconds=measured.predicted_seconds,
-            actual_seconds=measured.actual_seconds,
+            actual_seconds=max(0.0, measured.actual_seconds - checking),
             strokes=measured.strokes,
         )
         if not learned:
             return
         LOGGER.info(
-            "Run timing: predicted %.0fs, took %.0fs over %d strokes; per-stroke "
-            "overhead %.1f ms -> %.1f ms",
+            "Run timing: predicted %.0fs, took %.0fs over %d strokes (%.0fs of it "
+            "checking colors and repainting); per-stroke overhead %.1f ms -> %.1f ms",
             measured.predicted_seconds,
             measured.actual_seconds,
             measured.strokes,
+            checking,
             before * 1000.0,
             self._learned_timing.overhead_seconds * 1000.0,
         )
@@ -5273,6 +5302,8 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.apply_brush_check,
             self.verify_passes_spin,
+            self.confirm_strokes_check,
+            self.confirm_rounds_spin,
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,
@@ -5489,6 +5520,11 @@ class MainWindow(QMainWindow):
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
             self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
+            self.confirm_strokes_check.setChecked(
+                bool(painting.get("confirm_strokes", True))
+            )
+            self.confirm_rounds_spin.setValue(int(painting.get("confirm_max_rounds", 4)))
+            self.confirm_rounds_spin.setEnabled(self.confirm_strokes_check.isChecked())
             timelapse = settings.get("timelapse", {})
             self.timelapse_check.setChecked(bool(timelapse.get("enabled", False)))
             self.timelapse_interval_spin.setValue(
@@ -5628,6 +5664,8 @@ class MainWindow(QMainWindow):
             "brush_direction": "low_to_high",
             "stroke_merge_mode": self._merge_mode(),
             "verify_passes": int(self.verify_passes_spin.value()),
+            "confirm_strokes": self.confirm_strokes_check.isChecked(),
+            "confirm_max_rounds": int(self.confirm_rounds_spin.value()),
         }
         current["timelapse"] = {
             **current.get("timelapse", {}),
@@ -6948,6 +6986,8 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.verify_passes_spin,
+            self.confirm_strokes_check,
+            self.confirm_rounds_spin,
             self.focus_guard_check,
             self.expected_window_edit,
             self.expected_process_edit,
@@ -6994,6 +7034,8 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.apply_brush_check,
             self.verify_passes_spin,
+            self.confirm_strokes_check,
+            self.confirm_rounds_spin,
             self.timelapse_check,
             self.timelapse_interval_spin,
             self.timelapse_final_check,
@@ -7831,6 +7873,11 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 LOGGER.exception("Could not record the brush in the run report")
+        if painter is not None:
+            try:
+                report.record_confirmation(painter.confirmation_summary)
+            except Exception:
+                LOGGER.exception("Could not record the color checks in the run report")
 
         def wrap_up() -> None:
             if canvas is not None:

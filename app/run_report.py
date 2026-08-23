@@ -197,6 +197,25 @@ class RunReport:
         except Exception:
             LOGGER.exception("Could not record the measured brush")
 
+    def record_confirmation(self, summary: Any) -> None:
+        """Record what checking each color as it went down found and did.
+
+        The numbers that say whether the game was dropping presses on this
+        sign - how many cells missed on first reading, how many repaints it
+        took, how far the press hold had to be raised - which is the first
+        question about a sign that came out with holes.
+        """
+
+        try:
+            if summary is None:
+                self._document["confirmation"] = None
+            elif hasattr(summary, "to_dict"):
+                self._document["confirmation"] = summary.to_dict()
+            else:
+                self._document["confirmation"] = json.loads(json.dumps(summary, default=str))
+        except Exception:
+            LOGGER.exception("Could not record the color checks")
+
     def record_screen(self) -> None:
         """Capture the whole desktop once, as the artwork starts.
 

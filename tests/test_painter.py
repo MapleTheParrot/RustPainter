@@ -43,6 +43,9 @@ def _settings(**overrides: object) -> PainterSettings:
         "stroke_interpolation_step_pixels": 4.0,
         "progress_callback_interval_seconds": 0.0,
         "safety_poll_interval_seconds": 0.002,
+        # Checking each color as it goes down captures the screen; the tests
+        # that exercise it turn it on against a simulated sign.
+        "confirm_strokes": False,
     }
     values.update(overrides)
     return PainterSettings(**values)  # type: ignore[arg-type]
@@ -1014,6 +1017,7 @@ def _impatient(painter: Painter) -> Painter:
     """
 
     painter._CAPTURE_SETTLE_SECONDS = 0.0  # type: ignore[misc]
+    painter._CONFIRM_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._CLEAR_SETTLE_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_HOLD_SECONDS = 0.0  # type: ignore[misc]
     painter._KEY_GAP_SECONDS = 0.0  # type: ignore[misc]
@@ -2459,3 +2463,182 @@ def test_seconds_until_anti_afk_counts_down_from_the_job_start_and_the_last_brea
     painter.start(_dot_plan(3), profile, _settings(anti_afk_enabled=False))
     assert painter.seconds_until_anti_afk() is None
     assert painter.wait(_t(5.0))
+
+
+# ------------------------------------------------ checking colors as they land
+
+
+_BARE = (96, 96, 96)
+
+
+def _forgetful_sign(
+    controller: MockInputController,
+    canvas: ScreenRect,
+    hue_bar: ScreenRect,
+    plan: PaintPlan,
+    *,
+    drop_every: int,
+):
+    """A fake sign that never registers every ``drop_every``-th press.
+
+    The game, on a large sign, samples its input so slowly that a press can
+    fall entirely between two samples and paint nothing; this sign does the
+    same on a schedule.  A press that does register paints the cell under
+    it and every cell the cursor crosses before the release.  Replaying the
+    recorded events on each capture keeps it honest about what the painter
+    actually did, repaints included; the color a press paints is the plan's
+    next color each time the hue bar is clicked.  Returns the capture and a
+    function giving the cells currently painted.
+    """
+
+    cell_w = canvas.width / plan.width
+    cell_h = canvas.height / plan.height
+    colors = [group.color for group in plan.color_groups]
+
+    def cell_of(position: tuple[int, int]) -> tuple[int, int] | None:
+        if not canvas.contains(*position):
+            return None
+        return (
+            int((position[0] - canvas.left) // cell_w),
+            int((position[1] - canvas.top) // cell_h),
+        )
+
+    def painted() -> dict[tuple[int, int], tuple[int, int, int]]:
+        cells: dict[tuple[int, int], tuple[int, int, int]] = {}
+        position = (0, 0)
+        presses = 0
+        pressed_on_canvas = False
+        registered = False
+        color_index = -1
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+                if pressed_on_canvas and registered:
+                    cell = cell_of(position)
+                    if cell is not None:
+                        cells[cell] = colors[color_index]
+            elif event.kind == "mouse_down":
+                cell = cell_of(position)
+                if cell is None:
+                    # A picker click; the hue bar is visited once per color.
+                    pressed_on_canvas = False
+                    if hue_bar.contains(*position):
+                        color_index = min(color_index + 1, len(colors) - 1)
+                    continue
+                presses += 1
+                pressed_on_canvas = True
+                registered = presses % drop_every != 0
+                if registered:
+                    cells[cell] = colors[color_index]
+            elif event.kind == "mouse_up":
+                pressed_on_canvas = False
+        return cells
+
+    def capture(rect) -> Image.Image:
+        if (rect.left, rect.top) != (canvas.left, canvas.top):
+            return Image.new("RGB", (rect.width, rect.height), (21, 21, 12))
+        image = Image.new("RGB", (rect.width, rect.height), _BARE)
+        draw = ImageDraw.Draw(image)
+        for (x, y), color in painted().items():
+            draw.rectangle(
+                (
+                    round(x * cell_w),
+                    round(y * cell_h),
+                    round((x + 1) * cell_w) - 1,
+                    round((y + 1) * cell_h) - 1,
+                ),
+                fill=color,
+            )
+        return image
+
+    return capture, painted
+
+
+def _confirmation_plan() -> PaintPlan:
+    red, blue = (220, 40, 20), (20, 60, 220)
+    # Two long rows of one color, then forty dabs of another: the dabs are
+    # what the game drops most, and what a lost press costs a whole cell.
+    return PaintPlan(
+        20,
+        4,
+        (
+            ColorGroup(red, (Stroke(0, 0, 19, 0), Stroke(0, 1, 19, 1)), 40),
+            ColorGroup(
+                blue, tuple(Stroke(x, y, x, y) for y in (2, 3) for x in range(20)), 40
+            ),
+        ),
+    )
+
+
+def _run_forgetful_sign(*, confirm: bool, drop_every: int = 3):
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile(canvas_width=400)  # 400x80 canvas: 20x4 cells of 20 px
+    canvas, hue_bar = profile.canvas, profile.hue_bar
+    plan = _confirmation_plan()
+    capture, painted = _forgetful_sign(
+        controller, canvas, hue_bar, plan, drop_every=drop_every
+    )
+    painter = _impatient(Painter(controller, screen_capture=capture))
+    painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
+    settings = _settings(
+        confirm_strokes=confirm,
+        confirm_max_rounds=4,
+        verify_passes=0,
+        require_foreground=False,
+        pause_on_mouse_move=False,
+    )
+    assert painter.start(plan, profile, settings)
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    return painter, painted, plan
+
+
+def test_a_color_that_came_out_with_misses_is_repainted_before_the_next() -> None:
+    painter, painted, plan = _run_forgetful_sign(confirm=True)
+    cells = painted()
+    expected = {
+        (x, y): group.color
+        for group in plan.color_groups
+        for stroke in group.strokes
+        for y in (stroke.start_y,)
+        for x in range(stroke.start_x, stroke.end_x + 1)
+    }
+    missing = {cell for cell in expected if cells.get(cell) != expected[cell]}
+    assert not missing, sorted(missing)
+    summary = painter.confirmation_summary
+    assert summary.colors == 2
+    assert summary.missed > 0
+    assert summary.repainted_strokes > 0
+    assert summary.unrepaired == 0
+    assert summary.skipped_reason == ""
+
+
+def test_without_the_check_the_dropped_presses_stay_holes() -> None:
+    painter, painted, plan = _run_forgetful_sign(confirm=False)
+    cells = painted()
+    planned = sum(len(group.strokes) for group in plan.color_groups)
+    assert len(cells) < 80  # the two rows and the dabs do not all land
+    assert painter.confirmation_summary.skipped_reason == "turned off"
+    assert painter.confirmation_summary.colors == 0
+    # Exactly the planned presses went down: nothing was repainted.
+    presses = sum(1 for event in painter.input.events if event.kind == "mouse_down")
+    assert presses >= planned
+
+
+def test_the_press_hold_is_raised_while_colors_keep_missing() -> None:
+    """A third of every color's presses lost is the game running slow; the
+    hold grows a step per such color, up to its cap, and is reported."""
+
+    from app.paint_timing import (
+        CONFIRM_MIN_JUDGED_CELLS,
+        PRESS_HOLD_BOOST_STEP_SECONDS,
+    )
+
+    painter, _painted, plan = _run_forgetful_sign(confirm=True)
+    summary = painter.confirmation_summary
+    # The dab group alone has 40 judged cells - exactly the minimum a
+    # color needs before its miss rate is believed.
+    assert 40 >= CONFIRM_MIN_JUDGED_CELLS
+    assert summary.hold_boost_seconds >= PRESS_HOLD_BOOST_STEP_SECONDS
+    assert painter._press_hold_seconds(painter._job.settings) >= summary.hold_boost_seconds

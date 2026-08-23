@@ -149,6 +149,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # game exactly as the originals were, and a second capture is what
         # catches that.
         "verify_passes": 2,
+        # Check each color as it goes down: capture the sign after its
+        # strokes, repaint the cells that did not take, and capture again -
+        # up to this many rounds per color.  The game drops presses outright
+        # when its frames run long (a third of them on a 1024x512 sign), and
+        # this is what puts them back while the color is still selected.
+        "confirm_strokes": True,
+        "confirm_max_rounds": 4,
     },
     "timelapse": {
         # Capture the calibrated canvas region while painting, one PNG frame
@@ -485,6 +492,15 @@ def _validate(settings: Mapping[str, Any]) -> None:
         or not 0 <= verify_passes <= 5
     ):
         raise SettingsError("painting.verify_passes must be an integer from 0 to 5")
+    if not isinstance(painting.get("confirm_strokes", True), bool):
+        raise SettingsError("painting.confirm_strokes must be true or false")
+    confirm_rounds = painting.get("confirm_max_rounds", 4)
+    if (
+        isinstance(confirm_rounds, bool)
+        or not isinstance(confirm_rounds, int)
+        or not 1 <= confirm_rounds <= 8
+    ):
+        raise SettingsError("painting.confirm_max_rounds must be an integer from 1 to 8")
 
     assert isinstance(timelapse, Mapping)
     for key in ("enabled", "capture_final_frame"):

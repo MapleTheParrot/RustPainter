@@ -26,11 +26,12 @@ Two things came out of reading a real five-hour painting back:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
-from .models import ColorGroup, PaintPlan, RGBColor
+from .models import ColorGroup, PaintPlan, RGBColor, Stroke
 from .paint_optimizer import _srgb_to_lab
 from .paint_plan import merge_runs_across_gaps
 
@@ -82,6 +83,11 @@ BARE_CAPTURE_SPREAD_PERCENTILE = 90.0
 # and only holes are repaired.
 RECOLOR_MIN_CELL_PIXELS = 2.0
 
+# From this many screen pixels per cell a cell is read as the median of the
+# 3x3 pixels around its centre; under it, as the centre pixel alone, which
+# on a bilinearly drawn sign carries a share of the neighbouring cells.
+MEDIAN_SAMPLING_MIN_CELL_PIXELS = 3.0
+
 # Painting goes wrong in two shapes.  A stroke the game dropped is a hole.  A
 # picker click that missed paints *every* cell of that color alike, so a
 # color is either almost entirely right or almost entirely wrong: a color
@@ -120,18 +126,24 @@ class Mismatch:
         return int(self.cells.sum())
 
 
-def plan_expectations(plan: PaintPlan) -> tuple[np.ndarray, np.ndarray]:
-    """Replay the plan's coverage: the color index each cell ends up with.
+def plan_layers(plan: PaintPlan) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Replay the plan's coverage: what each cell ends up as, and what was under it.
 
-    Returns ``(indices, palette)`` where ``indices`` holds a row into
-    ``palette`` per cell and ``-1`` where no stroke reaches.  Groups are
-    replayed in painting order, so a cell crossed early and repainted late
-    reports its final color - the same invariant the planner builds on.
+    Returns ``(indices, underpaint, palette)``.  ``indices`` holds a row into
+    ``palette`` per cell and ``-1`` where no stroke reaches; ``underpaint``
+    holds, per cell, the color index the cell showed just before the stroke
+    that gave it its final color - ``-1`` for bare sign.  Groups are replayed
+    in painting order, so a cell crossed early and repainted late reports its
+    final color - the same invariant the planner builds on - and the
+    underpaint is what a dropped final stroke leaves showing: on a plan that
+    merges runs across later colors that is usually the first, darkest color
+    rather than the sign itself.
     """
 
     palette: list[RGBColor] = []
     palette_index: dict[RGBColor, int] = {}
     indices = np.full((plan.height, plan.width), -1, dtype=np.int32)
+    underpaint = np.full((plan.height, plan.width), -1, dtype=np.int32)
     for group in plan.color_groups:
         index = palette_index.get(group.color)
         if index is None:
@@ -144,11 +156,29 @@ def plan_expectations(plan: PaintPlan) -> tuple[np.ndarray, np.ndarray]:
             x1 = max(stroke.start_x, stroke.end_x)
             y0 = min(stroke.start_y, stroke.end_y)
             y1 = max(stroke.start_y, stroke.end_y)
-            indices[
-                max(0, y0 - radius) : min(plan.height, y1 + radius + 1),
-                max(0, x0) : min(plan.width, x1 + 1),
-            ] = index
-    return indices, np.array(palette, dtype=np.uint8).reshape(-1, 3)
+            rows = slice(max(0, y0 - radius), min(plan.height, y1 + radius + 1))
+            columns = slice(max(0, x0), min(plan.width, x1 + 1))
+            # A stroke crossing a cell already in its own color leaves the
+            # underpaint as it was: the cell's last real change is still the
+            # earlier stroke, and that is the one a capture would miss.
+            window = indices[rows, columns]
+            changed = window != index
+            underpaint[rows, columns] = np.where(
+                changed, window, underpaint[rows, columns]
+            )
+            window[...] = index
+    return indices, underpaint, np.array(palette, dtype=np.uint8).reshape(-1, 3)
+
+
+def plan_expectations(plan: PaintPlan) -> tuple[np.ndarray, np.ndarray]:
+    """Replay the plan's coverage: the color index each cell ends up with.
+
+    Returns ``(indices, palette)`` as :func:`plan_layers` does, without the
+    underpaint.
+    """
+
+    indices, _underpaint, palette = plan_layers(plan)
+    return indices, palette
 
 
 def sample_cell_colors(
@@ -193,7 +223,10 @@ def sample_cell_colors(
             1,
             max(1, width - 2),
         )
-    if min(height / max(1, logical_height), width / max(1, logical_width)) < 3.0:
+    if (
+        min(height / max(1, logical_height), width / max(1, logical_width))
+        < MEDIAN_SAMPLING_MIN_CELL_PIXELS
+    ):
         return pixels[centers_y][:, centers_x, :3].copy()
     neighborhood = np.stack(
         [
@@ -380,6 +413,7 @@ def classify_cells(
     palette: np.ndarray,
     *,
     bare_sampled: np.ndarray | None = None,
+    underpaint: np.ndarray | None = None,
     recolor: bool = True,
     margin: float = CLASSIFICATION_MARGIN_DELTA_E,
 ) -> Mismatch:
@@ -391,7 +425,12 @@ def classify_cells(
     the nearest other rendering, and the bare sign:
 
     - *blank*: decisively nearer the bare sign than its own color - a stroke
-      the game never registered.  Always repainted.
+      the game never registered.  Always repainted.  When ``underpaint``
+      (from :func:`plan_layers`) is given, a cell decisively nearer the color
+      that was under its final stroke counts as blank too: on a plan that
+      merges runs across later colors, a dropped stroke leaves the earlier
+      color showing rather than the sign, and that is exactly as much a
+      hole.
     - *wrong color*: decisively nearer another color's rendering - a picker
       click that missed.  Repainted only when ``recolor`` is set, because
       recoloring single cells with a brush or a capture too coarse to
@@ -455,6 +494,23 @@ def classify_cells(
         )
     else:
         blank = np.zeros(indices.shape, dtype=np.bool_)
+    if underpaint is not None:
+        # The color under the final stroke, as that color renders here; a
+        # cell nearer it than its own color lost its last stroke.  Cells
+        # whose underpaint is the bare sign are the blank case above.
+        under_index = np.asarray(underpaint)
+        buried = covered & (under_index >= 0) & (under_index != indices)
+        if buried.any():
+            to_under = np.full(indices.shape, np.inf)
+            under_lab = observed[np.where(buried, under_index, 0)]
+            to_under[buried] = np.sqrt(
+                ((sampled_lab[buried] - under_lab[buried]) ** 2).sum(axis=1)
+            )
+            blank = blank | (
+                buried
+                & (own - to_under > margin)
+                & (to_under - nearest_other < margin)
+            )
 
     unexplained_threshold = np.maximum(UNEXPLAINED_DELTA_E, SPREAD_MULTIPLIER * spread)[
         own_index
@@ -555,6 +611,278 @@ def _own_and_nearest_other(
     return own, nearest_other
 
 
+# A group's cells are judged only where the capture could tell a hit from a
+# miss: the pixel a hit would produce and the pixel a miss would produce must
+# differ by at least this much (sRGB distance, roughly eight units of Lab).
+# Below it the stroke's absence is as invisible to the eye as to the capture.
+MIN_CONFIRM_DISTANCE = 24.0
+
+# Repaint strokes may cross this many cells that are not misses, so a row of
+# scattered holes goes down in a few drags instead of a dab apiece.  Never a
+# cell of an earlier color or of bare sign - those would be smeared.
+REPAINT_MERGE_GAP = 2
+
+# The expected rendering of a color is taken from the cells that visibly
+# changed when it went down - at least this many - in preference to any
+# nominal or fitted value: a dark color over a dark underpaint is decided on
+# a few units' difference, where only the sign's own rendering will do, and
+# a fit made from colors that were themselves dropped would say anything.
+CONFIRM_REFINE_MIN_CELLS = 12
+
+
+def fit_sign_rendering(
+    sampled: np.ndarray,
+    indices: np.ndarray,
+    palette: np.ndarray,
+    *,
+    min_cells: int = OBSERVED_COLOR_MIN_CELLS,
+) -> np.ndarray | None:
+    """Fit how the sign renders a nominal color: the inverse of the lighting fit.
+
+    Same data and the same robustness as :func:`fit_capture_lighting` - one
+    point per color, outliers dropped and refitted - with the roles swapped,
+    so the result maps a plan color to the RGB a capture of this sign shows
+    for it.  ``None`` with fewer than four colors to fit on.
+    """
+
+    points: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    flat = np.asarray(sampled, dtype=np.float64).reshape(-1, 3)
+    flat_indices = np.asarray(indices).reshape(-1)
+    for index in range(len(palette)):
+        cells = flat[flat_indices == index]
+        if len(cells) >= min_cells:
+            points.append(np.asarray(palette[index], dtype=np.float64))
+            targets.append(np.median(cells, axis=0))
+    if len(points) < 4:
+        return None
+    nominal = np.array(points)
+    captured = np.array(targets)
+    full = len(points) >= 8
+
+    def fit(rows: np.ndarray) -> np.ndarray:
+        coefficients = np.zeros((4, 3))
+        if full:
+            design = np.hstack([nominal[rows], np.ones((int(rows.sum()), 1))])
+            coefficients, *_ = np.linalg.lstsq(design, captured[rows], rcond=None)
+            return coefficients
+        for channel in range(3):
+            design = np.column_stack(
+                [nominal[rows, channel], np.ones(int(rows.sum()))]
+            )
+            gain_offset, *_ = np.linalg.lstsq(
+                design, captured[rows, channel], rcond=None
+            )
+            coefficients[channel, channel] = gain_offset[0]
+            coefficients[3, channel] = gain_offset[1]
+        return coefficients
+
+    everything = np.ones(len(points), dtype=np.bool_)
+    coefficients = fit(everything)
+    design = np.hstack([nominal, np.ones((len(points), 1))])
+    residuals = np.linalg.norm(design @ coefficients - captured, axis=1)
+    typical = float(np.median(residuals))
+    keep = residuals <= max(3.0 * typical, CLASSIFICATION_MARGIN_DELTA_E)
+    if keep.sum() >= (8 if full else 4) and keep.sum() < len(points):
+        coefficients = fit(keep)
+    return coefficients
+
+
+@dataclass(frozen=True, slots=True)
+class CellBlend:
+    """How each sampled pixel mixes its cell with the neighbours it leans toward.
+
+    A sign drawn at under two screen pixels per texel is bilinearly filtered,
+    so the pixel nearest a texel's centre still carries some of the next
+    texel along each axis.  ``fraction_x[column]`` is that neighbour's share
+    along x (0 at the texel centre, up to a half at its edge) and
+    ``step_x[column]`` which side it lies on (``+1`` or ``-1``); likewise
+    per row for y.  A capture read at three pixels per cell or more through
+    a 3x3 median carries no such mix and uses no blend.
+    """
+
+    fraction_x: np.ndarray
+    step_x: np.ndarray
+    fraction_y: np.ndarray
+    step_y: np.ndarray
+
+    @classmethod
+    def from_centers(
+        cls,
+        centers_x: np.ndarray,
+        centers_y: np.ndarray,
+        pitch_x: float,
+        pitch_y: float,
+    ) -> "CellBlend":
+        """The blend for cells centred at these capture coordinates."""
+
+        def axis(centers: np.ndarray, pitch: float) -> tuple[np.ndarray, np.ndarray]:
+            centers = np.asarray(centers, dtype=np.float64)
+            # The sampled pixel is the one containing the centre; its own
+            # centre sits half a pixel past its integer coordinate.
+            offset = np.floor(centers) + 0.5 - centers
+            fraction = np.clip(np.abs(offset) / max(pitch, 1e-9), 0.0, 0.5)
+            step = np.where(offset >= 0.0, 1, -1).astype(np.int64)
+            return fraction, step
+
+        fraction_x, step_x = axis(centers_x, pitch_x)
+        fraction_y, step_y = axis(centers_y, pitch_y)
+        return cls(fraction_x, step_x, fraction_y, step_y)
+
+    def neighbour_share(self, samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per cell: the weight of its own texel, and the neighbours' mixed-in color."""
+
+        height, width = samples.shape[:2]
+        fx = self.fraction_x.reshape(1, width, 1)
+        fy = self.fraction_y.reshape(height, 1, 1)
+        columns = np.clip(np.arange(width) + self.step_x, 0, width - 1)
+        rows = np.clip(np.arange(height) + self.step_y, 0, height - 1)
+        along_x = samples[:, columns]
+        along_y = samples[rows, :]
+        diagonal = samples[rows][:, columns]
+        own = (1.0 - fx) * (1.0 - fy)
+        mixed = (
+            fx * (1.0 - fy) * along_x + (1.0 - fx) * fy * along_y + fx * fy * diagonal
+        )
+        return own, mixed
+
+
+def confirm_cells(
+    before: np.ndarray,
+    after: np.ndarray,
+    expected: np.ndarray,
+    judge: np.ndarray,
+    *,
+    blend: CellBlend | None = None,
+    stable: np.ndarray | None = None,
+    min_distance: float = MIN_CONFIRM_DISTANCE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Which cells a group of strokes was meant to paint actually took its color.
+
+    ``before`` and ``after`` are per-cell RGB readings of the sign from just
+    before the group went down and from after it (:func:`sample_cell_colors`
+    of two captures); ``expected`` is the RGB the group's color renders as
+    on this sign (one triple, or one per cell); ``judge`` marks the cells the
+    group was to leave in its color.
+
+    The decision is differential and needs no palette: for each cell the
+    pixel a hit would give and the pixel a miss would give are both
+    predicted, and the reading is given to whichever it is nearer.  A miss
+    leaves the cell as it was, shifted only by what its neighbours did
+    meanwhile; a hit replaces the cell's own share of the pixel with the
+    expected color.  With a ``blend`` those shares follow the bilinear mix
+    of a finely drawn sign, so a single lost texel among painted neighbours
+    is still told from a painted one, which a plain "did it move toward the
+    color" test cannot do once the neighbours carry half the pixel.
+
+    ``expected`` only seeds the decision.  The cells that visibly changed
+    when the color went down say what it really renders as on this sign,
+    and once there are enough of them the decision is remade on that:
+    a dark color over a dark underpaint turns on a few units, and a fit or
+    a nominal value that is a few units off would call its hits misses.
+    ``stable`` marks cells nothing should have touched; a shift common to
+    them - the capture's brightness moving between the two readings - is
+    taken off ``after`` first.
+
+    Returns ``(hit, judged)``: ``judged`` is ``judge`` less the cells whose
+    two predictions sit within ``min_distance`` of each other - a stroke
+    that would not show is not worth chasing - and ``hit`` is true for the
+    judged cells that took the color.
+    """
+
+    before = np.asarray(before, dtype=np.float64)
+    after = np.asarray(after, dtype=np.float64)
+    expected = np.broadcast_to(np.asarray(expected, dtype=np.float64), after.shape)
+    judge = np.asarray(judge, dtype=np.bool_)
+    if stable is not None:
+        untouched = np.asarray(stable, dtype=np.bool_) & ~judge
+        if int(untouched.sum()) >= CONFIRM_REFINE_MIN_CELLS:
+            shift = np.median((after - before)[untouched], axis=0)
+            if np.linalg.norm(shift) >= 0.25 * min_distance:
+                after = after - shift
+    if blend is None:
+        own = np.ones(after.shape[:2] + (1,))
+        mixed_after = np.zeros_like(after)
+        predicted_miss = before
+    else:
+        own, mixed_after = blend.neighbour_share(after)
+        _own, mixed_before = blend.neighbour_share(before)
+        predicted_miss = before + (mixed_after - mixed_before)
+
+    def decide(
+        expected_rgb: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        predicted_hit = own * expected_rgb + mixed_after
+        separation = np.linalg.norm(predicted_hit - predicted_miss, axis=2)
+        judged = judge & (separation >= min_distance)
+        to_hit = np.linalg.norm(after - predicted_hit, axis=2)
+        to_miss = np.linalg.norm(after - predicted_miss, axis=2)
+        return judged & (to_hit <= to_miss), judged, separation, to_miss
+
+    hit, judged, separation, to_miss = decide(expected)
+    # The sign's own rendering of the color is on the cells that plainly
+    # changed - moved well clear of the miss prediction, which already
+    # allows for whatever their neighbours did, and clear of the capture's
+    # grain.  A color the capture cannot see changes nothing, and the
+    # reading off those cells is then the grain around the underpaint,
+    # which the separation floor below leaves unjudged, as it should.
+    moved = judge & (to_miss >= np.maximum(0.35 * separation, 0.5 * min_distance))
+    if int(moved.sum()) >= CONFIRM_REFINE_MIN_CELLS:
+        own_color = (after - mixed_after) / np.maximum(own, 1e-6)
+        observed = np.median(own_color[moved], axis=0)
+        hit, judged, _separation, _to_miss = decide(
+            np.broadcast_to(observed, after.shape)
+        )
+    return hit, judged
+
+
+def stroke_coverage(stroke: Stroke, radius: int, shape: tuple[int, int]) -> tuple[slice, slice]:
+    """The rows and columns a stroke's band covers, clipped to the plan."""
+
+    height, width = shape
+    top = min(stroke.start_y, stroke.end_y) - radius
+    bottom = max(stroke.start_y, stroke.end_y) + radius + 1
+    left = min(stroke.start_x, stroke.end_x)
+    right = max(stroke.start_x, stroke.end_x) + 1
+    return slice(max(0, top), min(height, bottom)), slice(max(0, left), min(width, right))
+
+
+def repaint_runs(
+    missed: np.ndarray,
+    indices: np.ndarray,
+    color_index: int,
+    *,
+    strokes: Sequence[Stroke] = (),
+    radius: int = 0,
+    max_gap: int = REPAINT_MERGE_GAP,
+) -> list[Stroke]:
+    """Strokes that put one color back on the cells that missed it.
+
+    With a single-cell brush, runs along the rows: they may bridge a few
+    cells the color already holds or that a later color will repaint anyway,
+    never a cell of an earlier color or of bare sign - those are the
+    planner's own barriers, and crossing them would trade a hole for a
+    smear.  With a band ``radius`` cells beyond its row, the original
+    ``strokes`` whose band covers a missed cell are painted again whole: the
+    planner proved those rows safe for the band, and a run laid anywhere
+    else would reach rows it did not.
+    """
+
+    must = np.asarray(missed, dtype=np.bool_) & (indices == color_index)
+    if not must.any():
+        return []
+    if radius > 0:
+        return [
+            stroke
+            for stroke in strokes
+            if must[stroke_coverage(stroke, radius, must.shape)].any()
+        ]
+    barrier_cumulative = None
+    if max_gap > 0:
+        barrier_cumulative = np.cumsum(indices < color_index, axis=1)
+    return merge_runs_across_gaps(must, barrier_cumulative, max_gap)
+
+
 def touch_up_plan(
     mismatch: np.ndarray, indices: np.ndarray, palette: np.ndarray
 ) -> PaintPlan:
@@ -585,6 +913,16 @@ def touch_up_plan(
 
 __all__ = [
     "BARE_CAPTURE_SPREAD_DELTA_E",
+    "CONFIRM_REFINE_MIN_CELLS",
+    "CellBlend",
+    "MEDIAN_SAMPLING_MIN_CELL_PIXELS",
+    "MIN_CONFIRM_DISTANCE",
+    "REPAINT_MERGE_GAP",
+    "confirm_cells",
+    "fit_sign_rendering",
+    "plan_layers",
+    "repaint_runs",
+    "stroke_coverage",
     "BARE_CAPTURE_SPREAD_PERCENTILE",
     "BARE_REFERENCE_MIN_CELLS",
     "CLASSIFICATION_MARGIN_DELTA_E",

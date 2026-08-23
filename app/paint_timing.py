@@ -150,6 +150,29 @@ def stroke_pace(
         step = min(step, max_step_texels * pitch)
     return StrokePace(step_pixels=step, move_seconds=max(0.0, distance_pixels) / speed)
 
+# The frame floor above assumes the 15 FPS the paint UI was measured at on a
+# 320x240 sign.  On a 1024x512 sign the same UI was found dropping a third of
+# all presses: its frames stretch past a hundred milliseconds while it is
+# being painted on, and a press shorter than a frame is sampled as nothing.
+# The painter therefore checks each color as it goes down (see
+# ``Painter._confirm_group``) and, when a color came out with misses, holds
+# every following press longer - in these steps, up to this much over the
+# floor - and relaxes again once colors land clean.
+PRESS_HOLD_BOOST_MAX_SECONDS = 0.18
+PRESS_HOLD_BOOST_STEP_SECONDS = 0.02
+PRESS_HOLD_RELAX_STEP_SECONDS = 0.01
+# A color is "missing" when more than this share of its judged cells did
+# not take, and "clean" under this share; the hold relaxes after this many
+# clean colors in a row.  Fewer judged cells than the minimum say nothing.
+CONFIRM_RAISE_MISS_RATE = 0.10
+CONFIRM_RELAX_MISS_RATE = 0.01
+CONFIRM_RELAX_CLEAN_GROUPS = 3
+CONFIRM_MIN_JUDGED_CELLS = 40
+# After a color's last stroke, before the sign is captured to check it: the
+# game has to present the frame that carries the stroke, which at its
+# slowest observed can be a quarter of a second away.
+CONFIRM_SETTLE_SECONDS = 0.45
+
 # Keystrokes into Rust's Size field are held across a frame boundary and
 # separated from the next, for the same reason.
 KEY_HOLD_SECONDS = 0.03
@@ -534,11 +557,19 @@ class LearnedTiming:
 
 @dataclass(frozen=True, slots=True)
 class PhaseTiming:
-    """How a painting phase's clock compared with its prediction."""
+    """How a painting phase's clock compared with its prediction.
+
+    ``checking_seconds`` is the part of the clock spent checking colors as
+    they went down and repainting what missed.  The time left is predicted
+    from the whole clock, since the job will go on spending it; the
+    per-stroke overhead is learned without it, since it is the game's
+    dropped presses on this sign and not this machine's cost of a stroke.
+    """
 
     predicted_seconds: float
     actual_seconds: float
     strokes: int
+    checking_seconds: float = 0.0
 
 
 __all__ = [

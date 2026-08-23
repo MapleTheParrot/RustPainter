@@ -33,6 +33,11 @@ from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect
 from .paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
+    CONFIRM_MIN_JUDGED_CELLS,
+    CONFIRM_RAISE_MISS_RATE,
+    CONFIRM_RELAX_CLEAN_GROUPS,
+    CONFIRM_RELAX_MISS_RATE,
+    CONFIRM_SETTLE_SECONDS,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
     KEY_GAP_SECONDS,
     KEY_HOLD_SECONDS,
@@ -40,6 +45,9 @@ from .paint_timing import (
     LONG_DRAG_MAX_TEXELS_PER_SECOND,
     MIN_PRESS_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
+    PRESS_HOLD_BOOST_MAX_SECONDS,
+    PRESS_HOLD_BOOST_STEP_SECONDS,
+    PRESS_HOLD_RELAX_STEP_SECONDS,
     SETTLE_FLOOR_SECONDS,
     STROKE_GAP_FLOOR_SECONDS,
     PhaseTiming,
@@ -211,6 +219,14 @@ class PainterSettings:
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
+    # Check each color as it goes down: once its strokes are painted the
+    # sign is captured, the cells that did not take the color are repainted,
+    # and the capture is repeated - up to this many rounds per color.  The
+    # press hold is lengthened while colors keep coming out with misses.
+    # This is what catches the presses the game drops outright, which on a
+    # large sign were a third of them.
+    confirm_strokes: bool = True
+    confirm_max_rounds: int = 4
     brush_direction: str = "low_to_high"
     delay_after_brush_seconds: float = 0.07
     countdown_seconds: float = 3.0
@@ -247,6 +263,8 @@ class PainterSettings:
         "stroke_interpolation_step_pixels",
         "delay_after_brush_seconds",
         "verify_passes",
+        "confirm_strokes",
+        "confirm_max_rounds",
         "require_foreground",
         "expected_window_title_contains",
         "expected_process_name",
@@ -299,6 +317,10 @@ class PainterSettings:
             self.verify_passes, int
         ) or not 0 <= self.verify_passes <= 5:
             raise ValueError("verify_passes must be an integer between 0 and 5")
+        if isinstance(self.confirm_max_rounds, bool) or not isinstance(
+            self.confirm_max_rounds, int
+        ) or not 1 <= self.confirm_max_rounds <= 8:
+            raise ValueError("confirm_max_rounds must be an integer between 1 and 8")
         if self.brush_direction not in {"low_to_high", "high_to_low"}:
             raise ValueError("brush_direction must be low_to_high or high_to_low")
         if not math.isfinite(self.brush_size) or not 0.0 <= self.brush_size <= 1.0:
@@ -353,6 +375,8 @@ class PainterSettings:
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
+            confirm_strokes=bool(pick(painting, "confirm_strokes", True)),
+            confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
@@ -416,6 +440,61 @@ class PaintProgress:
 
 ProgressCallback = Callable[[PaintProgress], None]
 StateCallback = Callable[[PainterState, str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationSummary:
+    """What checking each color as it went down found and did, for the run report.
+
+    ``judged`` cells are those a capture could decide; ``missed`` is how
+    many of them had not taken their color when first checked, ``repainted``
+    how many repaint strokes went down for them, ``unrepaired`` how many
+    were still missing when the rounds ran out.  ``hold_boost_seconds`` is
+    how far above the frame floor the press hold ended up.
+    """
+
+    colors: int = 0
+    judged: int = 0
+    missed: int = 0
+    repainted_strokes: int = 0
+    unrepaired: int = 0
+    rounds: int = 0
+    hold_boost_seconds: float = 0.0
+    skipped_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "colorsChecked": self.colors,
+            "cellsJudged": self.judged,
+            "cellsMissedFirstCheck": self.missed,
+            "repaintStrokes": self.repainted_strokes,
+            "cellsUnrepaired": self.unrepaired,
+            "repaintRounds": self.rounds,
+            "pressHoldBoostSeconds": round(self.hold_boost_seconds, 3),
+            "skippedReason": self.skipped_reason,
+        }
+
+
+@dataclass(slots=True)
+class _Confirmation:
+    """The per-job state of checking colors as they go down."""
+
+    canvas: ScreenRect
+    park: tuple[int, int]
+    indices: Any  # final color index per cell
+    palette: Any
+    centers: tuple[Any, Any] | None
+    blend: Any
+    # Per-cell RGB reading of the sign as it stood before the color being
+    # painted now; replaced by the latest capture after each color.
+    reference: Any
+    colors: int = 0
+    judged: int = 0
+    missed: int = 0
+    repainted_strokes: int = 0
+    unrepaired: int = 0
+    rounds: int = 0
+    clean_streak: int = 0
 
 
 @dataclass(slots=True)
@@ -543,6 +622,11 @@ class Painter:
         self._ui_guard_suspended = False
         self._last_ui_check = 0.0
         self._ui_missing_checks = 0
+        # How much longer than the frame floor every press is held, learned
+        # from the colors that came out with misses (see _confirm_group).
+        self._press_hold_boost = 0.0
+        self._confirmation_summary = ConfirmationSummary()
+        self._confirmation_seconds = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -756,6 +840,13 @@ class Painter:
             return self._measured_brush_size_model
 
     @property
+    def confirmation_summary(self) -> ConfirmationSummary:
+        """What checking each color as it went down found, so far or in all."""
+
+        with self._condition:
+            return self._confirmation_summary
+
+    @property
     def measured_texel_grid(self) -> TexelGridModel | None:
         """The texel grid the last job painted on, if it had one.
 
@@ -808,6 +899,9 @@ class Painter:
             self._ui_guard_suspended = False
             self._last_ui_check = 0.0
             self._ui_missing_checks = 0
+            self._press_hold_boost = 0.0
+            self._confirmation_summary = ConfirmationSummary()
+            self._confirmation_seconds = 0.0
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -2447,7 +2541,20 @@ class Painter:
                 return None
             return self._paint_phase_timing
 
-    def _execute_plan(self, job: _Job, plan: PaintPlan | None = None) -> None:
+    def _execute_plan(
+        self,
+        job: _Job,
+        plan: PaintPlan | None = None,
+        *,
+        reference: Any = None,
+    ) -> None:
+        """Paint ``plan`` (the job's own by default), color by color.
+
+        ``reference`` is a per-cell reading of the sign from just before this
+        plan goes down, for checking each color against; the job's plan
+        reads its own from the cleared sign, or captures one.
+        """
+
         main_plan = plan is None
         plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
@@ -2536,6 +2643,7 @@ class Painter:
         applied_diameter: int | None = None
         applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
+        confirmation = self._confirmation_for(job, plan, reference=reference)
         for color_index, group in enumerate(plan.color_groups, start=1):
             if skip > completed and skip - completed >= len(group.strokes):
                 # The whole group is behind the offset.
@@ -2566,9 +2674,15 @@ class Painter:
                 if model is not None
                 else 0.0
             )
-            for index_in_group, stroke in enumerate(group.strokes, start=1):
-                if index_in_group <= first_index:
-                    continue
+
+            def paint_stroke(
+                stroke: object,
+                *,
+                group=group,
+                diameter: int = diameter,
+                extension: float = extension,
+            ) -> None:
+                nonlocal applied_diameter, applied_epoch, selected
                 while True:
                     self._checkpoint(check_focus=True)
                     # A pause may have retuned the job, so every stroke is
@@ -2576,7 +2690,7 @@ class Painter:
                     # ones it started with.  The schedule keeps its original
                     # pricing: percent still climbs monotonically, and the
                     # time left is corrected by the measured pace anyway.
-                    settings = job.settings
+                    current = job.settings
                     try:
                         # Leaving the sign and coming back starts a new
                         # epoch, so the color and brush are set again before
@@ -2590,13 +2704,13 @@ class Painter:
                             self._apply_brush_size(job, diameter, current_epoch)
                             applied_diameter = diameter
                         if selected != (group.color, current_epoch):
-                            self._select_color(group.color, target, settings, current_epoch)
+                            self._select_color(group.color, target, current, current_epoch)
                             selected = (group.color, current_epoch)
                         self._execute_stroke(
                             stroke,
                             plan,
                             paint_canvas,
-                            settings,
+                            current,
                             current_epoch,
                             bias,
                             extension,
@@ -2604,10 +2718,17 @@ class Painter:
                             mapper=mapper,
                             texel_pitch=texel_pitch,
                         )
-                        break
+                        return
                     except _RetryAction:
                         selected = None
                         continue
+
+            painted_in_group = 0
+            for index_in_group, stroke in enumerate(group.strokes, start=1):
+                if index_in_group <= first_index:
+                    continue
+                paint_stroke(stroke)
+                painted_in_group += 1
                 completed += 1
                 painted += 1
                 completed_work += schedule.stroke_cost(color_index - 1, index_in_group - 1)
@@ -2618,6 +2739,7 @@ class Painter:
                             predicted_seconds=completed_work,
                             actual_seconds=phase_elapsed,
                             strokes=painted,
+                            checking_seconds=self._confirmation_seconds,
                         )
                 self._set_progress(
                     color_index=color_index,
@@ -2636,10 +2758,384 @@ class Painter:
                     self._stroke_gap(job.settings.delay_between_strokes_seconds),
                     check_focus=True,
                 )
+            if confirmation is not None and painted_in_group:
+                self._confirm_group(
+                    confirmation,
+                    job,
+                    plan,
+                    color_index,
+                    group,
+                    paint_stroke,
+                )
             self._interruptible_sleep(
                 self._settle(job.settings.delay_between_colors_seconds),
                 check_focus=True,
             )
+
+    # ------------------------------------------- checking colors as they land
+
+    def _press_hold_seconds(self, settings: PainterSettings) -> float:
+        """How long every press is held: the set hold, floored, plus the boost."""
+
+        hold = settings.mouse_down_duration_seconds
+        if self.input.emits_real_input:
+            hold = max(hold, self._MIN_PRESS_SECONDS) + self._press_hold_boost
+        return hold
+
+    def _cell_sampling(
+        self, job: _Job, plan: PaintPlan, canvas: ScreenRect
+    ) -> tuple[tuple[Any, Any] | None, Any]:
+        """Where the plan's cells are read in a capture, and how they blend.
+
+        The centres follow the measured grid when there is one (else the
+        rectangle's even spacing, which is what the sampler uses on its
+        own); the blend describes the bilinear mix a capture under three
+        pixels per cell reads at each centre, and is ``None`` where the
+        sampler takes a 3x3 median instead.
+        """
+
+        import numpy as np
+
+        from .verification import MEDIAN_SAMPLING_MIN_CELL_PIXELS, CellBlend
+
+        centers = self._grid_cell_centers(job, plan, canvas)
+        if centers is not None:
+            rect = job.texel_grid.registered_rect()  # type: ignore[union-attr]
+            pitch_x = rect.width / plan.width
+            pitch_y = rect.height / plan.height
+            centers_x, centers_y = centers
+        else:
+            pitch_x = canvas.width / max(1, plan.width)
+            pitch_y = canvas.height / max(1, plan.height)
+            centers_x = (np.arange(plan.width) + 0.5) * pitch_x
+            centers_y = (np.arange(plan.height) + 0.5) * pitch_y
+        # The sampler switches to the centre pixel below three pixels per
+        # cell, measured on the rectangle as it does (see sample_cell_colors).
+        fine = (
+            min(
+                canvas.height / max(1, plan.height),
+                canvas.width / max(1, plan.width),
+            )
+            < MEDIAN_SAMPLING_MIN_CELL_PIXELS
+        )
+        blend = (
+            CellBlend.from_centers(centers_x, centers_y, pitch_x, pitch_y)
+            if fine
+            else None
+        )
+        return centers, blend
+
+    def _confirmation_for(
+        self, job: _Job, plan: PaintPlan, *, reference: Any = None
+    ) -> _Confirmation | None:
+        """Set up checking ``plan``'s colors as they go down, or say why not.
+
+        The reference reading of the sign comes from the cleared sign the
+        calibration kept, from ``reference`` (a touch-up pass hands over the
+        capture it was planned from), or from a capture taken now - a
+        resumed job, or one painting with sizing off, has nothing else.
+        """
+
+        import numpy as np
+
+        from .verification import plan_layers, sample_cell_colors
+
+        settings = job.settings
+        summary_lock = self._condition
+
+        def skip(reason: str) -> None:
+            with summary_lock:
+                self._confirmation_summary = replace(
+                    self._confirmation_summary, skipped_reason=reason
+                )
+
+        if not settings.confirm_strokes:
+            skip("turned off")
+            return None
+        if not getattr(self.input, "emits_real_input", True):
+            skip("no real input")
+            return None
+        if not any(group.strokes for group in plan.color_groups):
+            return None
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        indices, _underpaint, palette = plan_layers(plan)
+        centers, blend = self._cell_sampling(job, plan, canvas)
+
+        def sampled(capture: Any) -> Any:
+            return sample_cell_colors(
+                np.asarray(capture.convert("RGB"), dtype=np.float32),
+                plan.width,
+                plan.height,
+                centers=centers,
+            )
+
+        if reference is None and plan is job.plan and job.bare_canvas is not None:
+            try:
+                reference = sampled(job.bare_canvas)
+            except Exception:
+                LOGGER.exception("The cleared sign's capture could not be sampled")
+                reference = None
+        if reference is None:
+            for _attempt in range(self._CALIBRATION_ATTEMPTS):
+                epoch = self._pause_generation_value()
+                try:
+                    reference = sampled(self._capture_parked(canvas, park, epoch))
+                    break
+                except _RetryAction:
+                    continue
+                except _AbortRequested:
+                    raise
+                except Exception:
+                    LOGGER.exception("The sign could not be captured before painting")
+                    skip("the sign could not be captured before painting")
+                    return None
+            else:
+                skip("paused every time the sign was captured before painting")
+                return None
+        reference = np.asarray(reference, dtype=np.float32)
+        if reference.shape[:2] != (plan.height, plan.width):
+            skip("the reference capture does not match the plan")
+            return None
+        LOGGER.info(
+            "Each color is checked as it goes down (up to %d repaint rounds); "
+            "cells are read %s",
+            settings.confirm_max_rounds,
+            "through the bilinear blend of a fine sign"
+            if blend is not None
+            else "one per cell",
+        )
+        return _Confirmation(
+            canvas=canvas,
+            park=park,
+            indices=indices,
+            palette=palette,
+            centers=centers,
+            blend=blend,
+            reference=reference,
+        )
+
+    def _publish_confirmation(self, state: _Confirmation) -> None:
+        with self._condition:
+            self._confirmation_summary = ConfirmationSummary(
+                colors=state.colors,
+                judged=state.judged,
+                missed=state.missed,
+                repainted_strokes=state.repainted_strokes,
+                unrepaired=state.unrepaired,
+                rounds=state.rounds,
+                hold_boost_seconds=self._press_hold_boost,
+                skipped_reason=self._confirmation_summary.skipped_reason,
+            )
+
+    def _adapt_press_hold(self, miss_rate: float, judged: int, state: _Confirmation) -> None:
+        """Hold presses longer while colors come out with misses, shorter when clean.
+
+        A press the game samples as nothing is a press that fell entirely
+        inside one of its frames, and on a large sign those frames run well
+        past the floor the hold was sized for.  Raising the hold costs every
+        stroke a little; a miss costs a capture and a repaint.  The hold is
+        therefore raised a step at a time while a tenth of a color's cells
+        or more keep missing, and let back down only after a run of clean
+        colors, so it settles where the game actually is.
+        """
+
+        if judged < CONFIRM_MIN_JUDGED_CELLS:
+            return
+        before = self._press_hold_boost
+        if miss_rate > CONFIRM_RAISE_MISS_RATE:
+            state.clean_streak = 0
+            self._press_hold_boost = min(
+                PRESS_HOLD_BOOST_MAX_SECONDS, before + PRESS_HOLD_BOOST_STEP_SECONDS
+            )
+        elif miss_rate < CONFIRM_RELAX_MISS_RATE:
+            state.clean_streak += 1
+            if state.clean_streak >= CONFIRM_RELAX_CLEAN_GROUPS and before > 0.0:
+                state.clean_streak = 0
+                self._press_hold_boost = max(0.0, before - PRESS_HOLD_RELAX_STEP_SECONDS)
+        else:
+            state.clean_streak = 0
+        if self._press_hold_boost != before:
+            LOGGER.info(
+                "Press hold %s to %.0f ms over the frame floor (%.0f%% of the "
+                "last color's cells missed)",
+                "raised" if self._press_hold_boost > before else "relaxed",
+                self._press_hold_boost * 1000.0,
+                miss_rate * 100.0,
+            )
+
+    def _confirm_group(
+        self,
+        state: _Confirmation,
+        job: _Job,
+        plan: PaintPlan,
+        color_index: int,
+        group: Any,
+        paint_stroke: Callable[[object], None],
+    ) -> None:
+        """Capture the sign after a color and repaint the cells that missed it.
+
+        Read against the sign as it stood before the color, so no palette
+        or lighting model has to be right: a cell either moved to where the
+        color's stamp would put it or it stayed where it was.  Misses are
+        repainted in runs and the capture repeated, up to the configured
+        rounds, and the last capture becomes the next color's reference.
+        The press hold is adapted from the first round's miss rate.
+        """
+
+        import numpy as np
+
+        from .verification import (
+            apply_capture_lighting,
+            confirm_cells,
+            fit_sign_rendering,
+            repaint_runs,
+            sample_cell_colors,
+            stroke_coverage,
+        )
+
+        settings = job.settings
+        group_number = color_index
+        total_colors = len(plan.color_groups)
+        color = np.asarray(group.color, dtype=np.uint8)
+        palette_index = int(np.flatnonzero((state.palette == color).all(axis=1))[0])
+        diameter = max(1, int(getattr(group, "brush_diameter", 1)))
+        radius = (diameter - 1) // 2
+        # Only the cells this group's own strokes cover and that keep its
+        # color: an optimized plan paints one color in several passes, and
+        # the later passes' cells are not missing yet.
+        covered = np.zeros(state.indices.shape, dtype=np.bool_)
+        for stroke in group.strokes:
+            covered[stroke_coverage(stroke, radius, covered.shape)] = True
+        judge = covered & (state.indices == palette_index)
+        if not judge.any():
+            return
+        # What this color should look like on this sign, from the colors
+        # already on it; its nominal value until enough of them are down.
+        earlier = np.where(state.indices < palette_index, state.indices, -1)
+        coefficients = fit_sign_rendering(state.reference, earlier, state.palette)
+        expected = apply_capture_lighting(
+            np.asarray([group.color], dtype=np.float32), coefficients
+        )[0]
+        missed_before: int | None = None
+        missed_count = 0
+        stalled = 0
+        latest = state.reference
+        checking_started = self._active_elapsed()
+        for round_number in range(1, settings.confirm_max_rounds + 1):
+            while True:
+                epoch = self._pause_generation_value()
+                try:
+                    self._update_progress_state(
+                        PainterState.RUNNING,
+                        f"Checking color {group_number} of {total_colors}",
+                    )
+                    self._move(state.park, epoch)
+                    self._interruptible_sleep(
+                        self._CONFIRM_SETTLE_SECONDS, epoch=epoch, check_focus=True
+                    )
+                    self._checkpoint(epoch=epoch, check_focus=True)
+                    capture = self._screen_capture(state.canvas)
+                    break
+                except _RetryAction:
+                    continue
+            try:
+                latest = sample_cell_colors(
+                    np.asarray(capture.convert("RGB"), dtype=np.float32),
+                    plan.width,
+                    plan.height,
+                    centers=state.centers,
+                )
+            except Exception:
+                LOGGER.exception("The sign could not be read after color %d", group_number)
+                return
+            hit, judged = confirm_cells(
+                state.reference,
+                latest,
+                expected,
+                judge,
+                blend=state.blend,
+                # Cells of earlier colors are never crossed by this one's
+                # strokes, so any shift common to them is the capture's.
+                stable=(state.indices >= 0) & (state.indices < palette_index),
+            )
+            missed = judged & ~hit
+            judged_count = int(judged.sum())
+            missed_count = int(missed.sum())
+            if round_number == 1:
+                state.colors += 1
+                state.judged += judged_count
+                state.missed += missed_count
+                rate = missed_count / judged_count if judged_count else 0.0
+                self._adapt_press_hold(rate, judged_count, state)
+                if missed_count:
+                    LOGGER.info(
+                        "Color %d of %d: %d of %d cells did not take (%.1f%%); repainting",
+                        group_number,
+                        total_colors,
+                        missed_count,
+                        judged_count,
+                        rate * 100.0,
+                    )
+            if missed_count == 0:
+                break
+            if missed_before is not None and missed_count >= missed_before:
+                # Repainting gained nothing: a burst of dropped presses, or
+                # cells the capture cannot settle.  Once is bad luck; twice
+                # running and the rest is left to the touch-up pass rather
+                # than spent here.
+                stalled += 1
+                if stalled >= 2:
+                    LOGGER.warning(
+                        "Color %d of %d: %d cells still missing after repainting "
+                        "twice without gain; leaving them to the touch-up pass",
+                        group_number,
+                        total_colors,
+                        missed_count,
+                    )
+                    break
+            else:
+                stalled = 0
+            missed_before = missed_count
+            strokes = repaint_runs(
+                missed,
+                state.indices,
+                palette_index,
+                strokes=group.strokes,
+                radius=radius,
+            )
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Repainting {missed_count:,} cells of color {group_number} "
+                f"(round {round_number})",
+            )
+            state.rounds += 1
+            for stroke in strokes:
+                paint_stroke(stroke)
+                state.repainted_strokes += 1
+                self._interruptible_sleep(
+                    self._stroke_gap(job.settings.delay_between_strokes_seconds),
+                    check_focus=True,
+                )
+            self._publish_confirmation(state)
+        # The last round's repaint is not captured again; what it did not
+        # mend is counted as unrepaired, which errs on the honest side.
+        if missed_count:
+            state.unrepaired += missed_count
+        state.reference = latest
+        self._confirmation_seconds += max(0.0, self._active_elapsed() - checking_started)
+        self._publish_confirmation(state)
+
+    _CONFIRM_SETTLE_SECONDS = CONFIRM_SETTLE_SECONDS
 
     # The break's own waits: for the painting UI to close after Save, for the
     # jump to land (and the server to have seen it), and for the UI to be
@@ -2936,7 +3432,7 @@ class Painter:
             RECOLOR_MIN_CELL_PIXELS,
             UNRELIABLE_CAPTURE_FRACTION,
             classify_cells,
-            plan_expectations,
+            plan_layers,
             sample_cell_colors,
             touch_up_plan,
         )
@@ -2948,7 +3444,7 @@ class Painter:
             return
         if not any(group.strokes for group in plan.color_groups):
             return
-        indices, palette = plan_expectations(plan)
+        indices, underpaint, palette = plan_layers(plan)
         covered = int((indices >= 0).sum())
         if covered == 0:
             return
@@ -3019,6 +3515,7 @@ class Painter:
                     indices,
                     palette,
                     bare_sampled=bare_sampled,
+                    underpaint=underpaint,
                     recolor=recolor,
                 )
                 mismatch = verdict.cells
@@ -3076,7 +3573,9 @@ class Painter:
                     f"about {_describe_seconds(predicted)})",
                     phase="verify",
                 )
-                self._execute_plan(job, plan=repaint)
+                # The capture the touch-up was planned from is the reading
+                # of the sign before it, so its colors are checked too.
+                self._execute_plan(job, plan=repaint, reference=sampled)
                 pass_number += 1
             except _RetryAction:
                 # A pause released the mouse mid-pass; redo this pass whole,
@@ -3236,10 +3735,9 @@ class Painter:
                 # A silently dropped dab is a missing cell the verification
                 # pass then has to buy back with a whole extra
                 # capture-and-repaint round.
-                hold = settings.mouse_down_duration_seconds
-                if self.input.emits_real_input:
-                    hold = max(hold, self._MIN_PRESS_SECONDS)
-                self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
+                self._interruptible_sleep(
+                    self._press_hold_seconds(settings), epoch=epoch, check_focus=True
+                )
                 return
             pace = stroke_pace(
                 distance,
@@ -3275,7 +3773,9 @@ class Painter:
             # moving.  The hold is measured from the press rather than summed
             # from the nominal delays so the scheduler's own slack counts.
             if self.input.emits_real_input:
-                remaining = self._MIN_PRESS_SECONDS - (time.monotonic() - pressed_at)
+                remaining = self._press_hold_seconds(settings) - (
+                    time.monotonic() - pressed_at
+                )
                 if remaining > 0:
                     self._interruptible_sleep(remaining, epoch=epoch, check_focus=True)
         finally:

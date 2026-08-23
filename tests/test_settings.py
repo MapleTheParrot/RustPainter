@@ -166,6 +166,9 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
             "stroke_speed",
         ),
         ({"hotkeys": {"start_resume": "Ctrl+F8"}}, "start_resume"),
+        ({"painting": {"confirm_strokes": "yes"}}, "confirm_strokes"),
+        ({"painting": {"confirm_max_rounds": 0}}, "confirm_max_rounds"),
+        ({"painting": {"confirm_max_rounds": True}}, "confirm_max_rounds"),
     ],
 )
 def test_settings_reject_values_the_gui_cannot_represent(
@@ -257,3 +260,21 @@ def test_stroke_merging_switched_off_under_the_old_schema_is_lifted_to_balanced(
         encoding="utf-8",
     )
     assert SettingsStore(path).load()["painting"]["stroke_merge_mode"] == "off"
+
+
+def test_checking_each_color_is_on_by_default_and_read_by_the_painter() -> None:
+    from app.painter import PainterSettings
+    from app.settings import default_settings
+
+    defaults = default_settings()
+    assert defaults["painting"]["confirm_strokes"] is True
+    assert defaults["painting"]["confirm_max_rounds"] == 4
+    settings = PainterSettings.from_mapping(defaults)
+    assert settings.confirm_strokes is True and settings.confirm_max_rounds == 4
+    # Both can be changed from a paused job.
+    assert "confirm_strokes" in PainterSettings.RETUNABLE_FIELDS
+    assert "confirm_max_rounds" in PainterSettings.RETUNABLE_FIELDS
+    off = PainterSettings.from_mapping(
+        {"painting": {"confirm_strokes": False, "confirm_max_rounds": 2}}
+    )
+    assert off.confirm_strokes is False and off.confirm_max_rounds == 2

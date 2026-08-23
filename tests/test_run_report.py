@@ -136,3 +136,32 @@ def test_finishing_twice_keeps_the_first_result(tmp_path) -> None:
 
     document = json.loads((tmp_path / "job-5" / "run.json").read_text())
     assert document["outcome"] == "aborted"
+
+
+def test_the_report_records_what_checking_each_color_found(tmp_path) -> None:
+    from app.painter import ConfirmationSummary
+
+    report = RunReport(tmp_path, session_name="job-checks")
+    report.record_confirmation(
+        ConfirmationSummary(
+            colors=12,
+            judged=4000,
+            missed=1300,
+            repainted_strokes=900,
+            unrepaired=7,
+            rounds=20,
+            hold_boost_seconds=0.04,
+        )
+    )
+    report.finish("completed")
+    recorded = json.loads((tmp_path / "job-checks" / "run.json").read_text())
+    assert recorded["confirmation"] == {
+        "colorsChecked": 12,
+        "cellsJudged": 4000,
+        "cellsMissedFirstCheck": 1300,
+        "repaintStrokes": 900,
+        "cellsUnrepaired": 7,
+        "repaintRounds": 20,
+        "pressHoldBoostSeconds": 0.04,
+        "skippedReason": "",
+    }
