@@ -1834,6 +1834,14 @@ def test_the_touch_up_pass_uses_the_cleared_sign_to_see_holes() -> None:
         touch_up,
         center,
     )
+    # The pass ran to its end, so its clock is on record for the estimate.
+    timing = painter.touch_up_timing
+    assert timing is not None
+    assert timing.passes == 1
+    assert timing.seconds > 0.0
+    # And the artwork's own clock does not count it.
+    measured = painter.paint_phase_timing
+    assert measured is not None and measured.strokes == 32
 
 
 def test_time_left_is_predicted_before_the_first_stroke_and_measured_after() -> None:
@@ -1845,6 +1853,9 @@ def test_time_left_is_predicted_before_the_first_stroke_and_measured_after() -> 
     # A schedule priced from the painter's own timing rules, not "unknown".
     initial = painter._initial_estimate(job)
     assert initial is not None and initial > 0
+    # Mock input runs no checks and no touch-up, so neither is priced.
+    assert painter._checks_estimate(job, initial) == 0.0
+    assert painter._touch_up_estimate(job, initial) == 0.0
 
     assert painter.start()
     assert painter.wait(_t(2.0))
@@ -1855,6 +1866,72 @@ def test_time_left_is_predicted_before_the_first_stroke_and_measured_after() -> 
     assert measured.predicted_seconds > 0
     assert measured.actual_seconds >= 0
     assert painter.progress.percent == 100.0
+
+
+def test_the_first_estimate_counts_the_checks_and_the_touch_up() -> None:
+    """Under real input the time left before the first stroke is the whole
+    job's: the artwork, a capture per color that paints plus the repaints
+    the checks turn out to need, and the touch-up pass at the end, each
+    priced from what earlier runs measured."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    painter = Painter(
+        controller,
+        screen_capture=_panel_capture,
+        check_capture_seconds=2.0,
+        check_repaint_fraction=0.5,
+        touch_up_fraction=0.25,
+    )
+    plan = _confirmation_plan()  # two colors that paint
+    painter.configure(
+        plan,
+        _profile(),
+        _settings(
+            confirm_strokes=True, verify_passes=1, require_foreground=False
+        ),
+    )
+    job = painter._job
+    assert job is not None
+    painting = painter._work_schedule(job.plan, job.target, job.settings).total
+    assert painter._checks_estimate(job, painting) == pytest.approx(
+        2 * 2.0 + 0.5 * painting
+    )
+    assert painter._touch_up_estimate(job, painting) == pytest.approx(0.25 * painting)
+    initial = painter._initial_estimate(job)
+    assert initial == pytest.approx(painting * 1.75 + 4.0)
+
+    # Turned off, neither is priced.
+    painter.configure(
+        plan,
+        _profile(),
+        _settings(confirm_strokes=False, verify_passes=0, require_foreground=False),
+    )
+    job = painter._job
+    assert job is not None
+    assert painter._checks_estimate(job, painting) == 0.0
+    assert painter._touch_up_estimate(job, painting) == 0.0
+
+
+def test_the_touch_up_to_come_is_in_the_time_left_but_not_the_percent() -> None:
+    painter = Painter(MockInputController())
+    painter.configure(_dot_plan(3), _profile(), _settings())
+    painter._set_progress(
+        color_index=1,
+        total_colors=1,
+        stroke_index_in_color=50,
+        strokes_in_color=100,
+        completed_strokes=50,
+        total_strokes=100,
+        completed_work=50.0,
+        total_work=100.0,
+        phase_elapsed=50.0,
+        pending_seconds=30.0,
+        message="Painting",
+    )
+    progress = painter.progress
+    assert progress.percent == pytest.approx(50.0)
+    assert progress.estimated_remaining_seconds == pytest.approx(80.0)
 
 
 def test_a_later_pass_is_timed_against_its_own_clock() -> None:
@@ -2614,6 +2691,24 @@ def test_a_color_that_came_out_with_misses_is_repainted_before_the_next() -> Non
     assert summary.repainted_strokes > 0
     assert summary.unrepaired == 0
     assert summary.skipped_reason == ""
+
+
+def test_the_checks_are_clocked_apart_from_the_painting() -> None:
+    """What the run measured is what the next estimate learns from: how
+    many colors had a capture, what the captures cost, and what the
+    repaints on top of them did."""
+
+    painter, _painted, _plan = _run_forgetful_sign(confirm=True)
+    measured = painter.paint_phase_timing
+    assert measured is not None
+    assert measured.colors_checked == 2
+    assert measured.check_capture_seconds > 0.0
+    # Both colors missed something and were repainted, so the checking
+    # clock holds more than the two captures.
+    assert measured.checking_seconds > measured.check_capture_seconds
+    assert measured.checking_seconds <= measured.actual_seconds
+    # No touch-up was asked for, so nothing is claimed about one.
+    assert painter.touch_up_timing is None
 
 
 def test_without_the_check_the_dropped_presses_stay_holes() -> None:

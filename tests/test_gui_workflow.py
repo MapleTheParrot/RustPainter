@@ -2337,6 +2337,76 @@ def test_plan_recalculation_shows_pending_feedback(
     assert window.analysis_time.value_label.text() != "…"
 
 
+def test_the_estimate_is_one_figure_that_learns_the_checks_and_touch_up(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """The checks and the touch-up are in the number, not tacked on as
+    words; what each costs is in the tooltip; and a finished run refines
+    them and refreshes the figure."""
+
+    from types import SimpleNamespace
+
+    from app.paint_timing import LearnedTiming, PhaseTiming, TouchUpTiming
+
+    _load_small_plan(window, tmp_path, qtbot)
+    plan = window._plan
+    assert plan is not None
+    window.confirm_strokes_check.setChecked(True)
+    window.verify_passes_spin.setValue(1)
+    window._refresh_statistics()
+    shown = window.analysis_time.value_label.text()
+    assert "+" not in shown and "check" not in shown and "touch" not in shown
+    tip = window.analysis_time.toolTip()
+    assert "Color checks" in tip and "Touch-up" in tip
+    assert "guess" in tip  # nothing measured yet
+    estimate = window._estimate(plan)
+    assert estimate.checks > 0 and estimate.touch_up > 0
+    assert estimate.total == pytest.approx(
+        estimate.paint + estimate.checks + estimate.touch_up + estimate.calibration + estimate.countdown
+    )
+    # Turned off, neither is priced.
+    window.confirm_strokes_check.setChecked(False)
+    window.verify_passes_spin.setValue(0)
+    without = window._estimate(plan)
+    assert without.checks == 0 and without.touch_up == 0
+    assert without.total < estimate.total
+    window.confirm_strokes_check.setChecked(True)
+    window.verify_passes_spin.setValue(1)
+
+    # A run that painted 600 s of artwork, checked 20 colors at a second
+    # a capture with a minute of repainting, and touched up in 90 s.
+    before = window._learned_timing
+    assert before.check_samples == 0 and before.touch_up_samples == 0
+
+    class _Painter:
+        input = SimpleNamespace(emits_real_input=True)
+        paint_phase_timing = PhaseTiming(
+            predicted_seconds=600.0,
+            actual_seconds=680.0,
+            strokes=5000,
+            checking_seconds=80.0,
+            colors_checked=20,
+            check_capture_seconds=20.0,
+        )
+        touch_up_timing = TouchUpTiming(seconds=90.0, passes=2)
+
+    window._painter = _Painter()  # type: ignore[assignment]
+    window._learn_timing()
+    window._painter = None
+    learned = window._learned_timing
+    assert learned.check_samples == 1 and learned.touch_up_samples == 1
+    assert learned.touch_up_fraction > LearnedTiming().touch_up_fraction
+    assert learned.check_capture_seconds > LearnedTiming().check_capture_seconds
+    # Written down for the next session ...
+    saved = LearnedTiming.load(window._timing_path())
+    assert saved.touch_up_samples == 1
+    assert saved.history[-1]["touch_up_seconds"] == 90.0
+    assert saved.history[-1]["check_repaint_seconds"] == 60.0
+    # ... and already in the figure on the screen.
+    assert "from 1 run" in window.analysis_time.toolTip()
+    assert window._estimate(plan).touch_up > estimate.touch_up
+
+
 def test_typing_a_caption_waits_for_a_pause_before_replanning(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:

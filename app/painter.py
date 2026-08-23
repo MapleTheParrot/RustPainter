@@ -34,6 +34,8 @@ from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect
 from .paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
+    CHECK_CAPTURE_SECONDS_DEFAULT,
+    CHECK_REPAINT_FRACTION_DEFAULT,
     CONFIRM_SETTLE_SECONDS,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
     KEY_GAP_SECONDS,
@@ -44,8 +46,10 @@ from .paint_timing import (
     PICKER_CLICK_HOLD_SECONDS,
     SETTLE_FLOOR_SECONDS,
     STROKE_GAP_FLOOR_SECONDS,
+    TOUCH_UP_FRACTION_DEFAULT,
     PhaseTiming,
     PlanWorkSchedule,
+    TouchUpTiming,
     StrokeTiming,
     fields_below_floor,
     remaining_seconds,
@@ -588,6 +592,9 @@ class Painter:
         foreground_checker: Callable[[ForegroundRequirement], bool] | None = None,
         screen_capture: Callable[[RectangleLike], Any] | None = None,
         stroke_overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS,
+        check_capture_seconds: float = CHECK_CAPTURE_SECONDS_DEFAULT,
+        check_repaint_fraction: float = CHECK_REPAINT_FRACTION_DEFAULT,
+        touch_up_fraction: float = TOUCH_UP_FRACTION_DEFAULT,
     ) -> None:
         self.input = input_controller
         self._on_progress = on_progress
@@ -628,7 +635,13 @@ class Painter:
         # work schedule prices every stroke with it, so the first time-left
         # shown is already this machine's, not a generic one.
         self._stroke_overhead_seconds = stroke_overhead_seconds
+        # What earlier runs showed checking colors and touching up cost, so
+        # the time left counts the work that comes after the artwork.
+        self._check_capture_seconds = max(0.0, float(check_capture_seconds))
+        self._check_repaint_fraction = max(0.0, float(check_repaint_fraction))
+        self._touch_up_fraction = max(0.0, float(touch_up_fraction))
         self._paint_phase_timing: PhaseTiming | None = None
+        self._touch_up_timing: TouchUpTiming | None = None
         # Set once a pause changes the stroke timing.  The run's predicted
         # seconds were priced on the timing it started with, so its measured
         # pace then says nothing about the machine's per-stroke overhead.
@@ -648,6 +661,7 @@ class Painter:
         self._color_pick_summary = ColorPickSummary()
         self._confirmation_summary = ConfirmationSummary()
         self._confirmation_seconds = 0.0
+        self._check_capture_clock = 0.0
         self._progress = PaintProgress(
             PainterState.IDLE, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None
         )
@@ -931,6 +945,8 @@ class Painter:
             self._color_pick_summary = ColorPickSummary()
             self._confirmation_summary = ConfirmationSummary()
             self._confirmation_seconds = 0.0
+            self._check_capture_clock = 0.0
+            self._touch_up_timing = None
             total_strokes = sum(
                 len(group.strokes) for group in self._job.plan.color_groups
             )
@@ -2529,6 +2545,9 @@ class Painter:
         except Exception:  # an estimate must never stop a job from starting
             LOGGER.debug("Initial time estimate failed", exc_info=True)
             return None
+        # The checks and the touch-up scale with the painting, not with the
+        # brush measurement before it.
+        total += self._checks_estimate(job, total) + self._touch_up_estimate(job, total)
         if (
             job.start_stroke == 0
             and job.settings.apply_brush_size
@@ -2537,6 +2556,33 @@ class Painter:
         ):
             total += BRUSH_CALIBRATION_SECONDS
         return total
+
+    def _checks_estimate(self, job: _Job, paint_seconds: float) -> float:
+        """What checking each color as it goes down should add to ``paint_seconds``.
+
+        Priced from what earlier runs measured: a capture per color that
+        paints, and a share of the painting time in repaints.  Only before
+        the first stroke - once the job is under way the checks are on its
+        clock and the measured pace carries them.
+        """
+
+        if not job.settings.confirm_strokes or not getattr(
+            self.input, "emits_real_input", True
+        ):
+            return 0.0
+        colors = sum(1 for group in job.plan.color_groups if group.strokes)
+        return colors * self._check_capture_seconds + max(
+            0.0, paint_seconds
+        ) * self._check_repaint_fraction
+
+    def _touch_up_estimate(self, job: _Job, paint_seconds: float) -> float:
+        """What the touch-up pass after ``paint_seconds`` of painting should take."""
+
+        if job.settings.verify_passes <= 0 or not getattr(
+            self.input, "emits_real_input", True
+        ):
+            return 0.0
+        return max(0.0, paint_seconds) * self._touch_up_fraction
 
     @staticmethod
     def _skipped_work(
@@ -2570,6 +2616,17 @@ class Painter:
             if self._timing_retuned:
                 return None
             return self._paint_phase_timing
+
+    @property
+    def touch_up_timing(self) -> TouchUpTiming | None:
+        """How long the touch-up pass took, once it has run to its end.
+
+        ``None`` while the pass is still to come, was not asked for, or was
+        interrupted - a fraction of a pass says nothing about a whole one.
+        """
+
+        with self._condition:
+            return self._touch_up_timing
 
     def _execute_plan(
         self,
@@ -2608,6 +2665,22 @@ class Painter:
         # the artwork is done; timed against the whole run's elapsed it would
         # claim hours left for a few minutes of repainting.
         phase_started = self._active_elapsed()
+
+        def record_phase_timing(completed_work: float, painted: int) -> None:
+            """Keep the artwork's clock against its prediction up to date."""
+
+            if not main_plan:
+                return
+            with self._condition:
+                self._paint_phase_timing = PhaseTiming(
+                    predicted_seconds=completed_work,
+                    actual_seconds=self._active_elapsed() - phase_started,
+                    strokes=painted,
+                    checking_seconds=self._confirmation_seconds,
+                    colors_checked=self._confirmation_summary.colors,
+                    check_capture_seconds=self._check_capture_clock,
+                )
+
         if total == 0:
             self._set_progress(
                 color_index=0,
@@ -2763,14 +2836,7 @@ class Painter:
                 painted += 1
                 completed_work += schedule.stroke_cost(color_index - 1, index_in_group - 1)
                 phase_elapsed = self._active_elapsed() - phase_started
-                if main_plan:
-                    with self._condition:
-                        self._paint_phase_timing = PhaseTiming(
-                            predicted_seconds=completed_work,
-                            actual_seconds=phase_elapsed,
-                            strokes=painted,
-                            checking_seconds=self._confirmation_seconds,
-                        )
+                record_phase_timing(completed_work, painted)
                 self._set_progress(
                     color_index=color_index,
                     total_colors=total_colors,
@@ -2782,6 +2848,9 @@ class Painter:
                     total_work=total_work,
                     skipped_work=skipped_work,
                     phase_elapsed=phase_elapsed,
+                    pending_seconds=(
+                        self._touch_up_estimate(job, total_work) if main_plan else 0.0
+                    ),
                     message="Painting",
                 )
                 self._interruptible_sleep(
@@ -2797,6 +2866,9 @@ class Painter:
                     group,
                     paint_stroke,
                 )
+                # The check comes after the color's last stroke, so the
+                # record kept per stroke would otherwise miss the last one.
+                record_phase_timing(completed_work, painted)
             self._interruptible_sleep(
                 self._settle(job.settings.delay_between_colors_seconds),
                 check_focus=True,
@@ -3024,6 +3096,9 @@ class Painter:
         stalled = 0
         latest = state.reference
         checking_started = self._active_elapsed()
+        # The first round's capture is the fixed cost of checking a color;
+        # the repaints and the captures that follow them are what this
+        # sign's dropped presses cost, and the two are learned apart.
         for round_number in range(1, settings.confirm_max_rounds + 1):
             while True:
                 epoch = self._pause_generation_value()
@@ -3065,6 +3140,9 @@ class Painter:
             judged_count = int(judged.sum())
             missed_count = int(missed.sum())
             if round_number == 1:
+                self._check_capture_clock += max(
+                    0.0, self._active_elapsed() - checking_started
+                )
                 state.colors += 1
                 state.judged += judged_count
                 state.missed += missed_count
@@ -3484,6 +3562,15 @@ class Painter:
             int(round(target.color_box.top + target.color_box.height / 2.0)),
         )
         pass_number = 1
+        touch_up_started = self._active_elapsed()
+
+        def record_touch_up() -> None:
+            with self._condition:
+                self._touch_up_timing = TouchUpTiming(
+                    seconds=max(0.0, self._active_elapsed() - touch_up_started),
+                    passes=pass_number,
+                )
+
         while pass_number <= settings.verify_passes:
             try:
                 epoch = self._pause_generation_value()
@@ -3538,6 +3625,7 @@ class Painter:
                         message = "Verified: the sign matches the plan"
                     LOGGER.info("Verification pass %d: %s", pass_number, message)
                     self._update_progress_state(PainterState.RUNNING, message)
+                    record_touch_up()
                     return
                 if wrong > covered * UNRELIABLE_CAPTURE_FRACTION:
                     LOGGER.warning(
@@ -3573,6 +3661,8 @@ class Painter:
                 # A pause released the mouse mid-pass; redo this pass whole,
                 # from a fresh capture, once painting resumes.
                 continue
+        pass_number -= 1
+        record_touch_up()
 
     # How many rounds of picker clicks a color gets before the panel is
     # looked for again, and how many after that before the job pauses.
@@ -4304,6 +4394,7 @@ class Painter:
         total_work: float | None = None,
         skipped_work: float = 0.0,
         phase_elapsed: float | None = None,
+        pending_seconds: float = 0.0,
         message: str,
     ) -> None:
         """Publish progress.
@@ -4311,7 +4402,9 @@ class Painter:
         ``skipped_work`` is the predicted cost of strokes a resumed job took
         as already painted: it counts toward the percent, since the sign is
         that far along, and not toward the pace, which this run's own
-        strokes set.
+        strokes set.  ``pending_seconds`` is work that follows this plan -
+        the touch-up pass after the artwork - and is added to the time left
+        without moving the percent, which is the artwork's.
         """
 
         elapsed = self._active_elapsed()
@@ -4331,6 +4424,8 @@ class Painter:
                 completed_work,
                 max(0.0, total_work - skipped_work),
             )
+        if remaining is not None and pending_seconds > 0.0:
+            remaining += pending_seconds
         with self._condition:
             self._progress = PaintProgress(
                 self._state,

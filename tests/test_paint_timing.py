@@ -7,8 +7,14 @@ import pytest
 
 from app.models import ColorGroup, PaintPlan, Stroke
 from app.paint_timing import (
+    CHECK_CAPTURE_SECONDS_DEFAULT,
+    CHECK_REPAINT_FRACTION_DEFAULT,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
+    LEARN_PRIOR_COLORS,
+    LEARN_PRIOR_PAINT_SECONDS,
+    LEARN_PRIOR_STROKES,
     MAX_STROKE_OVERHEAD_SECONDS,
+    TOUCH_UP_FRACTION_DEFAULT,
     LONG_DRAG_MAX_TEXELS_PER_SECOND,
     MIN_PRESS_SECONDS,
     PACE_PRIOR_SECONDS,
@@ -232,15 +238,21 @@ def test_remaining_is_the_model_first_and_the_measured_pace_later() -> None:
     assert remaining_seconds(10.0, 700.0, 600.0) == 0.0
 
 
-def test_learned_timing_folds_in_the_residual_and_round_trips(tmp_path: Path) -> None:
+def test_learned_timing_weighs_each_run_by_its_strokes_and_round_trips(
+    tmp_path: Path,
+) -> None:
     learned = LearnedTiming()
     assert learned.overhead_seconds == DEFAULT_STROKE_OVERHEAD_SECONDS
     # Too few strokes to believe.
     assert not learned.observe(predicted_seconds=10.0, actual_seconds=20.0, strokes=50)
-    # 1000 strokes ran 10 s longer than predicted: 10 ms/stroke, blended.
+    # 1000 strokes ran 10 s longer than predicted: this run measured the
+    # overhead at 10 ms over the default, and counts for 1000 strokes
+    # against the default's prior.
     assert learned.observe(predicted_seconds=80.0, actual_seconds=90.0, strokes=1000)
+    measured = DEFAULT_STROKE_OVERHEAD_SECONDS + 0.01
     assert learned.overhead_seconds == pytest.approx(
-        DEFAULT_STROKE_OVERHEAD_SECONDS + 0.7 * 0.01
+        (DEFAULT_STROKE_OVERHEAD_SECONDS * LEARN_PRIOR_STROKES + measured * 1000)
+        / (LEARN_PRIOR_STROKES + 1000)
     )
     assert learned.samples == 1
 
@@ -250,13 +262,134 @@ def test_learned_timing_folds_in_the_residual_and_round_trips(tmp_path: Path) ->
     assert loaded.overhead_seconds == pytest.approx(learned.overhead_seconds, abs=1e-5)
     assert loaded.samples == 1
     assert loaded.history and loaded.history[0]["strokes"] == 1000
+    assert loaded.history[0]["measured_overhead_seconds"] == pytest.approx(measured, abs=1e-5)
 
     # A run much faster than predicted cannot push the overhead negative,
     # and a wildly slow one cannot push it past the ceiling.
-    loaded.observe(predicted_seconds=900.0, actual_seconds=100.0, strokes=1000)
-    assert loaded.overhead_seconds == 0.0
-    loaded.observe(predicted_seconds=100.0, actual_seconds=9000.0, strokes=1000)
-    assert loaded.overhead_seconds == MAX_STROKE_OVERHEAD_SECONDS
+    floor = LearnedTiming()
+    floor.observe(predicted_seconds=900.0, actual_seconds=100.0, strokes=1000)
+    assert floor.overhead_seconds < DEFAULT_STROKE_OVERHEAD_SECONDS
+    assert floor.history[-1]["measured_overhead_seconds"] == 0.0
+    ceiling = LearnedTiming()
+    ceiling.observe(predicted_seconds=100.0, actual_seconds=9000.0, strokes=1000)
+    assert ceiling.history[-1]["measured_overhead_seconds"] == MAX_STROKE_OVERHEAD_SECONDS
+    assert ceiling.overhead_seconds <= MAX_STROKE_OVERHEAD_SECONDS
+
+
+def test_a_short_late_run_barely_moves_what_long_runs_measured() -> None:
+    """The failure this replaces: one 229-stroke run that ran 24 s late
+    lifted the overhead from 19 ms to 92 ms, and every estimate after it
+    by hours."""
+
+    learned = LearnedTiming()
+    for _ in range(3):
+        learned.observe(predicted_seconds=1800.0, actual_seconds=1790.0, strokes=16000)
+    settled = learned.overhead_seconds
+    assert abs(settled - DEFAULT_STROKE_OVERHEAD_SECONDS) < 0.002
+    learned.observe(predicted_seconds=73.0, actual_seconds=97.0, strokes=229)
+    assert learned.overhead_seconds - settled < 0.001
+    # And a run's weight is capped: an overnight sign is one big vote, not
+    # the only one.
+    learned.observe(predicted_seconds=33000.0, actual_seconds=33000.0 + 0.05 * 300000, strokes=300000)
+    assert learned.overhead_seconds < settled + 0.05 * 0.5
+
+
+def test_checks_and_touch_up_are_learned_as_their_own_costs() -> None:
+    learned = LearnedTiming()
+    assert learned.check_capture_seconds == CHECK_CAPTURE_SECONDS_DEFAULT
+    assert learned.check_repaint_fraction == CHECK_REPAINT_FRACTION_DEFAULT
+    assert learned.touch_up_fraction == TOUCH_UP_FRACTION_DEFAULT
+    assert learned.check_samples == 0 and learned.touch_up_samples == 0
+    # Before any run: the defaults, shaped like the painter's work.
+    assert learned.check_seconds(10, 100.0) == pytest.approx(
+        10 * CHECK_CAPTURE_SECONDS_DEFAULT + 100.0 * CHECK_REPAINT_FRACTION_DEFAULT
+    )
+    assert learned.touch_up_seconds(100.0) == pytest.approx(100.0 * TOUCH_UP_FRACTION_DEFAULT)
+
+    # A run of 600 s painting, 20 colors checked at 1 s a capture, 60 s of
+    # repainting from the checks, and a 30 s touch-up.
+    assert learned.observe(
+        predicted_seconds=600.0,
+        actual_seconds=600.0,
+        strokes=5000,
+        colors_checked=20,
+        check_capture_seconds=20.0,
+        check_repaint_seconds=60.0,
+        touch_up_seconds=30.0,
+    )
+    assert learned.check_samples == 1 and learned.touch_up_samples == 1
+    assert learned.check_capture_seconds == pytest.approx(
+        (CHECK_CAPTURE_SECONDS_DEFAULT * LEARN_PRIOR_COLORS + 1.0 * 20) / (LEARN_PRIOR_COLORS + 20)
+    )
+    assert learned.check_repaint_fraction == pytest.approx(
+        (CHECK_REPAINT_FRACTION_DEFAULT * LEARN_PRIOR_PAINT_SECONDS + 0.1 * 600)
+        / (LEARN_PRIOR_PAINT_SECONDS + 600)
+    )
+    assert learned.touch_up_fraction == pytest.approx(
+        (TOUCH_UP_FRACTION_DEFAULT * LEARN_PRIOR_PAINT_SECONDS + 0.05 * 600)
+        / (LEARN_PRIOR_PAINT_SECONDS + 600)
+    )
+    # A run without checks, stopped before the touch-up, teaches neither.
+    assert learned.observe(predicted_seconds=300.0, actual_seconds=310.0, strokes=3000)
+    assert learned.check_samples == 1 and learned.touch_up_samples == 1
+    # Too few colors checked to say what a capture costs.
+    assert learned.observe(
+        predicted_seconds=300.0,
+        actual_seconds=310.0,
+        strokes=3000,
+        colors_checked=2,
+        check_capture_seconds=9.0,
+    )
+    assert learned.check_samples == 1
+    # A clean sign's touch-up is a few seconds of capture: a real, small sample.
+    assert learned.observe(
+        predicted_seconds=600.0, actual_seconds=600.0, strokes=5000, touch_up_seconds=2.0
+    )
+    assert learned.touch_up_samples == 2
+    assert learned.touch_up_fraction < TOUCH_UP_FRACTION_DEFAULT
+
+
+def test_an_older_timing_file_is_read_as_measurements(tmp_path: Path) -> None:
+    """Files from before per-run measurements were kept hold the overhead
+    after each run was blended in; each run's own measurement is the
+    overhead before it plus its residual."""
+
+    path = tmp_path / "timing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "overhead_seconds": 0.092,
+                "samples": 2,
+                "history": [
+                    {
+                        "predicted_seconds": 1774.0,
+                        "actual_seconds": 1730.1,
+                        "strokes": 15893,
+                        "overhead_seconds": 0.0117,
+                    },
+                    {
+                        "predicted_seconds": 73.2,
+                        "actual_seconds": 97.4,
+                        "strokes": 229,
+                        "overhead_seconds": 0.092,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = LearnedTiming.load(path)
+    first, second = loaded.history
+    assert first["measured_overhead_seconds"] == pytest.approx(
+        DEFAULT_STROKE_OVERHEAD_SECONDS + (1730.1 - 1774.0) / 15893, abs=1e-5
+    )
+    assert second["measured_overhead_seconds"] == pytest.approx(
+        0.0117 + (97.4 - 73.2) / 229, abs=1e-5
+    )
+    # The stored 92 ms is not believed; the long run outweighs the short one.
+    assert loaded.overhead_seconds < 0.02
+    assert loaded.check_capture_seconds == CHECK_CAPTURE_SECONDS_DEFAULT
+    assert loaded.touch_up_fraction == TOUCH_UP_FRACTION_DEFAULT
 
 
 def test_learned_timing_survives_a_damaged_file(tmp_path: Path) -> None:

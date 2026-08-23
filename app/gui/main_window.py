@@ -110,6 +110,7 @@ from app.paint_timing import (
     STROKE_GAP_FLOOR_SECONDS,
     LearnedTiming,
     PlanProfile,
+    RunEstimate,
     StrokeTiming,
 )
 from app.paint_optimizer import (
@@ -5038,21 +5039,50 @@ class MainWindow(QMainWindow):
         self.analysis_strokes.value_label.setText(  # type: ignore[attr-defined]
             f"{plan.stroke_count:,}"
         )
-        seconds = self._estimate_seconds(plan)
-        # Verification repaints however many cells the capture disputes, which
-        # cannot be known before the sign exists - so the estimate names the
-        # extra pass instead of quietly overrunning it.
-        verify_note = " + touch-up" if self.verify_passes_spin.value() > 0 else ""
-        if self.confirm_strokes_check.isChecked():
-            # Repaints cost whatever the game drops, which is not known
-            # before the sign exists; the learned per-stroke overhead
-            # carries the average, the note says the rest.
-            verify_note = " + checks" + verify_note
+        estimate = self._estimate(plan)
+        # One figure for the whole job, checks and touch-up included; what
+        # each part costs, and how well it is known, is a hover away.
         self.analysis_time.value_label.setText(  # type: ignore[attr-defined]
-            f"{self._format_duration(seconds)}{verify_note}"
+            self._format_duration(estimate.total)
         )
+        self.analysis_time.setToolTip(self._describe_estimate(estimate))
+
+    def _describe_estimate(self, estimate: RunEstimate) -> str:
+        learned = self._learned_timing
+        lines = [f"Painting: {self._format_duration(estimate.paint)}"]
+        if estimate.calibration > 0:
+            lines.append(f"Brush measurement: {self._format_duration(estimate.calibration)}")
+        if estimate.countdown > 0:
+            lines.append(f"Countdown: {self._format_duration(estimate.countdown)}")
+        if self.confirm_strokes_check.isChecked():
+            known = (
+                f"from {learned.check_samples} run{'s' if learned.check_samples != 1 else ''}"
+                if learned.check_samples
+                else "a guess until a run has measured it"
+            )
+            lines.append(
+                f"Color checks: {self._format_duration(estimate.checks)} ({known})"
+            )
+        if self.verify_passes_spin.value() > 0:
+            known = (
+                f"from {learned.touch_up_samples} run{'s' if learned.touch_up_samples != 1 else ''}"
+                if learned.touch_up_samples
+                else "a guess until a run has finished one"
+            )
+            lines.append(
+                f"Touch-up: {self._format_duration(estimate.touch_up)} ({known})"
+            )
+        lines.append(
+            "The checks and the touch-up repaint whatever the game dropped, which "
+            "no estimate can know before the sign exists; each finished run "
+            "refines these figures."
+        )
+        return "\n".join(lines)
 
     def _estimate_seconds(self, plan: PaintPlan) -> float:
+        return self._estimate(plan).total
+
+    def _estimate(self, plan: PaintPlan) -> RunEstimate:
         """Predict the run from the painter's own timing rules.
 
         Strokes are priced as the painter executes them - a held press per
@@ -5060,6 +5090,8 @@ class MainWindow(QMainWindow):
         brush change - plus the countdown and the brush measurement that
         precede the first stroke.  Mouse speed barely matters: at any usable
         setting nearly every stroke is shorter than the frame it is held for.
+        Checking colors as they go down and the touch-up pass at the end are
+        priced from what earlier runs measured them at.
         """
 
         canvas = self._profile_rect("canvas")
@@ -5069,7 +5101,7 @@ class MainWindow(QMainWindow):
         else:
             profile = PlanProfile.from_plan(plan)
         document = self._settings_document()
-        from app.painter import PainterSettings
+        from app.painter import Painter, PainterSettings
 
         try:
             settings = PainterSettings.from_mapping(document)
@@ -5085,11 +5117,42 @@ class MainWindow(QMainWindow):
             and self._profile_rect("brush_size_box") is not None
             and self._profile_rect("clear_button") is not None
         )
-        seconds = profile.seconds(timing, cell_width, sizing=calibrates)
-        seconds += max(0.0, float(self.countdown_spin.value()))
-        if calibrates:
-            seconds += BRUSH_CALIBRATION_SECONDS
-        return seconds
+        # Long drags are paced by the sign's texel pitch, which the painter
+        # takes from the grid or brush model measured on this sign; priced
+        # without it a plan of long sweeps is promised at a speed the drags
+        # are never driven at.
+        pitch = (
+            Painter._texel_pitch_pixels(
+                plan,
+                canvas,
+                self._brush_size_model() if calibrates else None,
+                self._texel_grid(),
+            )
+            if canvas is not None
+            else None
+        )
+        paint = profile.seconds(
+            timing, cell_width, sizing=calibrates, texel_pitch_pixels=pitch
+        )
+        checks = (
+            self._learned_timing.check_seconds(
+                sum(1 for group in profile.groups if group.stroke_count), paint
+            )
+            if self.confirm_strokes_check.isChecked()
+            else 0.0
+        )
+        touch_up = (
+            self._learned_timing.touch_up_seconds(paint)
+            if self.verify_passes_spin.value() > 0
+            else 0.0
+        )
+        return RunEstimate(
+            paint=paint,
+            checks=checks,
+            touch_up=touch_up,
+            calibration=BRUSH_CALIBRATION_SECONDS if calibrates else 0.0,
+            countdown=max(0.0, float(self.countdown_spin.value())),
+        )
 
     @classmethod
     def _timing_path(cls) -> Path:
@@ -5106,24 +5169,46 @@ class MainWindow(QMainWindow):
             return  # a dry run skips the holds the estimate is about
         before = self._learned_timing.overhead_seconds
         # Time spent checking colors and repainting the game's dropped
-        # presses is this sign's, not this machine's per-stroke cost.
+        # presses is this sign's, not this machine's per-stroke cost; it is
+        # learned on its own, as is the touch-up pass when one ran to its end.
         checking = float(getattr(measured, "checking_seconds", 0.0) or 0.0)
+        capture = float(getattr(measured, "check_capture_seconds", 0.0) or 0.0)
+        colors_checked = int(getattr(measured, "colors_checked", 0) or 0)
+        touch_up = getattr(painter, "touch_up_timing", None)
         learned = self._learned_timing.observe(
             predicted_seconds=measured.predicted_seconds,
             actual_seconds=max(0.0, measured.actual_seconds - checking),
             strokes=measured.strokes,
+            colors_checked=colors_checked,
+            check_capture_seconds=capture,
+            check_repaint_seconds=max(0.0, checking - capture),
+            touch_up_seconds=(
+                float(touch_up.seconds) if touch_up is not None else None
+            ),
         )
         if not learned:
             return
         LOGGER.info(
             "Run timing: predicted %.0fs, took %.0fs over %d strokes (%.0fs of it "
-            "checking colors and repainting); per-stroke overhead %.1f ms -> %.1f ms",
+            "checking %d colors and repainting); per-stroke overhead %.1f ms -> "
+            "%.1f ms, a check %.2fs a color plus %.0f%% of the painting in "
+            "repaints, the touch-up %s%.0f%% of the painting",
             measured.predicted_seconds,
             measured.actual_seconds,
             measured.strokes,
             checking,
+            colors_checked,
             before * 1000.0,
             self._learned_timing.overhead_seconds * 1000.0,
+            self._learned_timing.check_capture_seconds,
+            self._learned_timing.check_repaint_fraction * 100.0,
+            (
+                f"took {touch_up.seconds:.0f}s in {touch_up.passes} pass"
+                f"{'es' if touch_up.passes != 1 else ''}, now "
+                if touch_up is not None
+                else ""
+            ),
+            self._learned_timing.touch_up_fraction * 100.0,
         )
         try:
             self._learned_timing.save(self._timing_path())
@@ -7452,6 +7537,9 @@ class MainWindow(QMainWindow):
             painter = Painter(
                 input_controller,
                 stroke_overhead_seconds=self._learned_timing.overhead_seconds,
+                check_capture_seconds=self._learned_timing.check_capture_seconds,
+                check_repaint_fraction=self._learned_timing.check_repaint_fraction,
+                touch_up_fraction=self._learned_timing.touch_up_fraction,
                 on_progress=lambda progress: self._painter_bridge.progress.emit(
                     generation, progress
                 ),

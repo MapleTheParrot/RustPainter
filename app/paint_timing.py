@@ -9,10 +9,14 @@ around 85 ms whether it paints one cell or thirty - and an estimate built
 from mouse travel alone lands five times short.
 
 Everything here is derived from the same constants the painter executes
-with, so the estimate and the job cannot drift apart.  The one quantity that
-is not a constant, the per-stroke overhead of input calls, checkpoints and
-timer slack, is learned from completed runs (:class:`LearnedTiming`) and
-defaults to the value measured on the machine this was written on.
+with, so the estimate and the job cannot drift apart.  What is not a
+constant is learned from finished runs (:class:`LearnedTiming`): the
+per-stroke overhead of input calls, checkpoints and timer slack, what a
+capture costs when a color is checked as it goes down, and how much
+repainting the checks and the touch-up pass at the end turn out to need -
+the last two being the game's dropped presses on this sign, which no
+estimate can know before the sign exists.  Each defaults to what was
+measured on the machine this was written on.
 """
 
 from __future__ import annotations
@@ -185,11 +189,43 @@ MAX_STROKE_OVERHEAD_SECONDS = 0.25
 # wipes of the sign.  Measured at 18 s on a real sign.
 BRUSH_CALIBRATION_SECONDS = 18.0
 
-# How many strokes a run must have painted before its timing is believed,
-# and how much of the disagreement between prediction and reality is folded
-# into the learned overhead each time.
+# How many strokes a run must have painted before its timing is believed.
+# Each believed run measures the overhead on its own (its residual per
+# stroke on top of the overhead it was predicted with), and the learned
+# value is the mean of those measurements weighted by how many strokes
+# each run painted - a short run that ran late says little, an overnight
+# one says a lot - with the default standing in as a run of
+# LEARN_PRIOR_STROKES.  A single run's weight is capped so one enormous
+# sign does not hold the figure against every run after it.
 LEARN_MIN_STROKES = 200
-LEARN_BLEND = 0.7
+LEARN_PRIOR_STROKES = 2000
+LEARN_MAX_WEIGHT_STROKES = 20000
+
+# Checking each color as it goes down (``Painter._confirm_group``) costs a
+# capture per color - the settle before it, the screenshot, reading every
+# cell - and then whatever repainting the capture asks for, which is the
+# game's dropped presses on this sign and scales with how much was
+# painted.  The touch-up pass at the end (``Painter._verify_and_touch_up``)
+# is the same shape without the per-color part: a capture or two, and a
+# repaint that scales with the sign.  Neither can be known before the sign
+# exists, so both are learned from finished runs as averages and the
+# defaults below stand in until one has been measured: the capture from the
+# settle and sampling the painter does, the fractions from the runs this
+# was written against.
+CHECK_CAPTURE_SECONDS_DEFAULT = CONFIRM_SETTLE_SECONDS + 0.25
+CHECK_REPAINT_FRACTION_DEFAULT = 0.15
+TOUCH_UP_FRACTION_DEFAULT = 0.1
+# How many colors a run must have checked, and how long its artwork must
+# have painted, before its checks and touch-up are believed; the prior
+# weights match the stroke prior above in spirit - a few small runs.
+LEARN_MIN_CHECKED_COLORS = 3
+LEARN_MIN_PAINT_SECONDS = 30.0
+LEARN_PRIOR_COLORS = 10
+LEARN_MAX_WEIGHT_COLORS = 200
+LEARN_PRIOR_PAINT_SECONDS = 300.0
+LEARN_MAX_WEIGHT_PAINT_SECONDS = 3600.0
+MAX_CHECK_CAPTURE_SECONDS = 10.0
+MAX_REPAINT_FRACTION = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,12 +508,38 @@ def remaining_seconds(
     return left * pace
 
 
+def _weighted_mean(
+    samples: list[tuple[float, float]], *, prior: float, prior_weight: float
+) -> float:
+    """The mean of ``(value, weight)`` samples, with the prior counted in."""
+
+    total = prior * prior_weight
+    weight = prior_weight
+    for value, sample_weight in samples:
+        total += value * sample_weight
+        weight += sample_weight
+    return total / weight if weight > 0 else prior
+
+
 @dataclass
 class LearnedTiming:
-    """The per-stroke overhead this machine has shown, kept between runs."""
+    """What this machine's runs have shown the estimate cannot know upfront.
+
+    The per-stroke overhead of input calls and timer slack, the cost of a
+    capture when a color is checked, and how much repainting the checks and
+    the touch-up pass turn out to need, as fractions of the painting they
+    follow.  Every figure is a weighted mean over the runs on record with
+    the default as a prior, recomputed whenever a run is added, so a single
+    odd run moves it in proportion to how much that run painted.
+    """
 
     overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS
+    check_capture_seconds: float = CHECK_CAPTURE_SECONDS_DEFAULT
+    check_repaint_fraction: float = CHECK_REPAINT_FRACTION_DEFAULT
+    touch_up_fraction: float = TOUCH_UP_FRACTION_DEFAULT
     samples: int = 0
+    check_samples: int = 0
+    touch_up_samples: int = 0
     history: list[dict[str, float]] = field(default_factory=list)
 
     @classmethod
@@ -501,16 +563,138 @@ class LearnedTiming:
         if not 0.0 <= overhead <= MAX_STROKE_OVERHEAD_SECONDS:
             overhead = DEFAULT_STROKE_OVERHEAD_SECONDS
         history = data.get("history")
-        return cls(
+        learned = cls(
             overhead_seconds=overhead,
             samples=max(0, samples),
-            history=[dict(item) for item in history] if isinstance(history, list) else [],
+            history=(
+                [dict(item) for item in history if isinstance(item, Mapping)]
+                if isinstance(history, list)
+                else []
+            ),
         )
+        learned._restore_measurements()
+        learned._recompute()
+        return learned
+
+    def _restore_measurements(self) -> None:
+        """Give runs recorded before per-run measurements were kept theirs.
+
+        An older entry holds the overhead *after* the run was folded in;
+        the overhead it was predicted with is the entry before it (or the
+        default), and its own measurement is that plus its residual.
+        """
+
+        previous = DEFAULT_STROKE_OVERHEAD_SECONDS
+        for entry in self.history:
+            try:
+                strokes = int(entry.get("strokes", 0))
+                predicted = float(entry.get("predicted_seconds", 0.0))
+                actual = float(entry.get("actual_seconds", 0.0))
+                after = float(entry.get("overhead_seconds", previous))
+            except (TypeError, ValueError):
+                continue
+            if "measured_overhead_seconds" not in entry and strokes > 0:
+                measured = previous + (actual - predicted) / strokes
+                entry["measured_overhead_seconds"] = round(
+                    min(MAX_STROKE_OVERHEAD_SECONDS, max(0.0, measured)), 5
+                )
+            previous = after
+
+    def _recompute(self) -> None:
+        overhead: list[tuple[float, float]] = []
+        capture: list[tuple[float, float]] = []
+        repaint: list[tuple[float, float]] = []
+        touch_up: list[tuple[float, float]] = []
+        for entry in self.history:
+            try:
+                strokes = float(entry.get("strokes", 0))
+                measured = entry.get("measured_overhead_seconds")
+                if measured is not None and strokes > 0:
+                    overhead.append(
+                        (float(measured), min(strokes, LEARN_MAX_WEIGHT_STROKES))
+                    )
+                colors = float(entry.get("colors_checked", 0))
+                if colors > 0 and "check_capture_seconds" in entry:
+                    capture.append(
+                        (
+                            float(entry["check_capture_seconds"]) / colors,
+                            min(colors, LEARN_MAX_WEIGHT_COLORS),
+                        )
+                    )
+                paint = float(entry.get("actual_seconds", 0.0))
+                if paint > 0 and "check_repaint_seconds" in entry:
+                    repaint.append(
+                        (
+                            float(entry["check_repaint_seconds"]) / paint,
+                            min(paint, LEARN_MAX_WEIGHT_PAINT_SECONDS),
+                        )
+                    )
+                if paint > 0 and "touch_up_seconds" in entry:
+                    touch_up.append(
+                        (
+                            float(entry["touch_up_seconds"]) / paint,
+                            min(paint, LEARN_MAX_WEIGHT_PAINT_SECONDS),
+                        )
+                    )
+            except (TypeError, ValueError):
+                continue
+        if overhead:
+            self.overhead_seconds = min(
+                MAX_STROKE_OVERHEAD_SECONDS,
+                max(
+                    0.0,
+                    _weighted_mean(
+                        overhead,
+                        prior=DEFAULT_STROKE_OVERHEAD_SECONDS,
+                        prior_weight=LEARN_PRIOR_STROKES,
+                    ),
+                ),
+            )
+        self.check_capture_seconds = min(
+            MAX_CHECK_CAPTURE_SECONDS,
+            max(
+                0.0,
+                _weighted_mean(
+                    capture,
+                    prior=CHECK_CAPTURE_SECONDS_DEFAULT,
+                    prior_weight=LEARN_PRIOR_COLORS,
+                ),
+            ),
+        )
+        self.check_repaint_fraction = min(
+            MAX_REPAINT_FRACTION,
+            max(
+                0.0,
+                _weighted_mean(
+                    repaint,
+                    prior=CHECK_REPAINT_FRACTION_DEFAULT,
+                    prior_weight=LEARN_PRIOR_PAINT_SECONDS,
+                ),
+            ),
+        )
+        self.touch_up_fraction = min(
+            MAX_REPAINT_FRACTION,
+            max(
+                0.0,
+                _weighted_mean(
+                    touch_up,
+                    prior=TOUCH_UP_FRACTION_DEFAULT,
+                    prior_weight=LEARN_PRIOR_PAINT_SECONDS,
+                ),
+            ),
+        )
+        self.check_samples = len(capture)
+        self.touch_up_samples = len(touch_up)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "overhead_seconds": round(self.overhead_seconds, 5),
+            "check_capture_seconds": round(self.check_capture_seconds, 3),
+            "check_repaint_fraction": round(self.check_repaint_fraction, 4),
+            "touch_up_fraction": round(self.touch_up_fraction, 4),
             "samples": self.samples,
+            "check_samples": self.check_samples,
+            "touch_up_samples": self.touch_up_samples,
             "history": self.history[-20:],
         }
 
@@ -520,31 +704,67 @@ class LearnedTiming:
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def observe(
-        self, *, predicted_seconds: float, actual_seconds: float, strokes: int
+        self,
+        *,
+        predicted_seconds: float,
+        actual_seconds: float,
+        strokes: int,
+        colors_checked: int = 0,
+        check_capture_seconds: float = 0.0,
+        check_repaint_seconds: float = 0.0,
+        touch_up_seconds: float | None = None,
     ) -> bool:
-        """Fold one run's prediction-versus-clock into the overhead.
+        """Fold one run into the learned figures.
 
         ``predicted_seconds`` must have been computed with the overhead this
         object held at the time, so the residual per stroke is exactly the
-        correction the overhead needs.  Returns whether anything was learned.
+        correction the overhead needs; ``actual_seconds`` is the clock the
+        artwork's own strokes took, with the checking left out.  The checks
+        are described by how many colors had a capture, the time those
+        captures took and the time spent repainting from them; the touch-up
+        pass by the time it took in all, given only when it ran to its end.
+        Returns whether anything was learned.
         """
 
         if strokes < LEARN_MIN_STROKES or predicted_seconds <= 0 or actual_seconds <= 0:
             return False
-        residual = (actual_seconds - predicted_seconds) / strokes
-        corrected = self.overhead_seconds + LEARN_BLEND * residual
-        corrected = min(MAX_STROKE_OVERHEAD_SECONDS, max(0.0, corrected))
-        self.history.append(
-            {
-                "predicted_seconds": round(predicted_seconds, 1),
-                "actual_seconds": round(actual_seconds, 1),
-                "strokes": strokes,
-                "overhead_seconds": round(corrected, 5),
-            }
-        )
-        self.overhead_seconds = corrected
+        measured = self.overhead_seconds + (actual_seconds - predicted_seconds) / strokes
+        entry: dict[str, float] = {
+            "predicted_seconds": round(predicted_seconds, 1),
+            "actual_seconds": round(actual_seconds, 1),
+            "strokes": strokes,
+            "measured_overhead_seconds": round(
+                min(MAX_STROKE_OVERHEAD_SECONDS, max(0.0, measured)), 5
+            ),
+        }
+        believed_paint = actual_seconds >= LEARN_MIN_PAINT_SECONDS
+        if colors_checked >= LEARN_MIN_CHECKED_COLORS:
+            entry["colors_checked"] = int(colors_checked)
+            entry["check_capture_seconds"] = round(max(0.0, check_capture_seconds), 2)
+            if believed_paint:
+                entry["check_repaint_seconds"] = round(max(0.0, check_repaint_seconds), 2)
+        if touch_up_seconds is not None and believed_paint:
+            entry["touch_up_seconds"] = round(max(0.0, touch_up_seconds), 2)
+        self.history.append(entry)
+        self.history = self.history[-20:]
         self.samples += 1
+        self._recompute()
+        # Kept for readers of the file: the overhead after this run.
+        entry["overhead_seconds"] = round(self.overhead_seconds, 5)
         return True
+
+    def check_seconds(self, colors_checked: int, paint_seconds: float) -> float:
+        """What checking ``colors_checked`` colors over ``paint_seconds`` of painting costs."""
+
+        return (
+            max(0, int(colors_checked)) * self.check_capture_seconds
+            + max(0.0, float(paint_seconds)) * self.check_repaint_fraction
+        )
+
+    def touch_up_seconds(self, paint_seconds: float) -> float:
+        """What the touch-up pass after ``paint_seconds`` of painting costs."""
+
+        return max(0.0, float(paint_seconds)) * self.touch_up_fraction
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,20 +772,55 @@ class PhaseTiming:
     """How a painting phase's clock compared with its prediction.
 
     ``checking_seconds`` is the part of the clock spent checking colors as
-    they went down and repainting what missed.  The time left is predicted
-    from the whole clock, since the job will go on spending it; the
-    per-stroke overhead is learned without it, since it is the game's
-    dropped presses on this sign and not this machine's cost of a stroke.
+    they went down and repainting what missed; of it,
+    ``check_capture_seconds`` went on the first capture of each of the
+    ``colors_checked`` colors, and the rest on repainting and re-capturing.
+    The time left is predicted from the whole clock, since the job will go
+    on spending it; the per-stroke overhead is learned without it, since it
+    is the game's dropped presses on this sign and not this machine's cost
+    of a stroke.
     """
 
     predicted_seconds: float
     actual_seconds: float
     strokes: int
     checking_seconds: float = 0.0
+    colors_checked: int = 0
+    check_capture_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RunEstimate:
+    """A whole run's predicted seconds, part by part."""
+
+    paint: float
+    checks: float = 0.0
+    touch_up: float = 0.0
+    calibration: float = 0.0
+    countdown: float = 0.0
+
+    @property
+    def total(self) -> float:
+        return self.paint + self.checks + self.touch_up + self.calibration + self.countdown
+
+
+@dataclass(frozen=True, slots=True)
+class TouchUpTiming:
+    """How long the touch-up pass at the end of a run took, when it ran to its end.
+
+    ``passes`` counts the captures taken; a pass that found nothing to
+    repaint still counts, and its few seconds are the honest cost of a
+    clean sign.
+    """
+
+    seconds: float
+    passes: int
 
 
 __all__ = [
     "BRUSH_CALIBRATION_SECONDS",
+    "CHECK_CAPTURE_SECONDS_DEFAULT",
+    "CHECK_REPAINT_FRACTION_DEFAULT",
     "DEFAULT_STROKE_OVERHEAD_SECONDS",
     "FRAME_SECONDS",
     "KEY_GAP_SECONDS",
@@ -578,12 +833,15 @@ __all__ = [
     "PhaseTiming",
     "PlanProfile",
     "PlanWorkSchedule",
+    "RunEstimate",
     "SETTLE_FLOOR_SECONDS",
     "SHORT_RUN_TEXELS",
     "STROKE_GAP_FLOOR_SECONDS",
     "StrokePace",
     "StrokeTiming",
     "TIMING_FLOORS",
+    "TOUCH_UP_FRACTION_DEFAULT",
+    "TouchUpTiming",
     "estimate_plan_seconds",
     "fields_below_floor",
     "floored",
