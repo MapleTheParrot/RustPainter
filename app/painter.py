@@ -58,8 +58,10 @@ from .paint_timing import (
 )
 from .picker_calibration import trim_to_widget
 from .texel_grid import (
+    AIM_AUDIT_MAX_PITCH,
     GridProbePlan,
     TexelGridModel,
+    audit_cursor_map,
     find_quad_edges,
     measure_grid,
     stamp_diff,
@@ -2427,6 +2429,17 @@ class Painter:
             grid.residual,
             "counted from the sign's edges" if grid.from_edges else "counted from the rectangle",
         )
+        if min(grid.pitch_x, grid.pitch_y) < AIM_AUDIT_MAX_PITCH:
+            # On a fine sign the smooth cursor map is not the whole truth: a
+            # DPI-scaled display quantizes the game's cursor reads, and phase
+            # bands of columns land their dabs a texel over.  One dot per
+            # column and per row finds them; whole-pixel nudges fix them.
+            self._update_progress_state(
+                PainterState.RUNNING,
+                "Auditing the cursor aim, one dot per row and column",
+                phase="calibrate",
+            )
+            grid = audit_cursor_map(grid, stamp_batch, canvas)
         return grid
 
     def _probe_sizes(

@@ -921,6 +921,14 @@ class TexelGridModel:
     # swapped.  All-zero means "use the lattice and shear" (an old record).
     aim_map_x: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     aim_map_y: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    # Per-column / per-row aim corrections in screen pixels, measured by the
+    # aim audit (one dot per index, displaced landings nudged back).  On a
+    # DPI-scaled display the game reads the cursor in quantized steps the
+    # smooth map above cannot represent: a texel is 1.42 game pixels at 125%
+    # scale, and in the phase bands where the map's rounded pixel falls in
+    # the wrong step, every dab lands one texel over.  Empty means unaudited.
+    aim_nudge_x: tuple[float, ...] = ()
+    aim_nudge_y: tuple[float, ...] = ()
     residual: float = 0.0
     from_edges: bool = False
     captured_at: str = ""
@@ -996,7 +1004,7 @@ class TexelGridModel:
             x = (bx + sx * by) / determinant
             y = (by + sy * bx) / determinant
         if self.aim_map_x[1] == 0.0 or self.aim_map_y[1] == 0.0:
-            return x, y
+            return self._nudged(x, y, u, v)
         # The full map, with its twist: ``u = a + b x + c y + d x y`` solves
         # for x at a given y in closed form, and the two axes are iterated
         # from the affine answer - the twist is a few thousandths, so three
@@ -1006,6 +1014,17 @@ class TexelGridModel:
         for _ in range(3):
             x = (u - ax - cx * y) / (bx_ + dx * y)
             y = (v - ay - cy * x) / (by_ + dy * x)
+        return self._nudged(x, y, u, v)
+
+    def _nudged(self, x: float, y: float, u: float, v: float) -> tuple[float, float]:
+        """Apply the audit's per-index aim corrections, when any were measured."""
+
+        if self.aim_nudge_x:
+            index = min(max(int(u), 0), len(self.aim_nudge_x) - 1)
+            x += self.aim_nudge_x[index]
+        if self.aim_nudge_y:
+            index = min(max(int(v), 0), len(self.aim_nudge_y) - 1)
+            y += self.aim_nudge_y[index]
         return x, y
 
     def clamp_rect(self, canvas: Any) -> SimpleNamespace:
@@ -1052,7 +1071,7 @@ class TexelGridModel:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schemaVersion": TEXEL_GRID_SCHEMA,
             "columns": self.columns,
             "rows": self.rows,
@@ -1072,6 +1091,11 @@ class TexelGridModel:
             "fromEdges": self.from_edges,
             "capturedAt": self.captured_at,
         }
+        if self.aim_nudge_x:
+            value["aimNudgeX"] = list(self.aim_nudge_x)
+        if self.aim_nudge_y:
+            value["aimNudgeY"] = list(self.aim_nudge_y)
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TexelGridModel":
@@ -1090,6 +1114,8 @@ class TexelGridModel:
             aim_shear_y=float(value.get("aimShearY", 0.0)),
             aim_map_x=tuple(float(v) for v in value.get("aimMapX", (0.0, 0.0, 0.0, 0.0))),
             aim_map_y=tuple(float(v) for v in value.get("aimMapY", (0.0, 0.0, 0.0, 0.0))),
+            aim_nudge_x=tuple(float(v) for v in value.get("aimNudgeX", ())),
+            aim_nudge_y=tuple(float(v) for v in value.get("aimNudgeY", ())),
             residual=float(value.get("residual", 0.0)),
             from_edges=bool(value.get("fromEdges", False)),
             captured_at=str(value.get("capturedAt") or ""),
@@ -1252,6 +1278,139 @@ def snap_to_texture_sizes(
         _snap_axis_to_count(columns, width, edge_left, edge_right, "columns"),
         _snap_axis_to_count(rows, height, edge_top, edge_bottom, "rows"),
         (width, height),
+    )
+
+
+# Below this rendered pitch the aim audit runs after a successful probe: a
+# texel this small is at most a couple of game-side cursor steps wide on a
+# DPI-scaled display, and the smooth cursor map misplaces whole phase bands
+# of columns.  Coarser signs measured 1200/1200 exact without it.
+AIM_AUDIT_MAX_PITCH = 2.5
+# A landing this far (in texels) from the consensus is a displaced dab.
+_AUDIT_DISPLACED_TEXELS = 0.5
+# The most pixels one index's aim may be nudged by the audit.
+_AUDIT_MAX_NUDGE_PIXELS = 2.0
+
+
+def audit_cursor_map(
+    grid: TexelGridModel,
+    stamp_batch: "Callable[[GridProbePlan], np.ndarray]",
+    canvas: Any,
+    *,
+    rounds: int = 3,
+) -> TexelGridModel:
+    """Stamp one dot per column and per row; nudge the aims that landed off.
+
+    The cursor map is fitted smooth, but on a DPI-scaled display the game
+    reads the cursor in quantized steps: at 125% scale a 1.77 px texel is
+    1.42 game pixels, and in the phase bands where the smooth map's rounded
+    pixel falls in the wrong step every dab lands one texel over - measured
+    live as vertical bands of misplaced detail and unfilled holes.  One dot
+    per index shows exactly which aims are wrong; a one-pixel nudge flips
+    them back, and a verify round re-stamps just the corrected indexes.
+    """
+
+    from dataclasses import replace as _replace
+
+    left, top = float(canvas.left), float(canvas.top)
+    nudge_x = [0.0] * grid.columns
+    nudge_y = [0.0] * grid.rows
+
+    def stagger(k: int, other_count: int) -> int:
+        return 4 + (k * 37) % max(1, other_count - 8)
+
+    def aim_for(u_texel: int, v_texel: int) -> tuple[float, float]:
+        x, y = grid.cursor_point(u_texel + 0.5, v_texel + 0.5)
+        return x + nudge_x[u_texel], y + nudge_y[v_texel]
+
+    def landing(diff: np.ndarray, u_texel: int, v_texel: int, along_x: bool) -> float | None:
+        cx = grid.origin_x + (u_texel + 0.5) * grid.pitch_x - left
+        cy = grid.origin_y + (v_texel + 0.5) * grid.pitch_y - top
+        x0 = int(round(cx)) - 3
+        y0 = int(round(cy)) - 3
+        window = diff[max(0, y0) : y0 + 7, max(0, x0) : x0 + 7]
+        if window.size == 0 or window.max() < _NOISE_FLOOR:
+            return None
+        ys, xs = np.nonzero(window >= max(_NOISE_FLOOR, 0.5 * float(window.max())))
+        weight = window[ys, xs].astype(float)
+        mx = float((xs * weight).sum() / weight.sum()) + max(0, x0)
+        my = float((ys * weight).sum() / weight.sum()) + max(0, y0)
+        if along_x:
+            return (mx - cx) / grid.pitch_x
+        return (my - cy) / grid.pitch_y
+
+    def audit_axis(along_x: bool) -> int:
+        count = grid.columns if along_x else grid.rows
+        other = grid.rows if along_x else grid.columns
+        nudges = nudge_x if along_x else nudge_y
+        name = "columns" if along_x else "rows"
+        targets = list(range(count))
+        corrected = 0
+        for round_index in range(rounds):
+            if not targets:
+                break
+            plan_points = []
+            for k in targets:
+                if along_x:
+                    u_texel, v_texel = k, stagger(k, other)
+                else:
+                    u_texel, v_texel = stagger(k, other), k
+                plan_points.append(aim_for(u_texel, v_texel))
+            diff = stamp_batch(
+                GridProbePlan(tuple(plan_points), f"{name} aim audit {round_index + 1}")
+            )
+            offsets: dict[int, float | None] = {}
+            for k in targets:
+                if along_x:
+                    u_texel, v_texel = k, stagger(k, other)
+                else:
+                    u_texel, v_texel = stagger(k, other), k
+                offsets[k] = landing(diff, u_texel, v_texel, along_x)
+            finite = [value for value in offsets.values() if value is not None]
+            if not finite:
+                LOGGER.warning("%s aim audit saw no stamps; leaving the aims alone", name)
+                return corrected
+            if round_index == 0:
+                # The consensus landing offset comes from the full sweep; a
+                # verify round re-stamps only the corrected few, which are no
+                # crowd to take a median over.
+                baseline = float(np.median(finite))
+            displaced = []
+            for k, value in offsets.items():
+                if value is None:
+                    continue
+                relative = value - baseline
+                if abs(relative) < _AUDIT_DISPLACED_TEXELS:
+                    continue
+                proposed = nudges[k] - float(np.sign(relative))
+                if abs(proposed) > _AUDIT_MAX_NUDGE_PIXELS:
+                    continue
+                nudges[k] = proposed
+                displaced.append(k)
+            if round_index == 0:
+                corrected = len(displaced)
+            LOGGER.info(
+                "%s aim audit round %d: %d of %d dots landed a texel off%s",
+                name,
+                round_index + 1,
+                len(displaced),
+                len(targets),
+                "; nudging and re-checking" if displaced and round_index + 1 < rounds else "",
+            )
+            targets = displaced
+        return corrected
+
+    corrected_x = audit_axis(along_x=True)
+    corrected_y = audit_axis(along_x=False)
+    if corrected_x == 0 and corrected_y == 0:
+        return grid
+    LOGGER.info(
+        "Aim audit corrected %d column aims and %d row aims by whole pixels",
+        corrected_x,
+        corrected_y,
+    )
+    return _replace(
+        grid, aim_nudge_x=tuple(nudge_x), aim_nudge_y=tuple(nudge_y)
     )
 
 

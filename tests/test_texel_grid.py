@@ -10,6 +10,7 @@ from app.models import ScreenRect
 from app.texel_grid import (
     GridProbePlan,
     TexelGridModel,
+    audit_cursor_map,
     find_quad_edges,
     fit_staircase,
     ladder_offsets,
@@ -40,6 +41,7 @@ class SimulatedSign:
         stamp_offset: tuple[int, int] = (0, 0),
         cursor_pitch: tuple[float, float] | None = None,
         cursor_shear: tuple[float, float] = (0.0, 0.0),
+        cursor_quantum: float = 0.0,
         snap: bool = True,
         seed: int = 1,
     ) -> None:
@@ -53,6 +55,9 @@ class SimulatedSign:
         # against the flat canvas: column boundaries slide with y.
         self.cursor_shear = cursor_shear
         self.cursor_shift, self.stamp_offset, self.snap = cursor_shift, stamp_offset, snap
+        # A DPI-scaled display quantizes the game's cursor reads: physical
+        # pixels collapse onto logical ones in steps of the scale factor.
+        self.cursor_quantum = cursor_quantum
         base = np.array([214, 204, 186], dtype=np.float32)
         self.texture = base + rng.normal(0.0, 4.0, (rows, columns, 3)).astype(np.float32)
         self.dabs = 0
@@ -66,6 +71,25 @@ class SimulatedSign:
         ox, oy = self.origin
         return ox, oy, ox + self.columns * self.pitch[0], oy + self.rows * self.pitch[1]
 
+    def landing_texel(self, x: float, y: float) -> tuple[int, int] | None:
+        """Which texel a cursor at ``(x, y)`` stamps, or None off the texture."""
+
+        ox, oy = self.origin
+        px, py = self.pitch
+        if self.cursor_quantum:
+            quantum = self.cursor_quantum
+            x = math.floor(x / quantum) * quantum
+            y = math.floor(y / quantum) * quantum
+        if not (ox <= x < ox + self.columns * px and oy <= y < oy + self.rows * py):
+            return None
+        cx, cy = self.cursor_pitch
+        sx, sy = self.cursor_shear
+        column = math.floor((x - ox - self.cursor_shift[0] - sx * (y - oy)) / cx) + self.stamp_offset[0]
+        row = math.floor((y - oy - self.cursor_shift[1] - sy * (x - ox)) / cy) + self.stamp_offset[1]
+        if 0 <= column < self.columns and 0 <= row < self.rows:
+            return column, row
+        return None
+
     def dab(self, x: float, y: float, color=(200, 30, 160)) -> None:
         ox, oy = self.origin
         px, py = self.pitch
@@ -74,11 +98,9 @@ class SimulatedSign:
             self.dabs += 1
             return
         if self.snap:
-            cx, cy = self.cursor_pitch
-            sx, sy = self.cursor_shear
-            column = math.floor((x - ox - self.cursor_shift[0] - sx * (y - oy)) / cx) + self.stamp_offset[0]
-            row = math.floor((y - oy - self.cursor_shift[1] - sy * (x - ox)) / cy) + self.stamp_offset[1]
-            if 0 <= column < self.columns and 0 <= row < self.rows:
+            landed = self.landing_texel(x, y)
+            if landed is not None:
+                column, row = landed
                 self.texture[row, column] = color
         else:
             fx = (x - ox) / px * self._fine
@@ -335,3 +357,53 @@ def test_a_stray_dab_cannot_miscount_the_ladder() -> None:
     assert abs(grid.pitch_x - 4.04375) < 0.002
     assert abs(grid.pitch_y - 4.49167) < 0.002
     assert abs(grid.origin_x - 345.0) < 0.3
+
+
+def test_the_aim_audit_corrects_dpi_quantized_aims() -> None:
+    """At 125% display scale the game reads the cursor in 1.25 px steps, so
+    a smooth cursor map's rounded aim lands whole phase bands of columns one
+    texel over - measured live as bands of misplaced detail and holes.  One
+    dot per index shows which aims are wrong; whole-pixel nudges fix them."""
+
+    sign = SimulatedSign(
+        200, 100, origin=(100.0, 90.0), pitch=(1.77, 1.78), cursor_quantum=1.25
+    )
+    canvas = ScreenRect(99, 89, 356, 180)
+    grid = TexelGridModel(
+        columns=200, rows=100, pitch_x=1.77, pitch_y=1.78, origin_x=100.0, origin_y=90.0
+    )
+
+    colors = [(200, 30, 160), (30, 200, 60), (40, 90, 230), (240, 180, 20)]
+    batches = {"count": 0}
+
+    def stamp_batch(plan: GridProbePlan) -> np.ndarray:
+        before = sign.capture(canvas)
+        color = colors[batches["count"] % len(colors)]
+        batches["count"] += 1
+        for x, y in plan.points:
+            sign.dab(math.floor(x + 0.5), math.floor(y + 0.5), color)
+        after = sign.capture(canvas)
+        return stamp_diff(before, after)
+
+    def wrong_columns(model: TexelGridModel) -> int:
+        wrong = 0
+        for column in range(model.columns):
+            x, y = model.cursor_point(column + 0.5, 50.5)
+            landed = sign.landing_texel(math.floor(x + 0.5), math.floor(y + 0.5))
+            if landed is None or landed[0] != column:
+                wrong += 1
+        return wrong
+
+    def wrong_rows(model: TexelGridModel) -> int:
+        wrong = 0
+        for row in range(model.rows):
+            x, y = model.cursor_point(100.5, row + 0.5)
+            landed = sign.landing_texel(math.floor(x + 0.5), math.floor(y + 0.5))
+            if landed is None or landed[1] != row:
+                wrong += 1
+        return wrong
+
+    assert wrong_columns(grid) > 10  # the quantization does misplace phase bands
+    audited = audit_cursor_map(grid, stamp_batch, canvas)
+    assert wrong_columns(audited) == 0
+    assert wrong_rows(audited) == 0
