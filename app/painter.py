@@ -695,10 +695,8 @@ class Painter:
 
         None when there is no job, or the job will not take breaks: the
         option is off, or the profile has no Save button to leave the sign
-        by.  The interval is counted on the clock,
-        pauses included, exactly as the break itself is: a player stood
-        still through a pause is as idle to the server as one the painter
-        kept still.
+        by.  The clock stops while the job is paused and carries on from
+        the same value when it resumes.
         """
 
         with self._condition:
@@ -709,7 +707,10 @@ class Painter:
             if not settings.anti_afk_enabled or job.target.save_button is None:
                 return None
             due_at = self._last_anti_afk_at + settings.anti_afk_interval_seconds
-            return max(0.0, due_at - time.monotonic())
+            now = time.monotonic()
+            if self._state is PainterState.PAUSED and self._paused_at is not None:
+                now = self._paused_at
+            return max(0.0, due_at - now)
 
     def set_callbacks(
         self,
@@ -1017,7 +1018,11 @@ class Painter:
                 return False
             now = time.monotonic()
             if self._paused_at is not None:
-                self._paused_seconds += now - self._paused_at
+                paused_for = now - self._paused_at
+                self._paused_seconds += paused_for
+                # The anti-AFK clock stops with the job: a break is not owed
+                # for time spent paused.
+                self._last_anti_afk_at += paused_for
             self._paused_at = None
             resumed_state = self._state_before_pause
             self._state = resumed_state

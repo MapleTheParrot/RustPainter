@@ -843,8 +843,8 @@ class MainWindow(QMainWindow):
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._capture_timelapse_frame)
         # The readout under the progress bar counts down to the next
-        # anti-AFK break, which keeps running through a pause - when no
-        # progress updates arrive to move it - so it ticks on its own clock.
+        # anti-AFK break and the elapsed time, so it ticks on its own clock
+        # rather than waiting for a progress update.
         self._active_detail = ""
         self._status_overlay_linger = QTimer(self)
         self._status_overlay_linger.setSingleShot(True)
@@ -6371,7 +6371,7 @@ class MainWindow(QMainWindow):
     # so seeing it is how the user knows the app is running and watching.
     _STATUS_OVERLAY_WORDS = {
         "countdown": "GET READY",
-        "running": "PAINTING…",
+        "running": "PAINTING",
         "paused": "PAUSED",
         "aborted": "ABORTED",
         "completed": "COMPLETE",

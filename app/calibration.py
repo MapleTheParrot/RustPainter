@@ -681,6 +681,14 @@ class _CalibrationPreviewWindow(QWidget):
     # rather than across the sign, so it never sits over the part being
     # painted or over the picture the player is trying to look at.
     _STATUS_COLOR = QColor(255, 147, 54)
+    # Read from the corner of the eye, the color says it before the word
+    # does: white while nothing is happening, green while the job is
+    # painting, red while it waits on the user.
+    _STATUS_WORD_COLORS = {
+        "IDLE": QColor(240, 240, 240),
+        "PAINTING": QColor(72, 214, 108),
+        "PAUSED": QColor(255, 72, 60),
+    }
     _STATUS_BACKDROP = QColor(24, 8, 6, 190)
     # Inset from the monitor's corner, as a share of the text height.
     _STATUS_INSET = 0.8
@@ -709,7 +717,7 @@ class _CalibrationPreviewWindow(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(self._STATUS_BACKDROP)
         painter.drawRoundedRect(pill, pixel_size * 0.3, pixel_size * 0.3)
-        painter.setPen(self._STATUS_COLOR)
+        painter.setPen(self._STATUS_WORD_COLORS.get(text, self._STATUS_COLOR))
         painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
 
 

@@ -2528,12 +2528,15 @@ def test_seconds_until_anti_afk_counts_down_from_the_job_start_and_the_last_brea
     assert _wait_until(lambda: painter.progress.completed_strokes >= 1)
     until = painter.seconds_until_anti_afk()
     assert until is not None and 55.0 < until <= 60.0
-    # The clock keeps running through a pause, as the break's own does.
+    # The clock stops while the job is paused, and the time spent paused is
+    # not owed to the break once the job resumes.
     assert painter.pause()
-    time.sleep(0.05)
     paused = painter.seconds_until_anti_afk()
-    assert paused is not None and paused < until
+    time.sleep(0.2)
+    assert painter.seconds_until_anti_afk() == paused
     assert painter.resume()
+    resumed = painter.seconds_until_anti_afk()
+    assert resumed is not None and paused is not None and resumed > paused - 0.1
     assert painter.wait(_t(5.0))
     assert painter.state is PainterState.COMPLETED
     assert painter.seconds_until_anti_afk() is None

@@ -2885,7 +2885,7 @@ def test_the_status_label_follows_the_job_in_the_corner(
     )
     window._update_calibration_overlay()
     assert overlay.isVisible()
-    assert overlay.status == ("PAINTING…", canvas)
+    assert overlay.status == ("PAINTING", canvas)
     assert overlay.entries == []
 
     window._painter.state = PainterState.PAUSED
