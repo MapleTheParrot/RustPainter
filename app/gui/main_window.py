@@ -883,6 +883,7 @@ class MainWindow(QMainWindow):
         self._debug_controller: Any = None
         self._debug_thread: threading.Thread | None = None
         self._calibration_overlay: Any = None
+        self._calibration_overlay_decision: tuple[Any, ...] | None = None
         self._calibration_preview: CalibrationPreviewOverlay | None = None
         self._applying_speed_preset = False
         # Seeded before the resolution controls exist, so this ratio is spelled
@@ -6217,6 +6218,24 @@ class MainWindow(QMainWindow):
             and status is not None
             and canvas is not None
         )
+        # An overlay that quietly decides not to appear is indistinguishable
+        # from a broken one, so every change of mind is logged with what
+        # decided it.  Only changes: this runs on every progress update.
+        decision = (show_boxes, show_status, status)
+        if decision != self._calibration_overlay_decision:
+            self._calibration_overlay_decision = decision
+            LOGGER.info(
+                "Calibration overlay: boxes=%s (switch %s, %d rectangles, busy %s), "
+                "status=%s (switch %s, word %s, canvas %s)",
+                show_boxes,
+                self.show_calibration_check.isChecked(),
+                len(entries),
+                busy,
+                show_status,
+                self.show_status_check.isChecked(),
+                status,
+                canvas is not None,
+            )
         if self._closing or not (show_boxes or show_status):
             if self._calibration_preview is not None and self._calibration_preview.isVisible():
                 self._calibration_preview.hide()
@@ -6233,9 +6252,11 @@ class MainWindow(QMainWindow):
         except Exception:
             LOGGER.exception("Could not display the calibration overlay")
 
-    # What the banner over the sign says for each state the job can be in.
-    # A job's last word - stopped, done, failed - stays up a moment after
-    # the job, long enough to be read, then the sign is left alone.
+    # What the corner label on the sign's monitor says for each state the job
+    # can be in.  A job's last word - stopped, done, failed - stays up a
+    # moment after the job, long enough to be read, and then the label falls
+    # back to IDLE: with the switch on it is up for as long as the app is,
+    # so seeing it is how the user knows the app is running and watching.
     _STATUS_OVERLAY_WORDS = {
         "countdown": "GET READY",
         "running": "PAINTING…",
@@ -6244,6 +6265,7 @@ class MainWindow(QMainWindow):
         "completed": "COMPLETE",
         "error": "ERROR",
     }
+    _STATUS_OVERLAY_IDLE = "IDLE"
     _STATUS_OVERLAY_LINGER_MS = 4000
 
     def _status_overlay_text(self) -> str | None:
@@ -6251,13 +6273,13 @@ class MainWindow(QMainWindow):
         if self._countdown is not None and self._countdown.isVisible():
             return self._STATUS_OVERLAY_WORDS["countdown"]
         if painter is None:
-            return None
+            return self._STATUS_OVERLAY_IDLE
         value = getattr(getattr(painter, "state", None), "value", "")
         if value in {"countdown", "running", "paused"}:
             return self._STATUS_OVERLAY_WORDS[value]
         if value in self._STATUS_OVERLAY_WORDS and self._status_overlay_linger.isActive():
             return self._STATUS_OVERLAY_WORDS[value]
-        return None
+        return self._STATUS_OVERLAY_IDLE
 
     @staticmethod
     def _union_rect(*rectangles: ScreenRect) -> ScreenRect:

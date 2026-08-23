@@ -2765,15 +2765,16 @@ def test_paused_jobs_still_show_the_calibration_outlines(
     assert not window._calibration_preview.isVisible()
 
 
-def test_the_status_banner_follows_the_job_across_the_sign(
+def test_the_status_label_follows_the_job_in_the_corner(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With Show status on, the job's state is written across the canvas.
+    """With Show status on, the job's state is written on the sign's monitor.
 
-    It says PAINTING while strokes go down - with the boxes kept off the
-    screen, as they are for any running job - PAUSED through a pause, and
-    the job's last word for a moment after it ends.  Both switches are on
-    by default and both are saved.
+    It says IDLE with no job at all - the switch is what puts it up, not a
+    running job - PAINTING while strokes go down, with the boxes kept off
+    the screen as they are for any running job, PAUSED through a pause, and
+    the job's last word for a moment after it ends before falling back to
+    IDLE.  Both switches are on by default and both are saved.
     """
 
     from types import SimpleNamespace
@@ -2807,7 +2808,7 @@ def test_the_status_banner_follows_the_job_across_the_sign(
     window._update_calibration_overlay()
     overlay = window._calibration_preview
     assert overlay.isVisible()
-    assert overlay.status is None
+    assert overlay.status == ("IDLE", canvas), "the label is up with no job running"
 
     window._painter = SimpleNamespace(
         state=PainterState.RUNNING, is_active=True, is_alive=True
@@ -2830,7 +2831,7 @@ def test_the_status_banner_follows_the_job_across_the_sign(
     assert overlay.status == ("ABORTED", canvas)
     window._status_overlay_linger.stop()
     window._update_calibration_overlay()
-    assert overlay.status is None
+    assert overlay.status == ("IDLE", canvas), "and back to IDLE once it is read"
     assert overlay.isVisible(), "the boxes are back once the job is over"
     window._painter = None
 

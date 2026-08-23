@@ -589,6 +589,13 @@ class _CalibrationPreviewWindow(QWidget):
     def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
         super().showEvent(event)
         self._capture_excluded = exclude_window_from_capture(self)
+        if not self._capture_excluded:
+            # The status is dropped rather than risk the painter reading it
+            # back off the sign, so say why it is missing.
+            log.warning(
+                "This window could not be kept out of screen captures; "
+                "the job's status will not be written on the sign"
+            )
 
     def _on_monitor(self, rect: Rect) -> bool:
         physical = self._monitor.rect
@@ -599,18 +606,23 @@ class _CalibrationPreviewWindow(QWidget):
             and rect.bottom > physical.top
         )
 
+    # Both setters are called on every progress tick of a running job, and
+    # repainting a monitor-sized translucent window is not free, so a
+    # repaint is asked for only when what is drawn actually changed.
     def set_entries(self, entries: list[tuple[str, Rect]]) -> None:
-        self._entries = [
-            (label, rect) for label, rect in entries if self._on_monitor(rect)
-        ]
+        mine = [(label, rect) for label, rect in entries if self._on_monitor(rect)]
+        if mine == self._entries:
+            return
+        self._entries = mine
         self.update()
 
     def set_status(self, status: tuple[str, Rect] | None) -> None:
-        """Show ``status`` - a word and the canvas to write it across - or nothing."""
+        """Show ``status`` - a word and the sign it belongs to - or nothing."""
 
-        self._status = (
-            status if status is not None and self._on_monitor(status[1]) else None
-        )
+        mine = status if status is not None and self._on_monitor(status[1]) else None
+        if mine == self._status:
+            return
+        self._status = mine
         self.update()
 
     def _map_physical_rect(self, rect: Rect) -> QRectF:
@@ -663,27 +675,27 @@ class _CalibrationPreviewWindow(QWidget):
             self._paint_status(painter, *self._status)
         painter.end()
 
-    # The job's state written across the sign in the app's orange, big
-    # enough to read from across the room: the reassurance that the app is
-    # the one moving the mouse, and what it is doing with it.
+    # The job's state in the app's orange, in the top-right corner of the
+    # monitor the sign is on: the reassurance that the app is the one moving
+    # the mouse, and what it is doing with it.  Out of the corner of the eye
+    # rather than across the sign, so it never sits over the part being
+    # painted or over the picture the player is trying to look at.
     _STATUS_COLOR = QColor(255, 147, 54)
     _STATUS_BACKDROP = QColor(24, 8, 6, 190)
+    # Inset from the monitor's corner, as a share of the text height.
+    _STATUS_INSET = 0.8
 
     def _paint_status(self, painter: QPainter, text: str, canvas: Rect) -> None:
-        box = self._map_physical_rect(canvas)
-        if box.width() <= 0 or box.height() <= 0 or not text:
+        del canvas  # Only decides which monitor writes the status.
+        if not text or self.width() <= 0 or self.height() <= 0:
             return
         font = painter.font()
         font.setBold(True)
-        # Sized to the canvas, then shrunk until the word fits inside it.
-        pixel_size = max(18, min(120, int(box.height() * 0.22)))
-        while pixel_size > 12:
-            font.setPixelSize(pixel_size)
-            painter.setFont(font)
-            width = painter.fontMetrics().horizontalAdvance(text)
-            if width <= box.width() * 0.9:
-                break
-            pixel_size = int(pixel_size * 0.85)
+        # Sized to the monitor rather than the sign: a corner label is read
+        # by looking at it, so it only has to be legible, not large.
+        pixel_size = max(14, min(36, int(self.height() * 0.026)))
+        font.setPixelSize(pixel_size)
+        painter.setFont(font)
         metrics = painter.fontMetrics()
         pad_x, pad_y = pixel_size * 0.5, pixel_size * 0.2
         pill = QRectF(
@@ -692,7 +704,8 @@ class _CalibrationPreviewWindow(QWidget):
             metrics.horizontalAdvance(text) + pad_x * 2,
             metrics.height() + pad_y * 2,
         )
-        pill.moveCenter(box.center())
+        inset = pixel_size * self._STATUS_INSET
+        pill.moveTopRight(QPointF(self.width() - inset, inset))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(self._STATUS_BACKDROP)
         painter.drawRoundedRect(pill, pixel_size * 0.3, pixel_size * 0.3)
