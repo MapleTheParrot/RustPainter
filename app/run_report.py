@@ -200,21 +200,34 @@ class RunReport:
     def record_confirmation(self, summary: Any) -> None:
         """Record what checking each color as it went down found and did.
 
-        The numbers that say whether the game was dropping presses on this
+        The numbers that say whether strokes were going missing on this
         sign - how many cells missed on first reading, how many repaints it
-        took, how far the press hold had to be raised - which is the first
-        question about a sign that came out with holes.
+        took - which is the first question about a sign that came out with
+        holes.
         """
 
+        self._record_summary("confirmation", summary, "the color checks")
+
+    def record_color_picks(self, summary: Any) -> None:
+        """Record what reading each color pick back off the panel found.
+
+        How many picks had to be clicked again, and how many never took:
+        a group painted in the previous group's color is a swallowed picker
+        click, and this says whether any were caught.
+        """
+
+        self._record_summary("colorPicks", summary, "the color picks")
+
+    def _record_summary(self, key: str, summary: Any, what: str) -> None:
         try:
             if summary is None:
-                self._document["confirmation"] = None
+                self._document[key] = None
             elif hasattr(summary, "to_dict"):
-                self._document["confirmation"] = summary.to_dict()
+                self._document[key] = summary.to_dict()
             else:
-                self._document["confirmation"] = json.loads(json.dumps(summary, default=str))
+                self._document[key] = json.loads(json.dumps(summary, default=str))
         except Exception:
-            LOGGER.exception("Could not record the color checks")
+            LOGGER.exception("Could not record %s", what)
 
     def record_screen(self) -> None:
         """Capture the whole desktop once, as the artwork starts.

@@ -1254,13 +1254,24 @@ class MainWindow(QMainWindow):
         touch_up = QGroupBox("Touch-up")
         touch_up_form = QFormLayout(touch_up)
         self.confirm_strokes_check = QCheckBox("Check each color as it goes down")
-        self.confirm_strokes_check.setChecked(True)
+        self.confirm_strokes_check.setChecked(False)
         self.confirm_strokes_check.setToolTip(
             "After a color's strokes are painted, the sign is captured and the\n"
             "cells that did not take the color are repainted while it is still\n"
-            "selected.  Rust drops presses outright when its frames run long -\n"
-            "a third of them on a 1024x512 sign - and this is what puts them\n"
-            "back.  The press hold is lengthened while colors keep missing."
+            "selected.  Off by default: the game does not drop presses, and on\n"
+            "a fine sign the check can misread painted cells as missing and\n"
+            "spend its rounds repainting them.  The touch-up pass at the end\n"
+            "is what puts right whatever did go wrong."
+        )
+        self.verify_picks_check = QCheckBox("Read each color back before painting it")
+        self.verify_picks_check.setChecked(True)
+        self.verify_picks_check.setToolTip(
+            "After the two picker clicks that select a color, the block beside\n"
+            "the hue bar that shows the selected color is captured and compared\n"
+            "with the color asked for; the clicks are repeated, held longer,\n"
+            "until it agrees.  A click the game swallows otherwise paints the\n"
+            "whole color group in the previous group's color - 43 of 240 groups\n"
+            "on one 1024x512 sign.  Costs a few hundredths of a second a color."
         )
         self.confirm_rounds_spin = self._int_spin(1, 8, 4, "")
         self.confirm_rounds_spin.setToolTip(
@@ -1268,6 +1279,7 @@ class MainWindow(QMainWindow):
             "repainted before the job moves on.  Each round costs under a\n"
             "second plus the repaint; what is left goes to the touch-up pass."
         )
+        touch_up_form.addRow("", self.verify_picks_check)
         touch_up_form.addRow("", self.confirm_strokes_check)
         touch_up_form.addRow("Rounds per color", self.confirm_rounds_spin)
         self.confirm_strokes_check.toggled.connect(self.confirm_rounds_spin.setEnabled)
@@ -5303,6 +5315,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.apply_brush_check,
             self.verify_passes_spin,
+            self.verify_picks_check,
             self.confirm_strokes_check,
             self.confirm_rounds_spin,
             self.timelapse_check,
@@ -5522,10 +5535,11 @@ class MainWindow(QMainWindow):
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
             self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
             self.confirm_strokes_check.setChecked(
-                bool(painting.get("confirm_strokes", True))
+                bool(painting.get("confirm_strokes", False))
             )
             self.confirm_rounds_spin.setValue(int(painting.get("confirm_max_rounds", 4)))
             self.confirm_rounds_spin.setEnabled(self.confirm_strokes_check.isChecked())
+            self.verify_picks_check.setChecked(bool(painting.get("verify_color_picks", True)))
             timelapse = settings.get("timelapse", {})
             self.timelapse_check.setChecked(bool(timelapse.get("enabled", False)))
             self.timelapse_interval_spin.setValue(
@@ -5667,6 +5681,7 @@ class MainWindow(QMainWindow):
             "verify_passes": int(self.verify_passes_spin.value()),
             "confirm_strokes": self.confirm_strokes_check.isChecked(),
             "confirm_max_rounds": int(self.confirm_rounds_spin.value()),
+            "verify_color_picks": self.verify_picks_check.isChecked(),
         }
         current["timelapse"] = {
             **current.get("timelapse", {}),
@@ -7008,6 +7023,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.verify_passes_spin,
+            self.verify_picks_check,
             self.confirm_strokes_check,
             self.confirm_rounds_spin,
             self.focus_guard_check,
@@ -7056,6 +7072,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.apply_brush_check,
             self.verify_passes_spin,
+            self.verify_picks_check,
             self.confirm_strokes_check,
             self.confirm_rounds_spin,
             self.timelapse_check,
@@ -7898,6 +7915,7 @@ class MainWindow(QMainWindow):
         if painter is not None:
             try:
                 report.record_confirmation(painter.confirmation_summary)
+                report.record_color_picks(painter.color_pick_summary)
             except Exception:
                 LOGGER.exception("Could not record the color checks in the run report")
 

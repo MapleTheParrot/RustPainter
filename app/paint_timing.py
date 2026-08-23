@@ -152,21 +152,13 @@ def stroke_pace(
 
 # The frame floor above assumes the 15 FPS the paint UI was measured at on a
 # 320x240 sign.  On a 1024x512 sign the same UI was found dropping a third of
-# all presses: its frames stretch past a hundred milliseconds while it is
-# being painted on, and a press shorter than a frame is sampled as nothing.
-# The painter therefore checks each color as it goes down (see
-# ``Painter._confirm_group``) and, when a color came out with misses, holds
-# every following press longer - in these steps, up to this much over the
-# floor - and relaxes again once colors land clean.
-PRESS_HOLD_BOOST_MAX_SECONDS = 0.18
-PRESS_HOLD_BOOST_STEP_SECONDS = 0.02
-PRESS_HOLD_RELAX_STEP_SECONDS = 0.01
-# A color is "missing" when more than this share of its judged cells did
-# not take, and "clean" under this share; the hold relaxes after this many
-# clean colors in a row.  Fewer judged cells than the minimum say nothing.
-CONFIRM_RAISE_MISS_RATE = 0.10
-CONFIRM_RELAX_MISS_RATE = 0.01
-CONFIRM_RELAX_CLEAN_GROUPS = 3
+# all presses.  Measured on the largest sign: 7,473 presses at holds from
+# 8 ms to 160 ms, at brush sizes 1 and 10, under two minutes of continuous
+# painting and across anti-AFK breaks, and not one was dropped.  The
+# painter checks each color as it goes down anyway (see
+# ``Painter._confirm_group``), since a stroke can still go wrong, but the
+# press hold is never lengthened for it: the speckled signs were colors
+# picked wrong, not presses lost.
 CONFIRM_MIN_JUDGED_CELLS = 40
 # After a color's last stroke, before the sign is captured to check it: the
 # game has to present the frame that carries the stroke, which at its

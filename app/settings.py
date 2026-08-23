@@ -151,11 +151,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "verify_passes": 2,
         # Check each color as it goes down: capture the sign after its
         # strokes, repaint the cells that did not take, and capture again -
-        # up to this many rounds per color.  The game drops presses outright
-        # when its frames run long (a third of them on a 1024x512 sign), and
-        # this is what puts them back while the color is still selected.
-        "confirm_strokes": True,
+        # up to this many rounds per color.  Off: the game does not drop
+        # presses, and the check misread painted cells as missing.
+        "confirm_strokes": False,
         "confirm_max_rounds": 4,
+        # Read the selected color back off the panel after every pick and
+        # click again when it did not take.  A swallowed picker click paints
+        # a whole color group in the previous group's color - 43 of 240
+        # groups on one 1024x512 sign - and this is what stops it.
+        "verify_color_picks": True,
     },
     "timelapse": {
         # Capture the calibrated canvas region while painting, one PNG frame
@@ -492,7 +496,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         or not 0 <= verify_passes <= 5
     ):
         raise SettingsError("painting.verify_passes must be an integer from 0 to 5")
-    if not isinstance(painting.get("confirm_strokes", True), bool):
+    if not isinstance(painting.get("confirm_strokes", False), bool):
         raise SettingsError("painting.confirm_strokes must be true or false")
     confirm_rounds = painting.get("confirm_max_rounds", 4)
     if (
@@ -501,6 +505,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         or not 1 <= confirm_rounds <= 8
     ):
         raise SettingsError("painting.confirm_max_rounds must be an integer from 1 to 8")
+    if not isinstance(painting.get("verify_color_picks", True), bool):
+        raise SettingsError("painting.verify_color_picks must be true or false")
 
     assert isinstance(timelapse, Mapping)
     for key in ("enabled", "capture_final_frame"):

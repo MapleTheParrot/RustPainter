@@ -262,15 +262,18 @@ def test_stroke_merging_switched_off_under_the_old_schema_is_lifted_to_balanced(
     assert SettingsStore(path).load()["painting"]["stroke_merge_mode"] == "off"
 
 
-def test_checking_each_color_is_on_by_default_and_read_by_the_painter() -> None:
+def test_checking_each_color_is_off_by_default_and_reading_picks_back_is_on() -> None:
     from app.painter import PainterSettings
     from app.settings import default_settings
 
     defaults = default_settings()
-    assert defaults["painting"]["confirm_strokes"] is True
+    assert defaults["painting"]["confirm_strokes"] is False
     assert defaults["painting"]["confirm_max_rounds"] == 4
+    assert defaults["painting"]["verify_color_picks"] is True
     settings = PainterSettings.from_mapping(defaults)
-    assert settings.confirm_strokes is True and settings.confirm_max_rounds == 4
+    assert settings.confirm_strokes is False and settings.confirm_max_rounds == 4
+    assert settings.verify_color_picks is True
+    assert "verify_color_picks" in PainterSettings.RETUNABLE_FIELDS
     # Both can be changed from a paused job.
     assert "confirm_strokes" in PainterSettings.RETUNABLE_FIELDS
     assert "confirm_max_rounds" in PainterSettings.RETUNABLE_FIELDS

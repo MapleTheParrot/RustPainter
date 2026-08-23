@@ -150,7 +150,6 @@ def test_the_report_records_what_checking_each_color_found(tmp_path) -> None:
             repainted_strokes=900,
             unrepaired=7,
             rounds=20,
-            hold_boost_seconds=0.04,
         )
     )
     report.finish("completed")
@@ -162,6 +161,20 @@ def test_the_report_records_what_checking_each_color_found(tmp_path) -> None:
         "repaintStrokes": 900,
         "cellsUnrepaired": 7,
         "repaintRounds": 20,
-        "pressHoldBoostSeconds": 0.04,
+        "skippedReason": "",
+    }
+
+
+def test_the_report_records_what_reading_each_pick_back_found(tmp_path) -> None:
+    from app.painter import ColorPickSummary
+
+    report = RunReport(tmp_path, session_name="job-picks")
+    report.record_color_picks(ColorPickSummary(picks=240, retried=43, failed=1))
+    report.finish("completed")
+    recorded = json.loads((tmp_path / "job-picks" / "run.json").read_text())
+    assert recorded["colorPicks"] == {
+        "colorsRead": 240,
+        "picksRetried": 43,
+        "picksFailed": 1,
         "skippedReason": "",
     }

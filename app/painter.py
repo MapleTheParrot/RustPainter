@@ -27,16 +27,13 @@ from .brush_calibration import (
     measure_stroke_band,
 )
 from .color_calibration import ColorCorrectionModel
-from .color_mapping import map_rgb_to_picker
+from .color_mapping import map_rgb_to_picker, picker_points_to_rgb
+from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect
 from .paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
-    CONFIRM_MIN_JUDGED_CELLS,
-    CONFIRM_RAISE_MISS_RATE,
-    CONFIRM_RELAX_CLEAN_GROUPS,
-    CONFIRM_RELAX_MISS_RATE,
     CONFIRM_SETTLE_SECONDS,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
     KEY_GAP_SECONDS,
@@ -45,9 +42,6 @@ from .paint_timing import (
     LONG_DRAG_MAX_TEXELS_PER_SECOND,
     MIN_PRESS_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
-    PRESS_HOLD_BOOST_MAX_SECONDS,
-    PRESS_HOLD_BOOST_STEP_SECONDS,
-    PRESS_HOLD_RELAX_STEP_SECONDS,
     SETTLE_FLOOR_SECONDS,
     STROKE_GAP_FLOOR_SECONDS,
     PhaseTiming,
@@ -221,12 +215,16 @@ class PainterSettings:
     verify_passes: int = 2
     # Check each color as it goes down: once its strokes are painted the
     # sign is captured, the cells that did not take the color are repainted,
-    # and the capture is repeated - up to this many rounds per color.  The
-    # press hold is lengthened while colors keep coming out with misses.
-    # This is what catches the presses the game drops outright, which on a
-    # large sign were a third of them.
-    confirm_strokes: bool = True
+    # and the capture is repeated - up to this many rounds per color.  Off
+    # by default: it was built against presses the game was thought to
+    # drop, which measurement found it does not, and its first live outing
+    # misread a sixth of a sign's cells as missing and spent four rounds
+    # repainting them.  The picks are read back instead (below).
+    confirm_strokes: bool = False
     confirm_max_rounds: int = 4
+    # Read the selected color back off the panel after every pick, and
+    # pick again when the clicks did not take.
+    verify_color_picks: bool = True
     brush_direction: str = "low_to_high"
     delay_after_brush_seconds: float = 0.07
     countdown_seconds: float = 3.0
@@ -265,6 +263,7 @@ class PainterSettings:
         "verify_passes",
         "confirm_strokes",
         "confirm_max_rounds",
+        "verify_color_picks",
         "require_foreground",
         "expected_window_title_contains",
         "expected_process_name",
@@ -375,8 +374,9 @@ class PainterSettings:
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
-            confirm_strokes=bool(pick(painting, "confirm_strokes", True)),
+            confirm_strokes=bool(pick(painting, "confirm_strokes", False)),
             confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
+            verify_color_picks=bool(pick(painting, "verify_color_picks", True)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
@@ -449,8 +449,7 @@ class ConfirmationSummary:
     ``judged`` cells are those a capture could decide; ``missed`` is how
     many of them had not taken their color when first checked, ``repainted``
     how many repaint strokes went down for them, ``unrepaired`` how many
-    were still missing when the rounds ran out.  ``hold_boost_seconds`` is
-    how far above the frame floor the press hold ended up.
+    were still missing when the rounds ran out.
     """
 
     colors: int = 0
@@ -459,7 +458,6 @@ class ConfirmationSummary:
     repainted_strokes: int = 0
     unrepaired: int = 0
     rounds: int = 0
-    hold_boost_seconds: float = 0.0
     skipped_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -470,7 +468,30 @@ class ConfirmationSummary:
             "repaintStrokes": self.repainted_strokes,
             "cellsUnrepaired": self.unrepaired,
             "repaintRounds": self.rounds,
-            "pressHoldBoostSeconds": round(self.hold_boost_seconds, 3),
+            "skippedReason": self.skipped_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ColorPickSummary:
+    """What reading each color pick back off the panel found, for the run report.
+
+    ``picks`` is how many colors were read back, ``retried`` how many took
+    a second (or later) round of clicks, ``failed`` how many never read
+    right and paused the job.  ``skipped_reason`` says why the panel was
+    not read at all, or from which pick it stopped being.
+    """
+
+    picks: int = 0
+    retried: int = 0
+    failed: int = 0
+    skipped_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "colorsRead": self.picks,
+            "picksRetried": self.retried,
+            "picksFailed": self.failed,
             "skippedReason": self.skipped_reason,
         }
 
@@ -494,7 +515,6 @@ class _Confirmation:
     repainted_strokes: int = 0
     unrepaired: int = 0
     rounds: int = 0
-    clean_streak: int = 0
 
 
 @dataclass(slots=True)
@@ -622,9 +642,10 @@ class Painter:
         self._ui_guard_suspended = False
         self._last_ui_check = 0.0
         self._ui_missing_checks = 0
-        # How much longer than the frame floor every press is held, learned
-        # from the colors that came out with misses (see _confirm_group).
-        self._press_hold_boost = 0.0
+        # Where the panel shows the selected color, found beside the hue bar
+        # as the job starts; None while picks are not read back.
+        self._swatch: ScreenRect | None = None
+        self._color_pick_summary = ColorPickSummary()
         self._confirmation_summary = ConfirmationSummary()
         self._confirmation_seconds = 0.0
         self._progress = PaintProgress(
@@ -847,6 +868,13 @@ class Painter:
             return self._confirmation_summary
 
     @property
+    def color_pick_summary(self) -> ColorPickSummary:
+        """What reading each color pick back found, so far or in all."""
+
+        with self._condition:
+            return self._color_pick_summary
+
+    @property
     def measured_texel_grid(self) -> TexelGridModel | None:
         """The texel grid the last job painted on, if it had one.
 
@@ -899,7 +927,8 @@ class Painter:
             self._ui_guard_suspended = False
             self._last_ui_check = 0.0
             self._ui_missing_checks = 0
-            self._press_hold_boost = 0.0
+            self._swatch = None
+            self._color_pick_summary = ColorPickSummary()
             self._confirmation_summary = ConfirmationSummary()
             self._confirmation_seconds = 0.0
             total_strokes = sum(
@@ -1227,6 +1256,7 @@ class Painter:
             self._checkpoint(check_focus=True)
             self._confirm_painting_ui(job)
             job.target = self._measured_picker_target(job.target)
+            self._locate_color_swatch(job)
             if job.mode == "measure_brush":
                 measured = self._measure_brush_size_model(job)
                 with self._condition:
@@ -2775,11 +2805,11 @@ class Painter:
     # ------------------------------------------- checking colors as they land
 
     def _press_hold_seconds(self, settings: PainterSettings) -> float:
-        """How long every press is held: the set hold, floored, plus the boost."""
+        """How long every press is held: the set hold, lifted to the floor."""
 
         hold = settings.mouse_down_duration_seconds
         if self.input.emits_real_input:
-            hold = max(hold, self._MIN_PRESS_SECONDS) + self._press_hold_boost
+            hold = max(hold, self._MIN_PRESS_SECONDS)
         return hold
 
     def _cell_sampling(
@@ -2933,44 +2963,7 @@ class Painter:
                 repainted_strokes=state.repainted_strokes,
                 unrepaired=state.unrepaired,
                 rounds=state.rounds,
-                hold_boost_seconds=self._press_hold_boost,
                 skipped_reason=self._confirmation_summary.skipped_reason,
-            )
-
-    def _adapt_press_hold(self, miss_rate: float, judged: int, state: _Confirmation) -> None:
-        """Hold presses longer while colors come out with misses, shorter when clean.
-
-        A press the game samples as nothing is a press that fell entirely
-        inside one of its frames, and on a large sign those frames run well
-        past the floor the hold was sized for.  Raising the hold costs every
-        stroke a little; a miss costs a capture and a repaint.  The hold is
-        therefore raised a step at a time while a tenth of a color's cells
-        or more keep missing, and let back down only after a run of clean
-        colors, so it settles where the game actually is.
-        """
-
-        if judged < CONFIRM_MIN_JUDGED_CELLS:
-            return
-        before = self._press_hold_boost
-        if miss_rate > CONFIRM_RAISE_MISS_RATE:
-            state.clean_streak = 0
-            self._press_hold_boost = min(
-                PRESS_HOLD_BOOST_MAX_SECONDS, before + PRESS_HOLD_BOOST_STEP_SECONDS
-            )
-        elif miss_rate < CONFIRM_RELAX_MISS_RATE:
-            state.clean_streak += 1
-            if state.clean_streak >= CONFIRM_RELAX_CLEAN_GROUPS and before > 0.0:
-                state.clean_streak = 0
-                self._press_hold_boost = max(0.0, before - PRESS_HOLD_RELAX_STEP_SECONDS)
-        else:
-            state.clean_streak = 0
-        if self._press_hold_boost != before:
-            LOGGER.info(
-                "Press hold %s to %.0f ms over the frame floor (%.0f%% of the "
-                "last color's cells missed)",
-                "raised" if self._press_hold_boost > before else "relaxed",
-                self._press_hold_boost * 1000.0,
-                miss_rate * 100.0,
             )
 
     def _confirm_group(
@@ -3076,7 +3069,6 @@ class Painter:
                 state.judged += judged_count
                 state.missed += missed_count
                 rate = missed_count / judged_count if judged_count else 0.0
-                self._adapt_press_hold(rate, judged_count, state)
                 if missed_count:
                     LOGGER.info(
                         "Color %d of %d: %d of %d cells did not take (%.1f%%); repainting",
@@ -3582,6 +3574,14 @@ class Painter:
                 # from a fresh capture, once painting resumes.
                 continue
 
+    # How many rounds of picker clicks a color gets before the panel is
+    # looked for again, and how many after that before the job pauses.
+    _PICK_ATTEMPTS = 3
+    _PICK_ATTEMPTS_AFTER_RELOCATE = 2
+    # When the panel does not yet show the color, it is read once more after
+    # this long: the frame carrying the click may not have been presented.
+    _SWATCH_RECHECK_SECONDS = 0.15
+
     def _select_color(
         self,
         color: RGBColor,
@@ -3591,6 +3591,17 @@ class Painter:
         *,
         apply_correction: bool = True,
     ) -> None:
+        """Pick ``color`` on the panel, and make sure the panel agrees.
+
+        Two clicks select a color, one on the hue bar and one on the
+        saturation / value box, and a click the game swallows leaves the
+        previous color selected - the whole group then goes down in it.  So
+        when the panel's selected-color block was found at the start of the
+        job, it is read after the clicks and they are repeated, held
+        longer, until it shows the color.  A color the panel will not show
+        after repeated rounds pauses the job for the user to look.
+        """
+
         directions = target.picker_directions
         picker_color = (
             target.color_correction.correct(color)
@@ -3605,24 +3616,245 @@ class Painter:
             saturation_direction=directions.saturation,
             value_direction=directions.value,
         )
-        self._safe_click(
-            self._inset_into(coordinates.hue, target.hue_bar),
+        hue_point = self._inset_into(coordinates.hue, target.hue_bar)
+        sv_point = self._inset_into(coordinates.saturation_value, target.color_box)
+        if self._swatch is None:
+            self._click_picker(hue_point, sv_point, settings, epoch)
+            return
+        # The inset and clamped clicks select a color a shade off the one
+        # asked for; the panel shows that one.
+        expected = picker_points_to_rgb(
+            hue_point,
+            sv_point,
+            target.hue_bar,
+            target.color_box,
+            hue_direction=directions.hue,
+            saturation_direction=directions.saturation,
+            value_direction=directions.value,
+        )
+        reading = self._pick_until_shown(
+            hue_point, sv_point, expected, settings, epoch, self._PICK_ATTEMPTS
+        )
+        if reading is None or self._swatch is None:
+            return
+        # The block may have moved, or be covered: look for it again, then
+        # give the color a couple more rounds.
+        LOGGER.warning(
+            "The panel still shows %s, not %s; looking for its color block again",
+            reading.hex,
+            "#%02X%02X%02X" % expected,
+        )
+        if not self._find_swatch(target, settings, epoch):
+            self._stop_reading_picks(
+                "the color block was lost at color %d" % (self._color_pick_summary.picks + 1)
+            )
+            self._click_picker(hue_point, sv_point, settings, epoch)
+            return
+        reading = self._pick_until_shown(
+            hue_point,
+            sv_point,
+            expected,
+            settings,
             epoch,
-            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+            self._PICK_ATTEMPTS_AFTER_RELOCATE,
+            first_attempt=self._PICK_ATTEMPTS + 1,
+        )
+        if reading is None or self._swatch is None:
+            return
+        with self._condition:
+            self._color_pick_summary = replace(
+                self._color_pick_summary, failed=self._color_pick_summary.failed + 1
+            )
+        LOGGER.warning(
+            "The color picker did not take %s after %d rounds of clicks (the panel "
+            "shows %s); pausing",
+            "#%02X%02X%02X" % expected,
+            self._PICK_ATTEMPTS + self._PICK_ATTEMPTS_AFTER_RELOCATE,
+            reading.hex,
+        )
+        self.pause(
+            "the color picker did not take #%02X%02X%02X (the panel shows %s) - "
+            "check the sign's color panel and resume" % (*expected, reading.hex)
+        )
+        # Waits out the pause; resuming starts a new epoch, and the caller
+        # picks the color again under it.
+        self._checkpoint(epoch=epoch, check_focus=True)
+
+    def _pick_until_shown(
+        self,
+        hue_point: tuple[float, float],
+        sv_point: tuple[float, float],
+        expected: RGBColor,
+        settings: PainterSettings,
+        epoch: int,
+        attempts: int,
+        *,
+        first_attempt: int = 1,
+    ) -> SwatchReading | None:
+        """Click the picker until the panel shows ``expected``, up to ``attempts`` times.
+
+        Returns None once it does (or once the panel stopped being read),
+        else the last reading.
+        """
+
+        reading: SwatchReading | None = None
+        for attempt in range(first_attempt, first_attempt + attempts):
+            retry = attempt > 1
+            self._click_picker(hue_point, sv_point, settings, epoch, retry=retry)
+            if self._swatch is None:
+                return None
+            reading = self._read_selected_color(expected, epoch)
+            if reading is None:
+                return None
+            if reading.matches(expected):
+                with self._condition:
+                    summary = self._color_pick_summary
+                    self._color_pick_summary = replace(
+                        summary,
+                        picks=summary.picks + 1,
+                        retried=summary.retried + (1 if retry else 0),
+                    )
+                if retry:
+                    LOGGER.info(
+                        "Color #%02X%02X%02X took on round %d of clicks", *expected, attempt
+                    )
+                return None
+            LOGGER.warning(
+                "The panel shows %s after selecting #%02X%02X%02X (round %d); clicking again",
+                reading.hex,
+                *expected,
+                attempt,
+            )
+        return reading
+
+    def _click_picker(
+        self,
+        hue_point: tuple[float, float],
+        sv_point: tuple[float, float],
+        settings: PainterSettings,
+        epoch: int,
+        *,
+        retry: bool = False,
+    ) -> None:
+        """The two picker clicks; a retry holds them and waits twice as long."""
+
+        scale = 2.0 if retry else 1.0
+        self._safe_click(
+            hue_point, epoch, hold_floor=self._PICKER_CLICK_HOLD_SECONDS * scale
         )
         self._interruptible_sleep(
-            self._settle(settings.delay_after_hue_seconds), epoch=epoch, check_focus=True
-        )
-        self._safe_click(
-            self._inset_into(coordinates.saturation_value, target.color_box),
-            epoch,
-            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
-        )
-        self._interruptible_sleep(
-            self._settle(settings.delay_after_saturation_value_seconds),
+            self._settle(settings.delay_after_hue_seconds) * scale,
             epoch=epoch,
             check_focus=True,
         )
+        self._safe_click(
+            sv_point, epoch, hold_floor=self._PICKER_CLICK_HOLD_SECONDS * scale
+        )
+        self._interruptible_sleep(
+            self._settle(settings.delay_after_saturation_value_seconds) * scale,
+            epoch=epoch,
+            check_focus=True,
+        )
+
+    def _read_selected_color(self, expected: RGBColor, epoch: int) -> SwatchReading | None:
+        """Read the panel's color block; once more after a moment if it disagrees.
+
+        None when the block cannot be captured, which stops it being read
+        for the rest of the job rather than failing every color.
+        """
+
+        swatch = self._swatch
+        if swatch is None:
+            return None
+        try:
+            reading = read_swatch(self._screen_capture, swatch)
+            if reading.matches(expected):
+                return reading
+            self._interruptible_sleep(
+                self._SWATCH_RECHECK_SECONDS, epoch=epoch, check_focus=True
+            )
+            return read_swatch(self._screen_capture, swatch)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception:
+            LOGGER.warning("Could not read the panel's color block", exc_info=True)
+            self._stop_reading_picks("the color block could not be captured")
+            return None
+
+    def _locate_color_swatch(self, job: _Job) -> None:
+        """Find the panel's selected-color block, so every pick can be read back."""
+
+        settings = job.settings
+        if not settings.verify_color_picks:
+            self._stop_reading_picks("turned off")
+            return
+        if not getattr(self.input, "emits_real_input", True):
+            self._stop_reading_picks("no real input")
+            return
+        epoch = self._pause_generation_value()
+        if self._find_swatch(job.target, settings, epoch):
+            LOGGER.info(
+                "Color picks are read back from the panel's color block at %d,%d %dx%d",
+                self._swatch.left,  # type: ignore[union-attr]
+                self._swatch.top,  # type: ignore[union-attr]
+                self._swatch.width,  # type: ignore[union-attr]
+                self._swatch.height,  # type: ignore[union-attr]
+            )
+        else:
+            self._stop_reading_picks("no color block found beside the hue bar")
+            LOGGER.warning(
+                "No selected-color block was found beside the hue bar; color "
+                "picks are not read back on this job"
+            )
+
+    def _find_swatch(self, target: PaintingTarget, settings: PainterSettings, epoch: int) -> bool:
+        """Select the locator color and look for the block showing it."""
+
+        directions = target.picker_directions
+        coordinates = map_rgb_to_picker(
+            LOCATOR_COLOR,
+            target.hue_bar,
+            target.color_box,
+            hue_direction=directions.hue,
+            saturation_direction=directions.saturation,
+            value_direction=directions.value,
+        )
+        hue_point = self._inset_into(coordinates.hue, target.hue_bar)
+        sv_point = self._inset_into(coordinates.saturation_value, target.color_box)
+        shown = picker_points_to_rgb(
+            hue_point,
+            sv_point,
+            target.hue_bar,
+            target.color_box,
+            hue_direction=directions.hue,
+            saturation_direction=directions.saturation,
+            value_direction=directions.value,
+        )
+        hue_bar = ScreenRect(
+            target.hue_bar.left, target.hue_bar.top, target.hue_bar.width, target.hue_bar.height
+        )
+        for attempt in range(2):
+            self._click_picker(hue_point, sv_point, settings, epoch, retry=attempt > 0)
+            self._interruptible_sleep(
+                self._SWATCH_RECHECK_SECONDS, epoch=epoch, check_focus=True
+            )
+            try:
+                found = locate_swatch(self._screen_capture, hue_bar, shown)
+            except (_RetryAction, _AbortRequested):
+                raise
+            except Exception:
+                LOGGER.warning("Could not look for the panel's color block", exc_info=True)
+                found = None
+            if found is not None:
+                self._swatch = found
+                return True
+        self._swatch = None
+        return False
+
+    def _stop_reading_picks(self, reason: str) -> None:
+        self._swatch = None
+        with self._condition:
+            self._color_pick_summary = replace(self._color_pick_summary, skipped_reason=reason)
 
     def _execute_stroke(
         self,

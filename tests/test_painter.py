@@ -43,9 +43,11 @@ def _settings(**overrides: object) -> PainterSettings:
         "stroke_interpolation_step_pixels": 4.0,
         "progress_callback_interval_seconds": 0.0,
         "safety_poll_interval_seconds": 0.002,
-        # Checking each color as it goes down captures the screen; the tests
-        # that exercise it turn it on against a simulated sign.
+        # Checking each color as it goes down, and reading each pick back
+        # off the panel, capture the screen; the tests that exercise them
+        # turn them on against a simulated sign.
         "confirm_strokes": False,
+        "verify_color_picks": False,
     }
     values.update(overrides)
     return PainterSettings(**values)  # type: ignore[arg-type]
@@ -2626,19 +2628,251 @@ def test_without_the_check_the_dropped_presses_stay_holes() -> None:
     assert presses >= planned
 
 
-def test_the_press_hold_is_raised_while_colors_keep_missing() -> None:
-    """A third of every color's presses lost is the game running slow; the
-    hold grows a step per such color, up to its cap, and is reported."""
+# ------------------------------------------------- reading color picks back
 
-    from app.paint_timing import (
-        CONFIRM_MIN_JUDGED_CELLS,
-        PRESS_HOLD_BOOST_STEP_SECONDS,
+
+def _picky_sign(
+    controller: MockInputController,
+    profile: CalibrationProfile,
+    plan: PaintPlan,
+    *,
+    swallow_sv,
+):
+    """A fake sign and color panel whose picker can swallow clicks.
+
+    The selected color is whatever the last hue-bar click and the last
+    saturation / value click that *registered* say it is, exactly as
+    Rust's is; ``swallow_sv(n)`` decides whether the n-th S/V click (from
+    1) is ignored.  The panel draws the selected color as a flat block
+    right of the hue bar, as Rust does, and every press on the sign paints
+    its cell in the selected color.  Returns the capture and a function
+    giving the cells painted.
+    """
+
+    from app.color_mapping import picker_points_to_rgb
+
+    canvas, hue_bar, color_box = profile.canvas, profile.hue_bar, profile.color_box
+    cell_w = canvas.width / plan.width
+    cell_h = canvas.height / plan.height
+    panel = (21, 21, 12)
+    swatch = ScreenRect(
+        hue_bar.left + hue_bar.width + 2,
+        hue_bar.top,
+        int(hue_bar.width * 1.75),
+        int(hue_bar.height * 0.75),
     )
 
-    painter, _painted, plan = _run_forgetful_sign(confirm=True)
-    summary = painter.confirmation_summary
-    # The dab group alone has 40 judged cells - exactly the minimum a
-    # color needs before its miss rate is believed.
-    assert 40 >= CONFIRM_MIN_JUDGED_CELLS
-    assert summary.hold_boost_seconds >= PRESS_HOLD_BOOST_STEP_SECONDS
-    assert painter._press_hold_seconds(painter._job.settings) >= summary.hold_boost_seconds
+    def selected_color(hue_point, sv_point):
+        return picker_points_to_rgb(
+            hue_point,
+            sv_point,
+            hue_bar,
+            color_box,
+            hue_direction="bottom_to_top",
+            saturation_direction="left_low",
+            value_direction="top_bright",
+        )
+
+    def replay():
+        position = (0, 0)
+        hue_point = (hue_bar.left, hue_bar.top)
+        sv_point = (color_box.left, color_box.top)
+        sv_clicks = 0
+        cells: dict[tuple[int, int], tuple[int, int, int]] = {}
+        for event in controller.events:
+            if event.kind == "move" and event.x is not None and event.y is not None:
+                position = (event.x, event.y)
+            elif event.kind == "mouse_down":
+                if hue_bar.contains(*position):
+                    hue_point = position
+                elif color_box.contains(*position):
+                    sv_clicks += 1
+                    if not swallow_sv(sv_clicks):
+                        sv_point = position
+                elif canvas.contains(*position):
+                    cell = (
+                        int((position[0] - canvas.left) // cell_w),
+                        int((position[1] - canvas.top) // cell_h),
+                    )
+                    cells[cell] = selected_color(hue_point, sv_point)
+        return cells, selected_color(hue_point, sv_point)
+
+    def painted() -> dict[tuple[int, int], tuple[int, int, int]]:
+        return replay()[0]
+
+    def capture(rect) -> Image.Image:
+        cells, selected = replay()
+        image = Image.new("RGB", (rect.width, rect.height), panel)
+        draw = ImageDraw.Draw(image)
+
+        def box(r: ScreenRect):
+            return (
+                r.left - rect.left,
+                r.top - rect.top,
+                r.left + r.width - 1 - rect.left,
+                r.top + r.height - 1 - rect.top,
+            )
+
+        draw.rectangle(box(canvas), fill=_BARE)
+        for (x, y), color in cells.items():
+            draw.rectangle(
+                box(
+                    ScreenRect(
+                        canvas.left + round(x * cell_w),
+                        canvas.top + round(y * cell_h),
+                        round(cell_w),
+                        round(cell_h),
+                    )
+                ),
+                fill=color,
+            )
+        draw.rectangle(box(swatch), fill=selected)
+        return image
+
+    return capture, painted
+
+
+def _three_color_plan() -> PaintPlan:
+    # Three colors that differ in saturation and value as well as hue, so a
+    # swallowed S/V click changes what goes down.
+    colors = ((220, 40, 20), (40, 100, 200), (30, 200, 60))
+    return PaintPlan(
+        20,
+        3,
+        tuple(
+            ColorGroup(color, tuple(Stroke(x, y, x, y) for x in range(20)), 20)
+            for y, color in enumerate(colors)
+        ),
+    )
+
+
+def _run_picky_sign(*, swallow_sv):
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile(canvas_width=400)
+    plan = _three_color_plan()
+    capture, painted = _picky_sign(controller, profile, plan, swallow_sv=swallow_sv)
+    painter = _impatient(Painter(controller, screen_capture=capture))
+    painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
+    painter._SWATCH_RECHECK_SECONDS = 0.0  # type: ignore[misc]
+    settings = _settings(
+        verify_color_picks=True,
+        verify_passes=0,
+        require_foreground=False,
+        pause_on_mouse_move=False,
+    )
+    assert painter.start(plan, profile, settings)
+    return painter, painted, plan
+
+
+def _painted_as_planned(cells, plan: PaintPlan) -> bool:
+    """Every planned cell painted, each within the test picker's quantisation
+    of its own color - a 100 px box rounds a channel by a few units."""
+
+    expected = {
+        (stroke.start_x, stroke.start_y): group.color
+        for group in plan.color_groups
+        for stroke in group.strokes
+    }
+    if set(cells) != set(expected):
+        return False
+    return all(
+        max(abs(a - b) for a, b in zip(cells[cell], color)) <= 8
+        for cell, color in expected.items()
+    )
+
+
+def test_every_color_is_read_back_off_the_panel_when_the_clicks_land() -> None:
+    painter, painted, plan = _run_picky_sign(swallow_sv=lambda n: False)
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert _painted_as_planned(painted(), plan), painted()
+    summary = painter.color_pick_summary
+    assert summary.skipped_reason == ""
+    assert summary.picks == 3
+    assert summary.retried == 0
+    assert summary.failed == 0
+
+
+def test_a_swallowed_picker_click_is_clicked_again_until_the_panel_agrees() -> None:
+    """The locator color's S/V click is the first; the second color's is
+    the third.  Swallowed, it would paint that whole row in the first
+    color."""
+
+    painter, painted, plan = _run_picky_sign(swallow_sv=lambda n: n == 3)
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert _painted_as_planned(painted(), plan), painted()
+    summary = painter.color_pick_summary
+    assert summary.picks == 3
+    assert summary.retried == 1
+    assert summary.failed == 0
+
+
+def test_a_color_the_panel_never_shows_pauses_the_job_for_the_user() -> None:
+    """When the clicks keep failing the job stops before a stroke goes
+    down wrong, says which color, and picks it again once resumed."""
+
+    stuck = {"on": True}
+
+    def swallow(n: int) -> bool:
+        # Every S/V click from the second color's first one on, until released.
+        return stuck["on"] and n >= 3
+
+    painter, painted, plan = _run_picky_sign(swallow_sv=swallow)
+    deadline = time.monotonic() + _t(60.0)
+    while painter.state is not PainterState.PAUSED and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert painter.state is PainterState.PAUSED, painter.state
+    reason = painter.state_reason
+    assert "did not take #" in reason, reason
+    shown = reason.split("did not take #")[1][:6]
+    asked = tuple(int(shown[i : i + 2], 16) for i in (0, 2, 4))
+    assert max(abs(a - b) for a, b in zip(asked, (40, 100, 200))) <= 8, reason
+    # Nothing of the second color went down in the first color's paint.
+    assert all(cell[1] == 0 for cell in painted())
+    assert painter.color_pick_summary.failed == 1
+    stuck["on"] = False
+    assert painter.resume()
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert _painted_as_planned(painted(), plan), painted()
+
+
+def test_picks_are_not_read_back_when_the_panel_has_no_color_block() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile(canvas_width=400)
+    plan = _three_color_plan()
+    painter = _impatient(Painter(controller, screen_capture=_panel_capture))
+    painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
+    painter._SWATCH_RECHECK_SECONDS = 0.0  # type: ignore[misc]
+    settings = _settings(
+        verify_color_picks=True,
+        verify_passes=0,
+        require_foreground=False,
+        pause_on_mouse_move=False,
+    )
+    assert painter.start(plan, profile, settings)
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    summary = painter.color_pick_summary
+    assert summary.skipped_reason == "no color block found beside the hue bar"
+    assert summary.picks == 0
+
+
+def test_picks_are_not_read_back_when_turned_off() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    painter = _impatient(Painter(controller, screen_capture=_panel_capture))
+    painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
+    settings = _settings(
+        verify_color_picks=False,
+        verify_passes=0,
+        require_foreground=False,
+        pause_on_mouse_move=False,
+    )
+    assert painter.start(_three_color_plan(), _profile(), settings)
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED
+    assert painter.color_pick_summary.skipped_reason == "turned off"

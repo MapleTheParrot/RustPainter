@@ -201,6 +201,41 @@ def rgb_to_picker_coordinates(
     )
 
 
+def picker_points_to_rgb(
+    hue_point: ScreenPoint,
+    sv_point: ScreenPoint,
+    hue_bar: RectangleLike,
+    color_box: RectangleLike,
+    *,
+    hue_direction: HueDirection | str = HueDirection.TOP_TO_BOTTOM,
+    saturation_direction: SaturationDirection | str = SaturationDirection.LEFT_LOW,
+    value_direction: ValueDirection | str = ValueDirection.TOP_BRIGHT,
+) -> RGBColor:
+    """The color the picker selects when clicked at these two points.
+
+    The inverse of ``rgb_to_picker_coordinates``: a click pulled inside a
+    widget's edge, or clamped to it, selects a slightly different color from
+    the one asked for, and this is what the panel will show for it.
+    """
+
+    def fraction(position: float, start: float, length: float) -> float:
+        span = max(length - 1.0, 0.0)
+        if span <= 0.0:
+            return 0.0
+        return min(max((float(position) - start) / span, 0.0), 1.0)
+
+    hue_normalized = fraction(hue_point[1], hue_bar.top, hue_bar.height)
+    if _hue_direction(hue_direction) is HueDirection.BOTTOM_TO_TOP:
+        hue_normalized = 1.0 - hue_normalized
+    saturation = fraction(sv_point[0], color_box.left, color_box.width)
+    if _saturation_direction(saturation_direction) is SaturationDirection.LEFT_HIGH:
+        saturation = 1.0 - saturation
+    vertical = fraction(sv_point[1], color_box.top, color_box.height)
+    value = vertical if _value_direction(value_direction) is ValueDirection.TOP_DARK else 1.0 - vertical
+    red, green, blue = colorsys.hsv_to_rgb(hue_normalized % 1.0, saturation, value)
+    return int(round(red * 255.0)), int(round(green * 255.0)), int(round(blue * 255.0))
+
+
 # Friendly alias for painter code.
 map_rgb_to_picker = rgb_to_picker_coordinates
 
@@ -214,6 +249,7 @@ __all__ = [
     "map_hue_to_screen",
     "map_rgb_to_picker",
     "map_sv_to_screen",
+    "picker_points_to_rgb",
     "rgb_to_hsv",
     "rgb_to_picker_coordinates",
 ]

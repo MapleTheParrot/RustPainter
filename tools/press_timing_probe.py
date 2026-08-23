@@ -41,6 +41,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.brush_calibration import format_brush_size  # noqa: E402
 from app.color_mapping import map_rgb_to_picker  # noqa: E402
 from app.painter import _high_resolution_timer  # noqa: E402
 from app.input_controller import MouseButton, create_system_input_controller  # noqa: E402
@@ -153,17 +154,39 @@ def require_painting_ui(profile) -> None:
         )
 
 
+def set_brush_size(guard: Guard, profile, size: float) -> None:
+    """Type a Size into Rust's field the way the painter does: click it,
+    clear it from both sides of the caret, type, Enter."""
+
+    box = profile.brush_size_box
+    if box is None:
+        raise SystemExit("--size needs the profile's Size value box calibrated")
+    guard.check()
+    guard.input.click(box.left + box.width / 2, box.top + box.height / 2, hold_seconds=0.09)
+    guard.commanded(box.left + box.width / 2, box.top + box.height / 2)
+    time.sleep(0.12)
+    for key in ("BACKSPACE",) * 6 + ("DELETE",) * 6:
+        guard.input.press_key(key, hold_seconds=0.03)
+        time.sleep(0.02)
+    for char in format_brush_size(size):
+        guard.input.press_key(0xBE if char == "." else char, hold_seconds=0.03)
+        time.sleep(0.02)
+    guard.input.press_key("ENTER", hold_seconds=0.03)
+    time.sleep(0.15)
+    print(f"brush size set to {format_brush_size(size)}", flush=True)
+
+
 def select_color(guard: Guard, profile, color) -> None:
     """Click the picker for one colour, holding each click across a frame."""
 
-    directions = profile.picker_directions
+    # The same fixed directions the painter uses for every profile.
     coordinates = map_rgb_to_picker(
         color,
         profile.hue_bar,
         profile.color_box,
-        hue_direction=getattr(directions, "hue", "bottom_to_top"),
-        saturation_direction=getattr(directions, "saturation", "left_low"),
-        value_direction=getattr(directions, "value", "top_bright"),
+        hue_direction=getattr(profile, "hue_direction", "bottom_to_top"),
+        saturation_direction=getattr(profile, "saturation_direction", "left_low"),
+        value_direction=getattr(profile, "value_direction", "top_bright"),
     )
     for point, rect in (
         (coordinates.hue, profile.hue_bar),
@@ -275,6 +298,18 @@ def main() -> int:
         help="drag this many screen pixels during the press (0 = a dab)",
     )
     parser.add_argument("--spacing", type=float, default=DOT_SPACING_PIXELS)
+    parser.add_argument(
+        "--size",
+        type=float,
+        default=None,
+        help="type this brush Size into Rust first (default: leave the brush as it is)",
+    )
+    parser.add_argument(
+        "--color-offset",
+        type=int,
+        default=0,
+        help="start the band colours this far into the palette, to differ from an earlier test",
+    )
     parser.add_argument("--countdown", type=int, default=4)
     parser.add_argument("--budget", type=float, default=1200.0)
     parser.add_argument(
@@ -346,9 +381,11 @@ def main() -> int:
     results = []
     try:
         require_painting_ui(profile)
+        if args.size is not None:
+            set_brush_size(guard, profile, args.size)
         for index, hold in enumerate(holds):
             points = bands[index]
-            color = BAND_COLORS[index % len(BAND_COLORS)]
+            color = BAND_COLORS[(index + args.color_offset) % len(BAND_COLORS)]
             select_color(guard, profile, color)
             guard.park(park, settle=BAND_SETTLE_SECONDS)
             before = np.asarray(capture_region(canvas).convert("RGB"), dtype=np.float32)
