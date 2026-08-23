@@ -835,6 +835,9 @@ class MainWindow(QMainWindow):
         # reason, and time; and the viewers open on such screenshots.
         self._pause_screenshot: tuple[Path, str, str] | None = None
         self._offered_record: ResumeRecord | None = None
+        # Which offer (plan, record) the tick and slider were last set from,
+        # so re-planning the same picture leaves the user's choice alone.
+        self._offered_key: tuple[str, str, int] | None = None
         self._screenshot_viewers: list[Any] = []
         self._paint_job_snapshot: Any = None
         self._timelapse_timer = QTimer(self)
@@ -2445,6 +2448,7 @@ class MainWindow(QMainWindow):
             if not getattr(plan, "stroke_count", 0):
                 self._plan_fingerprint = None
                 self._offered_record = None
+                self._offered_key = None
                 self.resume_screenshot_button.setVisible(False)
                 slider.setRange(0, 0)
                 slider.setValue(0)
@@ -2463,8 +2467,15 @@ class MainWindow(QMainWindow):
                 and Path(self._offered_record.screenshot_path).exists()
             )
             if record is not None and record.resumable:
-                slider.setValue(min(record.completed_strokes, plan.stroke_count))
-                check.setChecked(True)
+                # The tick belongs to the user once they have seen this
+                # offer: re-planning the same picture (a brush or picture
+                # setting changed) must not re-tick a box they unticked, or
+                # drag the slider back from where they put it.
+                offer_key = (fingerprint, record.updated_at, record.completed_strokes)
+                if offer_key != self._offered_key:
+                    self._offered_key = offer_key
+                    slider.setValue(min(record.completed_strokes, plan.stroke_count))
+                    check.setChecked(True)
                 how = (
                     "the sign went away while painting" if record.interrupted_by_ui_loss
                     else record.state
@@ -2476,6 +2487,7 @@ class MainWindow(QMainWindow):
                     "carry on from there, or slide to where the sign really is."
                 )
             else:
+                self._offered_key = None
                 slider.setValue(0)
                 check.setChecked(False)
                 notice = (
