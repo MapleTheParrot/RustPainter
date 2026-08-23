@@ -30,6 +30,8 @@ time has been landing in frames of about H / (1 - D) ms).
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.wintypes as wintypes
 import json
 import sys
 import time
@@ -40,10 +42,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.color_mapping import map_rgb_to_picker  # noqa: E402
+from app.painter import _high_resolution_timer  # noqa: E402
 from app.input_controller import MouseButton, create_system_input_controller  # noqa: E402
 from app.models import ScreenRect  # noqa: E402
 from app.profiles import ProfileStore  # noqa: E402
 from app.screen import capture_region  # noqa: E402
+from app.ui_guard import looks_like_hue_bar  # noqa: E402
 from tools._safety import Aborted, Guard, countdown  # noqa: E402
 from tools.decimal_probe import _data_directory, _focus_rust  # noqa: E402
 
@@ -65,6 +69,9 @@ DOT_SPACING_PIXELS = 24.0
 # landed a texel or two off is still its own dot and not a miss.
 DOT_PATCH_PIXELS = 9
 
+# After Rust is handed the foreground by a script, before it is clicked.
+FOCUS_SETTLE_SECONDS = 1.5
+
 # Between the last dot of a band and the capture that scores it: the game has
 # to present the frame carrying it, which at its slowest is a quarter second.
 BAND_SETTLE_SECONDS = 0.6
@@ -81,6 +88,69 @@ BAND_COLORS = (
     (250, 130, 40),
     (140, 70, 230),
 )
+
+
+# The GUI's calibration overlay draws red outlines over the sign.  They are
+# click-through and the painter hides them while it works, but a script
+# driving the mouse itself has to, or every capture is scored against a
+# rectangle with a red border burnt across it.
+_OVERLAY_TITLE = "RustPainter Calibration Preview"
+_SW_HIDE, _SW_SHOWNA = 0, 8
+
+
+def _overlay_windows() -> list:
+    user32 = ctypes.windll.user32
+    found: list = []
+
+    def visit(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            if _OVERLAY_TITLE in buffer.value:
+                found.append(hwnd)
+        return True
+
+    prototype = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [prototype, wintypes.LPARAM]
+    user32.EnumWindows(prototype(visit), 0)
+    return found
+
+
+def hide_overlays() -> list:
+    windows = _overlay_windows()
+    for hwnd in windows:
+        ctypes.windll.user32.ShowWindow(hwnd, _SW_HIDE)
+    if windows:
+        print(f"hid {len(windows)} calibration overlay window(s)", flush=True)
+    return windows
+
+
+def restore_overlays(windows) -> None:
+    for hwnd in windows:
+        ctypes.windll.user32.ShowWindow(hwnd, _SW_SHOWNA)
+
+
+def require_painting_ui(profile) -> None:
+    """Refuse to paint unless Rust's painting UI is actually on the screen.
+
+    Every dot below is a left click at a point that is only a sign while the
+    painting interface is open.  With it closed those clicks land in the
+    world, on whatever the player happens to be holding, a thousand times
+    over.  The hue bar is the cheapest thing to recognise: a saturated strip
+    running through the spectrum, which nothing else on the screen is.
+    """
+
+    rect = profile.hue_bar
+    region = ScreenRect(rect.left, rect.top, rect.width, rect.height)
+    if not looks_like_hue_bar(capture_region(region)):
+        raise SystemExit(
+            "Rust's painting UI is not on the screen (no hue bar at the "
+            f"calibrated {region.left},{region.top} {region.width}x{region.height}).  "
+            "Open the sign's painting interface and run this again."
+        )
 
 
 def select_color(guard: Guard, profile, color) -> None:
@@ -133,27 +203,35 @@ def band_points(canvas: ScreenRect, band: int, bands: int, spacing: float) -> li
     ]
 
 
-def paint_dot(guard: Guard, point, hold_seconds: float, length_pixels: float) -> None:
-    """One press at ``point``, held ``hold_seconds``; a short drag if asked."""
+def paint_dot(guard: Guard, point, hold_seconds: float, length_pixels: float) -> float:
+    """One press at ``point``, held ``hold_seconds``; a short drag if asked.
+
+    Returns how long the button was really down.  A hold asked for in
+    milliseconds is not the hold delivered - Windows' scheduler rounds a
+    sleep to its timer resolution - and a measurement of the game has to be
+    made against what the game was actually given.
+    """
 
     guard.check()
     guard.input.move_mouse(*point)
     guard.commanded(*point)
-    time.sleep(0.004)
+    time.sleep(0.002)
     guard.input.mouse_down(MouseButton.LEFT)
-    pressed_at = time.monotonic()
+    pressed_at = time.perf_counter()
     try:
         if length_pixels > 0:
             steps = max(1, int(length_pixels))
             for step in range(1, steps + 1):
                 guard.input.move_mouse(point[0] + step * length_pixels / steps, point[1])
             guard.commanded(point[0] + length_pixels, point[1])
-        remaining = hold_seconds - (time.monotonic() - pressed_at)
+        remaining = hold_seconds - (time.perf_counter() - pressed_at)
         if remaining > 0:
             time.sleep(remaining)
+        held = time.perf_counter() - pressed_at
     finally:
         guard.input.mouse_up(MouseButton.LEFT)
-    time.sleep(0.02)
+    time.sleep(0.015)
+    return held
 
 
 def score_band(before: np.ndarray, after: np.ndarray, canvas: ScreenRect, points, patch: int):
@@ -179,6 +257,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="profile name to measure on (default: the app's selected profile)",
+    )
+    parser.add_argument(
         "--holds",
         type=str,
         default=",".join(str(h) for h in DEFAULT_HOLDS),
@@ -203,7 +287,20 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     store = ProfileStore(_data_directory() / "profiles")
-    profile = store.get_default() or store.list_profiles()[0]
+    profiles = store.list_profiles()
+    if args.profile:
+        wanted = args.profile.strip().lower()
+        matches = [p for p in profiles if p.name.strip().lower() == wanted]
+        if not matches:
+            matches = [p for p in profiles if wanted in p.name.strip().lower()]
+        if len(matches) != 1:
+            names = ", ".join(repr(p.name) for p in profiles)
+            raise SystemExit(
+                f"--profile {args.profile!r} matched {len(matches)} profiles; choose one of: {names}"
+            )
+        profile = matches[0]
+    else:
+        profile = store.get_default() or profiles[0]
     if profile.canvas is None or profile.color_box is None or profile.hue_bar is None:
         raise SystemExit("The profile needs its canvas, colour box and hue bar calibrated")
     canvas = ScreenRect(
@@ -217,6 +314,7 @@ def main() -> int:
         int(profile.color_box.top + profile.color_box.height / 2),
     )
     bands = [band_points(canvas, index, len(holds), args.spacing) for index in range(len(holds))]
+
     print(
         f"profile {profile.name!r}: {canvas.width}x{canvas.height} canvas, "
         f"{len(holds)} bands of {len(bands[0])} dots "
@@ -224,19 +322,30 @@ def main() -> int:
         flush=True,
     )
 
+    overlays = hide_overlays()
     _focus_rust()
     controller = create_system_input_controller()
     guard = Guard(controller, budget_seconds=args.budget)
+    # Rust wants a moment after it is given the foreground programmatically:
+    # a click sent too soon after has been seen closing the painting UI
+    # instead of pressing what it was aimed at.
+    time.sleep(FOCUS_SETTLE_SECONDS)
+    require_painting_ui(profile)
     countdown(args.countdown, "measuring the press hold")
 
     if not args.no_clear and profile.clear_button is not None:
         clear = profile.clear_button
         guard.click(clear.left + clear.width / 2, clear.top + clear.height / 2, settle=0.9)
+        # Rust takes the cursor back whenever it closes or reopens anything,
+        # so the guard's idea of where the script left the mouse has to be
+        # re-established before it is asked to judge a hand on the mouse.
+        guard.commanded(*controller.get_cursor_position())
         guard.park(park)
         print("sign cleared", flush=True)
 
     results = []
     try:
+        require_painting_ui(profile)
         for index, hold in enumerate(holds):
             points = bands[index]
             color = BAND_COLORS[index % len(BAND_COLORS)]
@@ -244,19 +353,20 @@ def main() -> int:
             guard.park(park, settle=BAND_SETTLE_SECONDS)
             before = np.asarray(capture_region(canvas).convert("RGB"), dtype=np.float32)
             started = time.monotonic()
-            for point in points:
-                paint_dot(guard, point, hold, args.length)
+            held = [paint_dot(guard, point, hold, args.length) for point in points]
             elapsed = time.monotonic() - started
+            actual = float(np.median(held)) * 1000.0
             guard.park(park, settle=BAND_SETTLE_SECONDS)
             after_image = capture_region(canvas).convert("RGB")
             after = np.asarray(after_image, dtype=np.float32)
             found, missing = score_band(before, after, canvas, points, DOT_PATCH_PIXELS)
             total = len(found) + len(missing)
             rate = len(missing) / total if total else 0.0
-            frame = hold * 1000.0 / (1.0 - rate) if rate < 1.0 else float("inf")
+            frame = actual / (1.0 - rate) if rate < 1.0 else float("inf")
             results.append(
                 {
                     "hold_ms": round(hold * 1000.0, 1),
+                    "actual_hold_ms": round(actual, 2),
                     "dots": total,
                     "painted": len(found),
                     "dropped": len(missing),
@@ -267,7 +377,8 @@ def main() -> int:
                 }
             )
             print(
-                f"  hold {hold * 1000:5.0f} ms: {len(found):4d}/{total:4d} painted, "
+                f"  hold {hold * 1000:5.0f} ms (really {actual:5.1f}): "
+                f"{len(found):4d}/{total:4d} painted, "
                 f"{100 * rate:5.1f}% dropped"
                 + (f", frames ~{frame:.0f} ms" if np.isfinite(frame) and rate > 0 else "")
                 + f"  ({elapsed / max(1, len(points)) * 1000:.0f} ms per press)",
@@ -281,6 +392,7 @@ def main() -> int:
             controller.release_all()
         except Exception:
             pass
+        restore_overlays(overlays)
 
     document = {
         "profile": profile.name,
@@ -296,7 +408,7 @@ def main() -> int:
     }
     clean = [row for row in results if row["drop_rate"] <= 0.01]
     if clean:
-        document["cleanestHoldMs"] = min(row["hold_ms"] for row in clean)
+        document["cleanestHoldMs"] = min(row["actual_hold_ms"] for row in clean)
         print(
             f"\nThe shortest hold this sign did not drop: "
             f"{document['cleanestHoldMs']:.0f} ms",
@@ -314,4 +426,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Windows rounds a sleep to the current timer resolution - 15.6 ms by
+    # default, which is longer than most of the holds worth measuring.  The
+    # painter raises the resolution for exactly this reason and so must
+    # anything measuring it.
+    with _high_resolution_timer():
+        raise SystemExit(main())
