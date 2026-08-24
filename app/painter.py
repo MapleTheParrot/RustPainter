@@ -207,6 +207,12 @@ class PaintingTarget:
     # sizing off, which is what types the probe's brush - paints on it when it
     # still sits on the calibrated rectangle.
     texel_grid: TexelGridModel | None = None
+    # The bare sign's colour, measured when a job last cleared this sign.
+    # A job that resumes onto an existing painting never sees the sign
+    # cleared, and a plan that covers every cell leaves no unpainted cell to
+    # read the wood from - so without this the touch-up pass cannot tell a
+    # hole from a cell painted some other colour, and holes go unrepaired.
+    bare_color: RGBColor | None = None
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -233,6 +239,17 @@ class PaintingTarget:
             if isinstance(sizing_value, Mapping)
             else None
         )
+        bare_value = (
+            metadata.get("bare_sign_color") if isinstance(metadata, Mapping) else None
+        )
+        bare_color = None
+        if isinstance(bare_value, (list, tuple)) and len(bare_value) == 3:
+            try:
+                bare_color = tuple(
+                    min(255, max(0, int(round(float(channel))))) for channel in bare_value
+                )
+            except (TypeError, ValueError):
+                LOGGER.warning("The profile's stored bare-sign colour is invalid")
         grid_value = metadata.get("texel_grid") if isinstance(metadata, Mapping) else None
         texel_grid = None
         if isinstance(grid_value, Mapping):
@@ -255,6 +272,7 @@ class PaintingTarget:
             color_correction=correction,
             brush_size_model=brush_size_model,
             texel_grid=texel_grid,
+            bare_color=bare_color,
         )
 
 
@@ -747,6 +765,8 @@ class Painter:
         # proved on its sign, or None while unmeasured (then the floors).
         self._measured_stroke_gap_seconds: float | None = None
         self._measured_drag_rate: float | None = None
+        # The bare sign's colour, from a capture this job took of it cleared.
+        self._measured_bare_color: RGBColor | None = None
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -910,6 +930,7 @@ class Painter:
             self._measured_detail_size = None
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
+            self._measured_bare_color = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -983,6 +1004,7 @@ class Painter:
             self._measured_detail_size = None
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
+            self._measured_bare_color = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -1013,6 +1035,18 @@ class Painter:
 
         with self._condition:
             return self._color_pick_summary
+
+    @property
+    def measured_bare_color(self) -> RGBColor | None:
+        """The bare sign's colour, if this job saw the sign cleared.
+
+        Worth storing on the profile: a later job that resumes onto this
+        sign, or touches it up as it stands, has no way to see the wood for
+        itself and cannot recognise a hole without it.
+        """
+
+        with self._condition:
+            return self._measured_bare_color
 
     @property
     def measured_stroke_gap_seconds(self) -> float | None:
@@ -1623,6 +1657,7 @@ class Painter:
             return
         if bare:
             job.bare_canvas = capture
+            self._remember_bare_color(capture)
             LOGGER.info(
                 "The sign looks bare before painting; the touch-up pass will "
                 "read holes against this capture"
@@ -2234,7 +2269,24 @@ class Painter:
             )
         else:
             LOGGER.info("Cleared the sign after measuring the brush")
+            self._remember_bare_color(after)
         job.bare_canvas = after
+
+    def _remember_bare_color(self, capture: Any) -> None:
+        """Keep the median colour of a capture of the cleared sign."""
+
+        import numpy as np
+
+        try:
+            pixels = np.asarray(capture.convert("RGB"), dtype=np.float32).reshape(-1, 3)
+            median = np.median(pixels, axis=0)
+        except Exception:
+            LOGGER.debug("The bare sign's colour could not be read", exc_info=True)
+            return
+        color = tuple(int(round(float(channel))) for channel in median)
+        with self._condition:
+            self._measured_bare_color = color  # type: ignore[assignment]
+        LOGGER.info("The bare sign reads #%02X%02X%02X", *color)
 
     def _canvas_changed(self, before: Any, after: Any) -> bool:
         """Whether two captures of the sign differ by more than capture noise."""
@@ -4573,6 +4625,22 @@ class Painter:
                 overshoot,
             )
         bare_sampled = None
+        if job.bare_canvas is None and target.bare_color is not None:
+            # This job never saw the sign cleared - it resumed onto an
+            # existing painting, or is touching one up as it stands - so the
+            # wood comes from what an earlier job on this sign measured.  A
+            # single colour is all the classifier takes from a bare capture
+            # (it medians it), and the capture's lighting is normalized
+            # before the comparison, so a colour read under other light
+            # still places the wood.
+            bare_sampled = np.full(
+                (plan.height, plan.width, 3), np.array(target.bare_color, dtype=np.float32)
+            )
+            LOGGER.info(
+                "Reading holes against the bare sign colour #%02X%02X%02X stored "
+                "for this profile; this job did not see the sign cleared",
+                *target.bare_color,
+            )
         if job.bare_canvas is not None:
             try:
                 bare_sampled = sample_cell_colors(

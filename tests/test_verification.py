@@ -751,3 +751,46 @@ def test_confirm_cells_learns_the_sign_rendering_from_the_cells_that_took() -> N
     hit, judged = confirm_cells(before, after, nominal, judge)
     assert judged.all()
     assert np.array_equal(hit, took)
+
+
+def test_a_stored_bare_colour_finds_holes_a_covered_plan_hides() -> None:
+    """A plan that paints every cell leaves no wood to read, so a job that
+    never saw the sign cleared cannot tell a hole from a wrong colour - and
+    on a sign too fine to recolour, wrong colours are left alone, so the
+    holes go unrepaired.  One remembered colour restores the blank test."""
+
+    import numpy as np
+
+    from app.verification import classify_cells
+
+    rows, cols = 24, 24
+    palette = np.array(
+        [[20, 20, 20], [200, 40, 40], [190, 175, 159]], dtype=np.float32
+    )
+    # Every cell is painted (no -1), and one palette colour happens to sit
+    # near the wood - exactly the case that defeats colour alone.
+    indices = np.zeros((rows, cols), dtype=np.int64)
+    indices[:, 12:] = 1
+    indices[0, :] = 2
+    sampled = palette[indices].astype(np.float32)
+    holes = [(5, 3), (5, 4), (9, 17), (14, 20), (18, 7)]
+    wood = np.array([190, 175, 159], dtype=np.float32)
+    for y, x in holes:
+        sampled[y, x] = wood
+
+    blind = classify_cells(sampled, indices, palette, bare_sampled=None, recolor=False)
+    seeing = classify_cells(
+        sampled,
+        indices,
+        palette,
+        bare_sampled=np.full((rows, cols, 3), wood),
+        recolor=False,
+    )
+    assert blind.blank == 0
+    assert seeing.blank == len(holes)
+    for y, x in holes:
+        assert seeing.cells[y, x]
+    # Nothing else is disturbed: the row genuinely painted the wood colour
+    # is not read as a hole, because it is not far from its own colour.
+    assert not seeing.cells[0].any()
+    assert int(seeing.cells.sum()) == len(holes)

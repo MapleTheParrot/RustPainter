@@ -7063,15 +7063,22 @@ class MainWindow(QMainWindow):
         profile = self._current_profile
         model = painter.measured_brush_size_model if painter is not None else None
         grid = getattr(painter, "measured_texel_grid", None) if painter is not None else None
+        # The wood, from a capture of this sign cleared.  A later job that
+        # resumes onto the painting, or touches it up as it stands, never
+        # sees the sign bare and cannot recognise a hole without it.
+        bare = getattr(painter, "measured_bare_color", None) if painter is not None else None
+        bare_value = list(bare) if bare is not None else None
         if model is None or profile is None:
             return
         stored = profile.metadata.get("brush_size_model")
         stored_grid = profile.metadata.get("texel_grid")
+        stored_bare = profile.metadata.get("bare_sign_color")
         grid_value = grid.to_dict() if grid is not None else None
         if (
             isinstance(stored, dict)
             and stored.get("slope") == model.slope
             and (grid is None or stored_grid == grid_value)
+            and (bare_value is None or stored_bare == bare_value)
         ):
             return
         try:
@@ -7079,6 +7086,8 @@ class MainWindow(QMainWindow):
             candidate.metadata["brush_size_model"] = model.to_dict()
             if grid_value is not None:
                 candidate.metadata["texel_grid"] = grid_value
+            if bare_value is not None:
+                candidate.metadata["bare_sign_color"] = bare_value
             self._current_profile = self._profile_store.save(candidate)
         except Exception:
             LOGGER.exception("Could not save the measured brush size model")

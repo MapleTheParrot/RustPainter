@@ -1288,3 +1288,39 @@ def test_a_sign_that_only_takes_the_floor_rate_keeps_it() -> None:
     assert painter.measured_drag_rate is None
     sign.capture(profile.canvas)
     assert set(sign.painted) == {(x, 30) for x in range(4, 124)}
+
+
+def test_a_cleared_sign_teaches_the_profile_its_wood_for_later_touch_ups() -> None:
+    """A job that clears the sign measures the wood; a later touch-up-only
+    job on the same profile reads its holes against that colour."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        faithful_colors=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    _record_color_picks(painter, controller)
+    plan = _dab_plan()
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    measured = painter.measured_bare_color
+    assert measured is not None and len(measured) == 3
+
+    # What the GUI stores, and what a later job reads back.
+    profile.metadata["bare_sign_color"] = list(measured)
+    profile.metadata["texel_grid"] = painter.measured_texel_grid.to_dict()
+    profile.metadata["brush_size_model"] = painter.measured_brush_size_model.to_dict()
+    from app.painter import PaintingTarget
+
+    assert PaintingTarget.from_profile(profile).bare_color == tuple(measured)
