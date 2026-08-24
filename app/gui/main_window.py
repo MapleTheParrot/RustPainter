@@ -1315,8 +1315,18 @@ class MainWindow(QMainWindow):
         advanced_layout.addRow("After S/V", self.sv_delay_spin)
         advanced_layout.addRow("After brush", self.brush_delay_spin)
         advanced_layout.addRow("Between strokes", self.stroke_delay_spin)
+        self.line_tool_check = QCheckBox("Draw long straight runs with Shift-click lines")
+        self.line_tool_check.setChecked(True)
+        self.line_tool_check.setToolTip(
+            "Rust's line tool: an anchor press, then a click with Shift held,\n"
+            "and the game draws the straight stroke between them - a full row\n"
+            "in two presses instead of a rate-capped drag.  Proven on each\n"
+            "sign with one probe stroke before painting; a sign that fails\n"
+            "the probe paints with drags exactly as before."
+        )
         advanced_layout.addRow("Between colors", self.color_delay_spin)
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
+        advanced_layout.addRow("", self.line_tool_check)
         layout.addWidget(advanced)
 
         touch_up = QGroupBox("Touch-up")
@@ -5506,6 +5516,7 @@ class MainWindow(QMainWindow):
             self.stroke_delay_spin,
             self.color_delay_spin,
             self.interpolation_spin,
+            self.line_tool_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
@@ -5726,6 +5737,7 @@ class MainWindow(QMainWindow):
                 float(painting.get("stroke_interpolation_step_pixels", 4.0))
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
+            self.line_tool_check.setChecked(bool(painting.get("use_line_tool", True)))
             self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
             self.confirm_strokes_check.setChecked(
                 bool(painting.get("confirm_strokes", False))
@@ -5869,6 +5881,7 @@ class MainWindow(QMainWindow):
             "delay_between_colors_seconds": self.color_delay_spin.value() / 1000.0,
             "stroke_interpolation_step_pixels": self.interpolation_spin.value(),
             "apply_brush_size": self.apply_brush_check.isChecked(),
+            "use_line_tool": self.line_tool_check.isChecked(),
             "brush_direction": "low_to_high",
             "stroke_merge_mode": self._merge_mode(),
             "verify_passes": int(self.verify_passes_spin.value()),
@@ -7215,6 +7228,7 @@ class MainWindow(QMainWindow):
             self.stroke_delay_spin,
             self.color_delay_spin,
             self.interpolation_spin,
+            self.line_tool_check,
             self.verify_passes_spin,
             self.verify_picks_check,
             self.confirm_strokes_check,
@@ -7263,6 +7277,7 @@ class MainWindow(QMainWindow):
             self.stroke_delay_spin,
             self.color_delay_spin,
             self.interpolation_spin,
+            self.line_tool_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
