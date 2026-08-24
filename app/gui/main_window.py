@@ -1346,8 +1346,18 @@ class MainWindow(QMainWindow):
             "time is dabs held for the 70 ms frame floor.  A sign that drops\n"
             "any probe dot keeps the floor; drags always keep their dwell."
         )
+        self.dab_size_check = QCheckBox("Prove the one-cell brush with lone dabs")
+        self.dab_size_check.setChecked(True)
+        self.dab_size_check.setToolTip(
+            "Before painting, batches of lone dabs at rising Size numbers find\n"
+            "the smallest brush that lands every one of them on this sign, and\n"
+            "the job's single-cell strokes use it.  On large signs Rust's\n"
+            "smallest brush is narrower than a texel and a lone dab can miss\n"
+            "its texel entirely - the specks a finished XXL sign shows."
+        )
         advanced_layout.addRow("", self.line_tool_check)
         advanced_layout.addRow("", self.press_hold_check)
+        advanced_layout.addRow("", self.dab_size_check)
         layout.addWidget(advanced)
 
         touch_up = QGroupBox("Touch-up")
@@ -5687,6 +5697,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.line_tool_check,
             self.press_hold_check,
+            self.dab_size_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
@@ -5911,6 +5922,7 @@ class MainWindow(QMainWindow):
             self.press_hold_check.setChecked(
                 bool(painting.get("measure_press_hold", True))
             )
+            self.dab_size_check.setChecked(bool(painting.get("measure_dab_size", True)))
             self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
             self.confirm_strokes_check.setChecked(
                 bool(painting.get("confirm_strokes", False))
@@ -6056,6 +6068,7 @@ class MainWindow(QMainWindow):
             "apply_brush_size": self.apply_brush_check.isChecked(),
             "use_line_tool": self.line_tool_check.isChecked(),
             "measure_press_hold": self.press_hold_check.isChecked(),
+            "measure_dab_size": self.dab_size_check.isChecked(),
             "brush_direction": "low_to_high",
             "stroke_merge_mode": self._merge_mode(),
             "verify_passes": int(self.verify_passes_spin.value()),
@@ -7409,6 +7422,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.line_tool_check,
             self.press_hold_check,
+            self.dab_size_check,
             self.verify_passes_spin,
             self.verify_picks_check,
             self.confirm_strokes_check,
@@ -7459,6 +7473,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin,
             self.line_tool_check,
             self.press_hold_check,
+            self.dab_size_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
