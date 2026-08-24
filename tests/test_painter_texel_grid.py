@@ -9,7 +9,7 @@ import pytest
 
 from PIL import Image
 
-from app.input_controller import MockInputController
+from app.input_controller import InputEvent, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
 from app.painter import Painter, PainterSettings, PainterState
 from app.profiles import CalibrationProfile
@@ -75,6 +75,7 @@ class ReplayingTexelSign(SimulatedSign):
         min_dab_hold: float = 0.0,
         max_drag_step_px: float = 8.0,
         dead_columns: frozenset[int] = frozenset(),
+        faithful_colors: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -89,6 +90,10 @@ class ReplayingTexelSign(SimulatedSign):
         # whose smallest brush is smaller than a texel, seen through the
         # cursor quantization that decides which texels it can reach.
         self.dead_columns = dead_columns
+        # Paint the colour the painter asked for (a "select_color" marker the
+        # test records after each pick) instead of cycling the palette on hue
+        # clicks, so a verification pass can compare the sign with the plan.
+        self.faithful_colors = faithful_colors
         # A press-and-release quicker than this paints nothing, like a game
         # frame that never sampled the button down.  Needs a controller that
         # records event times (TimedMockController); zero keeps every dab.
@@ -194,6 +199,8 @@ class ReplayingTexelSign(SimulatedSign):
             elif event.kind == "key_up":
                 if event.value == "SHIFT":
                     shift_down = False
+            elif event.kind == "select_color":
+                color = tuple(int(v) for v in event.value)  # type: ignore[union-attr]
             elif event.kind == "mouse_down":
                 down = True
                 if self.profile.clear_button.contains(*position):
@@ -201,8 +208,9 @@ class ReplayingTexelSign(SimulatedSign):
                     self.painted = {}
                     anchor = None
                 elif self.profile.hue_bar.contains(*position):
-                    color_index += 1
-                    color = self.PALETTE[color_index % len(self.PALETTE)]
+                    if not self.faithful_colors:
+                        color_index += 1
+                        color = self.PALETTE[color_index % len(self.PALETTE)]
                 elif self._on_texture(*position):
                     landed = self._texel_at(position[0], position[1])
                     if self.shift_lines and shift_down:
@@ -827,6 +835,18 @@ def test_the_press_hold_switch_keeps_the_floor_without_probing() -> None:
     assert set(sign.painted) == {(0, 0)}
 
 
+def _record_color_picks(painter: Painter, controller: MockInputController) -> None:
+    """Append a marker event after every colour pick, for a faithful sign."""
+
+    original = painter._select_color
+
+    def select(color, target, settings, epoch, **kwargs):  # type: ignore[no-untyped-def]
+        original(color, target, settings, epoch, **kwargs)
+        controller.events.append(InputEvent("select_color", value=tuple(color)))  # type: ignore[arg-type]
+
+    painter._select_color = select  # type: ignore[method-assign]
+
+
 def _presses_after_last_clear(controller: MockInputController, profile: CalibrationProfile):
     """(press position, moves while held) for every press after the sign was cleared."""
 
@@ -992,3 +1012,118 @@ def test_the_dab_probe_switch_leaves_the_one_cell_brush_unmeasured() -> None:
     sign.capture(profile.canvas)  # replay to the end of the job
     # Without the probe the dead columns stay bare - the failure the probe exists for.
     assert not any(column in {20, 25, 30} for column, _ in sign.painted)
+
+
+def test_a_touch_up_only_job_raises_the_brush_for_holes_that_survive_a_pass() -> None:
+    """A finished sign with holes the smallest brush cannot reach, touched up
+    as it is: the job starts at its last stroke, so nothing is cleared or
+    probed and every pass is a capture and a repaint - and a hole that
+    survives a pass is repainted with the next Size up until it fills."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        dead_columns=frozenset({20, 25, 30}),
+        faithful_colors=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    plan = _dab_plan()
+    expected = {(x, y) for y in (12, 30, 50) for x in (20, 25, 30, 61, 100)} | {
+        (x, 40) for x in range(4, 61)
+    }
+
+    # The nine-hour sign: painted without the dab probe, so the dead columns
+    # came out bare.
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    _record_color_picks(painter, controller)
+    assert painter.start(plan, profile, _settings(measure_dab_size=False))
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    sign.capture(profile.canvas)
+    assert not any(column in {20, 25, 30} for column, _ in sign.painted)
+    assert set(sign.painted) < expected
+    grid = painter.measured_texel_grid
+    model = painter.measured_brush_size_model
+    assert grid is not None and model is not None
+
+    # Touch it up as it is: the profile carries what the first job measured,
+    # the job begins at its last stroke, and three passes are allowed.
+    profile.metadata["texel_grid"] = grid.to_dict()
+    profile.metadata["brush_size_model"] = model.to_dict()
+    touch_up = _impatient(Painter(controller, screen_capture=sign.capture))
+    _record_color_picks(touch_up, controller)
+    assert touch_up.start(
+        plan,
+        profile,
+        _settings(verify_passes=3),
+        start_stroke=plan.stroke_count,
+    )
+    assert touch_up.wait(120.0)
+    assert touch_up.state is PainterState.COMPLETED, touch_up.state_reason
+    # Pass 1 repainted at the smallest brush and missed; pass 2 raised it to
+    # 1.25 and missed; pass 3 raised it to 1.5, which lands.
+    assert touch_up.measured_detail_size == pytest.approx(1.5)
+
+    sign.capture(profile.canvas)  # replay to the end of both jobs
+    assert set(sign.painted) == expected
+    assert not any(
+        profile.clear_button.contains(*_position_at(controller, index))
+        for index, event in enumerate(controller.events)
+        if event.kind == "mouse_down" and index > _last_clear_index(controller, profile)
+    )
+
+
+def _position_at(controller: MockInputController, index: int) -> tuple[int, int]:
+    position = (0, 0)
+    for event in controller.events[: index + 1]:
+        if event.kind == "move" and event.x is not None and event.y is not None:
+            position = (event.x, event.y)
+    return position
+
+
+def _last_clear_index(controller: MockInputController, profile: CalibrationProfile) -> int:
+    last = -1
+    position = (0, 0)
+    for index, event in enumerate(controller.events):
+        if event.kind == "move" and event.x is not None and event.y is not None:
+            position = (event.x, event.y)
+        elif event.kind == "mouse_down" and profile.clear_button.contains(*position):
+            last = index
+    return last
+
+
+def test_the_touch_up_brush_rises_only_when_repaints_did_not_take() -> None:
+    import numpy as np
+
+    from app.painter import PainterSettings, _Job
+
+    controller = MockInputController()
+    painter = Painter(controller, screen_capture=lambda rect: Image.new("RGB", (rect.width, rect.height)))
+    plan = _dab_plan()
+    job = _Job(plan, object(), PainterSettings(apply_brush_size=True))  # type: ignore[arg-type]
+    previous = np.zeros((64, 128), dtype=bool)
+    previous[12, 20:60] = True  # 40 cells repainted last pass
+    still = np.zeros((64, 128), dtype=bool)
+    still[12, 20:25] = True  # 5 of them still wrong: below the floor of 10
+    painter._escalate_touch_up_brush(job, 2, still, previous)
+    assert painter.measured_detail_size is None
+    still[12, 20:32] = True  # 12 still wrong: 30% of the 40, over both bars
+    painter._escalate_touch_up_brush(job, 2, still, previous)
+    assert painter.measured_detail_size == pytest.approx(1.25)
+    painter._escalate_touch_up_brush(job, 3, still, previous)
+    assert painter.measured_detail_size == pytest.approx(1.5)
+    for _ in range(5):
+        painter._escalate_touch_up_brush(job, 4, still, previous)
+    assert painter.measured_detail_size == pytest.approx(2.0)  # the ladder's top
+    # Off means off, whatever the holes say.
+    quiet = _Job(plan, object(), PainterSettings(apply_brush_size=True, measure_dab_size=False))  # type: ignore[arg-type]
+    painter._measured_detail_size = None
+    painter._escalate_touch_up_brush(quiet, 2, still, previous)
+    assert painter.measured_detail_size is None

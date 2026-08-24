@@ -4299,6 +4299,10 @@ class Painter:
         )
         pass_number = 1
         touch_up_started = self._active_elapsed()
+        # The cells the previous pass repainted: a cell still wrong after a
+        # stationary press at its audited aim is one this stamp cannot
+        # reach, and the next pass reaches for it with a bigger one.
+        previous_repaint: Any = None
 
         def record_touch_up() -> None:
             with self._condition:
@@ -4372,6 +4376,11 @@ class Painter:
                         covered,
                     )
                     return
+                if previous_repaint is not None:
+                    self._escalate_touch_up_brush(
+                        job, pass_number, mismatch, previous_repaint
+                    )
+                previous_repaint = mismatch.copy()
                 repaint = touch_up_plan(mismatch, indices, palette)
                 predicted = self._work_schedule(repaint, target, settings).total
                 LOGGER.info(
@@ -4402,6 +4411,63 @@ class Painter:
 
     # How many rounds of picker clicks a color gets before the panel is
     # looked for again, and how many after that before the job pauses.
+    # A pass whose repaints mostly did not take is using a stamp that cannot
+    # reach those cells: at least this many, and this share, of the cells
+    # repainted last pass still wrong raises the one-cell brush a step.
+    _TOUCH_UP_STUBBORN_MIN = 10
+    _TOUCH_UP_STUBBORN_FRACTION = 0.25
+
+    def _escalate_touch_up_brush(
+        self, job: _Job, pass_number: int, mismatch: Any, previous: Any
+    ) -> None:
+        """Raise the one-cell brush when last pass's repaints did not take.
+
+        A touch-up dab is a stationary press at the cell's audited aim.  A
+        cell that is still bare after one is a cell this stamp cannot reach
+        from any whole pixel the cursor can stand on - the lone-dab holes a
+        finished XXL sign shows - and repeating the same press would only
+        repeat the miss.  The next Size up (the same ladder the dab probe
+        climbs) is typed for this pass's single-cell strokes instead.  On a
+        sign that was cleared and probed this rarely triggers, since the
+        probe already found the Size that lands; on a sign resumed or
+        touched up as it is, where nothing may be stamped to probe, it is
+        how the touch-up still gets the holes filled.
+        """
+
+        settings = job.settings
+        if not settings.measure_dab_size or not settings.apply_brush_size:
+            return
+        repainted = int(previous.sum())
+        stubborn = int((mismatch & previous).sum())
+        if stubborn < max(
+            self._TOUCH_UP_STUBBORN_MIN, self._TOUCH_UP_STUBBORN_FRACTION * repainted
+        ):
+            return
+        current = self._measured_detail_size or BRUSH_SIZE_MIN
+        larger = [size for size in self._DAB_PROBE_SIZES if size > current + 1e-9]
+        if not larger:
+            LOGGER.info(
+                "Verification pass %d: %d of the %d cells repainted last pass are "
+                "still wrong, and the one-cell brush is already at Size %s, the "
+                "largest the painter will try",
+                pass_number,
+                stubborn,
+                repainted,
+                format_brush_size(current),
+            )
+            return
+        self._measured_detail_size = float(larger[0])
+        LOGGER.info(
+            "Verification pass %d: %d of the %d cells repainted last pass are "
+            "still wrong; raising the one-cell brush from Size %s to %s for "
+            "this pass",
+            pass_number,
+            stubborn,
+            repainted,
+            format_brush_size(current),
+            format_brush_size(larger[0]),
+        )
+
     _PICK_ATTEMPTS = 3
     _PICK_ATTEMPTS_AFTER_RELOCATE = 2
     # When the panel does not yet show the color, it is read once more after
