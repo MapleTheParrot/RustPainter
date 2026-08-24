@@ -137,6 +137,25 @@ DAB_PROBE_MAX_MISSES = 1
 # Below this many lone dabs in the plan the probe cannot pay for itself.
 DAB_PROBE_MIN_DABS = 200
 
+# The gap between one stroke's release and the next press exists so the game
+# sees the release: two presses in one frame can read as one held press.
+# Its 20 ms floor was set by reasoning, not measurement, and on a dab-heavy
+# sign it is a third of every stroke once the hold has been probed down.
+# So it is probed the way the hold is: batches of dots at these gaps,
+# longest first, at the hold this sign already proved, adopting the shortest
+# clean gap whose next-shorter neighbour was clean too.
+STROKE_GAP_PROBE_CANDIDATES = (0.020, 0.012, 0.008, 0.005)
+
+# Long drags are capped at LONG_DRAG_MAX_TEXELS_PER_SECOND because the game
+# paints between the cursor positions it samples only up to some distance;
+# past it a run has holes.  That cap was inferred from one sign.  The painter
+# probes it: one drag across half a row per candidate rate, fastest last,
+# read back for coverage, adopting the second-fastest clean rate so the one
+# used always has a proven step of margin above it.  Only signs whose plan
+# has runs at least DRAG_RATE_PROBE_MIN_RUN_TEXELS long bother.
+DRAG_RATE_PROBE_TEXELS_PER_SECOND = (250.0, 400.0, 600.0, 900.0)
+DRAG_RATE_PROBE_MIN_RUN_TEXELS = 8
+
 # Which timing settings have a floor, and what it is.  Every value is read
 # through :func:`floored` at its point of use under real input, so a preset
 # or a typed value below its floor is lifted - the painter logs once per
@@ -304,6 +323,10 @@ class StrokeTiming:
     # one was measured and is shorter than the configured hold.  Prices dabs
     # and the line tool's presses; drag dwells keep the configured floor.
     dab_press_seconds: float | None = None
+    # The gap between strokes this sign's probe proved, and the drag rate it
+    # proved, when measured and quicker than the floors.
+    gap_seconds: float | None = None
+    drag_texels_per_second: float | None = None
 
     @classmethod
     def from_settings(
@@ -313,6 +336,8 @@ class StrokeTiming:
         overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS,
         real_input: bool = True,
         dab_press_seconds: float | None = None,
+        gap_seconds: float | None = None,
+        drag_texels_per_second: float | None = None,
     ) -> "StrokeTiming":
         return cls(
             stroke_speed_pixels_per_second=settings.stroke_speed_pixels_per_second,
@@ -328,6 +353,8 @@ class StrokeTiming:
             overhead_seconds=overhead_seconds,
             real_input=real_input,
             dab_press_seconds=dab_press_seconds,
+            gap_seconds=gap_seconds,
+            drag_texels_per_second=drag_texels_per_second,
         )
 
     def _held(self, seconds: float, floor: float) -> float:
@@ -351,6 +378,8 @@ class StrokeTiming:
         """
 
         gap_floor = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
+        if self.gap_seconds is not None and self.real_input:
+            gap_floor = min(gap_floor, self.gap_seconds)
         stationary = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
         if self.dab_press_seconds is not None and self.real_input:
             stationary = min(stationary, self.dab_press_seconds)
@@ -368,6 +397,11 @@ class StrokeTiming:
                     texel_pitch_pixels if texel_pitch_pixels is not None else float("nan")
                 ),
                 real_input=self.real_input,
+                max_texels_per_second=(
+                    self.drag_texels_per_second
+                    if self.drag_texels_per_second is not None
+                    else LONG_DRAG_MAX_TEXELS_PER_SECOND
+                ),
             )
             press = self._held(pace.move_seconds, MIN_PRESS_SECONDS)
         return press + gap_floor + self.overhead_seconds

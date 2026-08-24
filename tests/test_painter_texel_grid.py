@@ -76,6 +76,8 @@ class ReplayingTexelSign(SimulatedSign):
         max_drag_step_px: float = 8.0,
         dead_columns: frozenset[int] = frozenset(),
         faithful_colors: bool = False,
+        min_gap_seconds: float = 0.0,
+        max_drag_texels_per_second: float = float("inf"),
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -94,6 +96,13 @@ class ReplayingTexelSign(SimulatedSign):
         # test records after each pick) instead of cycling the palette on hue
         # clicks, so a verification pass can compare the sign with the plan.
         self.faithful_colors = faithful_colors
+        # A press that begins sooner than this after the previous release is
+        # merged into it by the game and paints nothing (needs event times).
+        self.min_gap_seconds = min_gap_seconds
+        # A drag commanded faster than this (a "drag_rate" marker the test
+        # records before each stroke) paints only where its cursor events
+        # arrive, not the path between - the game sampling too rarely.
+        self.max_drag_texels_per_second = max_drag_texels_per_second
         # A press-and-release quicker than this paints nothing, like a game
         # frame that never sampled the button down.  Needs a controller that
         # records event times (TimedMockController); zero keeps every dab.
@@ -155,6 +164,10 @@ class ReplayingTexelSign(SimulatedSign):
                 pending = None
 
         line_from: tuple[int, int] | None = None
+        last_up_time: float | None = None
+        pending_rate: float | None = None
+        drag_rate: float | None = None
+        unsampled_travel = 0.0
         for index, event in enumerate(self.controller.events):
             if event.kind == "move" and event.x is not None and event.y is not None:
                 new_position = (event.x, event.y)
@@ -166,7 +179,16 @@ class ReplayingTexelSign(SimulatedSign):
                         pass  # the line tool paints nothing until the release
                     else:
                         travel = math.hypot(new_position[0] - position[0], new_position[1] - position[1])
-                        if travel > self.max_drag_step_px:
+                        too_fast = drag_rate is not None and drag_rate > self.max_drag_texels_per_second
+                        if too_fast:
+                            # Sampled too rarely: the game sees one position
+                            # in several and paints only there.
+                            unsampled_travel += travel
+                            if unsampled_travel >= 12.0:
+                                unsampled_travel = 0.0
+                                if self._on_texture(*new_position):
+                                    self._stamp(new_position[0], new_position[1], size, color)
+                        elif travel > self.max_drag_step_px:
                             # Too far for one frame: the game never saw the
                             # positions between, only where the cursor arrived.
                             if self._on_texture(*new_position):
@@ -201,8 +223,23 @@ class ReplayingTexelSign(SimulatedSign):
                     shift_down = False
             elif event.kind == "select_color":
                 color = tuple(int(v) for v in event.value)  # type: ignore[union-attr]
+            elif event.kind == "drag_rate":
+                pending_rate = None if event.value is None else float(event.value)  # type: ignore[arg-type]
             elif event.kind == "mouse_down":
                 down = True
+                drag_rate, pending_rate = pending_rate, None
+                if (
+                    self.min_gap_seconds > 0.0
+                    and times is not None
+                    and index < len(times)
+                    and last_up_time is not None
+                    and times[index] - last_up_time < self.min_gap_seconds
+                    and self._on_texture(*position)
+                ):
+                    # Too soon after the last release: the game never saw the
+                    # button come up, so this press is part of the previous one.
+                    down = False
+                    continue
                 if self.profile.clear_button.contains(*position):
                     self.texture = self.base.copy()
                     self.painted = {}
@@ -229,6 +266,8 @@ class ReplayingTexelSign(SimulatedSign):
                         self._stamp(position[0], position[1], size, color)
                     anchor = landed
             elif event.kind == "mouse_up":
+                if down and times is not None and index < len(times):
+                    last_up_time = times[index]
                 down = False
                 if line_from is not None:
                     if self.shift_lines and shift_down and self._on_texture(*position):
@@ -847,6 +886,18 @@ def _record_color_picks(painter: Painter, controller: MockInputController) -> No
     painter._select_color = select  # type: ignore[method-assign]
 
 
+def _record_drag_rates(painter: Painter, controller: MockInputController) -> None:
+    """Append a marker with the commanded drag rate before every stroke."""
+
+    original = painter._execute_stroke
+
+    def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
+        controller.events.append(InputEvent("drag_rate", value=kwargs.get("drag_rate")))  # type: ignore[arg-type]
+        return original(*args, **kwargs)
+
+    painter._execute_stroke = execute  # type: ignore[method-assign]
+
+
 def _presses_after_last_clear(controller: MockInputController, profile: CalibrationProfile):
     """(press position, moves while held) for every press after the sign was cleared."""
 
@@ -1127,3 +1178,113 @@ def test_the_touch_up_brush_rises_only_when_repaints_did_not_take() -> None:
     painter._measured_detail_size = None
     painter._escalate_touch_up_brush(quiet, 2, still, previous)
     assert painter.measured_detail_size is None
+
+
+def test_the_stroke_gap_probe_adopts_the_shortest_gap_with_a_margin_step() -> None:
+    """A sign that merges presses closer than 15 ms: the 4 ms batch loses
+    dots, so the gap adopted is the shortest clean one with a clean step
+    below it - and the artwork's dabs all land at it."""
+
+    controller = TimedMockController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        min_gap_seconds=0.015,
+        faithful_colors=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    # Frameless, not impatient: the between-strokes floor must stay so the
+    # grid probe's own dots are kept apart on this sign.
+    painter = _frameless(Painter(controller, screen_capture=sign.capture))
+    _record_color_picks(painter, controller)
+    painter._PRESS_HOLD_PROBE_MIN_STROKES = 0  # type: ignore[misc]
+    painter._PRESS_HOLD_PROBE_DOTS = 12  # type: ignore[misc]
+    painter._PRESS_HOLD_PROBE_CANDIDATES = (0.03, 0.02)  # type: ignore[misc]
+    # Sleeps never undershoot, so 40 and 25 ms always clear the sign's 15 ms;
+    # 4 ms plus any scheduler slack cannot reach it.
+    painter._STROKE_GAP_PROBE_CANDIDATES = (0.040, 0.025, 0.004)  # type: ignore[misc]
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(10, 10, 30, 10), Stroke(0, 0, 0, 0), Stroke(64, 40, 64, 40)), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings(delay_between_strokes_seconds=0.05))
+    assert painter.wait(120.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_stroke_gap_seconds == pytest.approx(0.040)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, 10) for x in range(10, 31)} | {(0, 0), (64, 40)}
+    assert set(sign.painted) == expected
+
+
+def test_the_drag_rate_probe_adopts_the_second_fastest_clean_rate() -> None:
+    """The sign paints drags whole up to 700 texels/s: 250, 400 and 600 are
+    clean and 900 is not, so 400 - the fastest with a proven step above
+    it - is adopted, and the artwork's long run paints exactly at it."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        max_drag_texels_per_second=700.0,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0  # type: ignore[misc]
+    _record_drag_rates(painter, controller)
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(4, 30, 123, 30),), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(120.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_drag_rate == pytest.approx(400.0)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    assert set(sign.painted) == {(x, 30) for x in range(4, 124)}
+    rates = [event.value for event in controller.events if event.kind == "drag_rate"]
+    assert rates[-1] == pytest.approx(400.0)  # the artwork's run was commanded at it
+
+
+def test_a_sign_that_only_takes_the_floor_rate_keeps_it() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        max_drag_texels_per_second=300.0,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0  # type: ignore[misc]
+    _record_drag_rates(painter, controller)
+    plan = PaintPlan(128, 64, (ColorGroup((40, 80, 160), (Stroke(4, 30, 123, 30),), 1),))
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(120.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_drag_rate is None
+    sign.capture(profile.canvas)
+    assert set(sign.painted) == {(x, 30) for x in range(4, 124)}

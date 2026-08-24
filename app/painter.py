@@ -43,6 +43,9 @@ from .paint_timing import (
     DAB_PROBE_MIN_DABS,
     DAB_PROBE_SIZES,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
+    DRAG_RATE_PROBE_MIN_RUN_TEXELS,
+    DRAG_RATE_PROBE_TEXELS_PER_SECOND,
+    STROKE_GAP_PROBE_CANDIDATES,
     KEY_GAP_SECONDS,
     KEY_HOLD_SECONDS,
     LONG_DRAG_MAX_STEP_TEXELS,
@@ -280,10 +283,11 @@ class PainterSettings:
     # Only ever used after a probe stroke proves the mechanic on this sign; a
     # sign that fails the probe paints with drags exactly as before.
     use_line_tool: bool = True
-    # Measure, on this sign, the shortest press hold that lands every dab
-    # (batches of dots at descending holds, read back from captures), and
-    # paint the job's dabs and line presses at it.  A sign that drops any
-    # probe dot keeps the 70 ms frame floor; drag dwells always keep it.
+    # Measure this sign's timing floors instead of assuming them: the
+    # shortest press hold that lands every dab, the shortest gap between
+    # strokes the game keeps apart, and the fastest long drag it paints
+    # whole (batches of dots and probe drags, read back from captures).  A
+    # sign that fails a probe keeps that floor; drag dwells always keep it.
     measure_press_hold: bool = True
     # Prove the one-cell brush on this sign before painting: batches of lone
     # dabs at rising Size numbers until one lands them all, which the job's
@@ -739,6 +743,10 @@ class Painter:
         # The Size number this job's probe proved lands a lone dab on its
         # sign, or None while unmeasured (then the smallest brush is used).
         self._measured_detail_size: float | None = None
+        # The gap between strokes and the long-drag rate this job's probes
+        # proved on its sign, or None while unmeasured (then the floors).
+        self._measured_stroke_gap_seconds: float | None = None
+        self._measured_drag_rate: float | None = None
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -900,6 +908,8 @@ class Painter:
             self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
+            self._measured_stroke_gap_seconds = None
+            self._measured_drag_rate = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -971,6 +981,8 @@ class Painter:
             self._measured_texel_grid = None
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
+            self._measured_stroke_gap_seconds = None
+            self._measured_drag_rate = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -1001,6 +1013,20 @@ class Painter:
 
         with self._condition:
             return self._color_pick_summary
+
+    @property
+    def measured_stroke_gap_seconds(self) -> float | None:
+        """The between-strokes gap this job's probe proved, if any."""
+
+        with self._condition:
+            return self._measured_stroke_gap_seconds
+
+    @property
+    def measured_drag_rate(self) -> float | None:
+        """The long-drag rate, in texels per second, this job's probe proved."""
+
+        with self._condition:
+            return self._measured_drag_rate
 
     @property
     def measured_detail_size(self) -> float | None:
@@ -2017,7 +2043,9 @@ class Painter:
                             stored.rows,
                         )
                 self._probe_press_hold(job)
+                self._probe_stroke_gap(job)
                 self._probe_dab_size(job)
+                self._probe_drag_rate(job)
                 job.line_tool_ok = self._probe_line_tool(job)
                 self._clear_canvas(job)
                 break
@@ -2587,6 +2615,122 @@ class Painter:
     _PRESS_HOLD_PROBE_DOTS = PRESS_HOLD_PROBE_DOTS
     _PRESS_HOLD_PROBE_MIN_STROKES = PRESS_HOLD_PROBE_MIN_STROKES
 
+    _STROKE_GAP_PROBE_CANDIDATES = STROKE_GAP_PROBE_CANDIDATES
+
+    def _dot_probe_setup(self, job: _Job) -> "tuple[TexelGridModel, ScreenRect, tuple[int, int], int] | None":
+        """What the dot probes share, or None when this job should not stamp any."""
+
+        settings = job.settings
+        grid = job.texel_grid
+        if not settings.measure_press_hold or grid is None or job.mode != "paint":
+            return None
+        total = sum(len(group.strokes) for group in job.plan.color_groups)
+        if total < self._PRESS_HOLD_PROBE_MIN_STROKES:
+            LOGGER.info(
+                "The plan's %d strokes are too few for the timing probes to pay "
+                "for their captures; keeping the frame floors",
+                total,
+            )
+            return None
+        dots = max(4, int(self._PRESS_HOLD_PROBE_DOTS))
+        if grid.columns < dots or grid.rows < 16:
+            return None
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        return grid, canvas, park, dots
+
+    def _stamp_dot_batch(
+        self,
+        job: _Job,
+        grid: TexelGridModel,
+        canvas: ScreenRect,
+        park: tuple[int, int],
+        before: Any,
+        batch: int,
+        dots: int,
+        *,
+        hold_seconds: float | None,
+        gap_seconds: float | None,
+        last_color: RGBColor | None,
+    ) -> "tuple[Any, int, RGBColor]":
+        """Stamp one batch of probe dots and count the ones that never landed.
+
+        Dots spread across the columns on rows staggered per batch, so no
+        batch stamps where an earlier one did; each is a stationary press
+        held ``hold_seconds`` (the job's hold when None) with
+        ``gap_seconds`` before the next (the job's gap when None).  Returns
+        the capture after the batch, the number of dots missing from it, and
+        the colour used.
+        """
+
+        settings = job.settings
+        target = job.target
+        epoch = self._pause_generation_value()
+        span = grid.columns - 8
+        texels = [
+            (
+                4 + round(index * (span - 1) / (dots - 1)),
+                4 + ((index * 37 + batch * 17) % max(1, grid.rows - 8)),
+            )
+            for index in range(dots)
+        ]
+        expected = [
+            (
+                grid.origin_x + (u + 0.5) * grid.pitch_x - canvas.left,
+                grid.origin_y + (v + 0.5) * grid.pitch_y - canvas.top,
+            )
+            for u, v in texels
+        ]
+        color = self._probe_color_against(before, expected, skip=last_color)
+        # A dot stamped in the colour already under it cannot be told from
+        # a dot that never landed: an earlier probe's mark, or the artwork's
+        # own colour on a sign painted before.  Those are left out of the
+        # count rather than read as drops.
+        import numpy as np
+
+        pixels = np.asarray(before.convert("RGB"), dtype=np.float32)
+        judgeable = []
+        for x, y in expected:
+            column = min(max(int(round(x)), 0), pixels.shape[1] - 1)
+            row = min(max(int(round(y)), 0), pixels.shape[0] - 1)
+            under = pixels[row, column]
+            judgeable.append(
+                float(np.linalg.norm(under - np.array(color, dtype=np.float32)))
+                >= 2.0 * self._LINE_PROBE_DIFF_FLOOR
+            )
+        self._select_color(color, target, settings, epoch, apply_correction=False)
+        for u, v in texels:
+            x, y = grid.cursor_point(u + 0.5, v + 0.5)
+            point = (math.floor(x + 0.5), math.floor(y + 0.5))
+            point = (
+                min(max(point[0], canvas.left), canvas.left + canvas.width - 1),
+                min(max(point[1], canvas.top), canvas.top + canvas.height - 1),
+            )
+            self._screen_stroke(point, point, settings, epoch, hold_seconds=hold_seconds)
+            self._interruptible_sleep(
+                gap_seconds
+                if gap_seconds is not None
+                else self._stroke_gap(settings.delay_between_strokes_seconds),
+                epoch=epoch,
+                check_focus=True,
+            )
+        after = self._capture_parked(canvas, park, epoch)
+        window = max(4.0, 2.0 * max(grid.pitch_x, grid.pitch_y))
+        landed = locate_stamps(stamp_diff(before, after), expected, window)
+        missed = sum(
+            1 for centre, judge in zip(landed, judgeable) if judge and centre is None
+        )
+        return after, missed, color
+
     def _probe_press_hold(self, job: _Job) -> None:
         """Measure the shortest press hold that lands every dab on this sign.
 
@@ -2601,89 +2745,26 @@ class Painter:
         the other calibration marks before the artwork starts.
         """
 
+        setup = self._dot_probe_setup(job)
+        if setup is None:
+            return
+        grid, canvas, park, dots = setup
         settings = job.settings
-        grid = job.texel_grid
-        if not settings.measure_press_hold or grid is None or job.mode != "paint":
-            return
-        total = sum(len(group.strokes) for group in job.plan.color_groups)
-        if total < self._PRESS_HOLD_PROBE_MIN_STROKES:
-            LOGGER.info(
-                "The plan's %d strokes are too few for the press-hold probe "
-                "to pay for its captures; keeping the frame floor",
-                total,
-            )
-            return
-        dots = max(4, int(self._PRESS_HOLD_PROBE_DOTS))
-        if grid.columns < dots or grid.rows < 16:
-            return
-        target = job.target
-        canvas = ScreenRect(
-            target.canvas.left,
-            target.canvas.top,
-            target.canvas.width,
-            target.canvas.height,
-        )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
         self._update_progress_state(
             PainterState.RUNNING,
             "Measuring the press hold this sign needs",
             phase="calibrate",
         )
         self._measured_press_hold_seconds = None
-        # Wide enough to catch a dot that snapped a texel away, narrow enough
-        # that the batch's neighbouring dots stay out of each other's windows.
-        window = max(4.0, 2.0 * max(grid.pitch_x, grid.pitch_y))
-
-        def batch_texels(batch: int) -> list[tuple[int, int]]:
-            # Dots spread across the columns, on rows staggered per batch so
-            # no batch stamps where an earlier one did.
-            span = grid.columns - 8
-            return [
-                (
-                    4 + round(index * (span - 1) / (dots - 1)),
-                    4 + ((index * 37 + batch * 17) % max(1, grid.rows - 8)),
-                )
-                for index in range(dots)
-            ]
-
         clean: list[float] = []
         last_color: RGBColor | None = None
         try:
-            epoch = self._pause_generation_value()
-            before = self._capture_parked(canvas, park, epoch)
+            before = self._capture_parked(canvas, park, self._pause_generation_value())
             for batch, hold in enumerate(self._PRESS_HOLD_PROBE_CANDIDATES):
-                epoch = self._pause_generation_value()
-                texels = batch_texels(batch)
-                expected = [
-                    (
-                        grid.origin_x + (u + 0.5) * grid.pitch_x - canvas.left,
-                        grid.origin_y + (v + 0.5) * grid.pitch_y - canvas.top,
-                    )
-                    for u, v in texels
-                ]
-                color = self._probe_color_against(before, expected, skip=last_color)
-                last_color = color
-                self._select_color(color, target, settings, epoch, apply_correction=False)
-                for u, v in texels:
-                    x, y = grid.cursor_point(u + 0.5, v + 0.5)
-                    point = (math.floor(x + 0.5), math.floor(y + 0.5))
-                    point = (
-                        min(max(point[0], canvas.left), canvas.left + canvas.width - 1),
-                        min(max(point[1], canvas.top), canvas.top + canvas.height - 1),
-                    )
-                    self._screen_stroke(point, point, settings, epoch, hold_seconds=hold)
-                    self._interruptible_sleep(
-                        self._stroke_gap(settings.delay_between_strokes_seconds),
-                        epoch=epoch,
-                        check_focus=True,
-                    )
-                after = self._capture_parked(canvas, park, epoch)
-                landed = locate_stamps(stamp_diff(before, after), expected, window)
-                before = after
-                missed = sum(1 for centre in landed if centre is None)
+                before, missed, last_color = self._stamp_dot_batch(
+                    job, grid, canvas, park, before, batch, dots,
+                    hold_seconds=hold, gap_seconds=None, last_color=last_color,
+                )
                 LOGGER.info(
                     "Press-hold probe: %d of %d dots landed at %d ms",
                     dots - missed,
@@ -2719,6 +2800,215 @@ class Painter:
             int(round(adopted * 1000)),
             int(round(clean[-1] * 1000)),
             floor_ms,
+        )
+
+    def _probe_stroke_gap(self, job: _Job) -> None:
+        """Measure the shortest gap between strokes the game keeps apart.
+
+        Same batches as the hold probe, at the hold this sign proved, with
+        the gap between dots shrinking batch by batch; a dot that never
+        lands is a press the game merged into the one before it.  The gap
+        adopted is the shortest clean one with a clean step below it, never
+        longer than the floor; anything less keeps the floor.
+        """
+
+        setup = self._dot_probe_setup(job)
+        if setup is None:
+            return
+        grid, canvas, park, dots = setup
+        settings = job.settings
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Measuring the gap between strokes this sign needs",
+            phase="calibrate",
+        )
+        self._measured_stroke_gap_seconds = None
+        floor = self._stroke_gap(settings.delay_between_strokes_seconds)
+        candidates = [gap for gap in self._STROKE_GAP_PROBE_CANDIDATES if gap < floor]
+        if len(candidates) < 2:
+            return
+        clean: list[float] = []
+        last_color: RGBColor | None = None
+        try:
+            before = self._capture_parked(canvas, park, self._pause_generation_value())
+            for batch, gap in enumerate(candidates):
+                before, missed, last_color = self._stamp_dot_batch(
+                    job, grid, canvas, park, before, 8 + batch, dots,
+                    hold_seconds=None, gap_seconds=gap, last_color=last_color,
+                )
+                LOGGER.info(
+                    "Stroke-gap probe: %d of %d dots landed with %d ms between them",
+                    dots - missed,
+                    dots,
+                    int(round(gap * 1000)),
+                )
+                if missed:
+                    break
+                clean.append(gap)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The stroke-gap probe could not run (%s); keeping the %d ms gap",
+                exc,
+                int(round(floor * 1000)),
+            )
+            return
+        if len(clean) < 2:
+            LOGGER.info(
+                "Stroke-gap probe kept the %d ms gap: %s",
+                int(round(floor * 1000)),
+                "no candidate landed cleanly"
+                if not clean
+                else "only one candidate landed cleanly, which is no margin",
+            )
+            return
+        adopted = clean[-2]
+        self._measured_stroke_gap_seconds = float(adopted)
+        LOGGER.info(
+            "Adopting a %d ms gap between this sign's strokes (%d ms proved clean below it)",
+            int(round(adopted * 1000)),
+            int(round(clean[-1] * 1000)),
+        )
+
+    _DRAG_RATE_PROBE_TEXELS_PER_SECOND = DRAG_RATE_PROBE_TEXELS_PER_SECOND
+    _DRAG_RATE_PROBE_MIN_RUN_TEXELS = DRAG_RATE_PROBE_MIN_RUN_TEXELS
+
+    def _probe_drag_rate(self, job: _Job) -> None:
+        """Measure how fast a long drag may run and still paint every texel.
+
+        One drag across half a row per candidate rate, slowest first, each
+        captured and read for coverage along the run; the first rate that
+        leaves holes ends the climb.  The rate adopted is the second-fastest
+        clean one - the fastest always has a proven step above it - and
+        never below the floor the painter would use anyway.
+        """
+
+        settings = job.settings
+        grid = job.texel_grid
+        if not settings.measure_press_hold or grid is None or job.mode != "paint":
+            return
+        if not math.isfinite(self._LONG_DRAG_MAX_TEXELS_PER_SECOND):
+            return  # drags are not capped at all: nothing to raise
+        longest = 0
+        for group in job.plan.color_groups:
+            for stroke in group.strokes:
+                if stroke.start_y == stroke.end_y:
+                    longest = max(longest, stroke.pixel_count)
+        if longest < self._DRAG_RATE_PROBE_MIN_RUN_TEXELS:
+            return
+        if grid.columns < 64 or grid.rows < 32:
+            return
+        aiming = self._aiming(job, job.plan)
+        if aiming.mapper is None or not aiming.native:
+            return
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Measuring how fast this sign takes a long drag",
+            phase="calibrate",
+        )
+        self._measured_drag_rate = None
+        first = grid.columns // 8
+        last = grid.columns // 2
+
+        def centre(u_texel: int, v_texel: int) -> tuple[int, int]:
+            return (
+                int(round(grid.origin_x + (u_texel + 0.5) * grid.pitch_x - canvas.left)),
+                int(round(grid.origin_y + (v_texel + 0.5) * grid.pitch_y - canvas.top)),
+            )
+
+        clean: list[float] = []
+        last_color: RGBColor | None = None
+        try:
+            before = self._capture_parked(canvas, park, self._pause_generation_value())
+            for batch, rate in enumerate(self._DRAG_RATE_PROBE_TEXELS_PER_SECOND):
+                epoch = self._pause_generation_value()
+                row = grid.rows // 3 + 4 * batch
+                if row >= grid.rows - 4:
+                    break
+                expected = [centre(k, row) for k in range(first, last + 1)]
+                color = self._probe_color_against(before, expected, skip=last_color)
+                last_color = color
+                self._select_color(color, target, settings, epoch, apply_correction=False)
+                self._execute_stroke(
+                    Stroke(first, row, last, row),
+                    job.plan,
+                    aiming.paint_canvas,
+                    settings,
+                    epoch,
+                    aiming.bias,
+                    0.0,
+                    clamp_rect=aiming.clamp_canvas,
+                    mapper=aiming.mapper,
+                    texel_pitch=aiming.texel_pitch,
+                    drag_rate=rate,
+                )
+                after = self._capture_parked(canvas, park, epoch)
+                diff = stamp_diff(before, after)
+                before = after
+                height, width = diff.shape[:2]
+
+                def changed(u_texel: int, v_texel: int) -> bool:
+                    x, y = centre(u_texel, v_texel)
+                    window = diff[
+                        max(0, y - 1) : min(height, y + 2), max(0, x - 1) : min(width, x + 2)
+                    ]
+                    return bool(window.size) and float(window.max()) >= self._LINE_PROBE_DIFF_FLOOR
+
+                interior = range(first + 1, last)
+                covered = sum(
+                    1
+                    for k in interior
+                    if any(changed(k, r) for r in (row - 1, row, row + 1) if 0 <= r < grid.rows)
+                )
+                coverage = covered / max(1, len(interior))
+                LOGGER.info(
+                    "Drag-rate probe: %d of %d texels painted at %d texels/s",
+                    covered,
+                    len(interior),
+                    int(rate),
+                )
+                if coverage < 0.98:
+                    break
+                clean.append(rate)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The drag-rate probe could not run (%s); keeping %d texels/s",
+                exc,
+                int(self._LONG_DRAG_MAX_TEXELS_PER_SECOND),
+            )
+            return
+        if len(clean) < 2:
+            LOGGER.info(
+                "Drag-rate probe kept %d texels/s: %s",
+                int(self._LONG_DRAG_MAX_TEXELS_PER_SECOND),
+                "no rate painted its run cleanly"
+                if not clean
+                else "only one rate painted cleanly, which is no margin",
+            )
+            return
+        adopted = clean[-2]
+        if adopted <= self._LONG_DRAG_MAX_TEXELS_PER_SECOND:
+            LOGGER.info("Drag-rate probe: the %d texels/s cap already has its margin", int(adopted))
+            return
+        self._measured_drag_rate = float(adopted)
+        LOGGER.info(
+            "Adopting %d texels/s for this sign's long drags (%d proved clean above it)",
+            int(adopted),
+            int(clean[-1]),
         )
 
     _DAB_PROBE_SIZES = DAB_PROBE_SIZES
@@ -3121,14 +3411,14 @@ class Painter:
         return replace(target, **measured) if measured else target
 
     def _stroke_timing(self, settings: PainterSettings) -> StrokeTiming:
-        measured = (
-            self._measured_press_hold_seconds if settings.measure_press_hold else None
-        )
+        probes = bool(settings.measure_press_hold)
         return StrokeTiming.from_settings(
             settings,
             overhead_seconds=self._stroke_overhead_seconds,
             real_input=bool(getattr(self.input, "emits_real_input", True)),
-            dab_press_seconds=measured,
+            dab_press_seconds=self._measured_press_hold_seconds if probes else None,
+            gap_seconds=self._measured_stroke_gap_seconds if probes else None,
+            drag_texels_per_second=self._measured_drag_rate if probes else None,
         )
 
     def _work_schedule(
@@ -3537,6 +3827,7 @@ class Painter:
                             mapper=mapper,
                             texel_pitch=texel_pitch,
                             line_tool=job.line_tool_ok and current.use_line_tool,
+                            drag_rate=self._drag_rate_cap(),
                         )
                         return
                     except _RetryAction:
@@ -4765,6 +5056,7 @@ class Painter:
         mapper: "Callable[[float, float], tuple[float, float]] | None" = None,
         texel_pitch: float | None = None,
         line_tool: bool = False,
+        drag_rate: float | None = None,
     ) -> None:
         # The line tool draws straight between its endpoints, so only a run
         # the plan itself laid straight may use it; a diagonal keeps gliding.
@@ -4826,7 +5118,13 @@ class Painter:
             start_int = math.floor(start[0]), math.floor(start[1])
             end_int = math.floor(end[0]), math.floor(end[1])
         self._screen_stroke(
-            start_int, end_int, settings, epoch, texel_pitch=texel_pitch, line_tool=line_tool
+            start_int,
+            end_int,
+            settings,
+            epoch,
+            texel_pitch=texel_pitch,
+            line_tool=line_tool,
+            drag_rate=drag_rate,
         )
 
     @staticmethod
@@ -4863,9 +5161,27 @@ class Painter:
         return seconds
 
     def _stroke_gap(self, seconds: float) -> float:
-        if self.input.emits_real_input:
-            return max(seconds, self._STROKE_GAP_FLOOR_SECONDS)
-        return seconds
+        if not self.input.emits_real_input:
+            return seconds
+        gap = max(seconds, self._STROKE_GAP_FLOOR_SECONDS)
+        measured = self._measured_stroke_gap_seconds
+        if measured is not None and self._timing_probes_apply():
+            gap = min(gap, measured)
+        return gap
+
+    def _timing_probes_apply(self) -> bool:
+        """Whether the job's probed floors are in force (its switch is on)."""
+
+        job = self._job
+        return job is None or bool(job.settings.measure_press_hold)
+
+    def _drag_rate_cap(self) -> float:
+        """Texels per second a long drag is capped at: the floor, or the probed rate."""
+
+        measured = self._measured_drag_rate
+        if measured is not None and self._timing_probes_apply():
+            return max(self._LONG_DRAG_MAX_TEXELS_PER_SECOND, measured)
+        return self._LONG_DRAG_MAX_TEXELS_PER_SECOND
 
     def _screen_stroke(
         self,
@@ -4877,6 +5193,7 @@ class Painter:
         texel_pitch: float | None = None,
         line_tool: bool = False,
         hold_seconds: float | None = None,
+        drag_rate: float | None = None,
     ) -> None:
         """Drag between two physical points, or dab when they are the same.
 
@@ -4927,7 +5244,9 @@ class Painter:
                 step_pixels=settings.stroke_interpolation_step_pixels,
                 texel_pitch_pixels=texel_pitch if texel_pitch is not None else float("nan"),
                 real_input=bool(self.input.emits_real_input),
-                max_texels_per_second=self._LONG_DRAG_MAX_TEXELS_PER_SECOND,
+                max_texels_per_second=(
+                    drag_rate if drag_rate is not None else self._drag_rate_cap()
+                ),
                 max_step_texels=self._LONG_DRAG_MAX_STEP_TEXELS,
             )
             steps = max(1, int(math.ceil(distance / pace.step_pixels)))

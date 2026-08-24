@@ -1337,14 +1337,15 @@ class MainWindow(QMainWindow):
         )
         advanced_layout.addRow("Between colors", self.color_delay_spin)
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
-        self.press_hold_check = QCheckBox("Measure the press hold on each sign")
+        self.press_hold_check = QCheckBox("Measure this sign's timing floors")
         self.press_hold_check.setChecked(True)
         self.press_hold_check.setToolTip(
-            "Before painting, batches of probe dots at descending press holds\n"
-            "find the shortest hold this sign lands every time, and the job's\n"
-            "dabs and line presses use it - most of a detailed sign's paint\n"
-            "time is dabs held for the 70 ms frame floor.  A sign that drops\n"
-            "any probe dot keeps the floor; drags always keep their dwell."
+            "Before painting, probe dots and probe drags measure the floors the\n"
+            "presets can never go under: the shortest press hold that lands\n"
+            "every dab, the shortest gap between strokes the game keeps apart,\n"
+            "and the fastest long drag it paints whole.  The job then runs at\n"
+            "what this sign proved - the only speed past Turbo there is.  A\n"
+            "sign that fails a probe keeps that floor; drags keep their dwell."
         )
         self.dab_size_check = QCheckBox("Prove the one-cell brush with lone dabs")
         self.dab_size_check.setChecked(True)
