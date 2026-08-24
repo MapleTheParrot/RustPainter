@@ -188,6 +188,19 @@ class ResumeRecordStore:
         os.replace(temporary, path)
         return path
 
+    def delete(self, fingerprint: str) -> bool:
+        """Forget a record: the sign keeps its paint, only the place is lost."""
+
+        path = self.path_for(fingerprint)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            LOGGER.warning("Could not delete the resume record %s", path, exc_info=True)
+            return False
+        return True
+
     def records(self) -> list[ResumeRecord]:
         """Every readable record, newest first."""
 

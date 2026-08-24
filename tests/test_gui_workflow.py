@@ -4482,3 +4482,190 @@ def test_the_progress_readout_counts_down_to_the_next_anti_afk_break(
     painter.until = None
     window._refresh_active_detail()
     assert window.active_detail_label.text() == "Stroke 3 / 9  •  1m 01s elapsed"
+
+
+# --------------------------------------------------------------- paint sessions
+
+
+def test_opening_a_session_restores_its_image_and_settings_and_arms_the_offer(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A long sign set aside for a smaller one can be picked up again.
+
+    Opening a saved session reloads its image and the picture settings its
+    plan was made with; the rebuilt plan matches the record's fingerprint,
+    so the resume offer arms itself at the recorded stroke.
+    """
+
+    from app.resume_record import advanced, plan_fingerprint, record_for_job
+
+    # The long sign: painted as far as stroke 3, then set aside.
+    _load_small_plan(window, tmp_path, qtbot)
+    long_path = window._image_path
+    record = advanced(
+        record_for_job(
+            window._plan,
+            image_path=long_path,
+            settings=window._settings_document(),
+        ),
+        completed_strokes=3,
+        color_index=1,
+        state="aborted",
+        reason="switched paint sessions",
+    )
+    window._resume_store.save(record)
+
+    # The smaller sign, planned at a different resolution.
+    small_path = tmp_path / "small.png"
+    Image.new("RGB", (8, 8), (30, 60, 200)).save(small_path)
+    window.logical_width_spin.setValue(8)
+    window.logical_height_spin.setValue(8)
+    window.load_image(small_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert plan_fingerprint(window._plan) != record.fingerprint
+    assert not window.resume_check.isChecked()
+
+    # Back to the long sign through its session.
+    window._open_paint_session(record)
+    qtbot.waitUntil(
+        lambda: window._plan_fingerprint == record.fingerprint, timeout=5000
+    )
+    assert window._image_path == long_path
+    assert window.logical_width_spin.value() == 16
+    assert window.resume_check.isChecked()
+    assert window.resume_slider.value() == 3
+    assert window.start_button.text().startswith("RESUME FROM STROKE 3")
+
+
+def test_the_sessions_dialog_lists_deletes_and_protects_the_active_job(
+    window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.gui.sessions as sessions_module
+    from app.gui.sessions import SessionListDialog
+    from app.resume_record import advanced, record_for_job
+
+    _load_small_plan(window, tmp_path, qtbot)
+    store = window._resume_store
+    mine = advanced(
+        record_for_job(window._plan, image_path=window._image_path, settings={}),
+        completed_strokes=2,
+        color_index=1,
+        state="paused",
+    )
+    other_plan = PaintPlan(4, 4, (ColorGroup((1, 2, 3), (Stroke(0, 0, 3, 0),), 8),))
+    other = advanced(
+        record_for_job(other_plan, image_path="elsewhere.png"),
+        completed_strokes=1,
+        color_index=1,
+        state="aborted",
+    )
+    store.save(mine)
+    store.save(other)
+
+    dialog = SessionListDialog(
+        store,
+        store.records(),
+        current_fingerprint=mine.fingerprint,
+        active_fingerprint=mine.fingerprint,
+        parent=window,
+    )
+    qtbot.addWidget(dialog)
+    assert dialog.list.count() == 2
+
+    def _select(fingerprint: str) -> None:
+        dialog.list.clearSelection()
+        for row in range(dialog.list.count()):
+            item = dialog.list.item(row)
+            item.setSelected(
+                item.data(Qt.ItemDataRole.UserRole).fingerprint == fingerprint
+            )
+
+    # The job painting right now can be neither opened nor deleted from here.
+    _select(mine.fingerprint)
+    assert not dialog.delete_button.isEnabled()
+    assert not dialog.open_button.isEnabled()
+
+    # The other session deletes after a confirmation, and only from disk once.
+    _select(other.fingerprint)
+    assert dialog.delete_button.isEnabled()
+    monkeypatch.setattr(
+        sessions_module.QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: sessions_module.QMessageBox.StandardButton.Yes),
+    )
+    dialog._delete_selected()
+    assert dialog.list.count() == 1
+    assert store.load(other.fingerprint) is None
+    assert store.load(mine.fingerprint) is not None
+
+    # With no job running, opening the remaining session reports it back.
+    idle = SessionListDialog(
+        store,
+        store.records(),
+        current_fingerprint=mine.fingerprint,
+        active_fingerprint=None,
+        parent=window,
+    )
+    qtbot.addWidget(idle)
+    idle.list.setCurrentRow(0)
+    assert idle.open_button.isEnabled()
+    idle._open_selected()
+    assert idle.chosen is not None
+    assert idle.chosen.fingerprint == mine.fingerprint
+
+
+def test_switching_sessions_stops_a_paused_job_and_keeps_its_place(
+    window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening another session mid-job asks first, then stops with its reason."""
+
+    from types import SimpleNamespace
+
+    from app.resume_record import advanced, record_for_job
+
+    _load_small_plan(window, tmp_path, qtbot)
+    small_path = tmp_path / "small.png"
+    Image.new("RGB", (8, 8), (30, 60, 200)).save(small_path)
+    other_plan = PaintPlan(4, 4, (ColorGroup((1, 2, 3), (Stroke(0, 0, 3, 0),), 8),))
+    record = advanced(
+        record_for_job(other_plan, image_path=small_path, settings={}),
+        completed_strokes=1,
+        color_index=1,
+        state="paused",
+    )
+
+    class _PausedPainter:
+        state = PainterState.PAUSED
+        is_active = True
+        is_alive = True
+        input = SimpleNamespace(emits_real_input=True)
+
+        def __init__(self) -> None:
+            self.aborted: list[str] = []
+
+        def abort(self, reason: str = "") -> None:
+            self.aborted.append(reason)
+
+    painter = _PausedPainter()
+    window._painter = painter
+
+    # Declined, nothing moves.
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: main_window_module.QMessageBox.StandardButton.No),
+    )
+    window._open_paint_session(record)
+    assert painter.aborted == []
+    assert window._image_path != small_path
+
+    # Confirmed, the job is stopped with its own reason and the image follows.
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: main_window_module.QMessageBox.StandardButton.Yes),
+    )
+    window._open_paint_session(record)
+    assert painter.aborted == ["switched paint sessions"]
+    window._painter = None
+    qtbot.waitUntil(lambda: window._image_path == small_path, timeout=5000)

@@ -2443,6 +2443,19 @@ class MainWindow(QMainWindow):
 
         run_group, run_layout = self._step_panel(3, "Paint")
         run_layout.addWidget(self._build_resume_panel())
+        sessions_row = QHBoxLayout()
+        self.sessions_button = QPushButton("Sessions…")
+        self.sessions_button.setObjectName("compactButton")
+        self.sessions_button.setToolTip(
+            "Every real painting run keeps its place as a session.  Open one\n"
+            "to switch back to its image and settings - pause a long sign for\n"
+            "a smaller one and come back to it - or delete sessions that are\n"
+            "done with."
+        )
+        self.sessions_button.clicked.connect(self._show_sessions_dialog)
+        sessions_row.addStretch(1)
+        sessions_row.addWidget(self.sessions_button)
+        run_layout.addLayout(sessions_row)
         self.start_button = QPushButton("START PAINTING  •  F8")
         self.start_button.setObjectName("accent")
         self.start_button.setMinimumHeight(44)
@@ -2869,6 +2882,122 @@ class MainWindow(QMainWindow):
             )
             self._resume_record = None
         self._refresh_resume_offer()
+
+    # -------------------------------------------------------- paint sessions
+
+    @Slot()
+    def _show_sessions_dialog(self) -> None:
+        """The saved paint sessions: open one to switch to it, or delete some."""
+
+        store = self._resume_store
+        if store is None:
+            return
+        from .sessions import SessionListDialog
+
+        active = (
+            self._resume_record.fingerprint
+            if self._resume_record is not None
+            and (self._painter_is_active() or self._painter_is_paused())
+            else None
+        )
+        dialog = SessionListDialog(
+            store,
+            store.records(),
+            current_fingerprint=self._plan_fingerprint,
+            active_fingerprint=active,
+            parent=self,
+        )
+        dialog.exec()
+        # A deletion in the dialog may have removed the record the resume
+        # slider is offering right now; the offer must not outlive it.
+        self._refresh_resume_offer()
+        if dialog.chosen is not None:
+            self._open_paint_session(dialog.chosen)
+
+    def _open_paint_session(self, record: ResumeRecord) -> None:
+        """Switch the app to a saved session: its profile, settings, and image.
+
+        The resume offer arms itself once the rebuilt plan matches the
+        record's fingerprint; a plan that no longer comes out the same (the
+        measured brush model has moved on, say) gets the existing "planned
+        differently" notice instead of a wrong stroke number.
+        """
+
+        if self._countdown_callback_running or self._debug_running:
+            self.statusBar().showMessage(
+                "Wait for the current start to finish before switching sessions.", 5000
+            )
+            return
+        image_path = Path(record.image_path) if record.image_path else None
+        if image_path is None or not image_path.exists():
+            QMessageBox.warning(
+                self,
+                "Image not found",
+                "This session's image file is gone:\n"
+                f"{record.image_path or '(never recorded)'}\n\n"
+                "Move it back and open the session again, or load the image "
+                "by hand and set the resume slider to where the sign is.",
+            )
+            return
+        countdown_open = self._countdown is not None and self._countdown.isVisible()
+        if self._painter_is_active() or self._painter_is_paused() or countdown_open:
+            if (
+                QMessageBox.question(
+                    self,
+                    "Switch paint sessions",
+                    "A job is under way.  Stop it and switch?  Its place is "
+                    "saved as it stops, and it stays in Sessions to come "
+                    "back to.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
+            self._pending_start_cancelled = True
+            self._pending_paint = None
+            if countdown_open:
+                self._countdown.reject()
+                self._set_idle_ui("Start cancelled")
+            if self._painter is not None:
+                try:
+                    self._painter.abort("switched paint sessions")
+                except Exception:
+                    LOGGER.exception("Could not stop the current job to switch sessions")
+                    return
+        # The profile first: selecting one re-derives the quality dimensions,
+        # which must not overwrite the session's stored resolution below.
+        if record.profile_id:
+            index = self.profile_combo.findData(record.profile_id)
+            if index >= 0:
+                if index != self.profile_combo.currentIndex():
+                    self.profile_combo.setCurrentIndex(index)
+            else:
+                self.statusBar().showMessage(
+                    "This session's sign profile no longer exists; keeping "
+                    "the current one.",
+                    8000,
+                )
+        # The plan is a function of the image and of the picture and painting
+        # settings it was made with; the rest of the settings document -
+        # hotkeys, safety, timing retuned since - stays as the user has it now.
+        stored = record.settings or {}
+        if isinstance(stored.get("image"), dict) or isinstance(stored.get("painting"), dict):
+            merged = self._settings_document()
+            for section in ("image", "painting"):
+                if isinstance(stored.get(section), dict):
+                    merged[section] = dict(stored[section])
+            try:
+                self._apply_settings(merged)
+                self._schedule_settings_save()
+            except Exception:
+                LOGGER.exception("Could not apply the session's stored settings")
+        self.load_image(image_path)
+        self.statusBar().showMessage(
+            f"Opened session {image_path.name} — the resume offer returns "
+            "when its plan is rebuilt.",
+            8000,
+        )
 
     def _build_settings_page(self) -> QWidget:
         content = QWidget()

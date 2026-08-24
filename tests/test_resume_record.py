@@ -167,3 +167,18 @@ def test_stroke_position_names_the_group_and_stroke_a_count_lands_on() -> None:
     assert stroke_position(plan, 7) == (2, 3)
     assert stroke_position(plan, 99) == (2, 3)
     assert stroke_position(PaintPlan(1, 1, ()), 0) == (0, 0)
+
+
+def test_deleting_a_record_forgets_it_and_only_it(tmp_path: Path) -> None:
+    store = ResumeRecordStore(tmp_path / "resume")
+    mine = record_for_job(_plan())
+    other = record_for_job(_plan(shuffle=True))
+    store.save(mine)
+    store.save(other)
+
+    assert store.delete(mine.fingerprint)
+    assert store.load(mine.fingerprint) is None
+    assert store.load(other.fingerprint) is not None
+    assert [record.fingerprint for record in store.records()] == [other.fingerprint]
+    # Already gone is not an error, just nothing to do.
+    assert not store.delete(mine.fingerprint)
