@@ -1337,7 +1337,17 @@ class MainWindow(QMainWindow):
         )
         advanced_layout.addRow("Between colors", self.color_delay_spin)
         advanced_layout.addRow("Interpolation step", self.interpolation_spin)
+        self.press_hold_check = QCheckBox("Measure the press hold on each sign")
+        self.press_hold_check.setChecked(True)
+        self.press_hold_check.setToolTip(
+            "Before painting, batches of probe dots at descending press holds\n"
+            "find the shortest hold this sign lands every time, and the job's\n"
+            "dabs and line presses use it - most of a detailed sign's paint\n"
+            "time is dabs held for the 70 ms frame floor.  A sign that drops\n"
+            "any probe dot keeps the floor; drags always keep their dwell."
+        )
         advanced_layout.addRow("", self.line_tool_check)
+        advanced_layout.addRow("", self.press_hold_check)
         layout.addWidget(advanced)
 
         touch_up = QGroupBox("Touch-up")
@@ -5547,6 +5557,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.line_tool_check,
+            self.press_hold_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
@@ -5768,6 +5779,9 @@ class MainWindow(QMainWindow):
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
             self.line_tool_check.setChecked(bool(painting.get("use_line_tool", True)))
+            self.press_hold_check.setChecked(
+                bool(painting.get("measure_press_hold", True))
+            )
             self.verify_passes_spin.setValue(int(painting.get("verify_passes", 2)))
             self.confirm_strokes_check.setChecked(
                 bool(painting.get("confirm_strokes", False))
@@ -5912,6 +5926,7 @@ class MainWindow(QMainWindow):
             "stroke_interpolation_step_pixels": self.interpolation_spin.value(),
             "apply_brush_size": self.apply_brush_check.isChecked(),
             "use_line_tool": self.line_tool_check.isChecked(),
+            "measure_press_hold": self.press_hold_check.isChecked(),
             "brush_direction": "low_to_high",
             "stroke_merge_mode": self._merge_mode(),
             "verify_passes": int(self.verify_passes_spin.value()),
@@ -7264,6 +7279,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.line_tool_check,
+            self.press_hold_check,
             self.verify_passes_spin,
             self.verify_picks_check,
             self.confirm_strokes_check,
@@ -7313,6 +7329,7 @@ class MainWindow(QMainWindow):
             self.color_delay_spin,
             self.interpolation_spin,
             self.line_tool_check,
+            self.press_hold_check,
             self.apply_brush_check,
             self.verify_passes_spin,
             self.verify_picks_check,
