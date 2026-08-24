@@ -20,6 +20,8 @@ from app.paint_timing import (
     PACE_PRIOR_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
     SETTLE_FLOOR_SECONDS,
+    SHIFT_LINE_MIN_TEXELS,
+    SHIFT_LINE_MODIFIER_LEAD_SECONDS,
     SHORT_RUN_TEXELS,
     STROKE_GAP_FLOOR_SECONDS,
     TIMING_FLOORS,
@@ -399,3 +401,63 @@ def test_learned_timing_survives_a_damaged_file(tmp_path: Path) -> None:
     path.write_text(json.dumps({"overhead_seconds": 9.0, "samples": "x"}), encoding="utf-8")
     assert LearnedTiming.load(path).overhead_seconds == DEFAULT_STROKE_OVERHEAD_SECONDS
     assert LearnedTiming.load(tmp_path / "missing.json").samples == 0
+
+
+def test_a_line_priced_stroke_is_flat_and_far_under_the_capped_drag() -> None:
+    """A Shift-click line costs its two presses however long the run is."""
+
+    timing = StrokeTiming.from_settings(PainterSettings())
+    pitch = 1.77
+    long_run = 500 * pitch
+    drag = timing.stroke_seconds(long_run, pitch)
+    line = timing.stroke_seconds(long_run, pitch, line_tool=True)
+    assert line < drag / 4
+    press = max(0.07, MIN_PRESS_SECONDS)
+    expected = (
+        2 * press
+        + 2 * SHIFT_LINE_MODIFIER_LEAD_SECONDS
+        + 2 * STROKE_GAP_FLOOR_SECONDS
+        + 2 * timing.overhead_seconds
+    )
+    assert line == pytest.approx(expected)
+    # Flat: the game draws the span, so its length does not appear.
+    assert line == pytest.approx(
+        timing.stroke_seconds(4 * long_run, pitch, line_tool=True)
+    )
+    # A dab keeps its ordinary price whatever the flag says.
+    assert timing.stroke_seconds(0.0, pitch, line_tool=True) == pytest.approx(
+        timing.stroke_seconds(0.0, pitch)
+    )
+
+
+def test_work_schedule_prices_long_straight_runs_as_lines_only_when_proven() -> None:
+    plan = PaintPlan(
+        1000,
+        10,
+        (
+            ColorGroup(
+                (10, 20, 30),
+                (Stroke(0, 2, 999, 2), Stroke(5, 4, 20, 4), Stroke(3, 1, 8, 7)),
+                1,
+            ),
+        ),
+    )
+    timing = StrokeTiming.from_settings(PainterSettings())
+    pitch = 2.0
+    as_drags = PlanWorkSchedule(
+        plan, timing, 2.0, sizing=False, texel_pitch_pixels=pitch
+    )
+    as_lines = PlanWorkSchedule(
+        plan,
+        timing,
+        2.0,
+        sizing=False,
+        texel_pitch_pixels=pitch,
+        line_min_pixels=SHIFT_LINE_MIN_TEXELS * pitch,
+    )
+    # The 1000-texel row is priced as a line, and only it: the short run is
+    # under the threshold and the diagonal cannot be drawn straight.
+    assert as_lines.stroke_cost(0, 0) < as_drags.stroke_cost(0, 0) / 4
+    assert as_lines.stroke_cost(0, 1) == pytest.approx(as_drags.stroke_cost(0, 1))
+    assert as_lines.stroke_cost(0, 2) == pytest.approx(as_drags.stroke_cost(0, 2))
+    assert as_lines.total < as_drags.total

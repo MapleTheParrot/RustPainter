@@ -80,6 +80,23 @@ SHORT_RUN_TEXELS = 3.0
 LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0
 LONG_DRAG_MAX_STEP_TEXELS = 1.0
 
+# Rust's paint UI draws a straight stroke from the last press to a click made
+# with Shift held - the line tool.  A run that long stops being a capped drag
+# and becomes two held presses, so a full row on an XXL sign goes down in a
+# quarter of a second instead of two, and the game itself fills the texels
+# between the endpoints, out of reach of the cursor quantization that shifts
+# individual dabs on a DPI-scaled display.  The painter only ever uses it
+# after proving it on this sign with a probe stroke, since the mechanic is
+# the game's and could change under us.  Runs shorter than this many texels
+# keep the glide: below it the drag is about as fast, and the drag is the
+# proven path.
+SHIFT_LINE_MIN_TEXELS = 32.0
+# The Shift key goes down this long before the line's click and stays down
+# this long after it.  The game reads the keyboard and the mouse per frame;
+# a modifier that arrives in the same slice as the click, or leaves in it,
+# can be sampled as absent and the line becomes a lone dab.
+SHIFT_LINE_MODIFIER_LEAD_SECONDS = 0.05
+
 # Which timing settings have a floor, and what it is.  Every value is read
 # through :func:`floored` at its point of use under real input, so a preset
 # or a typed value below its floor is lifted - the painter logs once per
@@ -271,15 +288,27 @@ class StrokeTiming:
         return max(seconds, floor) if self.real_input else seconds
 
     def stroke_seconds(
-        self, screen_length_pixels: float, texel_pitch_pixels: float | None = None
+        self,
+        screen_length_pixels: float,
+        texel_pitch_pixels: float | None = None,
+        *,
+        line_tool: bool = False,
     ) -> float:
         """One stroke of this on-screen length, start of press to next stroke.
 
         ``texel_pitch_pixels`` is what the painter paces long drags by; the
         estimate uses the same rule so a plan of long sweeps is not promised
-        at a speed the drags are never driven at.
+        at a speed the drags are never driven at.  ``line_tool`` prices the
+        stroke as the Shift-click line the painter will draw it with: an
+        anchor press, the gap the game needs to see it end, and the held
+        Shift-click - a flat cost however long the run is.
         """
 
+        gap_floor = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
+        if line_tool and screen_length_pixels > 0:
+            press = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
+            lead = SHIFT_LINE_MODIFIER_LEAD_SECONDS if self.real_input else 0.0
+            return 2 * press + 2 * lead + 2 * gap_floor + 2 * self.overhead_seconds
         if screen_length_pixels <= 0:
             press = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
         else:
@@ -293,8 +322,7 @@ class StrokeTiming:
                 real_input=self.real_input,
             )
             press = self._held(pace.move_seconds, MIN_PRESS_SECONDS)
-        gap = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
-        return press + gap + self.overhead_seconds
+        return press + gap_floor + self.overhead_seconds
 
     def group_gap_seconds(self) -> float:
         """The pause after a color's last stroke, before the picker."""
@@ -442,7 +470,14 @@ class PlanWorkSchedule:
         *,
         sizing: bool,
         texel_pitch_pixels: float | None = None,
+        line_min_pixels: float | None = None,
     ) -> None:
+        """``line_min_pixels`` prices straight runs at least that long as
+        Shift-click lines; ``None`` (the tool unproven or off) prices every
+        run as the drag it will be.  Priced wrong, a line-heavy run finishes
+        far ahead of its prediction and the learned per-stroke overhead is
+        dragged negative, souring the estimate for every plan after it."""
+
         pitch = texel_pitch_pixels if texel_pitch_pixels is not None else cell_width_pixels
         group_costs: list[float] = []
         stroke_costs: list[list[float]] = []
@@ -463,7 +498,14 @@ class PlanWorkSchedule:
             group_costs.append(cost)
             costs = [
                 timing.stroke_seconds(
-                    (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels, pitch
+                    (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels,
+                    pitch,
+                    line_tool=(
+                        line_min_pixels is not None
+                        and (stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y)
+                        and (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels
+                        >= line_min_pixels
+                    ),
                 )
                 for stroke in group.strokes
             ]

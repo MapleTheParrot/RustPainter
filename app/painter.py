@@ -46,6 +46,8 @@ from .paint_timing import (
     MIN_PRESS_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
     SETTLE_FLOOR_SECONDS,
+    SHIFT_LINE_MIN_TEXELS,
+    SHIFT_LINE_MODIFIER_LEAD_SECONDS,
     STROKE_GAP_FLOOR_SECONDS,
     TOUCH_UP_FRACTION_DEFAULT,
     PhaseTiming,
@@ -217,6 +219,12 @@ class PainterSettings:
     # probe cannot read falls back to the brush-derived grid, so this is an
     # escape hatch rather than a feature switch.
     measure_texel_grid: bool = True
+    # Draw straight runs of :data:`SHIFT_LINE_MIN_TEXELS` texels or more with
+    # Rust's Shift-click line tool: an anchor press, then a click with Shift
+    # held, and the game itself draws the straight stroke between them.  Only
+    # ever used after a probe stroke proves the mechanic on this sign; a sign
+    # that fails the probe paints with drags exactly as before.
+    use_line_tool: bool = True
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
@@ -267,6 +275,7 @@ class PainterSettings:
         "delay_between_colors_seconds",
         "stroke_interpolation_step_pixels",
         "delay_after_brush_seconds",
+        "use_line_tool",
         "verify_passes",
         "confirm_strokes",
         "confirm_max_rounds",
@@ -380,6 +389,7 @@ class PainterSettings:
             brush_size=float(pick(painting, "brush_size", 1.0)),
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
+            use_line_tool=bool(pick(painting, "use_line_tool", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
             confirm_strokes=bool(pick(painting, "confirm_strokes", False)),
             confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
@@ -551,6 +561,11 @@ class _Job:
     # sign.  A resumed job paints on a sign it did not clear and measures
     # nothing on it, trusting the profile's stored grid and brush model.
     start_stroke: int = 0
+    # Whether this sign proved the Shift-click line tool: a probe stroke drew
+    # a line and the capture showed the texels between its endpoints painted.
+    # False until proven, so a resumed job, a sizing-off job, or a sign whose
+    # probe fails all keep painting long runs as drags.
+    line_tool_ok: bool = False
 
 
 def _describe_seconds(seconds: float) -> str:
@@ -1887,6 +1902,7 @@ class Painter:
                             stored.columns,
                             stored.rows,
                         )
+                job.line_tool_ok = self._probe_line_tool(job)
                 self._clear_canvas(job)
                 break
             except _RetryAction:
@@ -2442,6 +2458,131 @@ class Painter:
             grid = audit_cursor_map(grid, stamp_batch, canvas)
         return grid
 
+    # A capture-diff value below this is noise; at or above it the texel
+    # changed.  The same floor the grid probe reads its stamps with.
+    _LINE_PROBE_DIFF_FLOOR = 24.0
+
+    def _probe_line_tool(self, job: _Job) -> bool:
+        """Prove the Shift-click line tool on this sign with one stroke.
+
+        An anchor press a quarter of the way along the middle row, a
+        Shift-click three quarters along it, and a capture: if the game drew
+        the straight stroke between them, the texels along the span read as
+        changed and every long straight run in the plan may go down the same
+        way - two presses instead of a rate-capped drag, with the game
+        itself filling the texels between, beyond the reach of the per-dab
+        cursor quantization a DPI-scaled display adds.  Anything less - the
+        mechanic missing, the click swallowed, the line landing somewhere
+        unexpected - leaves the tool unproven and every stroke a drag, which
+        is the path measured over thousands of live strokes.  The probe line
+        is wiped with the other calibration marks before the artwork starts.
+        """
+
+        settings = job.settings
+        grid = job.texel_grid
+        if not settings.use_line_tool or grid is None or job.mode != "paint":
+            return False
+        longest = 0
+        for group in job.plan.color_groups:
+            for stroke in group.strokes:
+                if stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y:
+                    longest = max(longest, stroke.pixel_count)
+        if longest < self._SHIFT_LINE_MIN_TEXELS:
+            LOGGER.info(
+                "No straight run reaches %d texels; the line tool is not probed",
+                int(self._SHIFT_LINE_MIN_TEXELS),
+            )
+            return False
+        row = grid.rows // 2
+        first = grid.columns // 4
+        last = grid.columns - 1 - grid.columns // 4
+        if last - first < 8:
+            return False
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        epoch = self._pause_generation_value()
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Proving the Shift-click line tool with one stroke",
+            phase="calibrate",
+        )
+
+        def center(u_texel: int, v_texel: int) -> tuple[float, float]:
+            return (
+                grid.origin_x + (u_texel + 0.5) * grid.pitch_x - canvas.left,
+                grid.origin_y + (v_texel + 0.5) * grid.pitch_y - canvas.top,
+            )
+
+        try:
+            before = self._capture_parked(canvas, park, epoch)
+            color = self._probe_color_against(
+                before, [center(k, row) for k in range(first, last + 1)]
+            )
+            self._select_color(color, target, settings, epoch, apply_correction=False)
+            x0, y0 = grid.cursor_point(first + 0.5, row + 0.5)
+            x1, y1 = grid.cursor_point(last + 0.5, row + 0.5)
+            # One shared y, exactly as the executor commands a same-row run.
+            shared_y = math.floor((y0 + y1) / 2.0 + 0.5)
+            start = (math.floor(x0 + 0.5), shared_y)
+            end = (math.floor(x1 + 0.5), shared_y)
+            self._line_stroke(start, end, settings, epoch)
+            after = self._capture_parked(canvas, park, epoch)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The line-tool probe could not run (%s); long runs stay drags", exc
+            )
+            return False
+        diff = stamp_diff(before, after)
+        height, width = diff.shape[:2]
+
+        def changed(u_texel: int, v_texel: int) -> bool:
+            x, y = center(u_texel, v_texel)
+            column, line_row = int(round(x)), int(round(y))
+            window = diff[
+                max(0, line_row - 1) : min(height, line_row + 2),
+                max(0, column - 1) : min(width, column + 2),
+            ]
+            return bool(window.size) and float(window.max()) >= self._LINE_PROBE_DIFF_FLOOR
+
+        interior = range(first + 1, last)
+        # The endpoints are ordinary presses; the interior is what only the
+        # game's own line can have painted.  The stroke may ride a texel row
+        # boundary, so each column accepts the row or either neighbour.
+        covered = sum(
+            1
+            for k in interior
+            if any(
+                changed(k, r) for r in (row - 1, row, row + 1) if 0 <= r < grid.rows
+            )
+        )
+        stray_rows = [r for r in (row - 3, row + 3) if 0 <= r < grid.rows]
+        strayed = sum(1 for k in interior for r in stray_rows if changed(k, r))
+        coverage = covered / max(1, len(interior))
+        stray = strayed / max(1, len(interior) * max(1, len(stray_rows)))
+        ok = coverage >= 0.9 and stray <= 0.3
+        LOGGER.info(
+            "Line-tool probe: %d of %d texels painted along the stroke, %.0f%% "
+            "spill three rows out - %s",
+            covered,
+            len(interior),
+            100.0 * stray,
+            "long straight runs will use Shift-click lines"
+            if ok
+            else "long runs stay drags",
+        )
+        return ok
+
     def _probe_sizes(
         self,
         job: _Job,
@@ -2554,6 +2695,8 @@ class Painter:
         target: PaintingTarget,
         settings: PainterSettings,
         grid: TexelGridModel | None = None,
+        *,
+        line_tool: bool = False,
     ) -> PlanWorkSchedule:
         cell_width = target.canvas.width / max(1, plan.width)
         sizing = bool(
@@ -2561,18 +2704,20 @@ class Painter:
             and target.brush_size_box is not None
             and target.brush_size_model is not None
         )
+        pitch = self._texel_pitch_pixels(
+            plan,
+            target.canvas,
+            target.brush_size_model if sizing else None,
+            grid,
+        )
         return PlanWorkSchedule(
             plan,
             self._stroke_timing(settings),
             cell_width,
             sizing=sizing,
-            texel_pitch_pixels=(
-                self._texel_pitch_pixels(
-                    plan,
-                    target.canvas,
-                    target.brush_size_model if sizing else None,
-                    grid,
-                )
+            texel_pitch_pixels=pitch,
+            line_min_pixels=(
+                self._SHIFT_LINE_MIN_TEXELS * pitch if line_tool else None
             ),
         )
 
@@ -2705,7 +2850,13 @@ class Painter:
         # rules the strokes below execute with, so percent and time left move
         # at the pace of the clock instead of racing through the big,
         # long-stroke colors and crawling through the small ones.
-        schedule = self._work_schedule(plan, target, settings, job.texel_grid)
+        schedule = self._work_schedule(
+            plan,
+            target,
+            settings,
+            job.texel_grid,
+            line_tool=job.line_tool_ok and settings.use_line_tool,
+        )
         total_work = schedule.total
         completed_work = 0.0
         skipped_work = 0.0
@@ -2902,6 +3053,7 @@ class Painter:
                             clamp_rect=clamp_canvas,
                             mapper=mapper,
                             texel_pitch=texel_pitch,
+                            line_tool=job.line_tool_ok and current.use_line_tool,
                         )
                         return
                     except _RetryAction:
@@ -4044,7 +4196,13 @@ class Painter:
         clamp_rect: RectangleLike | None = None,
         mapper: "Callable[[float, float], tuple[float, float]] | None" = None,
         texel_pitch: float | None = None,
+        line_tool: bool = False,
     ) -> None:
+        # The line tool draws straight between its endpoints, so only a run
+        # the plan itself laid straight may use it; a diagonal keeps gliding.
+        line_tool = line_tool and (
+            stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y  # type: ignore[attr-defined]
+        )
         if mapper is not None:
             # A measured cursor map places each cell itself; the rectangle
             # only bounds the mouse.
@@ -4099,7 +4257,9 @@ class Painter:
             # the next cell over.
             start_int = math.floor(start[0]), math.floor(start[1])
             end_int = math.floor(end[0]), math.floor(end[1])
-        self._screen_stroke(start_int, end_int, settings, epoch, texel_pitch=texel_pitch)
+        self._screen_stroke(
+            start_int, end_int, settings, epoch, texel_pitch=texel_pitch, line_tool=line_tool
+        )
 
     @staticmethod
     def _texel_pitch_pixels(
@@ -4147,15 +4307,29 @@ class Painter:
         epoch: int,
         *,
         texel_pitch: float | None = None,
+        line_tool: bool = False,
     ) -> None:
         """Drag between two physical points, or dab when they are the same.
 
         ``texel_pitch`` paces the drag: a run of a few texels goes at the
         set speed and is caught by the frame hold below, a longer drag is
         capped to a rate and an event spacing the game paints faithfully
-        (:func:`app.paint_timing.stroke_pace`).
+        (:func:`app.paint_timing.stroke_pace`).  With ``line_tool`` (probed
+        on this sign, straight stroke) a run of
+        :data:`SHIFT_LINE_MIN_TEXELS` texels or more is not dragged at all:
+        the game draws it from an anchor press to a Shift-click.
         """
 
+        if (
+            line_tool
+            and texel_pitch is not None
+            and math.isfinite(texel_pitch)
+            and texel_pitch > 0.0
+            and math.hypot(end_int[0] - start_int[0], end_int[1] - start_int[1])
+            >= self._SHIFT_LINE_MIN_TEXELS * texel_pitch
+        ):
+            self._line_stroke(start_int, end_int, settings, epoch)
+            return
         self._checkpoint(epoch=epoch, check_focus=True)
         self._move(start_int, epoch)
         self._checkpoint(epoch=epoch, check_focus=True)
@@ -4227,6 +4401,63 @@ class Painter:
         finally:
             self.input.mouse_up(MouseButton.LEFT)
 
+    def _line_stroke(
+        self,
+        start_int: tuple[int, int],
+        end_int: tuple[int, int],
+        settings: PainterSettings,
+        epoch: int,
+    ) -> None:
+        """Anchor a press at ``start_int``, then Shift-click ``end_int``.
+
+        The game draws the straight stroke between the two itself, in its
+        own texture space - the texels on the way are its to fill, so the
+        cursor never has to visit them and the per-dab quantization of a
+        DPI-scaled display cannot pull any of them sideways.  Each press is
+        held across a paint-UI frame exactly like a dab, and the gap between
+        the two lets the game see the anchor end before the line click
+        begins; Shift goes down a moment before the click and comes up a
+        moment after it, so no frame can sample the click without the
+        modifier.  Every exit - a pause, an abort, an input failure -
+        releases Shift, because a modifier left down would turn the next
+        stroke's press into a line from here.
+        """
+
+        hold = self._press_hold_seconds(settings)
+        lead = (
+            self._SHIFT_LINE_MODIFIER_LEAD_SECONDS
+            if self.input.emits_real_input
+            else 0.0
+        )
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self._move(start_int, epoch)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self._mouse_down(epoch)
+        try:
+            self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
+        finally:
+            self.input.mouse_up(MouseButton.LEFT)
+        self._interruptible_sleep(
+            self._stroke_gap(settings.delay_between_strokes_seconds),
+            epoch=epoch,
+            check_focus=True,
+        )
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self._move(end_int, epoch)
+        self.input.key_down(self._LINE_TOOL_KEY)
+        try:
+            if lead:
+                self._interruptible_sleep(lead, epoch=epoch, check_focus=True)
+            self._mouse_down(epoch)
+            try:
+                self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
+            finally:
+                self.input.mouse_up(MouseButton.LEFT)
+            if lead:
+                self._interruptible_sleep(lead, epoch=epoch, check_focus=True)
+        finally:
+            self.input.key_up(self._LINE_TOOL_KEY)
+
     @staticmethod
     def _space_and_clamp(
         point: tuple[float, float], canvas: RectangleLike, spacing: float
@@ -4275,6 +4506,13 @@ class Painter:
     _STROKE_GAP_FLOOR_SECONDS = STROKE_GAP_FLOOR_SECONDS
     _LONG_DRAG_MAX_TEXELS_PER_SECOND = LONG_DRAG_MAX_TEXELS_PER_SECOND
     _LONG_DRAG_MAX_STEP_TEXELS = LONG_DRAG_MAX_STEP_TEXELS
+
+    # The Shift-click line tool: the key held around the line's click, how
+    # long a straight run must be before two presses beat a capped drag, and
+    # the lead/trail that keeps the modifier and the click in one frame.
+    _LINE_TOOL_KEY = "SHIFT"
+    _SHIFT_LINE_MIN_TEXELS = SHIFT_LINE_MIN_TEXELS
+    _SHIFT_LINE_MODIFIER_LEAD_SECONDS = SHIFT_LINE_MODIFIER_LEAD_SECONDS
 
     def _safe_click(
         self,

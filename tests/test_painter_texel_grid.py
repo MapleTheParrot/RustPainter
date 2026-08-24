@@ -53,17 +53,28 @@ class ReplayingTexelSign(SimulatedSign):
     on the clear control wipes the texture, a click in the hue bar starts a new
     color, and while the button is held every move paints the texels along
     its path - which is what the game does, and what turns a run of cells
-    into a line.
+    into a line.  With ``shift_lines`` the sign also has the game's line
+    tool: a click made while Shift is held paints a straight run of texels
+    from the previous press to the click, the way Rust draws it.
     """
 
     PALETTE = ((200, 30, 160), (30, 200, 60), (40, 90, 230), (240, 180, 20), (20, 20, 20))
 
-    def __init__(self, controller: MockInputController, profile: CalibrationProfile, **kwargs) -> None:
+    def __init__(
+        self,
+        controller: MockInputController,
+        profile: CalibrationProfile,
+        *,
+        shift_lines: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.controller = controller
         self.profile = profile
         self.canvas = profile.canvas
         self.base = self.texture.copy()
+        self.shift_lines = shift_lines
+        self.shift_lines_drawn = 0
         self.painted: dict[tuple[int, int], tuple[int, int, int]] = {}
 
     def _on_texture(self, x: float, y: float) -> bool:
@@ -75,11 +86,15 @@ class ReplayingTexelSign(SimulatedSign):
             and oy <= y < oy + self.rows * self.pitch[1]
         )
 
-    def _stamp(self, x: float, y: float, size: float, color) -> None:
+    def _texel_at(self, x: float, y: float) -> tuple[int, int]:
         ox, oy = self.origin
         px, py = self.pitch
-        column = math.floor((x - ox - self.cursor_shift[0]) / px) + self.stamp_offset[0]
-        row = math.floor((y - oy - self.cursor_shift[1]) / py) + self.stamp_offset[1]
+        return (
+            math.floor((x - ox - self.cursor_shift[0]) / px) + self.stamp_offset[0],
+            math.floor((y - oy - self.cursor_shift[1]) / py) + self.stamp_offset[1],
+        )
+
+    def _stamp_texel(self, column: int, row: int, size: float, color) -> None:
         reach = int(max(1.0, size) // 2)
         for r in range(row - reach, row + reach + 1):
             for c in range(column - reach, column + reach + 1):
@@ -87,13 +102,20 @@ class ReplayingTexelSign(SimulatedSign):
                     self.texture[r, c] = color
                     self.painted[(c, r)] = color
 
+    def _stamp(self, x: float, y: float, size: float, color) -> None:
+        column, row = self._texel_at(x, y)
+        self._stamp_texel(column, row, size, color)
+
     def _replay(self) -> None:
         self.texture = self.base.copy()
         self.painted = {}
+        self.shift_lines_drawn = 0
         size = 1.0
         digits = ""
         position = (0, 0)
         down = False
+        shift_down = False
+        anchor: tuple[int, int] | None = None
         color_index = -1
         color = self.PALETTE[0]
         for event in self.controller.events:
@@ -112,7 +134,10 @@ class ReplayingTexelSign(SimulatedSign):
                 position = new_position
             elif event.kind == "key_down":
                 value = event.value
-                if value == 0xBE:
+                if value == "SHIFT":
+                    shift_down = True
+                    digits = ""
+                elif value == 0xBE:
                     digits += "."
                 elif isinstance(value, str) and len(value) == 1 and value.isdigit():
                     digits += value
@@ -121,16 +146,37 @@ class ReplayingTexelSign(SimulatedSign):
                     digits = ""
                 else:
                     digits = ""
+            elif event.kind == "key_up":
+                if event.value == "SHIFT":
+                    shift_down = False
             elif event.kind == "mouse_down":
                 down = True
                 if self.profile.clear_button.contains(*position):
                     self.texture = self.base.copy()
                     self.painted = {}
+                    anchor = None
                 elif self.profile.hue_bar.contains(*position):
                     color_index += 1
                     color = self.PALETTE[color_index % len(self.PALETTE)]
                 elif self._on_texture(*position):
-                    self._stamp(position[0], position[1], size, color)
+                    landed = self._texel_at(position[0], position[1])
+                    if self.shift_lines and shift_down and anchor is not None:
+                        # The game draws the straight run itself, texel to
+                        # texel from the last press, however far the cursor
+                        # jumped.
+                        steps = max(abs(landed[0] - anchor[0]), abs(landed[1] - anchor[1]), 1)
+                        for step in range(steps + 1):
+                            t = step / steps
+                            self._stamp_texel(
+                                round(anchor[0] + (landed[0] - anchor[0]) * t),
+                                round(anchor[1] + (landed[1] - anchor[1]) * t),
+                                size,
+                                color,
+                            )
+                        self.shift_lines_drawn += 1
+                    else:
+                        self._stamp(position[0], position[1], size, color)
+                    anchor = landed
             elif event.kind == "mouse_up":
                 down = False
 
@@ -438,3 +484,123 @@ def test_a_stored_grid_off_the_rectangle_is_not_painted_on() -> None:
     painter._adopt_stored_texel_grid(job)
     assert job.texel_grid is None
     assert painter.measured_texel_grid is None
+
+
+def test_long_straight_runs_go_down_as_shift_click_lines_when_the_probe_proves_them() -> None:
+    """On a sign with the line mechanic, the probe proves it and long rows
+    become an anchor press and a Shift-click; short runs keep the glide."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        shift_lines=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup(
+                (40, 80, 160), (Stroke(4, 30, 123, 30), Stroke(4, 32, 123, 32)), 1
+            ),
+            ColorGroup((200, 40, 40), (Stroke(20, 40, 40, 40),), 1),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = (
+        {(x, 30) for x in range(4, 124)}
+        | {(x, 32) for x in range(4, 124)}
+        | {(x, 40) for x in range(20, 41)}
+    )
+    assert set(sign.painted) == expected
+    # One line proved the tool, the two long rows each drew one; the
+    # 21-texel run is below the threshold and stayed a drag.
+    assert sign.shift_lines_drawn == 3
+    assert not controller.held_buttons
+    assert not controller.held_keys
+
+
+def test_a_sign_without_the_line_mechanic_keeps_painting_drags() -> None:
+    """A Shift-click that paints a lone dab fails the probe, so every run is
+    dragged exactly as before and Shift is never held again."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(4, 30, 123, 30),), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    assert set(sign.painted) == {(x, 30) for x in range(4, 124)}
+    assert sign.shift_lines_drawn == 0
+    holds = [
+        event
+        for event in controller.events
+        if event.kind == "key_down" and event.value == "SHIFT"
+    ]
+    assert len(holds) == 1  # the probe's one refused stroke
+    assert not controller.held_keys
+
+
+def test_the_line_tool_switch_keeps_every_run_a_drag_without_probing() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        shift_lines=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(4, 30, 123, 30),), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings(use_line_tool=False))
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    assert set(sign.painted) == {(x, 30) for x in range(4, 124)}
+    assert sign.shift_lines_drawn == 0
+    assert not any(
+        event.kind == "key_down" and event.value == "SHIFT"
+        for event in controller.events
+    )
