@@ -74,6 +74,7 @@ class ReplayingTexelSign(SimulatedSign):
         shift_lines: bool = False,
         min_dab_hold: float = 0.0,
         max_drag_step_px: float = 8.0,
+        dead_columns: frozenset[int] = frozenset(),
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -84,6 +85,10 @@ class ReplayingTexelSign(SimulatedSign):
         self.shift_lines = shift_lines
         self.shift_lines_drawn = 0
         self.max_drag_step_px = max_drag_step_px
+        # Columns where a stamp narrower than Size 1.5 never takes: a sign
+        # whose smallest brush is smaller than a texel, seen through the
+        # cursor quantization that decides which texels it can reach.
+        self.dead_columns = dead_columns
         # A press-and-release quicker than this paints nothing, like a game
         # frame that never sampled the button down.  Needs a controller that
         # records event times (TimedMockController); zero keeps every dab.
@@ -108,6 +113,8 @@ class ReplayingTexelSign(SimulatedSign):
         )
 
     def _stamp_texel(self, column: int, row: int, size: float, color) -> None:
+        if size < 1.5 and column in self.dead_columns:
+            return
         reach = int(max(1.0, size) // 2)
         for r in range(row - reach, row + reach + 1):
             for c in range(column - reach, column + reach + 1):
@@ -818,3 +825,170 @@ def test_the_press_hold_switch_keeps_the_floor_without_probing() -> None:
 
     sign.capture(profile.canvas)  # replay to the end of the job
     assert set(sign.painted) == {(0, 0)}
+
+
+def _presses_after_last_clear(controller: MockInputController, profile: CalibrationProfile):
+    """(press position, moves while held) for every press after the sign was cleared."""
+
+    presses: list[tuple[tuple[int, int], list[tuple[int, int]]]] = []
+    position = (0, 0)
+    down = False
+    for event in controller.events:
+        if event.kind == "move" and event.x is not None and event.y is not None:
+            position = (event.x, event.y)
+            if down:
+                presses[-1][1].append(position)
+        elif event.kind == "mouse_down":
+            down = True
+            if profile.clear_button.contains(*position):
+                presses = []
+                presses.append((position, []))
+            else:
+                presses.append((position, []))
+        elif event.kind == "mouse_up":
+            down = False
+    canvas = profile.canvas
+    return [
+        p
+        for p in presses
+        if canvas.left - 2 <= p[0][0] <= canvas.left + canvas.width + 2
+        and canvas.top - 2 <= p[0][1] <= canvas.top + canvas.height + 2
+    ]
+
+
+def test_a_native_lone_dab_is_one_stationary_press() -> None:
+    """On a measured native grid a dab has no sideways reach: no micro-drag
+    whose release could land in the neighbouring texel."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup((40, 80, 160), (Stroke(10, 10, 30, 10), Stroke(0, 0, 0, 0)), 1),
+            ColorGroup((200, 40, 40), (Stroke(64, 40, 64, 40), Stroke(127, 63, 127, 63)), 1),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    grid = painter.measured_texel_grid
+    assert grid is not None
+
+    presses = _presses_after_last_clear(controller, profile)
+    stationary = [p for p in presses if not p[1]]
+    micro = [p for p in presses if p[1] and max(abs(m[0] - p[0][0]) + abs(m[1] - p[0][1]) for m in p[1]) <= 3]
+    assert len(stationary) >= 3, presses  # the three lone dabs
+    assert micro == [], micro
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, 10) for x in range(10, 31)} | {(0, 0), (64, 40), (127, 63)}
+    assert set(sign.painted) == expected
+
+
+def _dab_plan() -> PaintPlan:
+    dabs = tuple(Stroke(x, y, x, y) for y in (12, 30, 50) for x in (20, 25, 30, 61, 100))
+    return PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup((40, 80, 160), dabs, 1),
+            ColorGroup((200, 40, 40), (Stroke(4, 40, 60, 40),), 1),
+        ),
+    )
+
+
+def test_the_dab_probe_raises_the_one_cell_brush_until_lone_dabs_land() -> None:
+    """Columns 20, 25 and 30 swallow the smallest brush; the probe sees its
+    dots go missing there, steps the Size up until they land, and the job's
+    dabs and runs then paint exactly."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        dead_columns=frozenset({20, 25, 30}),
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._DAB_PROBE_MIN_DABS = 0  # type: ignore[misc]
+    painter._DAB_PROBE_DOTS = 24  # type: ignore[misc]
+    plan = _dab_plan()
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_detail_size == pytest.approx(1.5)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, y) for y in (12, 30, 50) for x in (20, 25, 30, 61, 100)} | {
+        (x, 40) for x in range(4, 61)
+    }
+    assert set(sign.painted) == expected
+
+
+def test_the_dab_probe_keeps_the_smallest_brush_when_every_dab_lands() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._DAB_PROBE_MIN_DABS = 0  # type: ignore[misc]
+    painter._DAB_PROBE_DOTS = 24  # type: ignore[misc]
+
+    assert painter.start(_dab_plan(), profile, _settings())
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_detail_size == pytest.approx(1.0)
+
+
+def test_the_dab_probe_switch_leaves_the_one_cell_brush_unmeasured() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        dead_columns=frozenset({20, 25, 30}),
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._DAB_PROBE_MIN_DABS = 0  # type: ignore[misc]
+
+    assert painter.start(_dab_plan(), profile, _settings(measure_dab_size=False))
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_detail_size is None
+    sign.capture(profile.canvas)  # replay to the end of the job
+    # Without the probe the dead columns stay bare - the failure the probe exists for.
+    assert not any(column in {20, 25, 30} for column, _ in sign.painted)

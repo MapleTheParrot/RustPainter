@@ -118,6 +118,25 @@ PRESS_HOLD_PROBE_DOTS = 24
 # holds could save.
 PRESS_HOLD_PROBE_MIN_STROKES = 200
 
+# A lone dab is the stroke that goes missing.  Measured on a finished XXL
+# sign: texels painted as a lone dab came out bare 4.4% of the time (7.4%
+# in the light areas) against 0.3% for texels swept by a drag - two thirds
+# of every hole on the sign, on a sign that is a third lone dabs.  The
+# smallest brush there covers about half a texel, so whether one stationary
+# stamp takes its texel depends on where within the texel the game samples
+# the cursor.  The painter proves the dab per sign: batches of lone-dab
+# strokes - through the same aim, hold and extension the artwork will use -
+# at these Size numbers, smallest first, each captured and counted, and the
+# first Size that lands all but DAB_PROBE_MAX_MISSES of its dots is what the
+# job types for its one-cell strokes.  Spill into the neighbours is counted
+# and logged: a stamp wide enough never to miss can also be wide enough to
+# smear, and the log is where that trade shows.
+DAB_PROBE_SIZES = (1.0, 1.25, 1.5, 1.75, 2.0)
+DAB_PROBE_DOTS = 96
+DAB_PROBE_MAX_MISSES = 1
+# Below this many lone dabs in the plan the probe cannot pay for itself.
+DAB_PROBE_MIN_DABS = 200
+
 # Which timing settings have a floor, and what it is.  Every value is read
 # through :func:`floored` at its point of use under real input, so a preset
 # or a typed value below its floor is lifted - the painter logs once per

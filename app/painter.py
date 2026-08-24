@@ -32,12 +32,16 @@ from .color_mapping import picker_click_plan
 from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .input_controller import InputController, MouseButton
-from .models import PaintPlan, RGBColor, ScreenRect
+from .models import PaintPlan, RGBColor, ScreenRect, Stroke
 from .paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
     CHECK_CAPTURE_SECONDS_DEFAULT,
     CHECK_REPAINT_FRACTION_DEFAULT,
     CONFIRM_SETTLE_SECONDS,
+    DAB_PROBE_DOTS,
+    DAB_PROBE_MAX_MISSES,
+    DAB_PROBE_MIN_DABS,
+    DAB_PROBE_SIZES,
     DEFAULT_STROKE_OVERHEAD_SECONDS,
     KEY_GAP_SECONDS,
     KEY_HOLD_SECONDS,
@@ -281,6 +285,11 @@ class PainterSettings:
     # paint the job's dabs and line presses at it.  A sign that drops any
     # probe dot keeps the 70 ms frame floor; drag dwells always keep it.
     measure_press_hold: bool = True
+    # Prove the one-cell brush on this sign before painting: batches of lone
+    # dabs at rising Size numbers until one lands them all, which the job's
+    # single-cell strokes and touch-up then use.  Off, or unproven, the
+    # one-cell brush stays the game's smallest.
+    measure_dab_size: bool = True
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
@@ -333,6 +342,7 @@ class PainterSettings:
         "delay_after_brush_seconds",
         "use_line_tool",
         "measure_press_hold",
+        "measure_dab_size",
         "verify_passes",
         "confirm_strokes",
         "confirm_max_rounds",
@@ -448,6 +458,7 @@ class PainterSettings:
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             use_line_tool=bool(pick(painting, "use_line_tool", True)),
             measure_press_hold=bool(pick(painting, "measure_press_hold", True)),
+            measure_dab_size=bool(pick(painting, "measure_dab_size", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
             confirm_strokes=bool(pick(painting, "confirm_strokes", False)),
             confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
@@ -626,6 +637,22 @@ class _Job:
     line_tool_ok: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _Aiming:
+    """How a plan's cells are placed on the screen (see ``Painter._aiming``)."""
+
+    sizing: bool
+    model: BrushSizeModel | None
+    bias: tuple[float, float]
+    paint_canvas: RectangleLike
+    clamp_canvas: RectangleLike
+    mapper: "Callable[[float, float], tuple[float, float]] | None"
+    texel_pitch: float
+    # Every cell is one texel and sits exactly on it: the stroke geometry
+    # needs no sideways extension, and lone dabs are pure stationary presses.
+    native: bool
+
+
 def _describe_seconds(seconds: float) -> str:
     """``45s``, ``12 min``, ``1 h 05 min`` - for log lines and status text."""
 
@@ -709,6 +736,9 @@ class Painter:
         # The press hold this job's probe proved on its sign, or None while
         # unmeasured; applies to stationary presses only.
         self._measured_press_hold_seconds: float | None = None
+        # The Size number this job's probe proved lands a lone dab on its
+        # sign, or None while unmeasured (then the smallest brush is used).
+        self._measured_detail_size: float | None = None
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -869,6 +899,7 @@ class Painter:
                 raise RuntimeError("Cannot replace a paint job while one is active")
             self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
             self._measured_press_hold_seconds = None
+            self._measured_detail_size = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -939,6 +970,7 @@ class Painter:
             self._measured_brush_size_model = None
             self._measured_texel_grid = None
             self._measured_press_hold_seconds = None
+            self._measured_detail_size = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -969,6 +1001,13 @@ class Painter:
 
         with self._condition:
             return self._color_pick_summary
+
+    @property
+    def measured_detail_size(self) -> float | None:
+        """The Size number this job's probe proved for lone dabs, if any."""
+
+        with self._condition:
+            return self._measured_detail_size
 
     @property
     def measured_press_hold_seconds(self) -> float | None:
@@ -1769,8 +1808,13 @@ class Painter:
             # a texel or two off the grid still counts as native: requiring
             # exact equality let a one-column probe miscount silently swap
             # this one-texel dot for a 1.24-texel one, which chewed fine
-            # detail across a whole 5.6-hour run.
+            # detail across a whole 5.6-hour run.  When this sign's dab probe
+            # found the smallest brush missing lone dabs and proved a larger
+            # Size that lands them, that Size is the one-cell brush instead.
             size = BRUSH_SIZE_MIN
+            measured = self._measured_detail_size
+            if measured is not None and settings.measure_dab_size:
+                size = max(size, measured)
         else:
             size = self._brush_plan_size(
                 job.target, job.plan, diameter_cells, settings.logical_pixel_spacing, model
@@ -1973,6 +2017,7 @@ class Painter:
                             stored.rows,
                         )
                 self._probe_press_hold(job)
+                self._probe_dab_size(job)
                 job.line_tool_ok = self._probe_line_tool(job)
                 self._clear_canvas(job)
                 break
@@ -2091,6 +2136,9 @@ class Painter:
         size = self._brush_plan_size(
             job.target, job.plan, 1, job.settings.logical_pixel_spacing, model
         )
+        measured = self._measured_detail_size
+        if measured is not None and job.settings.measure_dab_size:
+            size = max(size, measured)
         checks = self._brush_footprint_checks(job.target, job.plan, 1, size, model)
         return max(painted / nominal for _, painted, nominal in checks)
 
@@ -2673,6 +2721,184 @@ class Painter:
             floor_ms,
         )
 
+    _DAB_PROBE_SIZES = DAB_PROBE_SIZES
+    _DAB_PROBE_DOTS = DAB_PROBE_DOTS
+    _DAB_PROBE_MAX_MISSES = DAB_PROBE_MAX_MISSES
+    _DAB_PROBE_MIN_DABS = DAB_PROBE_MIN_DABS
+
+    def _probe_dab_size(self, job: _Job) -> None:
+        """Prove the one-cell brush on this sign: which Size lands a lone dab.
+
+        Batches of lone-dab strokes - the same ``Stroke`` a plan would hold,
+        aimed, held and extended exactly as the artwork's - at each Size in
+        :data:`DAB_PROBE_SIZES`, smallest first.  Every batch is captured and
+        each dot scored: a hit is a stamp on its own texel, a spill a stamp
+        that also reached a neighbour's.  The first Size whose batch misses
+        no more than :data:`DAB_PROBE_MAX_MISSES` dots is the job's one-cell
+        brush; a sign where none does keeps the smallest brush, as before.
+        """
+
+        settings = job.settings
+        target = job.target
+        grid = job.texel_grid
+        box = target.brush_size_box
+        model = target.brush_size_model
+        if (
+            not settings.measure_dab_size
+            or not settings.apply_brush_size
+            or grid is None
+            or box is None
+            or model is None
+            or job.mode != "paint"
+        ):
+            return
+        plan = job.plan
+        aiming = self._aiming(job, plan)
+        if not aiming.native or aiming.mapper is None:
+            return
+        lone = sum(
+            1 for group in plan.color_groups for stroke in group.strokes if stroke.pixel_count == 1
+        )
+        if lone < self._DAB_PROBE_MIN_DABS:
+            LOGGER.info(
+                "The plan's %d lone dabs are too few for the dab probe to pay "
+                "for its captures; the one-cell brush stays the smallest",
+                lone,
+            )
+            return
+        dots = max(8, int(self._DAB_PROBE_DOTS))
+        if grid.columns < 24 or grid.rows < 16:
+            return
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        self._measured_detail_size = None
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Proving the one-cell brush with batches of lone dabs",
+            phase="calibrate",
+        )
+
+        def batch_texels(batch: int) -> list[tuple[int, int]]:
+            # Spread across the columns, rows staggered per batch so no
+            # batch stamps where an earlier one did, and never on the
+            # texel next to another dot of the same batch.
+            span = grid.columns - 8
+            return [
+                (
+                    4 + round(index * (span - 1) / (dots - 1)),
+                    4 + ((index * 37 + batch * 23) % max(1, grid.rows - 8)),
+                )
+                for index in range(dots)
+            ]
+
+        def centre(u_texel: int, v_texel: int) -> tuple[int, int]:
+            return (
+                int(round(grid.origin_x + (u_texel + 0.5) * grid.pitch_x - canvas.left)),
+                int(round(grid.origin_y + (v_texel + 0.5) * grid.pitch_y - canvas.top)),
+            )
+
+        def changed(diff: Any, u_texel: int, v_texel: int) -> float:
+            if not (0 <= u_texel < grid.columns and 0 <= v_texel < grid.rows):
+                return 0.0
+            x, y = centre(u_texel, v_texel)
+            window = diff[max(0, y - 1) : y + 2, max(0, x - 1) : x + 2]
+            return float(window.max()) if window.size else 0.0
+
+        last_color: RGBColor | None = None
+        chosen: float | None = None
+        try:
+            epoch = self._pause_generation_value()
+            before = self._capture_parked(canvas, park, epoch)
+            for batch, size in enumerate(self._DAB_PROBE_SIZES):
+                epoch = self._pause_generation_value()
+                texels = batch_texels(batch)
+                expected = [
+                    (
+                        grid.origin_x + (u + 0.5) * grid.pitch_x - canvas.left,
+                        grid.origin_y + (v + 0.5) * grid.pitch_y - canvas.top,
+                    )
+                    for u, v in texels
+                ]
+                self._write_brush_size(box, size, settings, epoch)
+                color = self._probe_color_against(before, expected, skip=last_color)
+                last_color = color
+                self._select_color(color, target, settings, epoch, apply_correction=False)
+                for u, v in texels:
+                    self._execute_stroke(
+                        Stroke(u, v, u, v),
+                        plan,
+                        aiming.paint_canvas,
+                        settings,
+                        epoch,
+                        aiming.bias,
+                        0.0,
+                        clamp_rect=aiming.clamp_canvas,
+                        mapper=aiming.mapper,
+                        texel_pitch=aiming.texel_pitch,
+                    )
+                    self._interruptible_sleep(
+                        self._stroke_gap(settings.delay_between_strokes_seconds),
+                        epoch=epoch,
+                        check_focus=True,
+                    )
+                after = self._capture_parked(canvas, park, epoch)
+                diff = stamp_diff(before, after)
+                before = after
+                hits = 0
+                spills = 0
+                for u, v in texels:
+                    own = changed(diff, u, v)
+                    around = [changed(diff, u - 1, v), changed(diff, u + 1, v), changed(diff, u, v - 1), changed(diff, u, v + 1)]
+                    peak = max([own] + around)
+                    if own >= self._LINE_PROBE_DIFF_FLOOR and own >= 0.5 * peak:
+                        hits += 1
+                        spills += sum(
+                            1 for value in around if value >= self._LINE_PROBE_DIFF_FLOOR and value >= 0.6 * own
+                        )
+                misses = dots - hits
+                LOGGER.info(
+                    "Dab probe: %d of %d lone dabs landed at Size %s, spilling "
+                    "into %.2f neighbours each",
+                    hits,
+                    dots,
+                    format_brush_size(size),
+                    spills / max(1, hits),
+                )
+                if misses <= self._DAB_PROBE_MAX_MISSES:
+                    chosen = float(size)
+                    break
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The dab probe could not run (%s); the one-cell brush stays the smallest",
+                exc,
+            )
+            return
+        if chosen is None:
+            LOGGER.warning(
+                "No probed Size landed every lone dab; the one-cell brush stays "
+                "the smallest and the touch-up pass will have holes to fill"
+            )
+            return
+        self._measured_detail_size = chosen
+        if chosen > BRUSH_SIZE_MIN:
+            LOGGER.info(
+                "Adopting Size %s for this sign's one-cell strokes: the smallest "
+                "brush missed lone dabs and this one lands them",
+                format_brush_size(chosen),
+            )
+        else:
+            LOGGER.info("The smallest brush lands every lone dab on this sign")
+
     def _probe_line_tool(self, job: _Job) -> bool:
         """Prove the Shift line tool on this sign with one stroke.
 
@@ -3037,76 +3263,18 @@ class Painter:
         with self._condition:
             return self._touch_up_timing
 
-    def _execute_plan(
-        self,
-        job: _Job,
-        plan: PaintPlan | None = None,
-        *,
-        reference: Any = None,
-    ) -> None:
-        """Paint ``plan`` (the job's own by default), color by color.
+    def _aiming(self, job: _Job, plan: PaintPlan) -> "_Aiming":
+        """Where this plan's cells are on the screen, and how they are hit.
 
-        ``reference`` is a per-cell reading of the sign from just before this
-        plan goes down, for checking each color against; the job's plan
-        reads its own from the cleared sign, or captures one.
+        The measured texel grid's cursor map when the job has one (with the
+        plan's cells laid one-to-one on the texels, or stretched when the
+        plan disagrees with the grid), else the brush-derived canvas and
+        rendering bias.  Shared by the artwork, the touch-up and the dab
+        probe, so a probe stroke lands exactly as an artwork stroke would.
         """
 
-        main_plan = plan is None
-        plan = job.plan if plan is None else plan
         target, settings = job.target, job.settings
-        # Strokes before the offset are already on the sign.  They count in
-        # the progress shown - the sign really is that far along - but not
-        # in the pace, which is measured on what this run paints.
-        skip = job.start_stroke if main_plan else 0
-        completed = 0
-        painted = 0
-        total = sum(len(group.strokes) for group in plan.color_groups)
-        total_colors = len(plan.color_groups)
-        # Progress advances in predicted seconds, priced from the same timing
-        # rules the strokes below execute with, so percent and time left move
-        # at the pace of the clock instead of racing through the big,
-        # long-stroke colors and crawling through the small ones.
-        schedule = self._work_schedule(
-            plan,
-            target,
-            settings,
-            job.texel_grid,
-            line_tool=job.line_tool_ok and settings.use_line_tool,
-        )
-        total_work = schedule.total
-        completed_work = 0.0
-        skipped_work = 0.0
-        # Each plan gets its own clock.  A touch-up pass re-enters here after
-        # the artwork is done; timed against the whole run's elapsed it would
-        # claim hours left for a few minutes of repainting.
-        phase_started = self._active_elapsed()
-
-        def record_phase_timing(completed_work: float, painted: int) -> None:
-            """Keep the artwork's clock against its prediction up to date."""
-
-            if not main_plan:
-                return
-            with self._condition:
-                self._paint_phase_timing = PhaseTiming(
-                    predicted_seconds=completed_work,
-                    actual_seconds=self._active_elapsed() - phase_started,
-                    strokes=painted,
-                    checking_seconds=self._confirmation_seconds,
-                    colors_checked=self._confirmation_summary.colors,
-                    check_capture_seconds=self._check_capture_clock,
-                )
-
-        if total == 0:
-            self._set_progress(
-                color_index=0,
-                total_colors=total_colors,
-                stroke_index_in_color=0,
-                strokes_in_color=0,
-                completed_strokes=0,
-                total_strokes=0,
-                message="Nothing to paint",
-            )
-            return
+        scale_u = scale_v = 1.0
         sizing_enabled = (
             settings.apply_brush_size
             and target.brush_size_box is not None
@@ -3188,6 +3356,96 @@ class Painter:
                 x, y = grid.cursor_point((cell_x + 0.5) * scale_u, (cell_y + 0.5) * scale_v)
                 return x, y
         texel_pitch = self._texel_pitch_pixels(plan, paint_canvas, model, grid)
+        native = mapper is not None and scale_u == 1.0 and scale_v == 1.0
+        return _Aiming(
+            sizing=sizing_enabled,
+            model=model,
+            bias=bias,
+            paint_canvas=paint_canvas,
+            clamp_canvas=clamp_canvas,
+            mapper=mapper,
+            texel_pitch=texel_pitch,
+            native=native,
+        )
+
+    def _execute_plan(
+        self,
+        job: _Job,
+        plan: PaintPlan | None = None,
+        *,
+        reference: Any = None,
+    ) -> None:
+        """Paint ``plan`` (the job's own by default), color by color.
+
+        ``reference`` is a per-cell reading of the sign from just before this
+        plan goes down, for checking each color against; the job's plan
+        reads its own from the cleared sign, or captures one.
+        """
+
+        main_plan = plan is None
+        plan = job.plan if plan is None else plan
+        target, settings = job.target, job.settings
+        # Strokes before the offset are already on the sign.  They count in
+        # the progress shown - the sign really is that far along - but not
+        # in the pace, which is measured on what this run paints.
+        skip = job.start_stroke if main_plan else 0
+        completed = 0
+        painted = 0
+        total = sum(len(group.strokes) for group in plan.color_groups)
+        total_colors = len(plan.color_groups)
+        # Progress advances in predicted seconds, priced from the same timing
+        # rules the strokes below execute with, so percent and time left move
+        # at the pace of the clock instead of racing through the big,
+        # long-stroke colors and crawling through the small ones.
+        schedule = self._work_schedule(
+            plan,
+            target,
+            settings,
+            job.texel_grid,
+            line_tool=job.line_tool_ok and settings.use_line_tool,
+        )
+        total_work = schedule.total
+        completed_work = 0.0
+        skipped_work = 0.0
+        # Each plan gets its own clock.  A touch-up pass re-enters here after
+        # the artwork is done; timed against the whole run's elapsed it would
+        # claim hours left for a few minutes of repainting.
+        phase_started = self._active_elapsed()
+
+        def record_phase_timing(completed_work: float, painted: int) -> None:
+            """Keep the artwork's clock against its prediction up to date."""
+
+            if not main_plan:
+                return
+            with self._condition:
+                self._paint_phase_timing = PhaseTiming(
+                    predicted_seconds=completed_work,
+                    actual_seconds=self._active_elapsed() - phase_started,
+                    strokes=painted,
+                    checking_seconds=self._confirmation_seconds,
+                    colors_checked=self._confirmation_summary.colors,
+                    check_capture_seconds=self._check_capture_clock,
+                )
+
+        if total == 0:
+            self._set_progress(
+                color_index=0,
+                total_colors=total_colors,
+                stroke_index_in_color=0,
+                strokes_in_color=0,
+                completed_strokes=0,
+                total_strokes=0,
+                message="Nothing to paint",
+            )
+            return
+        aiming = self._aiming(job, plan)
+        sizing_enabled = aiming.sizing
+        model = aiming.model
+        bias = aiming.bias
+        paint_canvas = aiming.paint_canvas
+        clamp_canvas = aiming.clamp_canvas
+        mapper = aiming.mapper
+        texel_pitch = aiming.texel_pitch
         # Physical brush facts and the pause epoch they were established under.
         # A pause hands the mouse back to the user, who may change the brush in
         # Rust, so an epoch bump re-applies the size before the next stroke -
@@ -3214,6 +3472,15 @@ class Painter:
                 completed += first_index
             completed_work += schedule.group_cost(color_index - 1)
             diameter = max(1, int(group.brush_diameter))
+            # The sideways reach that covers a logical cell wider than the
+            # brush.  On a native grid a cell IS a texel, which the game
+            # paints whole or not at all, so there is nothing to reach for -
+            # and the reach would turn every lone dab into a one- or two-
+            # pixel drag whose release lands in the neighbouring texel.
+            # Measured on a finished XXL sign: lone dabs came out bare 4.4%
+            # of the time against 0.3% for dragged texels, two thirds of
+            # every hole on the sign.  A native dab is a stationary press at
+            # the audited aim, and nothing else.
             extension = (
                 self._stroke_extension_pixels(
                     paint_canvas,
@@ -3223,7 +3490,7 @@ class Painter:
                         target, plan, diameter, settings.logical_pixel_spacing, model
                     ),
                 )
-                if model is not None
+                if model is not None and not aiming.native
                 else 0.0
             )
 
