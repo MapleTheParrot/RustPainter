@@ -599,9 +599,16 @@ def _apply_text_overlays(
         painter.end()
 
     overlay = ImageQt.fromqimage(overlay_qt).convert("RGBA")
-    overlay_mask = np.asarray(overlay.getchannel("A"), dtype=np.uint8) > 0
+    overlay_array = np.asarray(overlay, dtype=np.uint8).copy()
+    # The quantizer snaps antialiased fringe texels to full palette colors,
+    # which fattens every stroke and closes small counters like a P's bowl.
+    # Thresholding coverage first keeps a texel either fully lettered or
+    # untouched, so letters stay the width the font drew.
+    overlay_mask = overlay_array[:, :, 3] >= 128
     if not np.any(overlay_mask):
         return processed
+    overlay_array[:, :, 3] = np.where(overlay_mask, 255, 0).astype(np.uint8)
+    overlay = Image.fromarray(overlay_array, mode="RGBA")
 
     combined_mask = np.asarray(processed.paint_mask, dtype=np.bool_).copy()
     combined_mask |= overlay_mask

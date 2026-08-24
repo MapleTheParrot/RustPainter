@@ -728,6 +728,27 @@ def _apply_plain_text_mask(backdrop: ProcessedImage) -> int:
     return int(main_window_module._apply_text_overlays(backdrop, (plain,)).paint_mask.sum())
 
 
+def test_baked_text_has_no_antialiased_fringe() -> None:
+    """Every lettered texel carries the text color, never an edge blend.
+
+    Blends would survive quantization as fattened strokes and filled-in
+    counters, so coverage is thresholded before the palette pass.
+    """
+
+    backdrop = ProcessedImage(
+        Image.new("RGB", (160, 80), (0, 0, 0)),
+        np.zeros((80, 160), dtype=bool),
+        64,
+    )
+    plain = _TextOverlayOptions("RUST", "", 44, (255, 255, 255))
+    baked = main_window_module._apply_text_overlays(backdrop, (plain,))
+    painted = np.asarray(baked.image.convert("RGB"), dtype=np.uint8)[
+        np.asarray(baked.paint_mask, dtype=bool)
+    ]
+    assert painted.size > 0
+    assert np.all(painted == 255)
+
+
 def test_gradient_and_outline_round_trip_through_settings(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
