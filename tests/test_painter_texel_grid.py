@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
+
+import pytest
 
 from PIL import Image
 
@@ -66,6 +69,7 @@ class ReplayingTexelSign(SimulatedSign):
         profile: CalibrationProfile,
         *,
         shift_lines: bool = False,
+        min_dab_hold: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -75,6 +79,10 @@ class ReplayingTexelSign(SimulatedSign):
         self.base = self.texture.copy()
         self.shift_lines = shift_lines
         self.shift_lines_drawn = 0
+        # A press-and-release quicker than this paints nothing, like a game
+        # frame that never sampled the button down.  Needs a controller that
+        # records event times (TimedMockController); zero keeps every dab.
+        self.min_dab_hold = min_dab_hold
         self.painted: dict[tuple[int, int], tuple[int, int, int]] = {}
 
     def _on_texture(self, x: float, y: float) -> bool:
@@ -118,10 +126,24 @@ class ReplayingTexelSign(SimulatedSign):
         anchor: tuple[int, int] | None = None
         color_index = -1
         color = self.PALETTE[0]
-        for event in self.controller.events:
+        times = getattr(self.controller, "event_times", None)
+        # (column, row, size, color, event index of the press) of a press
+        # whose fate depends on how long it stays down.
+        pending: tuple[int, int, float, tuple[int, int, int], int] | None = None
+
+        def flush_pending() -> None:
+            nonlocal pending
+            if pending is not None:
+                self._stamp_texel(pending[0], pending[1], pending[2], pending[3])
+                pending = None
+
+        for index, event in enumerate(self.controller.events):
             if event.kind == "move" and event.x is not None and event.y is not None:
                 new_position = (event.x, event.y)
                 if down and self._on_texture(*position):
+                    # The cursor moved while pressed: this is a drag, whose
+                    # press paints however short it was.
+                    flush_pending()
                     steps = max(1, int(math.hypot(new_position[0] - position[0], new_position[1] - position[1])))
                     for step in range(1, steps + 1):
                         t = step / steps
@@ -174,11 +196,28 @@ class ReplayingTexelSign(SimulatedSign):
                                 color,
                             )
                         self.shift_lines_drawn += 1
+                    elif (
+                        self.min_dab_hold > 0.0
+                        and times is not None
+                        and index < len(times)
+                    ):
+                        # Held long enough it paints on release; see mouse_up.
+                        pending = (landed[0], landed[1], size, color, index)
                     else:
                         self._stamp(position[0], position[1], size, color)
                     anchor = landed
             elif event.kind == "mouse_up":
                 down = False
+                if pending is not None:
+                    held = (
+                        times[index] - times[pending[4]]
+                        if times is not None and index < len(times)
+                        else self.min_dab_hold
+                    )
+                    if held >= self.min_dab_hold:
+                        flush_pending()
+                    else:
+                        pending = None
 
     def capture(self, rect) -> Image.Image:
         canvas = self.canvas
@@ -604,3 +643,153 @@ def test_the_line_tool_switch_keeps_every_run_a_drag_without_probing() -> None:
         event.kind == "key_down" and event.value == "SHIFT"
         for event in controller.events
     )
+
+
+class TimedMockController(MockInputController):
+    """A mock controller that also remembers when each event happened.
+
+    The hold-sensitive sign reads a press's duration from these times the
+    way the game reads it from its frame clock.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.event_times: list[float] = []
+
+    def _stamp_times(self) -> None:
+        while len(self.event_times) < len(self.events):
+            self.event_times.append(time.monotonic())
+
+    def move_mouse(self, x, y):  # type: ignore[override]
+        super().move_mouse(x, y)
+        self._stamp_times()
+
+    def mouse_down(self, button="left"):  # type: ignore[override]
+        super().mouse_down(button)
+        self._stamp_times()
+
+    def mouse_up(self, button="left"):  # type: ignore[override]
+        super().mouse_up(button)
+        self._stamp_times()
+
+    def press_key(self, key, *, hold_seconds=0.01):  # type: ignore[override]
+        super().press_key(key, hold_seconds=hold_seconds)
+        self._stamp_times()
+
+    def key_down(self, key):  # type: ignore[override]
+        super().key_down(key)
+        self._stamp_times()
+
+    def key_up(self, key):  # type: ignore[override]
+        super().key_up(key)
+        self._stamp_times()
+
+
+def test_the_press_hold_probe_adopts_the_shortest_hold_with_a_margin_step() -> None:
+    """All candidates land on a forgiving sign, so the job's dabs run at the
+    second-shortest hold - one proven step above the shortest clean one."""
+
+    controller = TimedMockController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._PRESS_HOLD_PROBE_MIN_STROKES = 0  # type: ignore[misc]
+    painter._PRESS_HOLD_PROBE_DOTS = 12  # type: ignore[misc]
+    painter._PRESS_HOLD_PROBE_CANDIDATES = (0.03, 0.02, 0.012)  # type: ignore[misc]
+    plan = PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup((40, 80, 160), (Stroke(10, 10, 30, 10), Stroke(0, 0, 0, 0)), 1),
+            ColorGroup((200, 40, 40), (Stroke(64, 40, 64, 40), Stroke(127, 63, 127, 63)), 1),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_press_hold_seconds == pytest.approx(0.02)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, 10) for x in range(10, 31)} | {(0, 0), (64, 40), (127, 63)}
+    assert set(sign.painted) == expected
+
+
+def test_a_sign_that_drops_quick_presses_keeps_a_proven_longer_hold() -> None:
+    """The descent stops at the first dropped dot: the adopted hold is the
+    shortest clean one with a clean step below it, and painting stays exact."""
+
+    controller = TimedMockController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        min_dab_hold=0.055,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._PRESS_HOLD_PROBE_MIN_STROKES = 0  # type: ignore[misc]
+    painter._PRESS_HOLD_PROBE_DOTS = 12  # type: ignore[misc]
+    # 30 ms cannot reach the sign's 55 ms threshold even with scheduler
+    # slack; the two above it always land, because sleeps never undershoot.
+    # 80 ms is clean but its step below dropped dots, so it carries no
+    # margin: the probe settles on 100 ms, whose step below proved clean.
+    painter._PRESS_HOLD_PROBE_CANDIDATES = (0.10, 0.08, 0.03)  # type: ignore[misc]
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(10, 10, 30, 10), Stroke(64, 40, 64, 40)), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_press_hold_seconds == pytest.approx(0.10)
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    expected = {(x, 10) for x in range(10, 31)} | {(64, 40)}
+    assert set(sign.painted) == expected
+
+
+def test_the_press_hold_switch_keeps_the_floor_without_probing() -> None:
+    controller = TimedMockController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._PRESS_HOLD_PROBE_MIN_STROKES = 0  # type: ignore[misc]
+    plan = PaintPlan(
+        128,
+        64,
+        (ColorGroup((40, 80, 160), (Stroke(0, 0, 0, 0),), 1),),
+    )
+
+    assert painter.start(plan, profile, _settings(measure_press_hold=False))
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    assert painter.measured_press_hold_seconds is None
+
+    sign.capture(profile.canvas)  # replay to the end of the job
+    assert set(sign.painted) == {(0, 0)}

@@ -97,6 +97,25 @@ SHIFT_LINE_MIN_TEXELS = 32.0
 # can be sampled as absent and the line becomes a lone dab.
 SHIFT_LINE_MODIFIER_LEAD_SECONDS = 0.05
 
+# The press hold IS the painting phase on a detailed sign: tens of thousands
+# of dabs, each held for the 70 ms frame floor.  Yet 7,473 presses at holds
+# from 8 ms to 160 ms landed every single one (measured live on the largest
+# sign), so the floor is caution left over from the 15 FPS theory, not
+# physics.  The painter proves per sign whether the caution is needed: one
+# batch of dots per candidate hold, longest first, each batch captured and
+# counted, stopping at the first batch that dropped a dot.  The hold adopted
+# is the shortest clean one whose next-shorter neighbour ALSO landed
+# everything - a step of demonstrated margin - and it applies to stationary
+# presses only: dabs and the line tool's clicks.  Drag dwells keep the full
+# floor, because dropped short drags were a real live failure (708 bare
+# cells in one overnight run) and the measurement above covered presses that
+# never moved.
+PRESS_HOLD_PROBE_CANDIDATES = (0.040, 0.030, 0.024, 0.018)
+PRESS_HOLD_PROBE_DOTS = 24
+# Below this many strokes the probe's captures cost more than its shorter
+# holds could save.
+PRESS_HOLD_PROBE_MIN_STROKES = 200
+
 # Which timing settings have a floor, and what it is.  Every value is read
 # through :func:`floored` at its point of use under real input, so a preset
 # or a typed value below its floor is lifted - the painter logs once per
@@ -260,6 +279,10 @@ class StrokeTiming:
     overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS
     # Mock and dry-run input skips the frame holds entirely.
     real_input: bool = True
+    # The press hold this sign's probe proved for stationary presses, when
+    # one was measured and is shorter than the configured hold.  Prices dabs
+    # and the line tool's presses; drag dwells keep the configured floor.
+    dab_press_seconds: float | None = None
 
     @classmethod
     def from_settings(
@@ -268,6 +291,7 @@ class StrokeTiming:
         *,
         overhead_seconds: float = DEFAULT_STROKE_OVERHEAD_SECONDS,
         real_input: bool = True,
+        dab_press_seconds: float | None = None,
     ) -> "StrokeTiming":
         return cls(
             stroke_speed_pixels_per_second=settings.stroke_speed_pixels_per_second,
@@ -282,6 +306,7 @@ class StrokeTiming:
             stroke_interpolation_step_pixels=settings.stroke_interpolation_step_pixels,
             overhead_seconds=overhead_seconds,
             real_input=real_input,
+            dab_press_seconds=dab_press_seconds,
         )
 
     def _held(self, seconds: float, floor: float) -> float:
@@ -305,12 +330,14 @@ class StrokeTiming:
         """
 
         gap_floor = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
+        stationary = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
+        if self.dab_press_seconds is not None and self.real_input:
+            stationary = min(stationary, self.dab_press_seconds)
         if line_tool and screen_length_pixels > 0:
-            press = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
             lead = SHIFT_LINE_MODIFIER_LEAD_SECONDS if self.real_input else 0.0
-            return 2 * press + 2 * lead + 2 * gap_floor + 2 * self.overhead_seconds
+            return 2 * stationary + 2 * lead + 2 * gap_floor + 2 * self.overhead_seconds
         if screen_length_pixels <= 0:
-            press = self._held(self.mouse_down_duration_seconds, MIN_PRESS_SECONDS)
+            press = stationary
         else:
             pace = stroke_pace(
                 screen_length_pixels,

@@ -461,3 +461,31 @@ def test_work_schedule_prices_long_straight_runs_as_lines_only_when_proven() -> 
     assert as_lines.stroke_cost(0, 1) == pytest.approx(as_drags.stroke_cost(0, 1))
     assert as_lines.stroke_cost(0, 2) == pytest.approx(as_drags.stroke_cost(0, 2))
     assert as_lines.total < as_drags.total
+
+
+def test_a_measured_dab_press_prices_dabs_and_lines_but_never_drags() -> None:
+    """The probe's hold replaces the frame floor for stationary presses only."""
+
+    settings = PainterSettings()
+    plain = StrokeTiming.from_settings(settings)
+    measured = StrokeTiming.from_settings(settings, dab_press_seconds=0.024)
+    pitch = 1.77
+
+    saved = max(0.07, MIN_PRESS_SECONDS) - 0.024
+    assert plain.stroke_seconds(0.0, pitch) - measured.stroke_seconds(
+        0.0, pitch
+    ) == pytest.approx(saved)
+    long_run = 500 * pitch
+    assert plain.stroke_seconds(
+        long_run, pitch, line_tool=True
+    ) - measured.stroke_seconds(long_run, pitch, line_tool=True) == pytest.approx(
+        2 * saved
+    )
+    # A drag's dwell is not covered by the measurement and keeps its floor.
+    assert measured.stroke_seconds(long_run, pitch) == pytest.approx(
+        plain.stroke_seconds(long_run, pitch)
+    )
+    # Mock input has no frames to miss and no measured hold to honor.
+    fake = StrokeTiming.from_settings(settings, real_input=False, dab_press_seconds=0.024)
+    bare = StrokeTiming.from_settings(settings, real_input=False)
+    assert fake.stroke_seconds(0.0, pitch) == pytest.approx(bare.stroke_seconds(0.0, pitch))

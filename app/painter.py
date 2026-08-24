@@ -45,6 +45,9 @@ from .paint_timing import (
     LONG_DRAG_MAX_TEXELS_PER_SECOND,
     MIN_PRESS_SECONDS,
     PICKER_CLICK_HOLD_SECONDS,
+    PRESS_HOLD_PROBE_CANDIDATES,
+    PRESS_HOLD_PROBE_DOTS,
+    PRESS_HOLD_PROBE_MIN_STROKES,
     SETTLE_FLOOR_SECONDS,
     SHIFT_LINE_MIN_TEXELS,
     SHIFT_LINE_MODIFIER_LEAD_SECONDS,
@@ -65,6 +68,7 @@ from .texel_grid import (
     TexelGridModel,
     audit_cursor_map,
     find_quad_edges,
+    locate_stamps,
     measure_grid,
     stamp_diff,
 )
@@ -113,6 +117,53 @@ def _high_resolution_timer() -> Iterator[None]:
                 ctypes.WinDLL("winmm").timeEndPeriod(1)
             except (AttributeError, OSError):
                 LOGGER.warning("Could not restore the Windows timer resolution")
+
+
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+
+
+@contextlib.contextmanager
+def _above_normal_priority() -> Iterator[None]:
+    """Run the process a notch above normal while painting.
+
+    A stroke is a chain of tightly timed sleeps and SendInput calls; when the
+    game, a capture, and a background task all want the CPU, the scheduler
+    can hold this process past a frame and turn a short press into a missed
+    one.  One priority notch keeps the input thread on schedule without
+    starving the game the way a realtime class would.  The previous class is
+    restored on the way out, and any failure leaves the priority alone.
+    """
+
+    previous: int | None = None
+    kernel32 = None
+    handle = None
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # The pseudo-handle is (HANDLE)-1; without prototypes ctypes
+            # truncates it through a 32-bit int and every call fails quietly.
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.GetPriorityClass.argtypes = (ctypes.c_void_p,)
+            kernel32.GetPriorityClass.restype = ctypes.c_uint32
+            kernel32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+            kernel32.SetPriorityClass.restype = ctypes.c_int
+            handle = kernel32.GetCurrentProcess()
+            previous = int(kernel32.GetPriorityClass(handle)) or None
+            if previous is not None and previous != ABOVE_NORMAL_PRIORITY_CLASS:
+                if kernel32.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS) == 0:
+                    previous = None
+            else:
+                previous = None
+        except (AttributeError, OSError):
+            previous = None
+    try:
+        yield
+    finally:
+        if previous is not None and kernel32 is not None:
+            try:
+                kernel32.SetPriorityClass(handle, previous)
+            except (AttributeError, OSError):
+                LOGGER.warning("Could not restore the process priority class")
 
 
 class PainterState(str, Enum):
@@ -225,6 +276,11 @@ class PainterSettings:
     # ever used after a probe stroke proves the mechanic on this sign; a sign
     # that fails the probe paints with drags exactly as before.
     use_line_tool: bool = True
+    # Measure, on this sign, the shortest press hold that lands every dab
+    # (batches of dots at descending holds, read back from captures), and
+    # paint the job's dabs and line presses at it.  A sign that drops any
+    # probe dot keeps the 70 ms frame floor; drag dwells always keep it.
+    measure_press_hold: bool = True
     # After painting, capture the canvas and repaint decisively wrong cells,
     # up to this many correction passes. Zero disables verification.
     verify_passes: int = 2
@@ -276,6 +332,7 @@ class PainterSettings:
         "stroke_interpolation_step_pixels",
         "delay_after_brush_seconds",
         "use_line_tool",
+        "measure_press_hold",
         "verify_passes",
         "confirm_strokes",
         "confirm_max_rounds",
@@ -390,6 +447,7 @@ class PainterSettings:
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             use_line_tool=bool(pick(painting, "use_line_tool", True)),
+            measure_press_hold=bool(pick(painting, "measure_press_hold", True)),
             verify_passes=int(pick(painting, "verify_passes", 2)),
             confirm_strokes=bool(pick(painting, "confirm_strokes", False)),
             confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
@@ -648,6 +706,9 @@ class Painter:
         self._mouse_drift_started = 0.0
         self._measured_brush_size_model: BrushSizeModel | None = None
         self._measured_texel_grid: TexelGridModel | None = None
+        # The press hold this job's probe proved on its sign, or None while
+        # unmeasured; applies to stationary presses only.
+        self._measured_press_hold_seconds: float | None = None
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -807,6 +868,7 @@ class Painter:
             ):
                 raise RuntimeError("Cannot replace a paint job while one is active")
             self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
+            self._measured_press_hold_seconds = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -876,6 +938,7 @@ class Painter:
             )
             self._measured_brush_size_model = None
             self._measured_texel_grid = None
+            self._measured_press_hold_seconds = None
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -906,6 +969,13 @@ class Painter:
 
         with self._condition:
             return self._color_pick_summary
+
+    @property
+    def measured_press_hold_seconds(self) -> float | None:
+        """The press hold this job's probe proved on its sign, if any."""
+
+        with self._condition:
+            return self._measured_press_hold_seconds
 
     @property
     def measured_texel_grid(self) -> TexelGridModel | None:
@@ -1275,7 +1345,7 @@ class Painter:
 
     def _run(self) -> None:
         if getattr(self.input, "emits_real_input", True):
-            with _high_resolution_timer():
+            with _high_resolution_timer(), _above_normal_priority():
                 self._run_job()
         else:
             self._run_job()
@@ -1902,6 +1972,7 @@ class Painter:
                             stored.columns,
                             stored.rows,
                         )
+                self._probe_press_hold(job)
                 job.line_tool_ok = self._probe_line_tool(job)
                 self._clear_canvas(job)
                 break
@@ -2462,6 +2533,146 @@ class Painter:
     # changed.  The same floor the grid probe reads its stamps with.
     _LINE_PROBE_DIFF_FLOOR = 24.0
 
+    # Probe knobs as class attributes so a test driving a simulated sign can
+    # scale them to its size and clock.
+    _PRESS_HOLD_PROBE_CANDIDATES = PRESS_HOLD_PROBE_CANDIDATES
+    _PRESS_HOLD_PROBE_DOTS = PRESS_HOLD_PROBE_DOTS
+    _PRESS_HOLD_PROBE_MIN_STROKES = PRESS_HOLD_PROBE_MIN_STROKES
+
+    def _probe_press_hold(self, job: _Job) -> None:
+        """Measure the shortest press hold that lands every dab on this sign.
+
+        One batch of dots per candidate hold, longest hold first, each batch
+        captured and counted; the first batch that drops a dot ends the
+        descent.  The hold adopted for this job's stationary presses is the
+        shortest clean one whose next-shorter neighbour also landed
+        everything - one step of demonstrated margin - and never longer than
+        the configured hold.  A sign that gives no two clean steps keeps the
+        frame floor, exactly as before; the per-color checks and the
+        touch-up pass stay underneath either way.  The dots are wiped with
+        the other calibration marks before the artwork starts.
+        """
+
+        settings = job.settings
+        grid = job.texel_grid
+        if not settings.measure_press_hold or grid is None or job.mode != "paint":
+            return
+        total = sum(len(group.strokes) for group in job.plan.color_groups)
+        if total < self._PRESS_HOLD_PROBE_MIN_STROKES:
+            LOGGER.info(
+                "The plan's %d strokes are too few for the press-hold probe "
+                "to pay for its captures; keeping the frame floor",
+                total,
+            )
+            return
+        dots = max(4, int(self._PRESS_HOLD_PROBE_DOTS))
+        if grid.columns < dots or grid.rows < 16:
+            return
+        target = job.target
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Measuring the press hold this sign needs",
+            phase="calibrate",
+        )
+        self._measured_press_hold_seconds = None
+        # Wide enough to catch a dot that snapped a texel away, narrow enough
+        # that the batch's neighbouring dots stay out of each other's windows.
+        window = max(4.0, 2.0 * max(grid.pitch_x, grid.pitch_y))
+
+        def batch_texels(batch: int) -> list[tuple[int, int]]:
+            # Dots spread across the columns, on rows staggered per batch so
+            # no batch stamps where an earlier one did.
+            span = grid.columns - 8
+            return [
+                (
+                    4 + round(index * (span - 1) / (dots - 1)),
+                    4 + ((index * 37 + batch * 17) % max(1, grid.rows - 8)),
+                )
+                for index in range(dots)
+            ]
+
+        clean: list[float] = []
+        last_color: RGBColor | None = None
+        try:
+            epoch = self._pause_generation_value()
+            before = self._capture_parked(canvas, park, epoch)
+            for batch, hold in enumerate(self._PRESS_HOLD_PROBE_CANDIDATES):
+                epoch = self._pause_generation_value()
+                texels = batch_texels(batch)
+                expected = [
+                    (
+                        grid.origin_x + (u + 0.5) * grid.pitch_x - canvas.left,
+                        grid.origin_y + (v + 0.5) * grid.pitch_y - canvas.top,
+                    )
+                    for u, v in texels
+                ]
+                color = self._probe_color_against(before, expected, skip=last_color)
+                last_color = color
+                self._select_color(color, target, settings, epoch, apply_correction=False)
+                for u, v in texels:
+                    x, y = grid.cursor_point(u + 0.5, v + 0.5)
+                    point = (math.floor(x + 0.5), math.floor(y + 0.5))
+                    point = (
+                        min(max(point[0], canvas.left), canvas.left + canvas.width - 1),
+                        min(max(point[1], canvas.top), canvas.top + canvas.height - 1),
+                    )
+                    self._screen_stroke(point, point, settings, epoch, hold_seconds=hold)
+                    self._interruptible_sleep(
+                        self._stroke_gap(settings.delay_between_strokes_seconds),
+                        epoch=epoch,
+                        check_focus=True,
+                    )
+                after = self._capture_parked(canvas, park, epoch)
+                landed = locate_stamps(stamp_diff(before, after), expected, window)
+                before = after
+                missed = sum(1 for centre in landed if centre is None)
+                LOGGER.info(
+                    "Press-hold probe: %d of %d dots landed at %d ms",
+                    dots - missed,
+                    dots,
+                    int(round(hold * 1000)),
+                )
+                if missed:
+                    break
+                clean.append(hold)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The press-hold probe could not run (%s); keeping the frame floor",
+                exc,
+            )
+            return
+        floor_ms = int(round(self._drag_dwell_seconds(settings) * 1000))
+        if len(clean) < 2:
+            LOGGER.info(
+                "Press-hold probe kept the %d ms hold: %s",
+                floor_ms,
+                "no candidate landed cleanly"
+                if not clean
+                else "only one candidate landed cleanly, which is no margin",
+            )
+            return
+        adopted = clean[-2]
+        self._measured_press_hold_seconds = float(adopted)
+        LOGGER.info(
+            "Adopting a %d ms press hold for this sign's dabs and line presses "
+            "(%d ms proved clean below it; drags keep their %d ms dwell)",
+            int(round(adopted * 1000)),
+            int(round(clean[-1] * 1000)),
+            floor_ms,
+        )
+
     def _probe_line_tool(self, job: _Job) -> bool:
         """Prove the Shift-click line tool on this sign with one stroke.
 
@@ -2683,10 +2894,14 @@ class Painter:
         return replace(target, **measured) if measured else target
 
     def _stroke_timing(self, settings: PainterSettings) -> StrokeTiming:
+        measured = (
+            self._measured_press_hold_seconds if settings.measure_press_hold else None
+        )
         return StrokeTiming.from_settings(
             settings,
             overhead_seconds=self._stroke_overhead_seconds,
             real_input=bool(getattr(self.input, "emits_real_input", True)),
+            dab_press_seconds=measured,
         )
 
     def _work_schedule(
@@ -3111,7 +3326,26 @@ class Painter:
     # ------------------------------------------- checking colors as they land
 
     def _press_hold_seconds(self, settings: PainterSettings) -> float:
-        """How long every press is held: the set hold, lifted to the floor."""
+        """How long a stationary press is held.
+
+        The set hold lifted to the frame floor - or, when this sign's probe
+        proved a shorter one lands every dot, that measured hold.  Only
+        stationary presses (dabs, the line tool's clicks) take the measured
+        value; drag dwells use :meth:`_drag_dwell_seconds`, because the
+        measurement covers presses that never moved while dropped short
+        drags were a real live failure the dwell exists to prevent.
+        """
+
+        hold = settings.mouse_down_duration_seconds
+        if self.input.emits_real_input:
+            hold = max(hold, self._MIN_PRESS_SECONDS)
+        measured = self._measured_press_hold_seconds
+        if measured is not None and settings.measure_press_hold:
+            hold = min(hold, measured)
+        return hold
+
+    def _drag_dwell_seconds(self, settings: PainterSettings) -> float:
+        """The frame a drag dwells at its far end: never below the floor."""
 
         hold = settings.mouse_down_duration_seconds
         if self.input.emits_real_input:
@@ -4308,6 +4542,7 @@ class Painter:
         *,
         texel_pitch: float | None = None,
         line_tool: bool = False,
+        hold_seconds: float | None = None,
     ) -> None:
         """Drag between two physical points, or dab when they are the same.
 
@@ -4345,7 +4580,11 @@ class Painter:
                 # pass then has to buy back with a whole extra
                 # capture-and-repaint round.
                 self._interruptible_sleep(
-                    self._press_hold_seconds(settings), epoch=epoch, check_focus=True
+                    hold_seconds
+                    if hold_seconds is not None
+                    else self._press_hold_seconds(settings),
+                    epoch=epoch,
+                    check_focus=True,
                 )
                 return
             pace = stroke_pace(
@@ -4391,7 +4630,7 @@ class Painter:
             # only between two samples the game may never take together.
             if self.input.emits_real_input:
                 elapsed = time.monotonic() - pressed_at
-                hold = self._press_hold_seconds(settings)
+                hold = self._drag_dwell_seconds(settings)
                 if pace.move_seconds >= hold:
                     remaining = hold
                 else:

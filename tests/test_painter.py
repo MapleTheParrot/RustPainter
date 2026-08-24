@@ -2982,3 +2982,29 @@ def test_picks_are_not_read_back_when_turned_off() -> None:
     assert painter.wait(_t(60.0))
     assert painter.state is PainterState.COMPLETED
     assert painter.color_pick_summary.skipped_reason == "turned off"
+
+
+def test_above_normal_priority_context_restores_the_previous_class() -> None:
+    """Painting runs one notch above normal and puts the class back after."""
+
+    import os
+
+    from app.painter import ABOVE_NORMAL_PRIORITY_CLASS, _above_normal_priority
+
+    if os.name != "nt":
+        with _above_normal_priority():
+            pass
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetPriorityClass.argtypes = (ctypes.c_void_p,)
+    kernel32.GetPriorityClass.restype = ctypes.c_uint32
+    handle = kernel32.GetCurrentProcess()
+    before = int(kernel32.GetPriorityClass(handle))
+    assert before != 0
+    with _above_normal_priority():
+        inside = int(kernel32.GetPriorityClass(handle))
+        assert inside == ABOVE_NORMAL_PRIORITY_CLASS
+    assert int(kernel32.GetPriorityClass(handle)) == before
