@@ -57,7 +57,8 @@ def _panic(painter: Painter, stop: threading.Event) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--timeout", type=float, default=1800.0)
+    # Probe + aim audit + paint + verification: half an hour was mid-touch-up.
+    parser.add_argument("--timeout", type=float, default=3600.0)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
