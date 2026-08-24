@@ -271,10 +271,10 @@ class PainterSettings:
     # escape hatch rather than a feature switch.
     measure_texel_grid: bool = True
     # Draw straight runs of :data:`SHIFT_LINE_MIN_TEXELS` texels or more with
-    # Rust's Shift-click line tool: an anchor press, then a click with Shift
-    # held, and the game itself draws the straight stroke between them.  Only
-    # ever used after a probe stroke proves the mechanic on this sign; a sign
-    # that fails the probe paints with drags exactly as before.
+    # Rust's line tool: Shift held through a drag, and on release the game
+    # itself fills the straight stroke between the press and the release.
+    # Only ever used after a probe stroke proves the mechanic on this sign; a
+    # sign that fails the probe paints with drags exactly as before.
     use_line_tool: bool = True
     # Measure, on this sign, the shortest press hold that lands every dab
     # (batches of dots at descending holds, read back from captures), and
@@ -2674,16 +2674,17 @@ class Painter:
         )
 
     def _probe_line_tool(self, job: _Job) -> bool:
-        """Prove the Shift-click line tool on this sign with one stroke.
+        """Prove the Shift line tool on this sign with one stroke.
 
-        An anchor press a quarter of the way along the middle row, a
-        Shift-click three quarters along it, and a capture: if the game drew
-        the straight stroke between them, the texels along the span read as
-        changed and every long straight run in the plan may go down the same
-        way - two presses instead of a rate-capped drag, with the game
+        A press a quarter of the way along the middle row and a release
+        three quarters along it, Shift held throughout with one cursor jump
+        between, then a capture: if the game filled the straight stroke
+        between them, the texels along the span read as changed and every
+        long straight run in the plan may go down the same way - a press, a
+        jump and a release instead of a rate-capped drag, with the game
         itself filling the texels between, beyond the reach of the per-dab
         cursor quantization a DPI-scaled display adds.  Anything less - the
-        mechanic missing, the click swallowed, the line landing somewhere
+        mechanic missing, the modifier not seen, the line landing somewhere
         unexpected - leaves the tool unproven and every stroke a drag, which
         is the path measured over thousands of live strokes.  The probe line
         is wiped with the other calibration marks before the artwork starts.
@@ -4551,8 +4552,8 @@ class Painter:
         capped to a rate and an event spacing the game paints faithfully
         (:func:`app.paint_timing.stroke_pace`).  With ``line_tool`` (probed
         on this sign, straight stroke) a run of
-        :data:`SHIFT_LINE_MIN_TEXELS` texels or more is not dragged at all:
-        the game draws it from an anchor press to a Shift-click.
+        :data:`SHIFT_LINE_MIN_TEXELS` texels or more is not dragged along:
+        the game fills it between a press and a release made with Shift held.
         """
 
         if (
@@ -4647,19 +4648,20 @@ class Painter:
         settings: PainterSettings,
         epoch: int,
     ) -> None:
-        """Anchor a press at ``start_int``, then Shift-click ``end_int``.
+        """Draw a straight stroke with Rust's line tool: Shift held through a drag.
 
-        The game draws the straight stroke between the two itself, in its
-        own texture space - the texels on the way are its to fill, so the
-        cursor never has to visit them and the per-dab quantization of a
-        DPI-scaled display cannot pull any of them sideways.  Each press is
-        held across a paint-UI frame exactly like a dab, and the gap between
-        the two lets the game see the anchor end before the line click
-        begins; Shift goes down a moment before the click and comes up a
-        moment after it, so no frame can sample the click without the
-        modifier.  Every exit - a pause, an abort, an input failure -
-        releases Shift, because a modifier left down would turn the next
-        stroke's press into a line from here.
+        With Shift down, the game does not paint the cursor's path; it takes
+        the press as one end and the release as the other and fills the
+        straight run between them itself, in its own texture space.  So the
+        cursor goes to the start, Shift goes down, the button goes down and
+        is held a frame so the game registers where the stroke begins, the
+        cursor jumps straight to the end and is held there a frame so the
+        game sees it pressed at the far end, and the release draws the line.
+        Shift stays down a moment past the release, since the fill happens
+        on release and a frame that saw the release without the modifier
+        would paint nothing but two dabs.  Every exit - a pause, an abort,
+        an input failure - releases the button and Shift, because a
+        modifier left down would turn the next stroke's drag into a line.
         """
 
         hold = self._press_hold_seconds(settings)
@@ -4671,24 +4673,15 @@ class Painter:
         self._checkpoint(epoch=epoch, check_focus=True)
         self._move(start_int, epoch)
         self._checkpoint(epoch=epoch, check_focus=True)
-        self._mouse_down(epoch)
-        try:
-            self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
-        finally:
-            self.input.mouse_up(MouseButton.LEFT)
-        self._interruptible_sleep(
-            self._stroke_gap(settings.delay_between_strokes_seconds),
-            epoch=epoch,
-            check_focus=True,
-        )
-        self._checkpoint(epoch=epoch, check_focus=True)
-        self._move(end_int, epoch)
         self.input.key_down(self._LINE_TOOL_KEY)
         try:
             if lead:
                 self._interruptible_sleep(lead, epoch=epoch, check_focus=True)
             self._mouse_down(epoch)
             try:
+                self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
+                self._checkpoint(epoch=epoch, check_focus=True)
+                self._move(end_int, epoch)
                 self._interruptible_sleep(hold, epoch=epoch, check_focus=True)
             finally:
                 self.input.mouse_up(MouseButton.LEFT)
@@ -4746,9 +4739,9 @@ class Painter:
     _LONG_DRAG_MAX_TEXELS_PER_SECOND = LONG_DRAG_MAX_TEXELS_PER_SECOND
     _LONG_DRAG_MAX_STEP_TEXELS = LONG_DRAG_MAX_STEP_TEXELS
 
-    # The Shift-click line tool: the key held around the line's click, how
-    # long a straight run must be before two presses beat a capped drag, and
-    # the lead/trail that keeps the modifier and the click in one frame.
+    # The Shift line tool: the key held through the line's drag, how long a
+    # straight run must be before a press-jump-release beats a capped drag,
+    # and the lead/trail that keeps the modifier around the press and release.
     _LINE_TOOL_KEY = "SHIFT"
     _SHIFT_LINE_MIN_TEXELS = SHIFT_LINE_MIN_TEXELS
     _SHIFT_LINE_MODIFIER_LEAD_SECONDS = SHIFT_LINE_MODIFIER_LEAD_SECONDS

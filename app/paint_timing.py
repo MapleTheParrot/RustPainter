@@ -80,21 +80,23 @@ SHORT_RUN_TEXELS = 3.0
 LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0
 LONG_DRAG_MAX_STEP_TEXELS = 1.0
 
-# Rust's paint UI draws a straight stroke from the last press to a click made
-# with Shift held - the line tool.  A run that long stops being a capped drag
-# and becomes two held presses, so a full row on an XXL sign goes down in a
-# quarter of a second instead of two, and the game itself fills the texels
-# between the endpoints, out of reach of the cursor quantization that shifts
-# individual dabs on a DPI-scaled display.  The painter only ever uses it
-# after proving it on this sign with a probe stroke, since the mechanic is
-# the game's and could change under us.  Runs shorter than this many texels
-# keep the glide: below it the drag is about as fast, and the drag is the
-# proven path.
+# Rust's paint UI has a line tool: with Shift held through a drag, the game
+# fills the straight stroke between the press and the release itself, in its
+# own texture space.  A run that long stops being a capped drag and becomes
+# a press, one cursor jump and a release, so a full row on an XXL sign goes
+# down in a quarter of a second instead of two, and the texels between the
+# endpoints are the game's to fill, out of reach of the cursor quantization
+# that shifts individual dabs on a DPI-scaled display.  The painter only
+# ever uses it after proving it on this sign with a probe stroke, since the
+# mechanic is the game's and could change under us.  Runs shorter than this
+# many texels keep the glide: below it the drag is about as fast, and the
+# drag is the proven path.
 SHIFT_LINE_MIN_TEXELS = 32.0
-# The Shift key goes down this long before the line's click and stays down
-# this long after it.  The game reads the keyboard and the mouse per frame;
-# a modifier that arrives in the same slice as the click, or leaves in it,
-# can be sampled as absent and the line becomes a lone dab.
+# The Shift key goes down this long before the line's press and stays down
+# this long after its release.  The game reads the keyboard and the mouse
+# per frame; a modifier that arrives in the same slice as the press, or
+# leaves in the slice of the release, can be sampled as absent and the line
+# becomes a drag the cursor never travelled - two dabs.
 SHIFT_LINE_MODIFIER_LEAD_SECONDS = 0.05
 
 # The press hold IS the painting phase on a detailed sign: tens of thousands
@@ -324,9 +326,9 @@ class StrokeTiming:
         ``texel_pitch_pixels`` is what the painter paces long drags by; the
         estimate uses the same rule so a plan of long sweeps is not promised
         at a speed the drags are never driven at.  ``line_tool`` prices the
-        stroke as the Shift-click line the painter will draw it with: an
-        anchor press, the gap the game needs to see it end, and the held
-        Shift-click - a flat cost however long the run is.
+        stroke as the Shift line the painter will draw it with: a press held
+        a frame, one jump, a frame held at the far end, and the modifier's
+        lead and trail - a flat cost however long the run is.
         """
 
         gap_floor = self._held(self.delay_between_strokes_seconds, STROKE_GAP_FLOOR_SECONDS)
@@ -335,7 +337,7 @@ class StrokeTiming:
             stationary = min(stationary, self.dab_press_seconds)
         if line_tool and screen_length_pixels > 0:
             lead = SHIFT_LINE_MODIFIER_LEAD_SECONDS if self.real_input else 0.0
-            return 2 * stationary + 2 * lead + 2 * gap_floor + 2 * self.overhead_seconds
+            return 2 * stationary + 2 * lead + gap_floor + 2 * self.overhead_seconds
         if screen_length_pixels <= 0:
             press = stationary
         else:

@@ -57,8 +57,11 @@ class ReplayingTexelSign(SimulatedSign):
     color, and while the button is held every move paints the texels along
     its path - which is what the game does, and what turns a run of cells
     into a line.  With ``shift_lines`` the sign also has the game's line
-    tool: a click made while Shift is held paints a straight run of texels
-    from the previous press to the click, the way Rust draws it.
+    tool: while Shift is held the drag's path is not painted, and the
+    release fills a straight run of texels from the press to the release,
+    the way Rust draws it.  A cursor jump wider than ``max_drag_step_px``
+    while pressed paints only where the cursor arrives, as the game does
+    when it never samples the positions in between.
     """
 
     PALETTE = ((200, 30, 160), (30, 200, 60), (40, 90, 230), (240, 180, 20), (20, 20, 20))
@@ -70,6 +73,7 @@ class ReplayingTexelSign(SimulatedSign):
         *,
         shift_lines: bool = False,
         min_dab_hold: float = 0.0,
+        max_drag_step_px: float = 8.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -79,6 +83,7 @@ class ReplayingTexelSign(SimulatedSign):
         self.base = self.texture.copy()
         self.shift_lines = shift_lines
         self.shift_lines_drawn = 0
+        self.max_drag_step_px = max_drag_step_px
         # A press-and-release quicker than this paints nothing, like a game
         # frame that never sampled the button down.  Needs a controller that
         # records event times (TimedMockController); zero keeps every dab.
@@ -137,6 +142,7 @@ class ReplayingTexelSign(SimulatedSign):
                 self._stamp_texel(pending[0], pending[1], pending[2], pending[3])
                 pending = None
 
+        line_from: tuple[int, int] | None = None
         for index, event in enumerate(self.controller.events):
             if event.kind == "move" and event.x is not None and event.y is not None:
                 new_position = (event.x, event.y)
@@ -144,15 +150,25 @@ class ReplayingTexelSign(SimulatedSign):
                     # The cursor moved while pressed: this is a drag, whose
                     # press paints however short it was.
                     flush_pending()
-                    steps = max(1, int(math.hypot(new_position[0] - position[0], new_position[1] - position[1])))
-                    for step in range(1, steps + 1):
-                        t = step / steps
-                        self._stamp(
-                            position[0] + (new_position[0] - position[0]) * t,
-                            position[1] + (new_position[1] - position[1]) * t,
-                            size,
-                            color,
-                        )
+                    if self.shift_lines and shift_down and line_from is not None:
+                        pass  # the line tool paints nothing until the release
+                    else:
+                        travel = math.hypot(new_position[0] - position[0], new_position[1] - position[1])
+                        if travel > self.max_drag_step_px:
+                            # Too far for one frame: the game never saw the
+                            # positions between, only where the cursor arrived.
+                            if self._on_texture(*new_position):
+                                self._stamp(new_position[0], new_position[1], size, color)
+                        else:
+                            steps = max(1, int(travel))
+                            for step in range(1, steps + 1):
+                                t = step / steps
+                                self._stamp(
+                                    position[0] + (new_position[0] - position[0]) * t,
+                                    position[1] + (new_position[1] - position[1]) * t,
+                                    size,
+                                    color,
+                                )
                 position = new_position
             elif event.kind == "key_down":
                 value = event.value
@@ -182,20 +198,11 @@ class ReplayingTexelSign(SimulatedSign):
                     color = self.PALETTE[color_index % len(self.PALETTE)]
                 elif self._on_texture(*position):
                     landed = self._texel_at(position[0], position[1])
-                    if self.shift_lines and shift_down and anchor is not None:
-                        # The game draws the straight run itself, texel to
-                        # texel from the last press, however far the cursor
-                        # jumped.
-                        steps = max(abs(landed[0] - anchor[0]), abs(landed[1] - anchor[1]), 1)
-                        for step in range(steps + 1):
-                            t = step / steps
-                            self._stamp_texel(
-                                round(anchor[0] + (landed[0] - anchor[0]) * t),
-                                round(anchor[1] + (landed[1] - anchor[1]) * t),
-                                size,
-                                color,
-                            )
-                        self.shift_lines_drawn += 1
+                    if self.shift_lines and shift_down:
+                        # The line tool: the press marks one end and paints
+                        # it; the release will fill the straight run.
+                        self._stamp(position[0], position[1], size, color)
+                        line_from = landed
                     elif (
                         self.min_dab_hold > 0.0
                         and times is not None
@@ -208,6 +215,23 @@ class ReplayingTexelSign(SimulatedSign):
                     anchor = landed
             elif event.kind == "mouse_up":
                 down = False
+                if line_from is not None:
+                    if self.shift_lines and shift_down and self._on_texture(*position):
+                        # The game draws the straight run itself, texel to
+                        # texel from the press to the release, however far
+                        # the cursor jumped.
+                        landed = self._texel_at(position[0], position[1])
+                        steps = max(abs(landed[0] - line_from[0]), abs(landed[1] - line_from[1]), 1)
+                        for step in range(steps + 1):
+                            t = step / steps
+                            self._stamp_texel(
+                                round(line_from[0] + (landed[0] - line_from[0]) * t),
+                                round(line_from[1] + (landed[1] - line_from[1]) * t),
+                                size,
+                                color,
+                            )
+                        self.shift_lines_drawn += 1
+                    line_from = None
                 if pending is not None:
                     held = (
                         times[index] - times[pending[4]]
@@ -525,9 +549,10 @@ def test_a_stored_grid_off_the_rectangle_is_not_painted_on() -> None:
     assert painter.measured_texel_grid is None
 
 
-def test_long_straight_runs_go_down_as_shift_click_lines_when_the_probe_proves_them() -> None:
+def test_long_straight_runs_go_down_as_shift_lines_when_the_probe_proves_them() -> None:
     """On a sign with the line mechanic, the probe proves it and long rows
-    become an anchor press and a Shift-click; short runs keep the glide."""
+    become a press, a jump and a release with Shift held; short runs keep
+    the glide."""
 
     controller = MockInputController()
     controller.emits_real_input = True  # type: ignore[misc]
@@ -573,8 +598,8 @@ def test_long_straight_runs_go_down_as_shift_click_lines_when_the_probe_proves_t
 
 
 def test_a_sign_without_the_line_mechanic_keeps_painting_drags() -> None:
-    """A Shift-click that paints a lone dab fails the probe, so every run is
-    dragged exactly as before and Shift is never held again."""
+    """A Shift-held jump that paints only its two ends fails the probe, so
+    every run is dragged exactly as before and Shift is never held again."""
 
     controller = MockInputController()
     controller.emits_real_input = True  # type: ignore[misc]

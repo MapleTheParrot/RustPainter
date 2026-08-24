@@ -416,7 +416,7 @@ def test_a_line_priced_stroke_is_flat_and_far_under_the_capped_drag() -> None:
     expected = (
         2 * press
         + 2 * SHIFT_LINE_MODIFIER_LEAD_SECONDS
-        + 2 * STROKE_GAP_FLOOR_SECONDS
+        + STROKE_GAP_FLOOR_SECONDS
         + 2 * timing.overhead_seconds
     )
     assert line == pytest.approx(expected)
