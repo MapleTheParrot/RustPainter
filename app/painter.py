@@ -1509,8 +1509,8 @@ class Painter:
         with self._condition:
             self._measured_texel_grid = grid
         LOGGER.info(
-            "Automatic brush sizing is off; painting on the texel grid measured "
-            "%s: %dx%d texels, %.4f x %.4f px each from %.2f, %.2f",
+            "This job stamps no probe of its own; painting on the texel grid "
+            "measured %s: %dx%d texels, %.4f x %.4f px each from %.2f, %.2f",
             grid.captured_at or "earlier",
             grid.columns,
             grid.rows,
