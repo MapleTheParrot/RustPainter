@@ -869,6 +869,10 @@ class MainWindow(QMainWindow):
         # recalculation is owed but has not been handed to a worker yet, which
         # is what keeps the statistics reading as pending rather than absent.
         self._plan_pending = False
+        # A recalculation that came due while the Source tab was in front is
+        # held here instead of run, so the busy overlay never lands on top of
+        # an edit in progress; switching to the Rust preview runs it.
+        self._plan_deferred = False
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(350)
@@ -1811,6 +1815,11 @@ class MainWindow(QMainWindow):
         self.preview_notice.hide()
         self._refresh_preview_hint()
         self._refresh_text_section_visibility()
+        if self.preview_tabs.currentIndex() == 1 and self._plan_deferred:
+            # A recalculation held back while the Source tab was being edited
+            # is owed now that its result is the tab in front.
+            self._plan_deferred = False
+            self._schedule_processing()
 
     def _refresh_text_section_visibility(self) -> None:
         """Show the text controls with the tab they edit, the Source tab."""
@@ -4130,6 +4139,7 @@ class MainWindow(QMainWindow):
         self._process_serial += 1
         self._process_timer.stop()
         self._plan_pending = False
+        self._plan_deferred = False
         self._thread_pool.clear()
         # Every cached plan belongs to the image it was made from.
         self._plan_cache.clear()
@@ -4765,6 +4775,7 @@ class MainWindow(QMainWindow):
             self._plan_cache.move_to_end(key)
             self._process_timer.stop()
             self._plan_pending = False
+            self._plan_deferred = False
             self._thread_pool.clear()
             self._set_plan_processing(False)
             self._on_processing_complete(replace(cached, serial=self._process_serial))
@@ -5000,6 +5011,18 @@ class MainWindow(QMainWindow):
     def _start_processing(self) -> None:
         if self._original_image is None:
             return
+        if (
+            self.preview_tabs.currentIndex() == 0
+            and not self._show_preview_after_processing
+        ):
+            # The Source tab is where text is edited, and the recalculation's
+            # busy overlay would cover the editing in progress.  Hold the
+            # recalculation instead; flipping to the Rust preview - the only
+            # place its result is visible - runs it then.  A freshly imported
+            # image is exempt: its first plan is what fronts the preview.
+            self._plan_deferred = True
+            return
+        self._plan_deferred = False
         serial = self._process_serial
         # The settle delay has passed, so this recalculation is the one that
         # is really going to run and is the one worth announcing.  The overlay
@@ -7175,6 +7198,11 @@ class MainWindow(QMainWindow):
         if self._countdown and self._countdown.isVisible():
             return "Waiting for the countdown to finish."
         if self._plan is None:
+            if self._plan_deferred:
+                return (
+                    "The paint plan is waiting on your edits - switch to the "
+                    "Rust preview tab to recalculate it."
+                )
             return "Load an image and wait for its paint plan to finish."
         if not profile_ready and not self.dry_run_check.isChecked():
             missing = [

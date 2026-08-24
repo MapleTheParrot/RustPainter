@@ -2436,6 +2436,41 @@ def test_typing_a_caption_waits_for_a_pause_before_replanning(
     assert window._text_layers[0].text == "HELLO"
 
 
+def test_edits_on_the_source_tab_defer_replanning_until_the_preview_is_shown(
+    window: MainWindow, tmp_path: Path, qtbot
+) -> None:
+    """A recalculation due mid-edit would drop the busy overlay on the editor.
+
+    So while the Source tab is in front it is held instead of run, however
+    long the editing takes; flipping to the Rust preview - the only place the
+    result is visible - runs the one recalculation that matters.
+    """
+
+    source_path = tmp_path / "deferred.png"
+    Image.new("RGB", (32, 16), (30, 30, 30)).save(source_path)
+    window.load_image(source_path)
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    # The first plan of an import fronts the preview itself; editing means
+    # going back to the Source tab.
+    assert window.preview_tabs.currentIndex() == 1
+    window.preview_tabs.setCurrentIndex(0)
+
+    window.text_edit.setText("HELLO")
+    window._process_timer.stop()
+    window._start_processing()
+    # The settle delay ran out mid-edit, and still nothing recalculates: the
+    # work is held, the numbers read as pending, no overlay goes up.
+    assert window._plan_deferred
+    assert window._plan_pending
+    assert window._plan is None
+    assert not window.processing_spinner.is_spinning
+
+    window.preview_tabs.setCurrentIndex(1)
+    assert not window._plan_deferred
+    qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
+    assert window._text_layers[0].text == "HELLO"
+
+
 def test_the_rust_preview_can_be_saved_as_an_image(
     window: MainWindow, tmp_path: Path, qtbot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
