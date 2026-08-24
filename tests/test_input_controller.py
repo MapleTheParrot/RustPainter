@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from app.input_controller import (
+    MockInputController,
     MouseButton,
     SendInputController,
     create_system_input_controller,
@@ -91,3 +92,46 @@ def test_create_system_input_controller_picks_platform_backend() -> None:
     else:
         with pytest.raises(OSError):
             create_system_input_controller()
+
+
+def test_a_held_modifier_key_is_tracked_and_released_with_everything_else() -> None:
+    """Shift stays down between key_down and key_up, and release_all lifts it.
+
+    The line tool holds Shift across a click; a modifier left stuck after an
+    interrupted stroke would turn every later click into a line, so the held
+    key must be part of what release_all cleans up.
+    """
+
+    controller = object.__new__(SendInputController)
+    controller._lock = threading.RLock()
+    controller._held_buttons = set()
+    controller._held_keys = []
+    controller._map_virtual_key = lambda _vk, _kind: 0x2A
+    sent: list[tuple[int, int]] = []
+    controller._send = lambda native: sent.append((native.ki.wVk, native.ki.dwFlags))
+
+    controller.key_down("SHIFT")
+    controller.key_down("SHIFT")  # already held: no second press
+    assert [vk for vk, _flags in sent] == [0x10]
+    controller.release_all()
+    keyup = 0x0002
+    assert (sent[-1][0], sent[-1][1] & keyup) == (0x10, keyup)
+    assert controller._held_keys == []
+    controller.key_up("SHIFT")  # not held: nothing to send
+    assert len(sent) == 2
+
+
+def test_mock_controller_records_held_keys_and_releases_them() -> None:
+    controller = MockInputController()
+    controller.key_down("shift")
+    controller.key_down("shift")
+    assert controller.held_keys == ("SHIFT",)
+    controller.mouse_down()
+    controller.release_all()
+    assert controller.held_keys == ()
+    assert [event.kind for event in controller.events] == [
+        "key_down",
+        "mouse_down",
+        "mouse_up",
+        "key_up",
+    ]

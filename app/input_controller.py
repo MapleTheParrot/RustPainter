@@ -74,6 +74,10 @@ class InputController(Protocol):
 
     def press_key(self, key: int | str, *, hold_seconds: float = 0.01) -> None: ...
 
+    def key_down(self, key: int | str) -> None: ...
+
+    def key_up(self, key: int | str) -> None: ...
+
     def release_all(self) -> None: ...
 
     def get_cursor_position(self) -> tuple[int, int]: ...
@@ -286,6 +290,7 @@ class SendInputController(BaseInputController):
         self._map_virtual_key.restype = wintypes.UINT
         self._lock = threading.RLock()
         self._held_buttons: set[MouseButton] = set()
+        self._held_keys: list[int] = []
 
     @property
     def held_buttons(self) -> frozenset[MouseButton]:
@@ -399,8 +404,33 @@ class SendInputController(BaseInputController):
             with self._lock:
                 self._send(key_up)
 
+    def key_down(self, key: int | str) -> None:
+        """Press ``key`` and keep it held until :meth:`key_up`.
+
+        A held modifier changes what the game makes of the clicks sent while
+        it is down - Rust's paint UI draws a straight stroke from the last
+        press to a Shift-click.  The key is tracked so :meth:`release_all`
+        can lift it if the stroke is interrupted; a modifier left stuck
+        would turn every later click into a line.
+        """
+
+        vk = virtual_key_code(key)
+        with self._lock:
+            if vk in self._held_keys:
+                return
+            self._send(self._key_input(vk, up=False))
+            self._held_keys.append(vk)
+
+    def key_up(self, key: int | str) -> None:
+        vk = virtual_key_code(key)
+        with self._lock:
+            if vk not in self._held_keys:
+                return
+            self._send(self._key_input(vk, up=True))
+            self._held_keys.remove(vk)
+
     def release_all(self) -> None:
-        """Release every mouse button this controller believes it pressed."""
+        """Release every mouse button and key this controller believes it holds."""
 
         first_error: BaseException | None = None
         for button in tuple(self.held_buttons):
@@ -409,6 +439,14 @@ class SendInputController(BaseInputController):
             except BaseException as exc:  # continue releasing the other buttons
                 first_error = first_error or exc
                 LOGGER.exception("Could not release %s mouse button", button.value)
+        with self._lock:
+            held_keys = tuple(reversed(self._held_keys))
+        for vk in held_keys:
+            try:
+                self.key_up(vk)
+            except BaseException as exc:  # continue releasing the other keys
+                first_error = first_error or exc
+                LOGGER.exception("Could not release held key 0x%02X", vk)
         if first_error is not None:
             raise first_error
 
@@ -446,6 +484,7 @@ class MockInputController(BaseInputController):
         self.events: list[InputEvent] = []
         self._position = (int(initial_position[0]), int(initial_position[1]))
         self._held_buttons: set[MouseButton] = set()
+        self._held_keys: list[str | int] = []
         self._operation_delay = operation_delay
         self._record_events = record_events
         self._lock = threading.RLock()
@@ -505,9 +544,36 @@ class MockInputController(BaseInputController):
                 self.events.append(InputEvent("key_up", value=value))
         self._delay()
 
+    def key_down(self, key: int | str) -> None:
+        value = key if isinstance(key, int) else str(key).upper()
+        with self._lock:
+            if value in self._held_keys:
+                return
+            self._held_keys.append(value)
+            if self._record_events:
+                self.events.append(InputEvent("key_down", value=value))
+        self._delay()
+
+    def key_up(self, key: int | str) -> None:
+        value = key if isinstance(key, int) else str(key).upper()
+        with self._lock:
+            if value not in self._held_keys:
+                return
+            self._held_keys.remove(value)
+            if self._record_events:
+                self.events.append(InputEvent("key_up", value=value))
+        self._delay()
+
+    @property
+    def held_keys(self) -> tuple[str | int, ...]:
+        with self._lock:
+            return tuple(self._held_keys)
+
     def release_all(self) -> None:
         for button in tuple(self.held_buttons):
             self.mouse_up(button)
+        for key in tuple(reversed(self.held_keys)):
+            self.key_up(key)
 
     def get_cursor_position(self) -> tuple[int, int]:
         with self._lock:
