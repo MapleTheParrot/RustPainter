@@ -2366,12 +2366,14 @@ class MainWindow(QMainWindow):
         self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
         self.clear_button_status = CalibrationStatus("Clear button", optional=True)
         self.save_button_status = CalibrationStatus("Save button", optional=True)
+        self.download_button_status = CalibrationStatus("Download button", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
         self.calibrate_hue_bar_button = QPushButton("Set")
         self.calibrate_brush_button = QPushButton("Set")
         self.calibrate_clear_button = QPushButton("Set")
         self.calibrate_save_button = QPushButton("Set")
+        self.calibrate_download_button = QPushButton("Set")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -2392,6 +2394,14 @@ class MainWindow(QMainWindow):
                 self.calibrate_save_button,
                 "Calibrate Rust's Save changes button, which the anti-AFK break "
                 "clicks to leave the painting UI before it jumps",
+            ),
+            (
+                self.download_button_status,
+                self.calibrate_download_button,
+                "Calibrate Rust's download icon (second in the toolbar), which "
+                "writes the sign's texture to the desktop.  With it set, the "
+                "probes and the touch-up pass read every texel exactly instead "
+                "of guessing from a screenshot; each file is removed again.",
             ),
         )
         for row, (status, button, tooltip) in enumerate(entries):
@@ -5618,6 +5628,11 @@ class MainWindow(QMainWindow):
                 "save_button", "Save changes button that closes the painting UI"
             )
         )
+        self.calibrate_download_button.clicked.connect(
+            lambda: self._begin_calibration(
+                "download_button", "download icon that writes the sign's texture to the desktop"
+            )
+        )
         # Whether the Save button is needed follows the switch.
         self.anti_afk_check.toggled.connect(
             lambda _checked: self._refresh_profile_ui()
@@ -6196,6 +6211,7 @@ class MainWindow(QMainWindow):
         self.save_button_status.set_calibrated(
             bool(status.get("save_button")), not self.anti_afk_check.isChecked()
         )
+        self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
         self._refresh_brush_model_status()
         if self._refresh_quality_preset_availability():
             self._update_quality_dimensions()
@@ -6285,6 +6301,7 @@ class MainWindow(QMainWindow):
                     "brush_size_box",
                     "clear_button",
                     "save_button",
+                    "download_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
@@ -6399,6 +6416,7 @@ class MainWindow(QMainWindow):
                 "brush_size_box",
                 "clear_button",
                 "save_button",
+                "download_button",
             ):
                 if other != field:
                     setattr(candidate, other, None)
@@ -6551,6 +6569,7 @@ class MainWindow(QMainWindow):
             "brush_size_box",
             "clear_button",
             "save_button",
+            "download_button",
         ):
             rect = getattr(candidate, name, None)
             if rect is None:
@@ -6603,6 +6622,7 @@ class MainWindow(QMainWindow):
                     ("Size value box", getattr(profile, "brush_size_box", None)),
                     ("Clear button", getattr(profile, "clear_button", None)),
                     ("Save button", getattr(profile, "save_button", None)),
+                    ("Download button", getattr(profile, "download_button", None)),
                 )
                 if rect is not None
             ]
@@ -7502,6 +7522,7 @@ class MainWindow(QMainWindow):
             self.calibrate_brush_button,
             self.calibrate_clear_button,
             self.calibrate_save_button,
+            self.calibrate_download_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,

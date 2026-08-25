@@ -84,6 +84,7 @@ from .screen import (
     capture_region,
     foreground_window_matches,
 )
+from .sign_export import ExportWatcher, SignExport
 from .ui_guard import PaintingUiGuard
 
 
@@ -199,6 +200,7 @@ class PaintingTarget:
     brush_size_box: RectangleLike | None = None
     clear_button: RectangleLike | None = None
     save_button: RectangleLike | None = None
+    download_button: RectangleLike | None = None
     picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
     brush_size_model: BrushSizeModel | None = None
@@ -264,6 +266,7 @@ class PaintingTarget:
             brush_size_box=getattr(profile, "brush_size_box", None),
             clear_button=getattr(profile, "clear_button", None),
             save_button=getattr(profile, "save_button", None),
+            download_button=getattr(profile, "download_button", None),
             picker_directions=PickerDirections(
                 hue="bottom_to_top",
                 saturation="left_low",
@@ -770,6 +773,12 @@ class Painter:
         self._measured_drag_rate: float | None = None
         # The bare sign's colour, from a capture this job took of it cleared.
         self._measured_bare_color: RGBColor | None = None
+        # How the sign's texture is read back after the download button is
+        # clicked: the desktop watcher by default, a simulated sign in tests.
+        self._export_watcher = ExportWatcher()
+        self._export_reader: "Callable[[], SignExport | None] | None" = None
+        self._last_export: SignExport | None = None
+        self._exports_taken = 0
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -1047,6 +1056,84 @@ class Painter:
 
         with self._condition:
             return self._measured_dab_sweep
+
+    @property
+    def last_export(self) -> SignExport | None:
+        """The sign's texture as last read from Rust's export, if any."""
+
+        with self._condition:
+            return self._last_export
+
+    def use_export_reader(self, reader: "Callable[[], SignExport | None] | None") -> None:
+        """Read the sign's texture through ``reader`` after each download click.
+
+        For tests driving a simulated sign; a real job reads the desktop.
+        """
+
+        self._export_reader = reader
+
+    def _export_sign(self, job: _Job, epoch: int, *, why: str) -> SignExport | None:
+        """Click Rust's download button and read the texture it writes.
+
+        The cursor is parked off the sign first; the click is held a frame
+        like every other control click; the file that appears is read and
+        taken off the desktop.  Returns None when the button is not
+        calibrated, the export never appears, or it is the wrong size for
+        the plan - a stale file, or a sign other than the one calibrated.
+        """
+
+        button = job.target.download_button
+        if button is None:
+            return None
+        target = job.target
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        point = normalized_point(button, 0.5, 0.5)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        if self._export_reader is None:
+            self._export_watcher.snapshot()
+        self._move((int(round(point[0])), int(round(point[1]))), epoch)
+        self._checkpoint(epoch=epoch, check_focus=True)
+        self._mouse_down(epoch)
+        try:
+            self._interruptible_sleep(
+                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+            )
+        finally:
+            self.input.mouse_up(MouseButton.LEFT)
+        self._move(park, epoch)
+        if self._export_reader is not None:
+            export = self._export_reader()
+        else:
+            export = self._export_watcher.collect(
+                sleep=lambda s: self._interruptible_sleep(s, epoch=epoch, check_focus=True)
+            )
+        if export is None:
+            LOGGER.warning("No export could be read for %s; falling back to the screen", why)
+            return None
+        if (export.columns, export.rows) != (job.plan.width, job.plan.height):
+            LOGGER.warning(
+                "The export is %dx%d but the plan is %dx%d; it is not this sign's "
+                "texture at the plan's resolution, so the screen is used for %s",
+                export.columns,
+                export.rows,
+                job.plan.width,
+                job.plan.height,
+                why,
+            )
+            return None
+        with self._condition:
+            self._last_export = export
+            self._exports_taken += 1
+        LOGGER.info(
+            "Read the sign's texture from Rust's export for %s: %d of %d texels painted",
+            why,
+            int(export.painted.sum()),
+            export.painted.size,
+        )
+        return export
 
     @property
     def measured_bare_color(self) -> RGBColor | None:

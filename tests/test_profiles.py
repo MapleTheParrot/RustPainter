@@ -75,6 +75,7 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "brush_size_box": True,
         "clear_button": True,
         "save_button": True,
+        "download_button": False,
     }
     assert restored.display is not None
     assert restored.display.virtual_screen == Rect(-1920, 0, 4480, 1440)

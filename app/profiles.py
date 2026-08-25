@@ -307,6 +307,10 @@ class CalibrationProfile:
     # Rust's "Save changes" control.  The anti-AFK break clicks it to leave
     # the painting UI, jumps, and reopens the sign with a click.
     save_button: Rect | None = None
+    # Rust's download control, which writes the sign's texture to the desktop
+    # texel for texel.  With it calibrated the probes and the touch-up pass
+    # read the sign exactly instead of through a screenshot.
+    download_button: Rect | None = None
     hue_direction: str = HueDirection.BOTTOM_TO_TOP.value
     saturation_direction: str = SaturationDirection.LEFT_LOW.value
     value_direction: str = ValueDirection.TOP_BRIGHT.value
@@ -361,6 +365,7 @@ class CalibrationProfile:
             "brush_size_box": self.brush_size_box is not None,
             "clear_button": self.clear_button is not None,
             "save_button": self.save_button is not None,
+            "download_button": self.download_button is not None,
         }
 
     @property
@@ -392,6 +397,7 @@ class CalibrationProfile:
             "brushSizeBox": _rect_dict(self.brush_size_box),
             "clearButton": _rect_dict(self.clear_button),
             "saveButton": _rect_dict(self.save_button),
+            "downloadButton": _rect_dict(self.download_button),
             "pickerDirections": {
                 "hue": self.hue_direction,
                 "saturation": self.saturation_direction,
@@ -431,6 +437,11 @@ class CalibrationProfile:
             save_button=_rect_from(
                 _first(value, "saveButton", "save_button"),
                 "save button",
+                optional=True,
+            ),
+            download_button=_rect_from(
+                _first(value, "downloadButton", "download_button"),
+                "download button",
                 optional=True,
             ),
             hue_direction=_first(
