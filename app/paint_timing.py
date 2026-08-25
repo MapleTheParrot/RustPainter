@@ -77,7 +77,7 @@ SHORT_RUN_TEXELS = 3.0
 # in the middle; at it, with an event on every texel, it paints exactly the
 # run.  Measured on the 320x240 artist canvas: Relaxed's ~130 texels/s is
 # clean and Turbo's ~730 is not.
-LONG_DRAG_MAX_TEXELS_PER_SECOND = 250.0
+LONG_DRAG_MAX_TEXELS_PER_SECOND = 600.0
 LONG_DRAG_MAX_STEP_TEXELS = 1.0
 
 # Rust's paint UI has a line tool: with Shift held through a drag, the game

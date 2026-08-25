@@ -106,7 +106,7 @@ def test_stroke_pace_caps_only_long_drags_on_real_input() -> None:
     drag = pace(400.0)
     assert drag.step_pixels == pitch
     assert drag.move_seconds == pytest.approx(
-        400.0 / (LONG_DRAG_MAX_TEXELS_PER_SECOND * pitch)
+        400.0 / min(2200.0, LONG_DRAG_MAX_TEXELS_PER_SECOND * pitch)
     )
     # A setting slower than the cap is left alone.
     slow = pace(400.0, speed_pixels_per_second=300.0, step_pixels=2.0)
@@ -492,9 +492,9 @@ def test_a_measured_dab_press_prices_dabs_and_lines_but_never_drags() -> None:
 
 
 def test_probed_gap_and_drag_rate_price_strokes_at_what_the_sign_proved() -> None:
-    settings = PainterSettings()
+    settings = PainterSettings(stroke_speed_pixels_per_second=5000.0)
     plain = StrokeTiming.from_settings(settings)
-    probed = StrokeTiming.from_settings(settings, gap_seconds=0.008, drag_texels_per_second=600.0)
+    probed = StrokeTiming.from_settings(settings, gap_seconds=0.008, drag_texels_per_second=1500.0)
     pitch = 1.77
     # A dab keeps its hold but gets the shorter gap.
     assert plain.stroke_seconds(0.0, pitch) - probed.stroke_seconds(0.0, pitch) == pytest.approx(
@@ -503,13 +503,13 @@ def test_probed_gap_and_drag_rate_price_strokes_at_what_the_sign_proved() -> Non
     # A long drag runs at the proved rate - until the configured stroke speed
     # (700 px/s here) caps it first, exactly as the painter drives it.
     long_run = 500 * pitch
-    plain_speed = min(settings.stroke_speed_pixels_per_second, 250.0 * pitch)
-    probed_speed = min(settings.stroke_speed_pixels_per_second, 600.0 * pitch)
+    plain_speed = min(settings.stroke_speed_pixels_per_second, LONG_DRAG_MAX_TEXELS_PER_SECOND * pitch)
+    probed_speed = min(settings.stroke_speed_pixels_per_second, 1500.0 * pitch)
     assert probed.stroke_seconds(long_run, pitch) < plain.stroke_seconds(long_run, pitch)
     assert plain.stroke_seconds(long_run, pitch) - probed.stroke_seconds(long_run, pitch) == pytest.approx(
         long_run / plain_speed - long_run / probed_speed + (STROKE_GAP_FLOOR_SECONDS - 0.008)
     )
     # Mock input honours neither: there is no game to prove anything on.
-    fake = StrokeTiming.from_settings(settings, real_input=False, gap_seconds=0.008, drag_texels_per_second=600.0)
+    fake = StrokeTiming.from_settings(settings, real_input=False, gap_seconds=0.008, drag_texels_per_second=1500.0)
     bare = StrokeTiming.from_settings(settings, real_input=False)
     assert fake.stroke_seconds(long_run, pitch) == pytest.approx(bare.stroke_seconds(long_run, pitch))

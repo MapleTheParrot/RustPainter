@@ -779,6 +779,9 @@ class Painter:
         self._export_reader: "Callable[[], SignExport | None] | None" = None
         self._last_export: SignExport | None = None
         self._exports_taken = 0
+        # Per-cell aim corrections in screen pixels, learned by the touch-up
+        # from where a cell's dab actually landed.  Cleared per job.
+        self._cell_nudges: dict[tuple[int, int], tuple[int, int]] = {}
         self._last_progress_emit = 0.0
         # Per-stroke overhead learned from earlier runs on this machine; the
         # work schedule prices every stroke with it, so the first time-left
@@ -944,6 +947,7 @@ class Painter:
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
+            self._cell_nudges = {}
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -1019,6 +1023,7 @@ class Painter:
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
+            self._cell_nudges = {}
             self._abort_requested = False
             self._abort_event.clear()
             self._pause_event.clear()
@@ -3257,8 +3262,12 @@ class Painter:
         chosen: tuple[float, bool] | None = None
         # Point before sweep at each Size: the least invasive stamp that
         # lands every dot wins.  A point touches nothing but its texel; a
-        # sweep reaches sideways, and a wider brush reaches all round.
-        trials = [(size, sweep) for size in self._DAB_PROBE_SIZES for sweep in (False, True)]
+        # sweep reaches sideways, and a wider brush reaches all round.  On
+        # a native plan only the smallest brush is a one-texel stamp at all
+        # (Size 1.25 paints two to four texels, measured on the export), so
+        # the ladder stops there and a miss is answered by re-aiming.
+        sizes = (BRUSH_SIZE_MIN,) if aiming.native else self._DAB_PROBE_SIZES
+        trials = [(size, sweep) for size in sizes for sweep in (False, True)]
         try:
             epoch = self._pause_generation_value()
             before = self._capture_parked(canvas, park, epoch)
@@ -4693,6 +4702,7 @@ class Painter:
             RECOLOR_MIN_CELL_PIXELS,
             UNRELIABLE_CAPTURE_FRACTION,
             classify_cells,
+            classify_export,
             plan_layers,
             sample_cell_colors,
             touch_up_plan,
@@ -4782,6 +4792,8 @@ class Painter:
                     passes=pass_number,
                 )
 
+        native = self._aiming(job, plan).native
+        previous_targets: Any = None
         while pass_number <= settings.verify_passes:
             try:
                 epoch = self._pause_generation_value()
@@ -4790,24 +4802,35 @@ class Painter:
                     f"Verifying the painted sign (pass {pass_number})",
                     phase="verify",
                 )
-                self._move(park, epoch)
-                self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
-                self._checkpoint(epoch=epoch, check_focus=True)
-                capture = self._screen_capture(canvas)
-                sampled = sample_cell_colors(
-                    np.asarray(capture.convert("RGB"), dtype=np.float32),
-                    plan.width,
-                    plan.height,
-                    centers=self._grid_cell_centers(job, plan, canvas),
-                )
-                verdict = classify_cells(
-                    sampled,
-                    indices,
-                    palette,
-                    bare_sampled=bare_sampled,
-                    underpaint=underpaint,
-                    recolor=recolor,
-                )
+                export = self._export_sign(job, epoch, why=f"verification pass {pass_number}")
+                if export is not None:
+                    # Texel-exact: what was never painted, and what is the
+                    # wrong colour, straight from the game's own texture.
+                    verdict = classify_export(export.rgb, export.painted, indices, palette)
+                    sampled = export.rgb
+                    if previous_targets is not None:
+                        self._learn_cell_nudges(
+                            export, indices, palette, previous_targets, verdict.cells
+                        )
+                else:
+                    self._move(park, epoch)
+                    self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+                    self._checkpoint(epoch=epoch, check_focus=True)
+                    capture = self._screen_capture(canvas)
+                    sampled = sample_cell_colors(
+                        np.asarray(capture.convert("RGB"), dtype=np.float32),
+                        plan.width,
+                        plan.height,
+                        centers=self._grid_cell_centers(job, plan, canvas),
+                    )
+                    verdict = classify_cells(
+                        sampled,
+                        indices,
+                        palette,
+                        bare_sampled=bare_sampled,
+                        underpaint=underpaint,
+                        recolor=recolor,
+                    )
                 mismatch = verdict.cells
                 wrong = verdict.count
                 LOGGER.info(
@@ -4847,11 +4870,18 @@ class Painter:
                         covered,
                     )
                     return
-                if previous_repaint is not None:
+                if previous_repaint is not None and not native:
+                    # A bigger brush covers a logical cell of several texels
+                    # that the smallest missed.  On a native plan a cell is
+                    # one texel and Size 1.25 already paints two to four of
+                    # them (measured on the sign's export), so there the
+                    # answer to a miss is a re-aim, learned above, never a
+                    # wider stamp.
                     self._escalate_touch_up_brush(
                         job, pass_number, mismatch, previous_repaint
                     )
                 previous_repaint = mismatch.copy()
+                previous_targets = mismatch.copy()
                 repaint = touch_up_plan(mismatch, indices, palette)
                 predicted = self._work_schedule(repaint, target, settings).total
                 LOGGER.info(
@@ -4887,6 +4917,78 @@ class Painter:
     # repainted last pass still wrong raises the one-cell brush a step.
     _TOUCH_UP_STUBBORN_MIN = 10
     _TOUCH_UP_STUBBORN_FRACTION = 0.25
+
+    # A dab that missed its cell is re-aimed this many pixels the other way
+    # on the next pass; a miss the export cannot place is searched upward
+    # first (the direction every miss took in the live measurements), then
+    # the other ways.
+    _CELL_NUDGE_STEPS_PIXELS = (1, 2, 3)
+    _CELL_NUDGE_SEARCH = ((0, -1), (0, 1), (-1, 0), (1, 0))
+
+    def _learn_cell_nudges(
+        self, export: SignExport, indices: Any, palette: Any, targets: Any, still_wrong: Any
+    ) -> None:
+        """Re-aim the cells the last pass repainted and the export says it missed.
+
+        Where a dab lands is repeatable (measured live: the same aim lands
+        the same texel every time), so a cell that came out bare while a
+        neighbour took its colour was aimed a pixel or so towards that
+        neighbour - and is aimed that much the other way next pass.  A miss
+        the export cannot place is stepped through the four directions.
+        """
+
+        import numpy as np
+
+        rows, cols = indices.shape
+        missed = np.argwhere(targets & still_wrong)
+        if len(missed) == 0:
+            return
+        learned = 0
+        for v, u in missed:
+            own = int(indices[v, u])
+            if own < 0:
+                continue
+            own_color = np.asarray(palette[own], dtype=np.float32)
+            found: tuple[int, int] | None = None
+            for du, dv in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nu, nv = u + du, v + dv
+                if not (0 <= nu < cols and 0 <= nv < rows):
+                    continue
+                if indices[nv, nu] == own:
+                    continue  # its own colour belongs there anyway
+                if export.painted[nv, nu] and float(
+                    np.linalg.norm(export.rgb[nv, nu] - own_color)
+                ) < 40.0:
+                    found = (du, dv)
+                    break
+            key = (int(u), int(v))
+            current = self._cell_nudges.get(key, (0, 0))
+            if found is not None:
+                # Landed one texel over: aim a step the other way, growing
+                # by a pixel each time the same miss repeats.
+                step = 1
+                for candidate in self._CELL_NUDGE_STEPS_PIXELS:
+                    if abs(current[0]) >= candidate or abs(current[1]) >= candidate:
+                        step = candidate + 1
+                nudge = (-found[0] * step, -found[1] * step)
+            else:
+                tried = sum(1 for _ in [current]) if current != (0, 0) else 0
+                order = self._CELL_NUDGE_SEARCH
+                position = 0
+                if current != (0, 0):
+                    for i, (dx, dy) in enumerate(order):
+                        if (dx, dy) == (int(np.sign(current[0])), int(np.sign(current[1]))):
+                            position = i + 1
+                            break
+                dx, dy = order[position % len(order)]
+                nudge = (dx, dy)
+            self._cell_nudges[key] = (int(nudge[0]), int(nudge[1]))
+            learned += 1
+        LOGGER.info(
+            "Re-aiming %d cells the last pass missed, from where the export shows "
+            "their dabs landed",
+            learned,
+        )
 
     def _escalate_touch_up_brush(
         self, job: _Job, pass_number: int, mismatch: Any, previous: Any
@@ -5265,6 +5367,15 @@ class Painter:
                 shared_x = (start[0] + end[0]) / 2.0
                 start = (shared_x, start[1])
                 end = (shared_x, end[1])
+            if start == end:
+                # A cell the touch-up saw land in a neighbour is aimed the
+                # measured pixel or two the other way.
+                nudge = self._cell_nudges.get(
+                    (int(stroke.start_x), int(stroke.start_y))  # type: ignore[attr-defined]
+                )
+                if nudge is not None:
+                    start = (start[0] + nudge[0], start[1] + nudge[1])
+                    end = start
         else:
             start, end = logical_stroke_to_screen(stroke, plan.width, plan.height, canvas)  # type: ignore[arg-type]
         if extension > 0.0:

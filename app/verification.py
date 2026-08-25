@@ -383,6 +383,49 @@ def bare_reference_lab(
     return None
 
 
+def classify_export(
+    rgb: np.ndarray,
+    painted: np.ndarray,
+    indices: np.ndarray,
+    palette: np.ndarray,
+    *,
+    tolerance: float = 40.0,
+) -> Mismatch:
+    """Decide which cells need repainting from the sign's exported texture.
+
+    Nothing here is inferred: ``painted`` says exactly which texels were
+    ever touched, and ``rgb`` holds each texel's colour as the game keeps
+    it.  A covered cell that was never painted is blank; a painted cell
+    whose colour is not its own colour's rendering is wrong.  Each colour's
+    rendering is read off the export itself (the median of its cells), so
+    the picker's small deviations from the requested colour never count.
+    Every verdict is repainted: a point press paints exactly one texel, so
+    recolouring a single cell is safe at any resolution.
+    """
+
+    covered = indices >= 0
+    if len(palette) == 0 or not covered.any():
+        return Mismatch(np.zeros(indices.shape, dtype=np.bool_), 0, 0, 0)
+    rgb = np.asarray(rgb, dtype=np.float32)
+    painted = np.asarray(painted, dtype=np.bool_)
+    observed = np.asarray(palette, dtype=np.float32).copy()
+    for index in range(len(palette)):
+        cells = rgb[(indices == index) & painted]
+        if len(cells) >= OBSERVED_COLOR_MIN_CELLS:
+            observed[index] = np.median(cells, axis=0)
+    own_index = np.where(covered, indices, 0)
+    own = np.sqrt(((rgb - observed[own_index]) ** 2).sum(axis=2))
+    blank = covered & ~painted
+    wrong = covered & painted & (own > tolerance)
+    return Mismatch(
+        cells=blank | wrong,
+        blank=int(blank.sum()),
+        wrong_color=int(wrong.sum()),
+        unexplained=0,
+        discarded=0,
+    )
+
+
 def capture_looks_bare(
     sampled: np.ndarray,
     *,

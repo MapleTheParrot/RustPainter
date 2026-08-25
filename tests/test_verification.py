@@ -794,3 +794,21 @@ def test_a_stored_bare_colour_finds_holes_a_covered_plan_hides() -> None:
     # is not read as a hole, because it is not far from its own colour.
     assert not seeing.cells[0].any()
     assert int(seeing.cells.sum()) == len(holes)
+
+
+def test_classify_export_reads_blank_and_wrong_texels_exactly() -> None:
+    import numpy as np
+
+    from app.verification import classify_export
+
+    palette = np.array([[20, 20, 20], [200, 40, 40]], dtype=np.float32)
+    indices = np.zeros((6, 8), dtype=np.int64); indices[:, 4:] = 1
+    rgb = palette[indices].astype(np.float32)
+    painted = np.ones((6, 8), dtype=bool)
+    painted[2, 1] = False                 # never painted
+    rgb[3, 6] = (20, 20, 20)              # a red cell painted black
+    rgb[:, 0] += 5                        # the picker's small deviation is not a mistake
+    verdict = classify_export(rgb, painted, indices, palette)
+    assert verdict.blank == 1 and verdict.wrong_color == 1 and verdict.discarded == 0
+    assert verdict.cells[2, 1] and verdict.cells[3, 6]
+    assert int(verdict.cells.sum()) == 2

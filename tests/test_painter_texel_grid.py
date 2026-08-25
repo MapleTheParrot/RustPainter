@@ -103,6 +103,10 @@ class ReplayingTexelSign(SimulatedSign):
         # records before each stroke) paints only where its cursor events
         # arrive, not the path between - the game sampling too rarely.
         self.max_drag_texels_per_second = max_drag_texels_per_second
+        # (y0, y1, dy): presses whose cursor y lies in [y0, y1) land as if
+        # the cursor were dy pixels lower - a local error in the game's
+        # cursor map that only a re-aim can correct.  None for a true map.
+        self.cursor_band: tuple[float, float, float] | None = None
         # A press-and-release quicker than this paints nothing, like a game
         # frame that never sampled the button down.  Needs a controller that
         # records event times (TimedMockController); zero keeps every dab.
@@ -121,6 +125,8 @@ class ReplayingTexelSign(SimulatedSign):
     def _texel_at(self, x: float, y: float) -> tuple[int, int]:
         ox, oy = self.origin
         px, py = self.pitch
+        if self.cursor_band is not None and self.cursor_band[0] <= y < self.cursor_band[1]:
+            y = y + self.cursor_band[2]
         return (
             math.floor((x - ox - self.cursor_shift[0]) / px) + self.stamp_offset[0],
             math.floor((y - oy - self.cursor_shift[1]) / py) + self.stamp_offset[1],
@@ -296,6 +302,20 @@ class ReplayingTexelSign(SimulatedSign):
                         flush_pending()
                     else:
                         pending = None
+
+    def export(self):
+        """The sign's texture as Rust's download would write it."""
+
+        import numpy as np
+
+        from app.sign_export import SignExport
+
+        self._replay()
+        rgb = np.asarray(self.texture, dtype=np.float32).copy()
+        painted = np.zeros((self.rows, self.columns), dtype=bool)
+        for (c, r) in self.painted:
+            painted[r, c] = True
+        return SignExport(rgb=rgb, painted=painted, source="simulated")
 
     def capture(self, rect) -> Image.Image:
         canvas = self.canvas
@@ -1324,3 +1344,69 @@ def test_a_cleared_sign_teaches_the_profile_its_wood_for_later_touch_ups() -> No
     from app.painter import PaintingTarget
 
     assert PaintingTarget.from_profile(profile).bare_color == tuple(measured)
+
+
+def _profile_with_download() -> CalibrationProfile:
+    profile = _profile()
+    profile.download_button = ScreenRect(880, 140, 24, 24)
+    return profile
+
+
+def test_the_touch_up_reads_the_export_and_re_aims_the_dabs_that_missed() -> None:
+    """A finished sign whose cursor map is off by most of a texel in one band:
+    the export shows exactly which cells are bare and where their dabs
+    landed, and the touch-up re-aims those cells a pixel at a time until
+    every one is painted - without ever widening the brush."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile_with_download()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        faithful_colors=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    plan = _dab_plan()
+    expected = {(x, y) for y in (12, 30, 50) for x in (20, 25, 30, 61, 100)} | {
+        (x, 40) for x in range(4, 61)
+    }
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter.use_export_reader(sign.export)
+    _record_color_picks(painter, controller)
+    assert painter.start(plan, profile, _settings(measure_dab_size=False))
+    assert painter.wait(60.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    sign.capture(profile.canvas)
+    assert set(sign.painted) == expected
+    grid = painter.measured_texel_grid; model = painter.measured_brush_size_model
+    assert grid is not None and model is not None
+
+    # The game's cursor map drifts: in the band of screen rows holding plan
+    # row 30, every press lands one row lower than aimed.  The dabs on row
+    # 30 - and only those - now miss, landing on row 31.
+    y30 = grid.origin_y + 30.5 * grid.pitch_y
+    sign.cursor_band = (y30 - 2.6, y30 + 2.6, 4.0)
+    profile.metadata["texel_grid"] = grid.to_dict()
+    profile.metadata["brush_size_model"] = model.to_dict()
+    touch_up = _impatient(Painter(controller, screen_capture=sign.capture))
+    touch_up.use_export_reader(sign.export)
+    _record_color_picks(touch_up, controller)
+    # Knock out row 30 first, as a dropped stroke would: repaint it bare.
+    for x in (20, 25, 30, 61, 100):
+        sign.painted.pop((x, 30), None)
+    # (the sim replays events, so 'knocking out' is done by making the
+    # original press land elsewhere: the band moves those dabs to row 31)
+    assert touch_up.start(plan, profile, _settings(verify_passes=4), start_stroke=plan.stroke_count)
+    assert touch_up.wait(120.0)
+    assert touch_up.state is PainterState.COMPLETED, touch_up.state_reason
+    assert touch_up.measured_detail_size in (None, 1.0)  # never widened
+    final = sign.export()
+    for x in (20, 25, 30, 61, 100):
+        assert final.painted[30, x], f"row 30 texel {x} still bare"
+    # and the re-aim was learned, not guessed with a bigger brush
+    assert any(dy < 0 for (dx, dy) in touch_up._cell_nudges.values())

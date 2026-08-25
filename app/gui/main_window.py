@@ -8356,6 +8356,21 @@ class MainWindow(QMainWindow):
                 report.record_color_picks(painter.color_pick_summary)
             except Exception:
                 LOGGER.exception("Could not record the color checks in the run report")
+            # The sign's texture as the game holds it, when the job read one:
+            # texel-exact, unlike the screenshot the report also keeps.
+            export = getattr(painter, "last_export", None)
+            if export is not None:
+                try:
+                    import numpy as np
+                    from PIL import Image
+
+                    alpha = np.where(export.painted, 255, 0).astype(np.uint8)
+                    rgba = np.dstack((export.rgb.astype(np.uint8), alpha))
+                    Image.fromarray(rgba, mode="RGBA").save(
+                        Path(report.directory) / "sign_export.png"
+                    )
+                except Exception:
+                    LOGGER.exception("Could not save the sign's export in the run report")
 
         def wrap_up() -> None:
             if canvas is not None:
