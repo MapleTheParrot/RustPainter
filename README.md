@@ -64,8 +64,8 @@ painting unattended. Everything below is detail you only need when tuning.
 - Per-layer gradients and outlines, both drawn by the same renderer the paint plan bakes, so the letters on the Source tab are the letters the sign receives
 - Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y anywhere in the window, mid-typing included), so a whole drag or a run of keystrokes steps back as one edit
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
-- Named profiles per sign/UI layout, each inheriting the current calibration
-- Drag calibration for the canvas, color box, hue bar, and - for automatic brush sizing - the numeric Size field and Rust's clear button, with an on-screen overlay to verify them
+- Named profiles per sign layout; fixed UI/HUD targets (color box, hue bar, Size value, Clear, hunger, thirst, and Download) carry across profiles and remain individually recalibratable
+- Drag calibration for the canvas and shared UI targets, with an on-screen overlay to verify them
 - An anti-AFK break (off by default): every so often the job saves the sign, jumps, reopens the sign, and carries on, so a server that kicks idle players sees one moving
 - Brush sizing measured from the sign itself at the start of every job: a few probe strokes fit what Rust's Size numbers really cover, the sign is wiped clean again, and only then does the artwork go down
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
@@ -225,6 +225,9 @@ outline - is written to the whole selection at once.
 - **Outline** rings every letter with that many logical pixels of a chosen
   color, which is what keeps a caption readable over artwork it shares a color
   with. It paints extra cells, so it costs a little time.
+- **Smooth edges** supersamples only the selected text layer before it is baked.
+  Glyph edges gain intermediate colors while the image underneath keeps its
+  original hard logical pixels.
 
 Sizes are stored as a fraction of the canvas height rather than in pixels, so
 captions keep their proportions when a quality preset changes the painting

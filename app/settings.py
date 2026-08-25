@@ -111,6 +111,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                     "y": 0.5,
                     "bold": False,
                     "italic": False,
+                    # Blend the glyph edge colors without filtering the image
+                    # underneath. Off preserves the original crisp text mode.
+                    "smooth": False,
                     # A gradient runs from "color" into "gradient_color" over
                     # the text's own box; an outline rings every letter with
                     # that many logical pixels of "outline_color".
@@ -443,6 +446,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         for key in ("bold", "italic"):
             if not isinstance(layer.get(key), bool):
                 raise SettingsError(f"{label}.{key} must be true or false")
+        if not isinstance(layer.get("smooth", False), bool):
+            raise SettingsError(f"{label}.smooth must be true or false")
         if not isinstance(layer.get("gradient", False), bool):
             raise SettingsError(f"{label}.gradient must be true or false")
 

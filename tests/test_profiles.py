@@ -120,7 +120,8 @@ def test_profile_store_crud_and_default_survive_reload(tmp_path) -> None:
 
     reloaded = ProfileStore(path)
     assert [item.name for item in reloaded.list_profiles()] == ["Picture Frame", "Banner"]
-    assert reloaded.get_default() == second
+    assert reloaded.get_default() is not None
+    assert reloaded.get_default().id == second.id
     assert reloaded.require("picture frame").color_box == Rect(1000, 400, 300, 300)
 
     assert reloaded.delete(second.id)
@@ -131,6 +132,58 @@ def test_profile_store_crud_and_default_survive_reload(tmp_path) -> None:
     document = json.loads((path / "profiles.json").read_text(encoding="utf-8"))
     assert document["schemaVersion"] == 1
     assert document["defaultProfileId"] == first.id
+
+
+def test_fixed_ui_calibrations_are_shared_without_sharing_the_sign(tmp_path) -> None:
+    store = ProfileStore(tmp_path / "profiles")
+    first = store.create(
+        "Wooden Sign",
+        canvas=Rect(10, 20, 800, 400),
+        color_box=Rect(1000, 400, 300, 300),
+        hue_bar=Rect(1310, 400, 25, 300),
+        brush_size_box=Rect(900, 250, 60, 24),
+        clear_button=Rect(850, 250, 30, 30),
+        hunger=Rect(1800, 900, 50, 24),
+        thirst=Rect(1800, 930, 50, 24),
+        download_button=Rect(1400, 250, 30, 30),
+        save_button=Rect(1500, 850, 120, 36),
+    )
+
+    second = store.create("Banner", canvas=Rect(20, 30, 600, 200))
+
+    assert second.canvas == Rect(20, 30, 600, 200)
+    assert second.save_button is None
+    for field in (
+        "color_box",
+        "hue_bar",
+        "brush_size_box",
+        "clear_button",
+        "hunger",
+        "thirst",
+        "download_button",
+    ):
+        assert getattr(second, field) == getattr(first, field)
+
+    second.hue_bar = Rect(1320, 410, 30, 310)
+    store.save(second)
+    assert store.require(first.id).hue_bar == second.hue_bar
+
+
+def test_legacy_profiles_inherit_the_newest_available_shared_rectangles(tmp_path) -> None:
+    path = tmp_path / "profiles.json"
+    older = Profile(id="older", name="Older", color_box=Rect(1, 2, 3, 4))
+    older.updated_at = "2026-01-01T00:00:00+00:00"
+    newer = Profile(id="newer", name="Newer", hue_bar=Rect(5, 6, 7, 8))
+    newer.updated_at = "2026-02-01T00:00:00+00:00"
+    path.write_text(
+        json.dumps({"profiles": [older.to_dict(), newer.to_dict()]}),
+        encoding="utf-8",
+    )
+
+    profiles = ProfileStore(path).list_profiles()
+
+    assert [profile.color_box for profile in profiles] == [Rect(1, 2, 3, 4)] * 2
+    assert [profile.hue_bar for profile in profiles] == [Rect(5, 6, 7, 8)] * 2
 
 
 def test_profile_store_rejects_duplicate_names_and_corrupt_json(tmp_path) -> None:

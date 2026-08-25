@@ -12,8 +12,8 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 
 def _asset_root() -> Path:
@@ -85,3 +85,57 @@ def icon(name: str, size: int = 64, color: str | None = None) -> QIcon:
 
 def icon_size(edge: int) -> QSize:
     return QSize(edge, edge)
+
+
+@lru_cache(maxsize=None)
+def vector_icon(name: str, size: int = 64, color: str = "#f27a22") -> QIcon:
+    """Draw small semantic controls as resolution-independent line icons.
+
+    These intentionally stay code-native: profile, folder, refresh, and delete
+    marks are simple geometry and should remain crisp at every UI scale rather
+    than borrowing a textured illustration whose silhouette means something
+    else.
+    """
+
+    edge = max(16, int(size))
+    canvas = QPixmap(edge, edge)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.scale(edge / 64.0, edge / 64.0)
+    pen = QPen(QColor(color), 4.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if name == "profile-add":
+        painter.drawRoundedRect(QRectF(7, 10, 38, 44), 5, 5)
+        painter.drawEllipse(QPointF(26, 25), 6, 6)
+        painter.drawArc(QRectF(15, 31, 22, 15), 0, 180 * 16)
+        painter.drawLine(QPointF(48, 37), QPointF(60, 37))
+        painter.drawLine(QPointF(54, 31), QPointF(54, 43))
+    elif name == "folder-open":
+        path = QPainterPath()
+        path.moveTo(6, 19)
+        path.lineTo(25, 19)
+        path.lineTo(31, 25)
+        path.lineTo(58, 25)
+        path.lineTo(54, 52)
+        path.lineTo(10, 52)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawLine(QPointF(7, 19), QPointF(7, 47))
+    elif name == "refresh":
+        painter.drawArc(QRectF(10, 10, 44, 44), 35 * 16, 285 * 16)
+        painter.drawLine(QPointF(49, 11), QPointF(54, 25))
+        painter.drawLine(QPointF(54, 25), QPointF(40, 22))
+    elif name == "delete":
+        painter.drawRoundedRect(QRectF(17, 19, 30, 36), 3, 3)
+        painter.drawLine(QPointF(13, 17), QPointF(51, 17))
+        painter.drawLine(QPointF(24, 10), QPointF(40, 10))
+        painter.drawLine(QPointF(27, 27), QPointF(27, 47))
+        painter.drawLine(QPointF(37, 27), QPointF(37, 47))
+
+    painter.end()
+    return QIcon(canvas)

@@ -31,6 +31,7 @@ from app.gui.main_window import (
     PLAN_SETTLE_MS,
     _PendingPaint,
     _TextOverlayOptions,
+    _build_plan_prefix_image,
 )
 from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
@@ -749,6 +750,29 @@ def test_baked_text_has_no_antialiased_fringe() -> None:
     assert np.all(painted == 255)
 
 
+def test_text_can_smooth_its_edges_without_smoothing_the_image() -> None:
+    backdrop_array = np.zeros((80, 160, 3), dtype=np.uint8)
+    backdrop_array[:, ::2] = (20, 40, 60)
+    backdrop_array[:, 1::2] = (180, 200, 220)
+    backdrop = ProcessedImage(
+        Image.fromarray(backdrop_array, mode="RGB"),
+        np.ones((80, 160), dtype=bool),
+        256,
+    )
+    smooth = _TextOverlayOptions(
+        "RUST", "", 44, (255, 255, 255), smooth=True
+    )
+
+    baked = main_window_module._apply_text_overlays(backdrop, (smooth,))
+    result = np.asarray(baked.image.convert("RGB"), dtype=np.uint8)
+
+    # The corners are outside the glyphs, so the alternating hard-edged image
+    # pixels must survive byte for byte.
+    assert np.array_equal(result[0], backdrop_array[0])
+    # Antialiased glyph coverage creates edge colors between backdrop and fill.
+    assert np.any((result > backdrop_array) & (result < 255))
+
+
 def test_gradient_and_outline_round_trip_through_settings(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
@@ -759,6 +783,7 @@ def test_gradient_and_outline_round_trip_through_settings(
     window.text_gradient_color_button.set_color("#FF0000", emit=True)
     window.text_outline_spin.setValue(2)
     window.text_outline_color_button.set_color("#00FF00", emit=True)
+    window.text_smooth_check.setChecked(True)
 
     document = window._settings_document()
     saved = document["image"]["text_overlay"]["layers"]
@@ -767,6 +792,7 @@ def test_gradient_and_outline_round_trip_through_settings(
     assert saved[0]["gradient_color"] == "#FF0000"
     assert saved[0]["outline_width"] == 2
     assert saved[0]["outline_color"] == "#00FF00"
+    assert saved[0]["smooth"] is True
 
     window._apply_settings(document)
     restored = window._text_layers[0]
@@ -775,6 +801,7 @@ def test_gradient_and_outline_round_trip_through_settings(
     assert restored.gradient_color == (255, 0, 0)
     assert restored.outline_width == 2
     assert restored.outline_color == (0, 255, 0)
+    assert restored.smooth is True
     # The gradient's own controls follow the checkbox rather than sitting live
     # next to a switched-off gradient.
     window.text_gradient_check.setChecked(False)
@@ -4223,6 +4250,25 @@ def test_the_resume_slider_previews_the_first_strokes_and_starts_the_job_there(
     assert window._painter._job.start_stroke == offset
     assert window._painter.progress.completed_strokes == plan.stroke_count
     qtbot.waitUntil(lambda: window.resume_panel.isEnabled(), timeout=2000)
+
+
+def test_resume_preview_replays_early_color_instead_of_revealing_final_color() -> None:
+    plan = PaintPlan(
+        2,
+        1,
+        (
+            ColorGroup((180, 30, 20), (Stroke(0, 0, 1, 0),), 2),
+            ColorGroup((20, 40, 190), (Stroke(0, 0, 0, 0),), 1),
+        ),
+    )
+
+    after_first = _build_plan_prefix_image(plan, 1)
+    finished = _build_plan_prefix_image(plan, 2)
+
+    assert after_first.getpixel((0, 0)) == (180, 30, 20)
+    assert after_first.getpixel((1, 0)) == (180, 30, 20)
+    assert finished.getpixel((0, 0)) == (20, 40, 190)
+    assert finished.getpixel((1, 0)) == (180, 30, 20)
 
 
 def test_resume_records_follow_a_real_job_and_stamp_why_it_stopped(

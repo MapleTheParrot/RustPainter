@@ -36,6 +36,20 @@ DEFAULT_PROFILE_STORE_PATH = (
 # same runtime type as the core coordinate model.
 Rect = ScreenRect
 
+# These controls belong to Rust's painting UI/HUD rather than to an individual
+# sign.  Profiles still serialize the rectangles for backwards compatibility,
+# but the store keeps them synchronized so switching signs never asks for the
+# same fixed widget to be calibrated again.
+SHARED_CALIBRATION_FIELDS: tuple[str, ...] = (
+    "color_box",
+    "hue_bar",
+    "brush_size_box",
+    "clear_button",
+    "hunger",
+    "thirst",
+    "download_button",
+)
+
 
 class ProfileError(ValueError):
     """Base error for invalid profile data or operations."""
@@ -566,6 +580,32 @@ class ProfileStore:
                 )
 
             index = next((i for i, item in enumerate(profiles) if item.id == candidate.id), None)
+            previous = profiles[index] if index is not None else None
+
+            # A new profile takes the shared UI/HUD rectangles from the store.
+            # When an existing profile recalibrates one, that edit is copied to
+            # every profile. Comparing against the saved copy also prevents an
+            # unrelated per-sign save from being mistaken for recalibration.
+            changed_shared = {
+                field
+                for field in SHARED_CALIBRATION_FIELDS
+                if (
+                    previous is not None
+                    and getattr(candidate, field) != getattr(previous, field)
+                )
+                or (
+                    previous is None
+                    and getattr(candidate, field) is not None
+                )
+            }
+            shared = self._shared_calibration(profiles)
+            for field in SHARED_CALIBRATION_FIELDS:
+                if field not in changed_shared and getattr(candidate, field) is None:
+                    setattr(candidate, field, shared.get(field))
+            for field in changed_shared:
+                value = getattr(candidate, field)
+                for item in profiles:
+                    setattr(item, field, value)
             if index is None:
                 profiles.append(candidate)
             else:
@@ -664,7 +704,35 @@ class ProfileStore:
                 raise ProfileDataError(f"Duplicate profile name: {profile.name}")
             ids.add(profile.id)
             names.add(folded)
+
+        # Old stores may have the fixed Rust UI rectangles on only one profile
+        # (or conflicting copies after separate recalibrations).  The newest
+        # non-empty value wins field by field and is exposed on every profile;
+        # the next write persists the normalized form.
+        shared = self._shared_calibration(profiles)
+        for profile in profiles:
+            for field, rectangle in shared.items():
+                setattr(profile, field, rectangle)
         return profiles, None if default_id is None else str(default_id)
+
+    @staticmethod
+    def _shared_calibration(profiles: Sequence[Profile]) -> dict[str, Rect | None]:
+        newest_first = sorted(
+            profiles,
+            key=lambda profile: (profile.updated_at, profile.created_at, profile.id),
+            reverse=True,
+        )
+        return {
+            field: next(
+                (
+                    getattr(profile, field)
+                    for profile in newest_first
+                    if getattr(profile, field) is not None
+                ),
+                None,
+            )
+            for field in SHARED_CALIBRATION_FIELDS
+        }
 
     def _write(self, profiles: Sequence[Profile], default_id: str | None) -> None:
         document = {
@@ -716,4 +784,5 @@ __all__ = [
     "ProfileNotFoundError",
     "ProfileStore",
     "Rect",
+    "SHARED_CALIBRATION_FIELDS",
 ]

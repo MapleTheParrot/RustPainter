@@ -109,13 +109,13 @@ try:
     _NEAREST = Image.Resampling.NEAREST
     _DITHER_NONE = Image.Dither.NONE
     _DITHER_FS = Image.Dither.FLOYDSTEINBERG
-    _MEDIANCUT = Image.Quantize.MEDIANCUT
+    _MAXCOVERAGE = Image.Quantize.MAXCOVERAGE
 except AttributeError:  # Pillow < 9.1
     _LANCZOS = Image.LANCZOS
     _NEAREST = Image.NEAREST
     _DITHER_NONE = Image.NONE
     _DITHER_FS = Image.FLOYDSTEINBERG
-    _MEDIANCUT = Image.MEDIANCUT
+    _MAXCOVERAGE = Image.MAXCOVERAGE
 
 
 def _validate_size(size: tuple[int, int], label: str) -> None:
@@ -841,8 +841,14 @@ def quantize_image(
         # Build the palette from painted pixels only.  Otherwise transparent Fit
         # padding can consume a requested palette entry (usually as black).
         samples = Image.fromarray(painted_colors.reshape(1, -1, 3), mode="RGB")
+        # Median cut spends nearly all of its entries where the most pixels
+        # are.  That is disastrous for artwork with one dominant family: a
+        # mostly orange image can lose every small magenta or cyan accent even
+        # with a 256-color budget.  Maximum coverage chooses representatives
+        # across the occupied RGB gamut, protecting visually distinct minority
+        # hues while still respecting the same hard palette limit.
         palette = samples.quantize(
-            colors=color_count, method=_MEDIANCUT, dither=_DITHER_NONE
+            colors=color_count, method=_MAXCOVERAGE, dither=_DITHER_NONE
         )
         mapped_rgb = np.asarray(
             Image.fromarray(rgb, mode="RGB")

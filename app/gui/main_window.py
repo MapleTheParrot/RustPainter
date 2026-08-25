@@ -125,6 +125,7 @@ from app.resume_record import (
     ResumeRecord,
     ResumeRecordStore,
     advanced as advanced_record,
+    paint_plan_prefix,
     plan_fingerprint,
     plan_prefix_labels,
     record_for_job,
@@ -141,7 +142,12 @@ from app.timelapse_export import (
     session_frames,
 )
 
-from .assets import icon as art_icon, pixmap as art_pixmap, tinted_pixmap
+from .assets import (
+    icon as art_icon,
+    pixmap as art_pixmap,
+    tinted_pixmap,
+    vector_icon,
+)
 from .styles import DANGER, ON_ACCENT, TEXT, badge_foreground, state_badge_style
 from .text_render import (
     GRADIENT_DIRECTIONS,
@@ -398,6 +404,7 @@ class _TextOverlayOptions:
     y: float = 0.5
     bold: bool = False
     italic: bool = False
+    smooth: bool = False
     size_ratio: float = 0.0
     gradient: bool = False
     gradient_color: tuple[int, int, int] = (255, 255, 255)
@@ -571,6 +578,33 @@ def _build_simulation_image(
     )
 
 
+def _build_plan_prefix_image(
+    plan: PaintPlan,
+    stroke_count: int,
+    correction: ColorCorrectionModel | None = None,
+) -> Image.Image:
+    """Replay the plan through one stroke, over an untouched-sign checker.
+
+    Unlike the final simulation, an intermediate frame has to preserve the
+    color of an early stroke even where a later group will paint over it.
+    The checker deliberately stands for the Rust sign material, whose color
+    or skin is not part of the paint plan.
+    """
+
+    labels = plan_prefix_labels(plan, stroke_count)
+    untouched = np.zeros(labels.shape, dtype=np.bool_)
+    backdrop = np.asarray(
+        _compose_checker_backdrop(
+            np.zeros((plan.height, plan.width, 3), dtype=np.uint8), untouched
+        ),
+        dtype=np.uint8,
+    )
+    partial = paint_plan_prefix(backdrop, plan, stroke_count)
+    if correction is not None:
+        partial = _predicted_sign_colors(partial, labels > 0, correction)
+    return Image.fromarray(partial, mode="RGB")
+
+
 def _apply_text_overlays(
     processed: ProcessedImage,
     overlay_options: tuple[_TextOverlayOptions, ...],
@@ -582,12 +616,24 @@ def _apply_text_overlays(
         return processed
 
     width, height = processed.size
-    overlay_qt = QImage(width, height, QImage.Format.Format_RGBA8888)
-    overlay_qt.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(overlay_qt)
-    try:
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-        for layer in visible_layers:
+    composited = processed.image.convert("RGBA")
+    combined_mask = np.asarray(processed.paint_mask, dtype=np.bool_).copy()
+    for layer in visible_layers:
+        # Qt's path rasterizer can produce binary coverage at this small
+        # logical resolution.  Smooth text is therefore drawn larger and only
+        # its transparent layer is reduced; the artwork beneath is never
+        # resized or filtered.
+        render_scale = 2 if layer.smooth else 1
+        overlay_qt = QImage(
+            width * render_scale,
+            height * render_scale,
+            QImage.Format.Format_RGBA8888,
+        )
+        overlay_qt.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(overlay_qt)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            painter.scale(render_scale, render_scale)
             draw_text(
                 painter,
                 layer.text,
@@ -595,24 +641,34 @@ def _apply_text_overlays(
                 QPointF(layer.x * width, layer.y * height),
                 TextStyle.from_layer(layer),
             )
-    finally:
-        painter.end()
+        finally:
+            painter.end()
 
-    overlay = ImageQt.fromqimage(overlay_qt).convert("RGBA")
-    overlay_array = np.asarray(overlay, dtype=np.uint8).copy()
-    # The quantizer snaps antialiased fringe texels to full palette colors,
-    # which fattens every stroke and closes small counters like a P's bowl.
-    # Thresholding coverage first keeps a texel either fully lettered or
-    # untouched, so letters stay the width the font drew.
-    overlay_mask = overlay_array[:, :, 3] >= 128
-    if not np.any(overlay_mask):
-        return processed
-    overlay_array[:, :, 3] = np.where(overlay_mask, 255, 0).astype(np.uint8)
-    overlay = Image.fromarray(overlay_array, mode="RGBA")
+        overlay_image = ImageQt.fromqimage(overlay_qt).convert("RGBA")
+        if render_scale > 1:
+            overlay_image = overlay_image.resize(
+                (width, height), Image.Resampling.LANCZOS
+            )
+        overlay_array = np.asarray(overlay_image, dtype=np.uint8).copy()
+        alpha = overlay_array[:, :, 3]
+        if layer.smooth:
+            # Only the glyph coverage is blended.  The already-processed image
+            # is never resampled, so its hard logical cells stay untouched.
+            # Ignore only the vanishingly faint Lanczos ring, which would cost
+            # paint strokes without adding a visible edge step.
+            overlay_mask = alpha >= 8
+        else:
+            # The legacy crisp mode keeps a texel either fully lettered or
+            # untouched, preventing the palette pass from fattening strokes.
+            overlay_mask = alpha >= 128
+            overlay_array[:, :, 3] = np.where(overlay_mask, 255, 0).astype(np.uint8)
+        if not np.any(overlay_mask):
+            continue
+        combined_mask |= overlay_mask
+        composited = Image.alpha_composite(
+            composited, Image.fromarray(overlay_array, mode="RGBA")
+        )
 
-    combined_mask = np.asarray(processed.paint_mask, dtype=np.bool_).copy()
-    combined_mask |= overlay_mask
-    composited = Image.alpha_composite(processed.image.convert("RGBA"), overlay)
     quantized = quantize_image(
         composited,
         processed.requested_colors,
@@ -1169,7 +1225,10 @@ class MainWindow(QMainWindow):
         say) rather than as the default rust orange.
         """
 
-        button.setIcon(art_icon(name, 64, color))
+        if name in {"profile-add", "folder-open", "refresh", "delete"}:
+            button.setIcon(vector_icon(name, 64, color or "#f27a22"))
+        else:
+            button.setIcon(art_icon(name, 64, color))
         button.setIconSize(QSize(size, size))
 
     @staticmethod
@@ -1573,16 +1632,16 @@ class MainWindow(QMainWindow):
         # Icon-only buttons for the housekeeping actions: they are used rarely,
         # and their labels were most of the text on the page.
         self.open_timelapse_button = self._icon_button(
-            "drag-drop", "Open the timelapse folder"
+            "folder-open", "Open the timelapse folder"
         )
         self.open_session_button = self._icon_button(
-            "workspace", "Open the selected recording's folder"
+            "folder-open", "Open the selected recording's folder"
         )
         self.refresh_sessions_button = self._icon_button(
-            "status", "Look for recordings again"
+            "refresh", "Look for recordings again"
         )
         self.delete_session_button = self._icon_button(
-            "trash",
+            "delete",
             "Delete the selected recording and every frame in it",
             color=DANGER,
         )
@@ -2258,11 +2317,17 @@ class MainWindow(QMainWindow):
         )
         self.text_bold_check = QCheckBox("Bold")
         self.text_italic_check = QCheckBox("Italic")
+        self.text_smooth_check = QCheckBox("Smooth edges")
+        self.text_smooth_check.setToolTip(
+            "Blend only the edge pixels of the selected text. The underlying "
+            "image keeps its original hard logical pixels."
+        )
         text_style_layout = QHBoxLayout()
         text_style_layout.setContentsMargins(0, 0, 0, 0)
         text_style_layout.setSpacing(12)
         text_style_layout.addWidget(self.text_bold_check)
         text_style_layout.addWidget(self.text_italic_check)
+        text_style_layout.addWidget(self.text_smooth_check)
         text_style_layout.addStretch(1)
 
         self.text_gradient_check = QCheckBox("Gradient")
@@ -2374,7 +2439,8 @@ class MainWindow(QMainWindow):
         profile_group, profile_layout = self._step_panel(2, "Rust setup")
         self.profile_combo = NoWheelComboBox()
         self.profile_combo.setToolTip(
-            "Each profile stores one sign/UI layout's calibration rectangles."
+            "Each profile stores one sign's canvas and setup. Fixed Rust UI/HUD "
+            "calibrations carry across every profile."
         )
         profile_row = QHBoxLayout()
         profile_row.addWidget(self.profile_combo, 1)
@@ -2387,9 +2453,9 @@ class MainWindow(QMainWindow):
         self.delete_profile_button = QPushButton("")
         self.delete_profile_button.setToolTip("Delete profile")
         for button, icon in (
-            (self.new_profile_button, "drag-drop"),
+            (self.new_profile_button, "profile-add"),
             (self.rename_profile_button, "pencil"),
-            (self.delete_profile_button, "trash"),
+            (self.delete_profile_button, "delete"),
         ):
             button.setObjectName("iconButton")
             button.setFixedWidth(38)
@@ -2402,6 +2468,10 @@ class MainWindow(QMainWindow):
 
         calibration_title = QLabel("Calibration")
         calibration_title.setObjectName("sectionTitle")
+        calibration_title.setToolTip(
+            "Color box, hue bar, Size value, Clear, hunger, thirst, and Download "
+            "are shared. Every Set button remains available for recalibration."
+        )
         profile_layout.addWidget(calibration_title)
 
         calibration_grid = QGridLayout()
@@ -2613,6 +2683,15 @@ class MainWindow(QMainWindow):
         self.resume_notice.setObjectName("muted")
         self.resume_notice.setWordWrap(True)
         layout.addWidget(self.resume_notice)
+        self.resume_preview_note = QLabel(
+            "Slider preview replays the planned strokes; checkerboard means the "
+            "Rust sign is still untouched there and its surface may look different. "
+            "The 100% Rust preview is the final-result reference."
+        )
+        self.resume_preview_note.setObjectName("muted")
+        self.resume_preview_note.setWordWrap(True)
+        self.resume_preview_note.setToolTip(self._RESUME_TOOLTIP)
+        layout.addWidget(self.resume_preview_note)
         self.resume_check.toggled.connect(self._on_resume_controls_changed)
         self.resume_slider.valueChanged.connect(self._on_resume_controls_changed)
         self.resume_panel.setEnabled(False)
@@ -2748,18 +2827,15 @@ class MainWindow(QMainWindow):
             else self._resume_start_stroke()
         )
         try:
-            target = np.asarray(simulation.convert("RGB"), dtype=np.uint8)
-            if target.shape[0] != plan.height or target.shape[1] != plan.width:
+            if simulation.height != plan.height or simulation.width != plan.width:
                 self.paint_preview.set_source(self._pil_to_pixmap(simulation))
                 return
-            painted = plan_prefix_labels(plan, count) > 0
-            backdrop = _compose_checker_backdrop(
-                target, np.zeros(painted.shape, dtype=np.bool_)
-            )
-            partial = np.asarray(backdrop, dtype=np.uint8).copy()
-            partial[painted] = target[painted]
             self.paint_preview.set_source(
-                self._pil_to_pixmap(Image.fromarray(partial, mode="RGB"))
+                self._pil_to_pixmap(
+                    _build_plan_prefix_image(
+                        plan, count, self._color_correction_model()
+                    )
+                )
             )
         except Exception:
             LOGGER.exception("Could not render the resume preview")
@@ -3421,6 +3497,9 @@ class MainWindow(QMainWindow):
         self.text_italic_check.toggled.connect(
             lambda checked: self._apply_to_selected_text(italic=checked)
         )
+        self.text_smooth_check.toggled.connect(
+            lambda checked: self._apply_to_selected_text(smooth=checked)
+        )
         self.text_gradient_check.toggled.connect(self._on_text_gradient_toggled)
         self.text_gradient_direction_combo.currentIndexChanged.connect(
             lambda _index: self._apply_to_selected_text(
@@ -3647,6 +3726,7 @@ class MainWindow(QMainWindow):
             self.text_color_button.set_color(QColor(*layer.color))
             self.text_bold_check.setChecked(layer.bold)
             self.text_italic_check.setChecked(layer.italic)
+            self.text_smooth_check.setChecked(layer.smooth)
             self.text_gradient_check.setChecked(layer.gradient)
             self._set_combo_data(
                 self.text_gradient_direction_combo, layer.gradient_direction
@@ -3697,6 +3777,7 @@ class MainWindow(QMainWindow):
                 y=min(0.85, 0.5 + offset),
                 bold=self.text_bold_check.isChecked(),
                 italic=self.text_italic_check.isChecked(),
+                smooth=self.text_smooth_check.isChecked(),
                 size_ratio=self._text_size_ratio(font_size),
                 gradient=self.text_gradient_check.isChecked(),
                 gradient_color=_rgb(self.text_gradient_color_button.color()),
@@ -5964,6 +6045,7 @@ class MainWindow(QMainWindow):
                         y=float(layer_value.get("y", 0.5)),
                         bold=bool(layer_value.get("bold", False)),
                         italic=bool(layer_value.get("italic", False)),
+                        smooth=bool(layer_value.get("smooth", False)),
                         size_ratio=float(layer_value.get("size_ratio", 0.0))
                         or self._text_size_ratio(font_size),
                         gradient=bool(layer_value.get("gradient", False)),
@@ -6149,6 +6231,7 @@ class MainWindow(QMainWindow):
                         "y": layer.y,
                         "bold": layer.bold,
                         "italic": layer.italic,
+                        "smooth": layer.smooth,
                         "gradient": layer.gradient,
                         "gradient_color": "#{:02X}{:02X}{:02X}".format(
                             *layer.gradient_color

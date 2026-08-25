@@ -212,6 +212,26 @@ class TransparencyAndQuantizationTests(unittest.TestCase):
         self.assertEqual(painted[4], (250, 190, 44))
         self.assertEqual(painted[5], (120, 60, 220))
 
+    def test_quantization_keeps_a_rare_distinct_hue(self) -> None:
+        """A dominant warm gamut must not erase a small magenta accent."""
+
+        height = width = 64
+        rows, columns = np.indices((height, width))
+        pixels = np.empty((height, width, 4), dtype=np.uint8)
+        pixels[:, :, 0] = 180 + columns * 75 // (width - 1)
+        pixels[:, :, 1] = 20 + rows * 140 // (height - 1)
+        pixels[:, :, 2] = columns * 40 // (width - 1)
+        pixels[:, :, 3] = 255
+        magenta = (228, 19, 173)
+        pixels[0, 0, :3] = magenta
+
+        result = quantize_image(Image.fromarray(pixels, mode="RGBA"), 16)
+        red, green, blue = result.getpixel((0, 0))[:3]
+
+        # Median cut mapped this to (236, 26, 30), visually deleting the hue.
+        self.assertGreater(blue, green + 80)
+        self.assertLessEqual(max(abs(red - magenta[0]), abs(blue - magenta[2])), 5)
+
 
 class CoordinateTests(unittest.TestCase):
     def test_logical_pixels_map_to_cell_centers_on_negative_monitor(self) -> None:
