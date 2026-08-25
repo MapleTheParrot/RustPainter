@@ -50,3 +50,24 @@ def test_a_failed_capture_is_skipped_not_raised(tmp_path) -> None:
     path = recorder.capture_frame()
     assert path is not None and path.name == "frame_00001.png"
     assert recorder.frame_count == 1
+
+
+def test_capture_guard_skips_a_frame_without_touching_the_screen(tmp_path) -> None:
+    allowed = False
+    captures: list[ScreenRect] = []
+
+    recorder = TimelapseRecorder(
+        tmp_path,
+        REGION,
+        capture=lambda region: captures.append(region) or Image.new("RGB", (32, 16)),
+        capture_allowed=lambda: allowed,
+        session_name="guarded",
+    )
+
+    assert recorder.capture_frame() is None
+    assert captures == []
+    assert recorder.frame_count == 0
+
+    allowed = True
+    assert recorder.capture_frame() is not None
+    assert captures == [REGION]

@@ -584,6 +584,7 @@ class _CalibrationPreviewWindow(QWidget):
         self._monitor = monitor
         self._entries: list[tuple[str, Rect]] = []
         self._status: tuple[str, Rect] | None = None
+        self._alerts: tuple[str, ...] = ()
         self._capture_excluded = False
 
     def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
@@ -625,6 +626,13 @@ class _CalibrationPreviewWindow(QWidget):
         self._status = mine
         self.update()
 
+    def set_alerts(self, alerts: tuple[str, ...]) -> None:
+        alerts = tuple(alert for alert in alerts if alert)
+        if alerts == self._alerts:
+            return
+        self._alerts = alerts
+        self.update()
+
     def _map_physical_rect(self, rect: Rect) -> QRectF:
         """Convert a physical rectangle to this window's local coordinates."""
 
@@ -644,7 +652,6 @@ class _CalibrationPreviewWindow(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         outline = QColor(255, 59, 48)
-        fill = QColor(255, 59, 48, 24)
         font = painter.font()
         font.setPointSize(10)
         font.setBold(True)
@@ -653,8 +660,8 @@ class _CalibrationPreviewWindow(QWidget):
 
         for label, rect in self._entries:
             box = self._map_physical_rect(rect)
-            painter.setPen(QPen(outline, 2))
-            painter.setBrush(fill)
+            painter.setPen(QPen(outline, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(box)
 
             tag_width = metrics.horizontalAdvance(label) + 16.0
@@ -672,7 +679,7 @@ class _CalibrationPreviewWindow(QWidget):
         # Without the capture exclusion the status would be read back off
         # the sign by the painter's own captures, so it is not drawn at all.
         if self._status is not None and self._capture_excluded:
-            self._paint_status(painter, *self._status)
+            self._paint_status(painter, *self._status, self._alerts)
         painter.end()
 
     # The job's state in the app's orange, in the top-right corner of the
@@ -693,7 +700,13 @@ class _CalibrationPreviewWindow(QWidget):
     # Inset from the monitor's corner, as a share of the text height.
     _STATUS_INSET = 0.8
 
-    def _paint_status(self, painter: QPainter, text: str, canvas: Rect) -> None:
+    def _paint_status(
+        self,
+        painter: QPainter,
+        text: str,
+        canvas: Rect,
+        alerts: tuple[str, ...] = (),
+    ) -> None:
         del canvas  # Only decides which monitor writes the status.
         if not text or self.width() <= 0 or self.height() <= 0:
             return
@@ -719,6 +732,21 @@ class _CalibrationPreviewWindow(QWidget):
         painter.drawRoundedRect(pill, pixel_size * 0.3, pixel_size * 0.3)
         painter.setPen(self._STATUS_WORD_COLORS.get(text, self._STATUS_COLOR))
         painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+        alert_top = pill.bottom() + pixel_size * 0.25
+        for alert in alerts:
+            alert_pill = QRectF(
+                0.0,
+                0.0,
+                metrics.horizontalAdvance(alert) + pad_x * 2,
+                metrics.height() + pad_y * 2,
+            )
+            alert_pill.moveTopRight(QPointF(self.width() - inset, alert_top))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._STATUS_BACKDROP)
+            painter.drawRoundedRect(alert_pill, pixel_size * 0.3, pixel_size * 0.3)
+            painter.setPen(QColor(255, 36, 36))
+            painter.drawText(alert_pill, Qt.AlignmentFlag.AlignCenter, alert)
+            alert_top = alert_pill.bottom() + pixel_size * 0.2
 
 
 class CalibrationPreviewOverlay:
@@ -734,6 +762,7 @@ class CalibrationPreviewOverlay:
         self._entries: list[tuple[str, Rect]] = []
 
         self._status: tuple[str, Rect] | None = None
+        self._alerts: tuple[str, ...] = ()
 
     def set_rectangles(self, entries: list[tuple[str, Rect | None]]) -> None:
         self._entries = [
@@ -748,6 +777,11 @@ class CalibrationPreviewOverlay:
         self._status = status
         for window in self._windows:
             window.set_status(status)
+
+    def set_alerts(self, alerts: tuple[str, ...]) -> None:
+        self._alerts = tuple(alerts)
+        for window in self._windows:
+            window.set_alerts(self._alerts)
 
     def show_overlay(self) -> None:
         # Rebuild from the live monitor layout every time the overlay comes
@@ -773,6 +807,7 @@ class CalibrationPreviewOverlay:
             window = _CalibrationPreviewWindow(screen, monitor)
             window.set_entries(self._entries)
             window.set_status(self._status)
+            window.set_alerts(self._alerts)
             self._windows.append(window)
             window.show()
             window.raise_()

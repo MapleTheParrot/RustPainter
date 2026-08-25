@@ -47,6 +47,8 @@ def _complete_profile() -> Profile:
         brush_size_box=Rect(1760, 392, 62, 26),
         clear_button=Rect(1690, 392, 30, 30),
         save_button=Rect(1840, 900, 120, 36),
+        hunger=Rect(2260, 1290, 55, 28),
+        thirst=Rect(2260, 1320, 55, 28),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -75,6 +77,8 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "brush_size_box": True,
         "clear_button": True,
         "save_button": True,
+        "hunger": True,
+        "thirst": True,
         "download_button": False,
     }
     assert restored.display is not None

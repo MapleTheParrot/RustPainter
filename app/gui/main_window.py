@@ -818,6 +818,39 @@ class _NameDialog(QDialog):
         return self.edit.text().strip()
 
 
+class _MetricCard(QFrame):
+    """A metric tile that can expose the calculation behind its value."""
+
+    clicked = Signal()
+
+    def __init__(self, *, clickable: bool = False) -> None:
+        super().__init__()
+        self._clickable = clickable
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        if (
+            self._clickable
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        if self._clickable and event.key() in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Space,
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class _PainterBridge(QObject):
     """Converts painter-thread callbacks into queued Qt signals."""
 
@@ -891,6 +924,7 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer.setInterval(5000)
         self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
         self._timelapse_recorder: Any = None
+        self._survival_alerts: tuple[str, ...] = ()
         self._run_report: Any = None
         # Where the running job has got to, on disk, so the job can be
         # picked up again after a server restart takes the sign away.
@@ -1479,6 +1513,19 @@ class MainWindow(QMainWindow):
         sessions_group = QGroupBox("Recordings")
         sessions_layout = QVBoxLayout(sessions_group)
         sessions_layout.setSpacing(9)
+        recordings_head = QHBoxLayout()
+        self.timelapse_total_storage_label = QLabel("Total storage: 0 B")
+        self.timelapse_total_storage_label.setObjectName("muted")
+        self.timelapse_sort_combo = NoWheelComboBox()
+        self.timelapse_sort_combo.addItem("Most recent", "recent")
+        self.timelapse_sort_combo.addItem("Largest first", "largest")
+        self.timelapse_sort_combo.addItem("Smallest first", "smallest")
+        self.timelapse_sort_combo.setToolTip("Order recordings by date or storage used.")
+        recordings_head.addWidget(self.timelapse_total_storage_label)
+        recordings_head.addStretch(1)
+        recordings_head.addWidget(QLabel("Sort"))
+        recordings_head.addWidget(self.timelapse_sort_combo)
+        sessions_layout.addLayout(recordings_head)
         self.timelapse_sessions = QListWidget()
         self.timelapse_sessions.setAlternatingRowColors(True)
         self.timelapse_sessions.setMinimumHeight(180)
@@ -1719,7 +1766,8 @@ class MainWindow(QMainWindow):
         self.analysis_resolution = self._metric("Resolution", "—", "resolution")
         self.analysis_colors = self._metric("Colors", "—", "palette")
         self.analysis_strokes = self._metric("Strokes", "—", "brush")
-        self.analysis_time = self._metric("Est. time", "—", "clock")
+        self.analysis_time = self._metric("Est. time", "—", "clock", clickable=True)
+        self.analysis_time.clicked.connect(self._show_estimate_breakdown)  # type: ignore[attr-defined]
         for column, widget in enumerate(
             (
                 self.analysis_resolution,
@@ -2366,6 +2414,8 @@ class MainWindow(QMainWindow):
         self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
         self.clear_button_status = CalibrationStatus("Clear button", optional=True)
         self.save_button_status = CalibrationStatus("Save button", optional=True)
+        self.hunger_status = CalibrationStatus("Hunger number", optional=True)
+        self.thirst_status = CalibrationStatus("Thirst number", optional=True)
         self.download_button_status = CalibrationStatus("Download button", optional=True)
         self.calibrate_canvas_button = QPushButton("Set")
         self.calibrate_color_box_button = QPushButton("Set")
@@ -2373,6 +2423,8 @@ class MainWindow(QMainWindow):
         self.calibrate_brush_button = QPushButton("Set")
         self.calibrate_clear_button = QPushButton("Set")
         self.calibrate_save_button = QPushButton("Set")
+        self.calibrate_hunger_button = QPushButton("Set")
+        self.calibrate_thirst_button = QPushButton("Set")
         self.calibrate_download_button = QPushButton("Set")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
@@ -2394,6 +2446,18 @@ class MainWindow(QMainWindow):
                 self.calibrate_save_button,
                 "Calibrate Rust's Save changes button, which the anti-AFK break "
                 "clicks to leave the painting UI before it jumps",
+            ),
+            (
+                self.hunger_status,
+                self.calibrate_hunger_button,
+                "Calibrate only the hunger digits shown on Rust's HUD. During "
+                "each anti-AFK break, values at or below 50 show STARVING.",
+            ),
+            (
+                self.thirst_status,
+                self.calibrate_thirst_button,
+                "Calibrate only the thirst digits shown on Rust's HUD. During "
+                "each anti-AFK break, values at or below 50 show THIRSTY.",
             ),
             (
                 self.download_button_status,
@@ -3234,8 +3298,14 @@ class MainWindow(QMainWindow):
         return content
 
     @staticmethod
-    def _metric(label: str, value: str, icon_name: str = "status") -> QWidget:
-        box = QFrame()
+    def _metric(
+        label: str,
+        value: str,
+        icon_name: str = "status",
+        *,
+        clickable: bool = False,
+    ) -> QWidget:
+        box = _MetricCard(clickable=clickable)
         box.setObjectName("metricCard")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -5387,6 +5457,18 @@ class MainWindow(QMainWindow):
         )
         return "\n".join(lines)
 
+    @Slot()
+    def _show_estimate_breakdown(self) -> None:
+        if self._plan is None:
+            return
+        estimate = self._estimate(self._plan)
+        QMessageBox.information(
+            self,
+            "Estimated time breakdown",
+            f"Estimated total: {self._format_duration(estimate.total)}\n\n"
+            f"{self._describe_estimate(estimate)}",
+        )
+
     def _estimate_seconds(self, plan: PaintPlan) -> float:
         return self._estimate(plan).total
 
@@ -5628,6 +5710,12 @@ class MainWindow(QMainWindow):
                 "save_button", "Save changes button that closes the painting UI"
             )
         )
+        self.calibrate_hunger_button.clicked.connect(
+            lambda: self._begin_calibration("hunger", "hunger number on Rust's HUD")
+        )
+        self.calibrate_thirst_button.clicked.connect(
+            lambda: self._begin_calibration("thirst", "thirst number on Rust's HUD")
+        )
         self.calibrate_download_button.clicked.connect(
             lambda: self._begin_calibration(
                 "download_button", "download icon that writes the sign's texture to the desktop"
@@ -5668,6 +5756,9 @@ class MainWindow(QMainWindow):
         )
         self.timelapse_sessions.itemDoubleClicked.connect(
             lambda _item: self._play_selected_session()
+        )
+        self.timelapse_sort_combo.currentIndexChanged.connect(
+            self._refresh_timelapse_sessions
         )
         # Delete is what the key is for everywhere else a list of files is
         # shown, and it is scoped to the list so it cannot fire from elsewhere
@@ -5724,6 +5815,7 @@ class MainWindow(QMainWindow):
             self.timelapse_final_check,
             self.timelapse_speed_slider,
             self.timelapse_format_combo,
+            self.timelapse_sort_combo,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
@@ -5960,6 +6052,9 @@ class MainWindow(QMainWindow):
             self._set_combo_data(
                 self.timelapse_format_combo, str(timelapse.get("export_format", "avi"))
             )
+            self._set_combo_data(
+                self.timelapse_sort_combo, str(timelapse.get("sort_order", "recent"))
+            )
             merge_mode = str(painting.get("stroke_merge_mode", "balanced"))
             if merge_mode not in MERGE_MODE_GAPS:
                 merge_mode = "balanced"
@@ -6099,6 +6194,7 @@ class MainWindow(QMainWindow):
             "capture_final_frame": self.timelapse_final_check.isChecked(),
             "playback_frame_rate": self.timelapse_speed_slider.value(),
             "export_format": str(self.timelapse_format_combo.currentData() or "avi"),
+            "sort_order": str(self.timelapse_sort_combo.currentData() or "recent"),
         }
         current["hotkeys"] = {
             **current.get("hotkeys", {}),
@@ -6211,6 +6307,8 @@ class MainWindow(QMainWindow):
         self.save_button_status.set_calibrated(
             bool(status.get("save_button")), not self.anti_afk_check.isChecked()
         )
+        self.hunger_status.set_calibrated(bool(status.get("hunger")), True)
+        self.thirst_status.set_calibrated(bool(status.get("thirst")), True)
         self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
         self._refresh_brush_model_status()
         if self._refresh_quality_preset_availability():
@@ -6301,6 +6399,8 @@ class MainWindow(QMainWindow):
                     "brush_size_box",
                     "clear_button",
                     "save_button",
+                    "hunger",
+                    "thirst",
                     "download_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
@@ -6416,6 +6516,8 @@ class MainWindow(QMainWindow):
                 "brush_size_box",
                 "clear_button",
                 "save_button",
+                "hunger",
+                "thirst",
                 "download_button",
             ):
                 if other != field:
@@ -6569,6 +6671,8 @@ class MainWindow(QMainWindow):
             "brush_size_box",
             "clear_button",
             "save_button",
+            "hunger",
+            "thirst",
             "download_button",
         ):
             rect = getattr(candidate, name, None)
@@ -6622,6 +6726,8 @@ class MainWindow(QMainWindow):
                     ("Size value box", getattr(profile, "brush_size_box", None)),
                     ("Clear button", getattr(profile, "clear_button", None)),
                     ("Save button", getattr(profile, "save_button", None)),
+                    ("Hunger number", getattr(profile, "hunger", None)),
+                    ("Thirst number", getattr(profile, "thirst", None)),
                     ("Download button", getattr(profile, "download_button", None)),
                 )
                 if rect is not None
@@ -6650,7 +6756,8 @@ class MainWindow(QMainWindow):
         # An overlay that quietly decides not to appear is indistinguishable
         # from a broken one, so every change of mind is logged with what
         # decided it.  Only changes: this runs on every progress update.
-        decision = (show_boxes, show_status, status)
+        alerts = self._survival_alerts if show_status else ()
+        decision = (show_boxes, show_status, status, alerts)
         if decision != self._calibration_overlay_decision:
             self._calibration_overlay_decision = decision
             LOGGER.info(
@@ -6676,6 +6783,9 @@ class MainWindow(QMainWindow):
             self._calibration_preview.set_status(
                 (status, canvas) if show_status else None
             )
+            set_alerts = getattr(self._calibration_preview, "set_alerts", None)
+            if callable(set_alerts):
+                set_alerts(alerts)
             if not self._calibration_preview.isVisible():
                 self._calibration_preview.show_overlay()
         except Exception:
@@ -7522,6 +7632,8 @@ class MainWindow(QMainWindow):
             self.calibrate_brush_button,
             self.calibrate_clear_button,
             self.calibrate_save_button,
+            self.calibrate_hunger_button,
+            self.calibrate_thirst_button,
             self.calibrate_download_button,
             self.countdown_spin,
             self.dry_run_check,
@@ -7753,7 +7865,7 @@ class MainWindow(QMainWindow):
         if apply_brush_size:
             names.extend(("brush_size_box", "clear_button"))
         if anti_afk:
-            names.append("save_button")
+            names.extend(("save_button", "hunger", "thirst"))
         required = {
             "save_button": (
                 "The anti-AFK break leaves the painting UI through Rust's Save "
@@ -8058,6 +8170,10 @@ class MainWindow(QMainWindow):
         percent = min(max(float(progress.percent), 0.0), 100.0)
         self.paint_progress.setValue(round(percent * 10))
         self.progress_state_label.setText(str(progress.message or progress.state.value))
+        alerts = tuple(str(value) for value in getattr(progress, "alerts", ()) if value)
+        if alerts != self._survival_alerts:
+            self._survival_alerts = alerts
+            self._update_calibration_overlay()
         remaining = (
             f" • {self._format_duration(progress.estimated_remaining_seconds)} remaining"
             if progress.estimated_remaining_seconds is not None
@@ -8397,7 +8513,9 @@ class MainWindow(QMainWindow):
         from app.timelapse import TimelapseRecorder
 
         recorder = TimelapseRecorder(
-            self._local_data_directory() / "timelapse", canvas
+            self._local_data_directory() / "timelapse",
+            canvas,
+            capture_allowed=self._timelapse_capture_allowed,
         )
         self._timelapse_recorder = recorder
         interval = max(1, self.timelapse_interval_spin.value())
@@ -8453,8 +8571,9 @@ class MainWindow(QMainWindow):
             if painter is not None
             else None
         )
-        # A paused job is not making visible progress; skip those frames.
-        if state != "running":
+        # A paused job is not making visible progress, and an anti-AFK break
+        # deliberately leaves the painting UI; neither belongs in the movie.
+        if state != "running" or not self._timelapse_capture_allowed():
             self._update_timelapse_status()
             return
         self._schedule_timelapse_frame(recorder)
@@ -8474,11 +8593,21 @@ class MainWindow(QMainWindow):
             else None
         )
         frames = recorder.frame_count
-        label = "Paused" if state != "running" else "Recording"
+        phase = getattr(getattr(painter, "progress", None), "phase", "paint")
+        label = (
+            "Skipping anti-AFK"
+            if phase == "anti_afk"
+            else "Paused" if state != "running" else "Recording"
+        )
         self.timelapse_status_badge.setText(
             f"{label} • {frames} frame{'s' if frames != 1 else ''} • "
             f"{recorder.directory.name}"
         )
+
+    def _timelapse_capture_allowed(self) -> bool:
+        painter = self._painter
+        phase = getattr(getattr(painter, "progress", None), "phase", "paint")
+        return phase != "anti_afk"
 
     @staticmethod
     def _schedule_timelapse_frame(recorder: Any) -> None:
@@ -8527,25 +8656,34 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _refresh_timelapse_sessions(self) -> None:
-        """List every recorded session, newest first, with its frame count."""
+        """List every recorded session in the chosen order with disk usage."""
 
         selected = {path.name for path in self._selected_session_paths()}
         self.timelapse_sessions.clear()
         root = self._timelapse_root()
         try:
-            sessions = sorted(
-                (path for path in root.iterdir() if path.is_dir()),
-                key=lambda path: path.name,
-                reverse=True,
-            )
+            session_paths = [path for path in root.iterdir() if path.is_dir()]
         except OSError:
-            sessions = []
-        for session in sessions:
+            session_paths = []
+        sessions = [
+            (session, self._directory_size(session)) for session in session_paths
+        ]
+        order = str(self.timelapse_sort_combo.currentData() or "recent")
+        if order == "largest":
+            sessions.sort(key=lambda value: (value[1], value[0].name), reverse=True)
+        elif order == "smallest":
+            sessions.sort(key=lambda value: (value[1], value[0].name))
+        else:
+            sessions.sort(key=lambda value: value[0].name, reverse=True)
+        total_bytes = sum(size for _session, size in sessions)
+        self.timelapse_total_storage_label.setText(
+            f"Total storage: {self._format_storage(total_bytes)}"
+        )
+        for session, size_bytes in sessions:
             frames = session_frames(session)
-            megabytes = sum(frame.stat().st_size for frame in frames) / (1024 * 1024)
             item = QListWidgetItem(
                 f"{session.name}  •  {len(frames)} frame"
-                f"{'s' if len(frames) != 1 else ''}  •  {megabytes:.1f} MB"
+                f"{'s' if len(frames) != 1 else ''}  •  {self._format_storage(size_bytes)}"
             )
             item.setData(Qt.ItemDataRole.UserRole, str(session))
             self.timelapse_sessions.addItem(item)
@@ -8561,6 +8699,30 @@ class MainWindow(QMainWindow):
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             self.timelapse_sessions.addItem(placeholder)
         self._sync_session_buttons()
+
+    @staticmethod
+    def _directory_size(directory: Path) -> int:
+        total = 0
+        try:
+            files = directory.rglob("*")
+            for path in files:
+                try:
+                    if path.is_file():
+                        total += path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return total
+
+    @staticmethod
+    def _format_storage(size_bytes: int) -> str:
+        value = float(max(0, size_bytes))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024.0 or unit == "TB":
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024.0
+        return f"{value:.1f} TB"
 
     def _selected_session_paths(self) -> list[Path]:
         """Every picked recording, in the order the list shows them."""

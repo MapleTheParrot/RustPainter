@@ -171,6 +171,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # into a video file, so what the user watched is what they save.
         "playback_frame_rate": 15,
         "export_format": "avi",
+        # The recordings page opens newest-first; users can instead put the
+        # largest folders at either end for storage cleanup.
+        "sort_order": "recent",
     },
     "hotkeys": {
         "start_resume": "F8",
@@ -535,6 +538,14 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError(
             "timelapse.export_format must be one of: "
             + ", ".join(sorted(SUPPORTED_VIDEO_FORMATS))
+        )
+    if timelapse.get("sort_order", "recent") not in {
+        "recent",
+        "largest",
+        "smallest",
+    }:
+        raise SettingsError(
+            "timelapse.sort_order must be recent, largest, or smallest"
         )
 
     assert isinstance(hotkeys, Mapping)

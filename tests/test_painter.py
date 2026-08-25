@@ -583,6 +583,25 @@ def test_anti_afk_needs_the_save_button_only_for_real_input() -> None:
     assert not any(event.kind == "key_down" for event in input_controller.events)
 
 
+def test_anti_afk_reads_optional_survival_numbers_and_publishes_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    profile.hunger = ScreenRect(800, 100, 40, 20)
+    profile.thirst = ScreenRect(850, 100, 40, 20)
+    readings = iter((50, 72))
+    monkeypatch.setattr("app.painter.read_number", lambda _image: next(readings))
+    painter = Painter(MockInputController(), screen_capture=_panel_capture)
+    painter.configure(_dot_plan(1), profile, _settings())
+    assert painter._job is not None
+    painter._state = PainterState.RUNNING
+
+    painter._read_survival_status(painter._job)
+
+    assert painter.progress.phase == "anti_afk"
+    assert painter.progress.alerts == ("STARVING",)
+
+
 def test_abort_stops_queued_strokes_and_releases_mouse() -> None:
     input_controller = MockInputController()
     painter = Painter(input_controller)

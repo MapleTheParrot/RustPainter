@@ -32,10 +32,12 @@ class TimelapseRecorder:
         region: RectangleLike,
         *,
         capture: "Callable[[RectangleLike], Image] | None" = None,
+        capture_allowed: Callable[[], bool] | None = None,
         session_name: str | None = None,
     ) -> None:
         self.region = region
         self._capture = capture
+        self._capture_allowed = capture_allowed
         stamp = session_name or time.strftime("%Y%m%d-%H%M%S")
         self.directory = Path(root) / stamp
         self._lock = threading.Lock()
@@ -58,6 +60,11 @@ class TimelapseRecorder:
                 return None
             self._busy = True
         try:
+            # Checked in the capture thread, immediately before grabbing the
+            # screen.  This closes the race where an anti-AFK break begins just
+            # after the GUI timer schedules a frame.
+            if self._capture_allowed is not None and not self._capture_allowed():
+                return None
             capturer = self._capture if self._capture is not None else capture_region
             image = capturer(self.region)
             self.directory.mkdir(parents=True, exist_ok=True)

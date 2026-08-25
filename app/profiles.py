@@ -307,6 +307,10 @@ class CalibrationProfile:
     # Rust's "Save changes" control.  The anti-AFK break clicks it to leave
     # the painting UI, jumps, and reopens the sign with a click.
     save_button: Rect | None = None
+    # Optional HUD number crops.  They are read while the painting UI is closed
+    # for an anti-AFK break, when Rust's survival HUD is visible again.
+    hunger: Rect | None = None
+    thirst: Rect | None = None
     # Rust's download control, which writes the sign's texture to the desktop
     # texel for texel.  With it calibrated the probes and the touch-up pass
     # read the sign exactly instead of through a screenshot.
@@ -365,6 +369,8 @@ class CalibrationProfile:
             "brush_size_box": self.brush_size_box is not None,
             "clear_button": self.clear_button is not None,
             "save_button": self.save_button is not None,
+            "hunger": self.hunger is not None,
+            "thirst": self.thirst is not None,
             "download_button": self.download_button is not None,
         }
 
@@ -397,6 +403,8 @@ class CalibrationProfile:
             "brushSizeBox": _rect_dict(self.brush_size_box),
             "clearButton": _rect_dict(self.clear_button),
             "saveButton": _rect_dict(self.save_button),
+            "hunger": _rect_dict(self.hunger),
+            "thirst": _rect_dict(self.thirst),
             "downloadButton": _rect_dict(self.download_button),
             "pickerDirections": {
                 "hue": self.hue_direction,
@@ -439,6 +447,8 @@ class CalibrationProfile:
                 "save button",
                 optional=True,
             ),
+            hunger=_rect_from(value.get("hunger"), "hunger", optional=True),
+            thirst=_rect_from(value.get("thirst"), "thirst", optional=True),
             download_button=_rect_from(
                 _first(value, "downloadButton", "download_button"),
                 "download button",

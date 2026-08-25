@@ -2394,6 +2394,7 @@ def test_the_estimate_is_one_figure_that_learns_the_checks_and_touch_up(
     window.confirm_strokes_check.setChecked(True)
     window.verify_passes_spin.setValue(1)
 
+
     # A run that painted 600 s of artwork, checked 20 colors at a second
     # a capture with a minute of repainting, and touched up in 90 s.
     before = window._learned_timing
@@ -2426,6 +2427,28 @@ def test_the_estimate_is_one_figure_that_learns_the_checks_and_touch_up(
     # ... and already in the figure on the screen.
     assert "from 1 run" in window.analysis_time.toolTip()
     assert window._estimate(plan).touch_up > estimate.touch_up
+
+
+def test_clicking_the_estimate_shows_its_breakdown(
+    window: MainWindow,
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _load_small_plan(window, tmp_path, qtbot)
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda _parent, title, text: shown.append((title, text)),
+    )
+
+    qtbot.mouseClick(window.analysis_time, Qt.MouseButton.LeftButton)
+
+    assert shown
+    assert shown[0][0] == "Estimated time breakdown"
+    assert "Estimated total:" in shown[0][1]
+    assert "Painting:" in shown[0][1]
 
 
 def test_typing_a_caption_waits_for_a_pause_before_replanning(
@@ -3185,11 +3208,32 @@ def test_recording_waits_for_the_artwork_and_does_not_restart_at_the_end(
 def test_timelapse_settings_persist(window: MainWindow) -> None:
     window.timelapse_check.setChecked(True)
     window.timelapse_interval_spin.setValue(25)
+    window._set_combo_data(window.timelapse_sort_combo, "largest")
 
     document = window._settings_document()
 
     assert document["timelapse"]["enabled"] is True
     assert document["timelapse"]["interval_seconds"] == 25
+    assert document["timelapse"]["sort_order"] == "largest"
+
+
+def test_timelapse_storage_total_and_size_sorting(window: MainWindow) -> None:
+    root = window._timelapse_root()
+    small = root / "20260818-100000"
+    large = root / "20260818-090000"
+    small.mkdir(parents=True)
+    large.mkdir(parents=True)
+    (small / "frame_00001.png").write_bytes(b"s" * 100)
+    (large / "frame_00001.png").write_bytes(b"l" * 1500)
+
+    window._set_combo_data(window.timelapse_sort_combo, "largest")
+    window._refresh_timelapse_sessions()
+    assert window._selected_session_paths() == []
+    assert window.timelapse_sessions.item(0).data(Qt.ItemDataRole.UserRole) == str(large)
+    assert window.timelapse_total_storage_label.text() == "Total storage: 1.6 KB"
+
+    window._set_combo_data(window.timelapse_sort_combo, "smallest")
+    assert window.timelapse_sessions.item(0).data(Qt.ItemDataRole.UserRole) == str(small)
 
 
 def test_timelapse_page_lists_recordings_and_deletes_a_selected_one(
