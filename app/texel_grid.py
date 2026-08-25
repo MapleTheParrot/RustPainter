@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Mapping, Sequence
 
 import logging
 
@@ -929,9 +929,14 @@ class TexelGridModel:
     # the wrong step, every dab lands one texel over.  Empty means unaudited.
     aim_nudge_x: tuple[float, ...] = ()
     aim_nudge_y: tuple[float, ...] = ()
+    # How far outside the calibrated rectangle the cursor may go to reach a
+    # texel the aim lattice places there.  A few pixels: enough for the
+    # lattice's offset from the texture and the hand that dragged the
+    # rectangle, not enough to leave the sign.
     residual: float = 0.0
     from_edges: bool = False
     captured_at: str = ""
+    _AIM_SLACK_PIXELS: ClassVar[float] = 4.0
 
     def __post_init__(self) -> None:
         if self.columns < 2 or self.rows < 2:
@@ -1028,20 +1033,40 @@ class TexelGridModel:
         return x, y
 
     def clamp_rect(self, canvas: Any) -> SimpleNamespace:
-        """Where the mouse may go: whole pixels on the rendered texture.
+        """Where the mouse may go: whole pixels the cursor may stamp from.
 
         The game takes paint clicks on the texture and nowhere else, and the
         texture is known to a fraction of a pixel; the calibrated rectangle
         still bounds it, being what the user vouched for, with a pixel of
         slack for the hand that dragged it.  In the rectangle convention the
         last usable coordinate is ``left + width - 1``.
+
+        The cursor lattice is not the texture, though: the game maps the
+        cursor over a slightly offset rectangle, so the position that stamps
+        the first row can sit a couple of pixels above where that row is
+        drawn - measured live at 2.5 px on a 1024x512 sign, which put the
+        whole top row outside this rectangle and left it unpaintable however
+        often it was repainted.  Those positions are measured evidence that
+        the game accepts a click there, so the span the cursor lattice needs
+        is allowed too, bounded by the rectangle plus the same hand-drag
+        slack rather than by the texture alone.
         """
 
+        aim_left = self.aim_origin_x
+        aim_right = self.aim_origin_x + self.columns * self.aim_pitch_x
+        aim_top = self.aim_origin_y
+        aim_bottom = self.aim_origin_y + self.rows * self.aim_pitch_y
         left, right = pixel_span(
-            self.origin_x, self.origin_x + self.width, canvas.left, canvas.left + canvas.width
+            min(self.origin_x, aim_left),
+            max(self.origin_x + self.width, aim_right),
+            canvas.left - self._AIM_SLACK_PIXELS,
+            canvas.left + canvas.width + self._AIM_SLACK_PIXELS,
         )
         top, bottom = pixel_span(
-            self.origin_y, self.origin_y + self.height, canvas.top, canvas.top + canvas.height
+            min(self.origin_y, aim_top),
+            max(self.origin_y + self.height, aim_bottom),
+            canvas.top - self._AIM_SLACK_PIXELS,
+            canvas.top + canvas.height + self._AIM_SLACK_PIXELS,
         )
         return SimpleNamespace(
             left=float(left),
@@ -1384,6 +1409,20 @@ def audit_cursor_map(
                     continue
                 proposed = nudges[k] - float(np.sign(relative))
                 if abs(proposed) > _AUDIT_MAX_NUDGE_PIXELS:
+                    continue
+                # A nudge that walks the aim off the measured lattice is not
+                # a correction.  At the very edge the dot cannot move freely
+                # - the mouse is held inside the sign - so it reads as
+                # displaced every round and the nudge grows until that
+                # index is unreachable: live, the top row of a 1024x512
+                # sign was nudged 2 px above the rectangle and could not be
+                # painted at all, however many times it was repainted.
+                pitch = grid.aim_pitch_x if along_x else grid.aim_pitch_y
+                origin = grid.aim_origin_x if along_x else grid.aim_origin_y
+                aimed = origin + (k + 0.5) * pitch + proposed
+                if not (
+                    origin - 0.5 * pitch <= aimed <= origin + (count - 0.5) * pitch
+                ):
                     continue
                 nudges[k] = proposed
                 displaced.append(k)

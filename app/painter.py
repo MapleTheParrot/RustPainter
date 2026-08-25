@@ -761,6 +761,9 @@ class Painter:
         # The Size number this job's probe proved lands a lone dab on its
         # sign, or None while unmeasured (then the smallest brush is used).
         self._measured_detail_size: float | None = None
+        # Whether a lone dab sweeps across its texel rather than pressing at
+        # a point.  True until a probe says this sign does not need it.
+        self._measured_dab_sweep: bool = True
         # The gap between strokes and the long-drag rate this job's probes
         # proved on its sign, or None while unmeasured (then the floors).
         self._measured_stroke_gap_seconds: float | None = None
@@ -928,6 +931,7 @@ class Painter:
             self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
+            self._measured_dab_sweep = True
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
@@ -1002,6 +1006,7 @@ class Painter:
             self._measured_texel_grid = None
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
+            self._measured_dab_sweep = True
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
@@ -1035,6 +1040,13 @@ class Painter:
 
         with self._condition:
             return self._color_pick_summary
+
+    @property
+    def measured_dab_sweep(self) -> bool:
+        """Whether lone dabs sweep across their texel on this sign."""
+
+        with self._condition:
+            return self._measured_dab_sweep
 
     @property
     def measured_bare_color(self) -> RGBColor | None:
@@ -3155,11 +3167,15 @@ class Painter:
             return float(window.max()) if window.size else 0.0
 
         last_color: RGBColor | None = None
-        chosen: float | None = None
+        chosen: tuple[float, bool] | None = None
+        # Sweep before point at each Size: the least invasive stamp that
+        # lands every dot wins, and a sweep across one texel disturbs its
+        # neighbours less than a brush a quarter wider does.
+        trials = [(size, sweep) for size in self._DAB_PROBE_SIZES for sweep in (True, False)]
         try:
             epoch = self._pause_generation_value()
             before = self._capture_parked(canvas, park, epoch)
-            for batch, size in enumerate(self._DAB_PROBE_SIZES):
+            for batch, (size, sweep) in enumerate(trials):
                 epoch = self._pause_generation_value()
                 texels = batch_texels(batch)
                 expected = [
@@ -3173,6 +3189,13 @@ class Painter:
                 color = self._probe_color_against(before, expected, skip=last_color)
                 last_color = color
                 self._select_color(color, target, settings, epoch, apply_correction=False)
+                extension = (
+                    self._stroke_extension_pixels(
+                        aiming.paint_canvas, plan, model, size
+                    )
+                    if sweep
+                    else 0.0
+                )
                 for u, v in texels:
                     self._execute_stroke(
                         Stroke(u, v, u, v),
@@ -3181,7 +3204,7 @@ class Painter:
                         settings,
                         epoch,
                         aiming.bias,
-                        0.0,
+                        extension,
                         clamp_rect=aiming.clamp_canvas,
                         mapper=aiming.mapper,
                         texel_pitch=aiming.texel_pitch,
@@ -3207,15 +3230,16 @@ class Painter:
                         )
                 misses = dots - hits
                 LOGGER.info(
-                    "Dab probe: %d of %d lone dabs landed at Size %s, spilling "
+                    "Dab probe: %d of %d lone dabs landed at Size %s %s, spilling "
                     "into %.2f neighbours each",
                     hits,
                     dots,
                     format_brush_size(size),
+                    "swept across the texel" if sweep else "pressed at a point",
                     spills / max(1, hits),
                 )
                 if misses <= self._DAB_PROBE_MAX_MISSES:
-                    chosen = float(size)
+                    chosen = (float(size), sweep)
                     break
         except (_RetryAction, _AbortRequested):
             raise
@@ -3227,19 +3251,19 @@ class Painter:
             return
         if chosen is None:
             LOGGER.warning(
-                "No probed Size landed every lone dab; the one-cell brush stays "
-                "the smallest and the touch-up pass will have holes to fill"
+                "No probed stamp landed every lone dab; the one-cell brush stays "
+                "the smallest, sweeping its texel, and the touch-up pass will "
+                "have holes to fill"
             )
             return
-        self._measured_detail_size = chosen
-        if chosen > BRUSH_SIZE_MIN:
-            LOGGER.info(
-                "Adopting Size %s for this sign's one-cell strokes: the smallest "
-                "brush missed lone dabs and this one lands them",
-                format_brush_size(chosen),
-            )
-        else:
-            LOGGER.info("The smallest brush lands every lone dab on this sign")
+        size, sweep = chosen
+        self._measured_detail_size = size
+        self._measured_dab_sweep = sweep
+        LOGGER.info(
+            "Adopting Size %s %s for this sign's one-cell strokes",
+            format_brush_size(size),
+            "swept across each texel" if sweep else "pressed at a point",
+        )
 
     def _probe_line_tool(self, job: _Job) -> bool:
         """Prove the Shift line tool on this sign with one stroke.
@@ -3814,15 +3838,20 @@ class Painter:
                 completed += first_index
             completed_work += schedule.group_cost(color_index - 1)
             diameter = max(1, int(group.brush_diameter))
-            # The sideways reach that covers a logical cell wider than the
-            # brush.  On a native grid a cell IS a texel, which the game
-            # paints whole or not at all, so there is nothing to reach for -
-            # and the reach would turn every lone dab into a one- or two-
-            # pixel drag whose release lands in the neighbouring texel.
-            # Measured on a finished XXL sign: lone dabs came out bare 4.4%
-            # of the time against 0.3% for dragged texels, two thirds of
-            # every hole on the sign.  A native dab is a stationary press at
-            # the audited aim, and nothing else.
+            # The sideways reach that covers a cell wider than the brush -
+            # and, on a native grid, what makes a lone dab a sweep across
+            # its own texel rather than a single point.  The game samples
+            # the cursor in whole logical pixels, 1.25 physical ones at 125%
+            # scale against a 1.77 px texel, so a point press lands in the
+            # neighbouring texel whenever the sample falls the wrong side of
+            # the boundary: measured live, texels painted as a lone dab came
+            # out bare 4-6% of the time while texels swept by a drag came
+            # out at 0.0-0.3%.  A sweep across the texel is painted whatever
+            # sample the game takes, and is still narrow enough not to reach
+            # a neighbour's centre.  Whether this sign needs it is measured
+            # (:meth:`_probe_dab_size`); unmeasured, it is used, because the
+            # sweep is the behaviour every finished sign was painted with.
+            swept = self._measured_dab_sweep
             extension = (
                 self._stroke_extension_pixels(
                     paint_canvas,
@@ -3832,7 +3861,7 @@ class Painter:
                         target, plan, diameter, settings.logical_pixel_spacing, model
                     ),
                 )
-                if model is not None and not aiming.native
+                if model is not None and (swept or not aiming.native)
                 else 0.0
             )
 
