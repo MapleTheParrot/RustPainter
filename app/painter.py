@@ -762,8 +762,8 @@ class Painter:
         # sign, or None while unmeasured (then the smallest brush is used).
         self._measured_detail_size: float | None = None
         # Whether a lone dab sweeps across its texel rather than pressing at
-        # a point.  True until a probe says this sign does not need it.
-        self._measured_dab_sweep: bool = True
+        # a point.  False until a probe says this sign needs the sweep.
+        self._measured_dab_sweep: bool = False
         # The gap between strokes and the long-drag rate this job's probes
         # proved on its sign, or None while unmeasured (then the floors).
         self._measured_stroke_gap_seconds: float | None = None
@@ -931,7 +931,7 @@ class Painter:
             self._job = _Job(plan, target, resolved_settings, start_stroke=start_stroke)
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
-            self._measured_dab_sweep = True
+            self._measured_dab_sweep = False
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
@@ -1006,7 +1006,7 @@ class Painter:
             self._measured_texel_grid = None
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
-            self._measured_dab_sweep = True
+            self._measured_dab_sweep = False
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
@@ -3168,10 +3168,10 @@ class Painter:
 
         last_color: RGBColor | None = None
         chosen: tuple[float, bool] | None = None
-        # Sweep before point at each Size: the least invasive stamp that
-        # lands every dot wins, and a sweep across one texel disturbs its
-        # neighbours less than a brush a quarter wider does.
-        trials = [(size, sweep) for size in self._DAB_PROBE_SIZES for sweep in (True, False)]
+        # Point before sweep at each Size: the least invasive stamp that
+        # lands every dot wins.  A point touches nothing but its texel; a
+        # sweep reaches sideways, and a wider brush reaches all round.
+        trials = [(size, sweep) for size in self._DAB_PROBE_SIZES for sweep in (False, True)]
         try:
             epoch = self._pause_generation_value()
             before = self._capture_parked(canvas, park, epoch)
@@ -3838,19 +3838,15 @@ class Painter:
                 completed += first_index
             completed_work += schedule.group_cost(color_index - 1)
             diameter = max(1, int(group.brush_diameter))
-            # The sideways reach that covers a cell wider than the brush -
-            # and, on a native grid, what makes a lone dab a sweep across
-            # its own texel rather than a single point.  The game samples
-            # the cursor in whole logical pixels, 1.25 physical ones at 125%
-            # scale against a 1.77 px texel, so a point press lands in the
-            # neighbouring texel whenever the sample falls the wrong side of
-            # the boundary: measured live, texels painted as a lone dab came
-            # out bare 4-6% of the time while texels swept by a drag came
-            # out at 0.0-0.3%.  A sweep across the texel is painted whatever
-            # sample the game takes, and is still narrow enough not to reach
-            # a neighbour's centre.  Whether this sign needs it is measured
-            # (:meth:`_probe_dab_size`); unmeasured, it is used, because the
-            # sweep is the behaviour every finished sign was painted with.
+            # The sideways reach that covers a cell wider than the brush.
+            # On a native grid a cell is one texel, and whether a lone dab
+            # should sweep across it or press at a point is measured
+            # (:meth:`_probe_dab_size`), not assumed.  Unmeasured, it
+            # presses: the sign's own exported texture showed a third of its
+            # lone texels painted a neighbour's colour, twice as often
+            # sideways as up or down - the sweep's endpoints reaching past
+            # the texel's edge - while the point presses of its touch-up
+            # passes landed 83% of the hardest cells at the first attempt.
             swept = self._measured_dab_sweep
             extension = (
                 self._stroke_extension_pixels(
