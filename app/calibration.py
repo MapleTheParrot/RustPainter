@@ -813,6 +813,7 @@ class _CalibrationResizeHandle(QWidget):
         self._monitor = monitor
         self._drag_rect: Rect | None = None
         self._drag_edges: tuple[bool, bool, bool, bool] | None = None
+        self._hover_edges = (False, False, False, False)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -826,6 +827,55 @@ class _CalibrationResizeHandle(QWidget):
         self.setWindowTitle(f"Resize {label} calibration")
         self.setScreen(screen)
         self._set_border_geometry(screen)
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        exclude_window_from_capture(self)
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt API
+        """Keep Windows' layered hit test alive and reveal hovered handles."""
+
+        del event
+        painter = QPainter(self)
+        # Windows passes mouse input through fully transparent pixels in a
+        # layered window.  Alpha 1 is visually imperceptible but makes the
+        # masked border a real hit target; the interior is absent from the
+        # window mask and remains genuinely click-through.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), QColor(255, 59, 48, 1))
+        if any(self._hover_edges):
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceOver
+            )
+            painter.setPen(QPen(QColor(255, 88, 76, 235), 3))
+            hit = self._HIT_WIDTH
+            left, right, top, bottom = self._hover_edges
+            x_left = hit
+            x_right = self.width() - hit - 1
+            y_top = hit
+            y_bottom = self.height() - hit - 1
+            if left:
+                painter.drawLine(x_left, y_top, x_left, y_bottom)
+            if right:
+                painter.drawLine(x_right, y_top, x_right, y_bottom)
+            if top:
+                painter.drawLine(x_left, y_top, x_right, y_top)
+            if bottom:
+                painter.drawLine(x_left, y_bottom, x_right, y_bottom)
+            if (left or right) and (top or bottom):
+                center_x = x_left if left else x_right
+                center_y = y_top if top else y_bottom
+                painter.setBrush(QColor(255, 88, 76, 245))
+                painter.drawRect(QRect(center_x - 4, center_y - 4, 8, 8))
+        painter.end()
+
+    def _set_hover_edges(
+        self, edges: tuple[bool, bool, bool, bool]
+    ) -> None:
+        if edges == self._hover_edges:
+            return
+        self._hover_edges = edges
+        self.update()
 
     def _set_border_geometry(self, screen: Any) -> None:
         physical = self._monitor.rect
@@ -902,13 +952,16 @@ class _CalibrationResizeHandle(QWidget):
             return
         self._drag_rect = self._rect
         self._drag_edges = edges
+        self._set_hover_edges(edges)
         self.grabMouse()
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
         x, y = self._sample_physical(event)
         if self._drag_rect is None or self._drag_edges is None:
-            self.setCursor(self._cursor_for(self._edges_at(x, y)))
+            edges = self._edges_at(x, y)
+            self._set_hover_edges(edges)
+            self.setCursor(self._cursor_for(edges))
             return
         self._rect = _resized_rect(
             self._drag_rect, self._drag_edges, x, y, self._MINIMUM_SIZE
@@ -930,6 +983,12 @@ class _CalibrationResizeHandle(QWidget):
         self.rectangle_changing.emit(self._label, self._rect)
         self.rectangle_changed.emit(self._label, self._rect)
         event.accept()
+
+    def leaveEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        if self._drag_rect is None:
+            self._set_hover_edges((False, False, False, False))
+            self.unsetCursor()
+        super().leaveEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         try:

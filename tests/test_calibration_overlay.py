@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtGui import QGuiApplication
+
 from app.calibration import (
     CalibrationPreviewOverlay,
+    _CalibrationResizeHandle,
     _resize_edges,
     _resized_rect,
 )
@@ -46,6 +50,29 @@ def test_preview_reports_the_finished_resize_without_requesting_a_redrag() -> No
 
     assert overlay._entries == [("Canvas", Rect(8, 20, 102, 55))]
     assert updates == [("Canvas", Rect(8, 20, 102, 55))]
+
+
+def test_resize_border_has_nonzero_alpha_for_windows_hit_testing(qtbot) -> None:
+    screen = QGuiApplication.primaryScreen()
+    assert screen is not None
+    geometry = screen.geometry()
+    monitor_rect = Rect(
+        geometry.x(), geometry.y(), geometry.width(), geometry.height()
+    )
+    monitor = SimpleNamespace(rect=monitor_rect, logical_rect=monitor_rect)
+    handle = _CalibrationResizeHandle(
+        "Canvas",
+        Rect(geometry.x() + 20, geometry.y() + 20, 100, 50),
+        screen,
+        monitor,
+    )
+    qtbot.addWidget(handle)
+    handle.show()
+    handle.repaint()
+
+    image = handle.grab().toImage()
+
+    assert image.pixelColor(0, 0).alpha() > 0
 
 
 def test_finished_overlay_resize_is_saved_to_the_current_profile(
