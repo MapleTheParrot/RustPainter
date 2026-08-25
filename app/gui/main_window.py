@@ -2487,8 +2487,9 @@ class MainWindow(QMainWindow):
         self.show_calibration_check = QCheckBox("Show boxes on screen")
         self.show_calibration_check.setToolTip(
             "Draws labeled red outlines over every calibrated region so you can\n"
-            "confirm they still line up with Rust's painting UI. The outlines\n"
-            "are click-through and hide automatically while painting."
+            "confirm they still line up with Rust's painting UI. Hover an edge\n"
+            "or corner and drag to resize it; the interiors stay click-through.\n"
+            "The boxes cannot be edited while a paint job is active."
         )
         profile_layout.addWidget(self.apply_brush_check)
         self.brush_model_status = QLabel("Brush size measured at the start of each job")
@@ -6711,6 +6712,69 @@ class MainWindow(QMainWindow):
     def _on_show_calibration_toggled(self, *_args: Any) -> None:
         self._update_calibration_overlay()
 
+    _CALIBRATION_LABEL_FIELDS = {
+        "Canvas": "canvas",
+        "Color box": "color_box",
+        "Hue bar": "hue_bar",
+        "Size value box": "brush_size_box",
+        "Clear button": "clear_button",
+        "Save button": "save_button",
+        "Hunger number": "hunger",
+        "Thirst number": "thirst",
+        "Download button": "download_button",
+    }
+
+    def _resize_calibration_rectangle(self, label: str, rectangle: ScreenRect) -> None:
+        """Persist an edge/corner edit made directly on the preview overlay."""
+
+        field = self._CALIBRATION_LABEL_FIELDS.get(label)
+        profile = self._current_profile
+        operation_active = (
+            self._painter_is_active()
+            or self._debug_running
+            or self._countdown_callback_running
+            or bool(self._countdown and self._countdown.isVisible())
+        )
+        if field is None or profile is None or operation_active:
+            self._update_calibration_overlay()
+            return
+        previous = getattr(profile, field, None)
+        if previous == rectangle:
+            return
+
+        candidate = Profile.from_dict(profile.to_dict())
+        setattr(candidate, field, rectangle)
+        if field in {"color_box", "hue_bar"}:
+            candidate.metadata.pop("ui_reference", None)
+        if field in {"canvas", "color_box", "hue_bar"}:
+            candidate.metadata.pop("color_correction", None)
+        if field == "canvas" and self._canvas_shape_changed(rectangle):
+            candidate.metadata.pop("brush_size_model", None)
+            candidate.metadata.pop("texel_grid", None)
+        try:
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not save resized calibration")
+            QMessageBox.warning(self, "Could not resize calibration", str(exc))
+            self._update_calibration_overlay()
+            return
+
+        LOGGER.info(
+            "Resized %s: left=%d top=%d width=%d height=%d",
+            field,
+            rectangle.left,
+            rectangle.top,
+            rectangle.width,
+            rectangle.height,
+        )
+        self.statusBar().showMessage(f"Updated {label} calibration", 4000)
+        self._refresh_profile_ui()
+        if field == "canvas":
+            self._update_quality_dimensions()
+        elif field == "brush_size_box":
+            self._schedule_processing()
+        self._update_calibration_overlay()
+
     def _update_calibration_overlay(self) -> None:
         """Show, refresh, or hide the labeled on-screen calibration outlines."""
 
@@ -6735,8 +6799,14 @@ class MainWindow(QMainWindow):
         # A paused job is the moment the outlines are most wanted: nothing is
         # being clicked, and what the user is checking is whether the boxes
         # still line up with Rust before letting the job carry on.  The
-        # overlay takes no input, and a recording skips paused frames, so
-        # nothing downstream sees it either.
+        # overlay's resize borders are disabled while any job is active, and
+        # a recording skips paused frames, so nothing downstream sees it.
+        operation_active = (
+            self._painter_is_active()
+            or self._debug_running
+            or self._countdown_callback_running
+            or bool(self._countdown and self._countdown.isVisible())
+        )
         busy = (
             (self._painter_is_active() and not self._painter_is_paused())
             or self._debug_running
@@ -6779,7 +6849,15 @@ class MainWindow(QMainWindow):
         try:
             if self._calibration_preview is None:
                 self._calibration_preview = CalibrationPreviewOverlay()
+                set_resize_callback = getattr(
+                    self._calibration_preview, "set_resize_callback", None
+                )
+                if callable(set_resize_callback):
+                    set_resize_callback(self._resize_calibration_rectangle)
             self._calibration_preview.set_rectangles(entries if show_boxes else [])
+            set_editable = getattr(self._calibration_preview, "set_editable", None)
+            if callable(set_editable):
+                set_editable(show_boxes and not operation_active)
             self._calibration_preview.set_status(
                 (status, canvas) if show_status else None
             )

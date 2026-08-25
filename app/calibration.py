@@ -27,6 +27,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPainter,
     QPen,
+    QRegion,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -35,6 +36,7 @@ from .profiles import DisplayMetadata, MonitorMetadata, Rect
 
 log = logging.getLogger(__name__)
 PhysicalPositionProvider = Callable[[], tuple[int, int]]
+RectangleEditedCallback = Callable[[str, Rect], None]
 
 
 def _normalized_device_name(name: str) -> str:
@@ -749,6 +751,194 @@ class _CalibrationPreviewWindow(QWidget):
             alert_top = alert_pill.bottom() + pixel_size * 0.2
 
 
+def _resize_edges(
+    rect: Rect, x: int, y: int, tolerance: int
+) -> tuple[bool, bool, bool, bool]:
+    """Return the closest horizontal and vertical edges near ``(x, y)``."""
+
+    tolerance = max(1, int(tolerance))
+    left_distance = abs(x - rect.left)
+    right_distance = abs(x - rect.right)
+    top_distance = abs(y - rect.top)
+    bottom_distance = abs(y - rect.bottom)
+    left = left_distance <= tolerance and left_distance <= right_distance
+    right = right_distance <= tolerance and right_distance < left_distance
+    top = top_distance <= tolerance and top_distance <= bottom_distance
+    bottom = bottom_distance <= tolerance and bottom_distance < top_distance
+    return left, right, top, bottom
+
+
+def _resized_rect(
+    rect: Rect,
+    edges: tuple[bool, bool, bool, bool],
+    x: int,
+    y: int,
+    minimum_size: int,
+) -> Rect:
+    """Resize ``rect`` along ``edges``, keeping both dimensions usable."""
+
+    left_edge, right_edge, top_edge, bottom_edge = edges
+    minimum_size = max(1, int(minimum_size))
+    left, right = rect.left, rect.right
+    top, bottom = rect.top, rect.bottom
+    if left_edge:
+        left = min(int(x), right - minimum_size)
+    elif right_edge:
+        right = max(int(x), left + minimum_size)
+    if top_edge:
+        top = min(int(y), bottom - minimum_size)
+    elif bottom_edge:
+        bottom = max(int(y), top + minimum_size)
+    return Rect(left, top, right - left, bottom - top)
+
+
+class _CalibrationResizeHandle(QWidget):
+    """An input-only border around one preview rectangle.
+
+    Its center is removed from the native window mask, so clicks inside a
+    calibrated region still reach Rust.  Only the edge and corner hit zones
+    accept input.
+    """
+
+    rectangle_changing = Signal(str, object)
+    rectangle_changed = Signal(str, object)
+
+    _HIT_WIDTH = 7
+    _MINIMUM_SIZE = 3
+
+    def __init__(self, label: str, rect: Rect, screen: Any, monitor: Any) -> None:
+        super().__init__(None)
+        self._label = label
+        self._rect = rect
+        self._monitor = monitor
+        self._drag_rect: Rect | None = None
+        self._drag_edges: tuple[bool, bool, bool, bool] | None = None
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
+        self.setWindowTitle(f"Resize {label} calibration")
+        self.setScreen(screen)
+        self._set_border_geometry(screen)
+
+    def _set_border_geometry(self, screen: Any) -> None:
+        physical = self._monitor.rect
+        logical = self._monitor.logical_rect
+        scale_x = logical.width / physical.width
+        scale_y = logical.height / physical.height
+        box = QRectF(
+            screen.geometry().x() + (self._rect.left - physical.left) * scale_x,
+            screen.geometry().y() + (self._rect.top - physical.top) * scale_y,
+            self._rect.width * scale_x,
+            self._rect.height * scale_y,
+        )
+        hit = self._HIT_WIDTH
+        geometry = QRect(
+            math.floor(box.left()) - hit,
+            math.floor(box.top()) - hit,
+            max(1, math.ceil(box.width()) + hit * 2),
+            max(1, math.ceil(box.height()) + hit * 2),
+        )
+        self.setGeometry(geometry)
+        outer = QRegion(self.rect())
+        inner = self.rect().adjusted(hit * 2, hit * 2, -hit * 2, -hit * 2)
+        self.setMask(outer.subtracted(QRegion(inner)) if inner.isValid() else outer)
+
+    def _sample_physical(self, event: QMouseEvent) -> tuple[int, int]:
+        try:
+            x, y = physical_cursor_position()
+            if math.isfinite(x) and math.isfinite(y):
+                return round(x), round(y)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            log.warning("Physical cursor query failed while resizing", exc_info=True)
+        position = event.globalPosition()
+        physical = self._monitor.rect
+        logical = self._monitor.logical_rect
+        return (
+            round(
+                physical.left
+                + (position.x() - logical.left) * physical.width / logical.width
+            ),
+            round(
+                physical.top
+                + (position.y() - logical.top) * physical.height / logical.height
+            ),
+        )
+
+    def _edges_at(self, x: int, y: int) -> tuple[bool, bool, bool, bool]:
+        physical = self._monitor.rect
+        logical = self._monitor.logical_rect
+        tolerance = math.ceil(
+            self._HIT_WIDTH
+            * max(physical.width / logical.width, physical.height / logical.height)
+        )
+        return _resize_edges(self._rect, x, y, tolerance)
+
+    @staticmethod
+    def _cursor_for(edges: tuple[bool, bool, bool, bool]) -> Qt.CursorShape:
+        left, right, top, bottom = edges
+        if (left and top) or (right and bottom):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (right and top) or (left and bottom):
+            return Qt.CursorShape.SizeBDiagCursor
+        if left or right:
+            return Qt.CursorShape.SizeHorCursor
+        if top or bottom:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.ArrowCursor
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = self._sample_physical(event)
+        edges = self._edges_at(x, y)
+        if not any(edges):
+            return
+        self._drag_rect = self._rect
+        self._drag_edges = edges
+        self.grabMouse()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
+        x, y = self._sample_physical(event)
+        if self._drag_rect is None or self._drag_edges is None:
+            self.setCursor(self._cursor_for(self._edges_at(x, y)))
+            return
+        self._rect = _resized_rect(
+            self._drag_rect, self._drag_edges, x, y, self._MINIMUM_SIZE
+        )
+        self.rectangle_changing.emit(self._label, self._rect)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
+        if event.button() != Qt.MouseButton.LeftButton or self._drag_rect is None:
+            return
+        self.releaseMouse()
+        x, y = self._sample_physical(event)
+        assert self._drag_edges is not None
+        self._rect = _resized_rect(
+            self._drag_rect, self._drag_edges, x, y, self._MINIMUM_SIZE
+        )
+        self._drag_rect = None
+        self._drag_edges = None
+        self.rectangle_changing.emit(self._label, self._rect)
+        self.rectangle_changed.emit(self._label, self._rect)
+        event.accept()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        try:
+            self.releaseMouse()
+        except RuntimeError:
+            pass
+        event.accept()
+
+
 class CalibrationPreviewOverlay:
     """Labeled on-screen outlines of every calibrated rectangle.
 
@@ -759,17 +949,35 @@ class CalibrationPreviewOverlay:
 
     def __init__(self) -> None:
         self._windows: list[_CalibrationPreviewWindow] = []
+        self._handles: list[_CalibrationResizeHandle] = []
         self._entries: list[tuple[str, Rect]] = []
 
+        self._screen_monitors: list[tuple[Any, Any]] = []
+        self._editable = False
+        self._rectangle_edited: RectangleEditedCallback | None = None
         self._status: tuple[str, Rect] | None = None
         self._alerts: tuple[str, ...] = ()
 
+    def set_resize_callback(self, callback: RectangleEditedCallback | None) -> None:
+        self._rectangle_edited = callback
+
+    def set_editable(self, editable: bool) -> None:
+        editable = bool(editable)
+        if editable == self._editable:
+            return
+        self._editable = editable
+        self._rebuild_handles()
+
     def set_rectangles(self, entries: list[tuple[str, Rect | None]]) -> None:
-        self._entries = [
+        updated = [
             (str(label), rect) for label, rect in entries if rect is not None
         ]
+        if updated == self._entries:
+            return
+        self._entries = updated
         for window in self._windows:
             window.set_entries(self._entries)
+        self._rebuild_handles()
 
     def set_status(self, status: tuple[str, Rect] | None) -> None:
         """Write a job's state across the canvas, or wipe it with None."""
@@ -787,6 +995,7 @@ class CalibrationPreviewOverlay:
         # Rebuild from the live monitor layout every time the overlay comes
         # back, so display/DPI changes made while hidden are always honored.
         self._destroy_windows()
+        self._screen_monitors = []
         screens = QGuiApplication.screens()
         if not screens:
             return
@@ -809,12 +1018,16 @@ class CalibrationPreviewOverlay:
             window.set_status(self._status)
             window.set_alerts(self._alerts)
             self._windows.append(window)
+            self._screen_monitors.append((screen, monitor))
             window.show()
             window.raise_()
+        self._rebuild_handles()
 
     def hide(self) -> None:
         for window in self._windows:
             window.hide()
+        for handle in self._handles:
+            handle.hide()
 
     def isVisible(self) -> bool:  # noqa: N802 - mirrors the QWidget API
         return any(window.isVisible() for window in self._windows)
@@ -823,12 +1036,59 @@ class CalibrationPreviewOverlay:
         self._destroy_windows()
 
     def _destroy_windows(self) -> None:
+        self._destroy_handles()
         windows, self._windows = self._windows, []
         for window in windows:
             try:
                 window.close()
             finally:
                 window.deleteLater()
+
+    def _destroy_handles(self) -> None:
+        handles, self._handles = self._handles, []
+        for handle in handles:
+            try:
+                handle.close()
+            finally:
+                handle.deleteLater()
+
+    def _rebuild_handles(self) -> None:
+        self._destroy_handles()
+        if not self._editable or not self.isVisible():
+            return
+        for label, rect in self._entries:
+            for screen, monitor in self._screen_monitors:
+                physical = monitor.rect
+                if not (
+                    rect.left < physical.right
+                    and rect.right > physical.left
+                    and rect.top < physical.bottom
+                    and rect.bottom > physical.top
+                ):
+                    continue
+                handle = _CalibrationResizeHandle(label, rect, screen, monitor)
+                handle.rectangle_changing.connect(self._preview_resize)
+                handle.rectangle_changed.connect(self._finish_resize)
+                self._handles.append(handle)
+                handle.show()
+                handle.raise_()
+
+    def _replace_entry(self, label: str, rect: Rect) -> None:
+        self._entries = [
+            (entry_label, rect if entry_label == label else entry_rect)
+            for entry_label, entry_rect in self._entries
+        ]
+        for window in self._windows:
+            window.set_entries(self._entries)
+
+    def _preview_resize(self, label: str, rect: Rect) -> None:
+        self._replace_entry(label, rect)
+
+    def _finish_resize(self, label: str, rect: Rect) -> None:
+        self._replace_entry(label, rect)
+        self._rebuild_handles()
+        if self._rectangle_edited is not None:
+            self._rectangle_edited(label, rect)
 
 
 def select_screen_rect(
