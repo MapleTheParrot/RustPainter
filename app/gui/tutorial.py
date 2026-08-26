@@ -45,9 +45,9 @@ TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     ),
     TutorialStep(
         "Prepare RustPainter",
-        "Under Prepare Rust, set the canvas, colour box, and hue bar. Keep the "
-        "painting screen open and stationary while you mark them. RustPainter "
-        "remembers these areas for the sign profile.",
+        "Under Prepare Rust, click Detect Rust setup, switch back during the "
+        "countdown, then review the outlines. If one is off, drag its edge or "
+        "use Set area. RustPainter remembers them for the sign profile.",
         "tutorial-prepare-rust",
     ),
     TutorialStep(

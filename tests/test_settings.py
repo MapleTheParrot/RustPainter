@@ -71,6 +71,7 @@ def test_default_settings_returns_independent_documents() -> None:
     assert second["image"]["color_count"] == DEFAULT_COLOR_COUNT
     assert second["execution"]["dry_run"] is False
     assert second["ui"]["tutorial_version_seen"] == 0
+    assert second["painting"]["reuse_calibration"] is True
     assert second["image"]["text_overlay"] == {
         "layers": [
             {
@@ -174,6 +175,7 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
         ({"painting": {"confirm_strokes": "yes"}}, "confirm_strokes"),
         ({"painting": {"confirm_max_rounds": 0}}, "confirm_max_rounds"),
         ({"painting": {"confirm_max_rounds": True}}, "confirm_max_rounds"),
+        ({"painting": {"reuse_calibration": "yes"}}, "reuse_calibration"),
     ],
 )
 def test_settings_reject_values_the_gui_cannot_represent(

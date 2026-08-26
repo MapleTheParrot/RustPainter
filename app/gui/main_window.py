@@ -105,6 +105,7 @@ from app.models import (
 from app.paint_plan import count_unmerged_strokes, generate_paint_plan
 from app.paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
+    FAST_CALIBRATION_SECONDS,
     MIN_PRESS_SECONDS,
     SETTLE_FLOOR_SECONDS,
     STROKE_GAP_FLOOR_SECONDS,
@@ -158,6 +159,7 @@ from .styles import (
     state_badge_style,
 )
 from .tutorial import GettingStartedDialog, TUTORIAL_VERSION
+from .setup_review import SetupReviewDialog
 from .text_render import (
     GRADIENT_DIRECTIONS,
     MAX_OUTLINE_WIDTH,
@@ -2663,6 +2665,16 @@ class MainWindow(QMainWindow):
         setup_summary_layout.addLayout(setup_summary_text, 1)
         profile_layout.addWidget(self.setup_summary)
 
+        self.detect_setup_button = QPushButton("Detect Rust setup")
+        self.detect_setup_button.setObjectName("accentButton")
+        self.detect_setup_button.setToolTip(
+            "After a short countdown, find the adaptive colour picker, canvas, "
+            "and common controls on Rust's painting screen. You review the "
+            "result before it is saved."
+        )
+        self._set_icon(self.detect_setup_button, "target", size=16)
+        profile_layout.addWidget(self.detect_setup_button)
+
         self.canvas_status = CalibrationStatus("Canvas")
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
@@ -2795,6 +2807,17 @@ class MainWindow(QMainWindow):
             "The boxes cannot be edited while a paint job is active."
         )
         optional_layout.addWidget(self.apply_brush_check)
+        self.reuse_calibration_check = QCheckBox(
+            "Fast startup when the saved measurement still matches"
+        )
+        self.reuse_calibration_check.setChecked(True)
+        self.reuse_calibration_check.setToolTip(
+            "Checks the sign's visible edges against its saved texel grid. If "
+            "they still agree, RustPainter clears the sign and starts without "
+            "repeating every probe. A mismatch automatically runs the full "
+            "measurement."
+        )
+        optional_layout.addWidget(self.reuse_calibration_check)
         self.brush_model_status = QLabel("Brush size measured at the start of each job")
         self.brush_model_status.setObjectName("muted")
         self.brush_model_status.setWordWrap(True)
@@ -5880,8 +5903,8 @@ class MainWindow(QMainWindow):
         timing = StrokeTiming.from_settings(
             settings, overhead_seconds=self._learned_timing.overhead_seconds
         )
-        # The painter measures the brush before every sizing run, which needs
-        # the Size field and clear control calibrated.
+        # Sizing either validates the saved measurement or measures again; both
+        # paths need the Size field and clear control available.
         calibrates = bool(
             self.apply_brush_check.isChecked()
             and self._profile_rect("brush_size_box") is not None
@@ -5916,11 +5939,23 @@ class MainWindow(QMainWindow):
             if self.verify_passes_spin.value() > 0
             else 0.0
         )
+        reusable = bool(
+            calibrates
+            and self.reuse_calibration_check.isChecked()
+            and self._brush_size_model() is not None
+            and self._texel_grid() is not None
+        )
         return RunEstimate(
             paint=paint,
             checks=checks,
             touch_up=touch_up,
-            calibration=BRUSH_CALIBRATION_SECONDS if calibrates else 0.0,
+            calibration=(
+                FAST_CALIBRATION_SECONDS
+                if reusable
+                else BRUSH_CALIBRATION_SECONDS
+                if calibrates
+                else 0.0
+            ),
             countdown=max(0.0, float(self.countdown_spin.value())),
         )
 
@@ -6076,6 +6111,7 @@ class MainWindow(QMainWindow):
     def _connect_service_controls(self) -> None:
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
         self.new_profile_button.clicked.connect(self._new_profile)
+        self.detect_setup_button.clicked.connect(self._begin_setup_detection)
         self.rename_profile_button.clicked.connect(self._rename_profile)
         self.delete_profile_button.clicked.connect(self._delete_profile)
         self.calibrate_canvas_button.clicked.connect(
@@ -6198,6 +6234,7 @@ class MainWindow(QMainWindow):
             self.press_hold_check,
             self.dab_size_check,
             self.apply_brush_check,
+            self.reuse_calibration_check,
             self.verify_passes_spin,
             self.verify_picks_check,
             self.confirm_strokes_check,
@@ -6471,6 +6508,9 @@ class MainWindow(QMainWindow):
                 float(painting.get("stroke_interpolation_step_pixels", 4.0))
             )
             self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
+            self.reuse_calibration_check.setChecked(
+                bool(painting.get("reuse_calibration", True))
+            )
             self.line_tool_check.setChecked(bool(painting.get("use_line_tool", True)))
             self.press_hold_check.setChecked(
                 bool(painting.get("measure_press_hold", True))
@@ -6624,6 +6664,7 @@ class MainWindow(QMainWindow):
             "delay_between_colors_seconds": self.color_delay_spin.value() / 1000.0,
             "stroke_interpolation_step_pixels": self.interpolation_spin.value(),
             "apply_brush_size": self.apply_brush_check.isChecked(),
+            "reuse_calibration": self.reuse_calibration_check.isChecked(),
             "use_line_tool": self.line_tool_check.isChecked(),
             "measure_press_hold": self.press_hold_check.isChecked(),
             "measure_dab_size": self.dab_size_check.isChecked(),
@@ -6775,9 +6816,9 @@ class MainWindow(QMainWindow):
         self.canvas_status.set_calibrated(bool(status.get("canvas")))
         self.color_box_status.set_calibrated(bool(status.get("color_box")))
         self.hue_bar_status.set_calibrated(bool(status.get("hue_bar")))
-        # Automatic sizing measures the brush on every run and wipes the
-        # probes afterwards, so it needs both the Size field and the control
-        # that clears the sign; with it off, neither is used.
+        # Automatic sizing validates or measures the brush at startup and
+        # clears any probe paint, so it needs both the Size field and Clear;
+        # with it off, neither is used.
         brush_optional = not self.apply_brush_check.isChecked()
         self.brush_size_box_status.set_calibrated(
             bool(status.get("brush_size_box")), brush_optional
@@ -6940,7 +6981,12 @@ class MainWindow(QMainWindow):
                     setattr(candidate, field, getattr(source, field, None))
                 candidate.display = source.display
                 if isinstance(source.metadata, dict):
-                    for key in ("color_correction", "brush_size_model", "texel_grid"):
+                    for key in (
+                        "color_correction",
+                        "brush_size_model",
+                        "texel_grid",
+                        "calibration_performance",
+                    ):
                         if key in source.metadata:
                             candidate.metadata[key] = deepcopy(source.metadata[key])
                 profile = self._profile_store.save(candidate)
@@ -7020,6 +7066,130 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Calibration failed", str(exc))
             self._update_calibration_overlay()
             return
+        self._finish_manual_calibration(field, rectangle)
+
+    @Slot()
+    def _begin_setup_detection(self) -> None:
+        """Capture Rust's monitor and propose its painting regions in one pass."""
+
+        if (
+            self._painter_is_active()
+            or self._debug_running
+            or self._countdown_callback_running
+            or bool(self._countdown and self._countdown.isVisible())
+        ):
+            self.statusBar().showMessage(
+                "Stop or wait for the current operation before detecting setup.", 5000
+            )
+            return
+        self._launch_countdown(
+            3,
+            self._capture_detected_setup,
+            hint="Open the sign and switch to Adaptive Palette • F10 cancels",
+        )
+
+    def _capture_detected_setup(self) -> None:
+        from app.screen import capture_region, find_window_matching, window_monitor_rect
+        from app.setup_detection import detect_painting_setup
+
+        title = self.expected_window_edit.text().strip() or None
+        process = self.expected_process_edit.text().strip() or None
+        try:
+            window = find_window_matching(title_contains=title, executable=process)
+            if window is None and title and process:
+                # Process paths can be unavailable without elevation even while
+                # the correctly titled Rust window is visible.
+                window = find_window_matching(title_contains=title)
+            if window is None:
+                raise RuntimeError(
+                    "Rust's window was not found. Keep Rust open on the sign's painting screen."
+                )
+            screen = window_monitor_rect(window.hwnd)
+            if screen is None:
+                raise RuntimeError("Rust's monitor could not be identified.")
+            capture = capture_region(screen)
+            detection = detect_painting_setup(capture, screen)
+        except Exception as exc:
+            LOGGER.exception("Automatic Rust setup detection failed")
+            QMessageBox.warning(self, "Setup detection failed", str(exc))
+            return
+
+        if "hue_bar" not in detection.regions:
+            QMessageBox.information(
+                self,
+                "Adaptive Palette not found",
+                "RustPainter could not find the rainbow hue bar. In Rust, toggle "
+                "Adaptive Palette so the large gradient colour box and vertical "
+                "rainbow bar are visible, then try again.",
+            )
+            return
+        review = SetupReviewDialog(capture, screen, detection, self)
+        if review.exec() != QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("Detected setup was not saved", 4000)
+            return
+        self._save_detected_setup(detection)
+
+    def _save_detected_setup(self, detection: Any) -> None:
+        profile = self._current_profile
+        if profile is None:
+            return
+        try:
+            candidate = Profile.from_dict(profile.to_dict())
+            previous_canvas = candidate.canvas
+            previous_picker = (candidate.color_box, candidate.hue_bar)
+            for field in (
+                "canvas",
+                "color_box",
+                "hue_bar",
+                "brush_size_box",
+                "clear_button",
+                "save_button",
+                "download_button",
+            ):
+                found = detection.regions.get(field)
+                if found is not None:
+                    setattr(candidate, field, found.rect)
+            if candidate.canvas != previous_canvas:
+                candidate.metadata.pop("texel_grid", None)
+                if (
+                    previous_canvas is not None
+                    and candidate.canvas is not None
+                    and abs(
+                        previous_canvas.aspect_ratio - candidate.canvas.aspect_ratio
+                    )
+                    > previous_canvas.aspect_ratio * 0.05
+                ):
+                    candidate.metadata.pop("brush_size_model", None)
+                    candidate.metadata.pop("calibration_performance", None)
+            if (candidate.color_box, candidate.hue_bar) != previous_picker:
+                candidate.metadata.pop("color_correction", None)
+            candidate.metadata["auto_setup_confidence"] = {
+                name: round(float(region.confidence), 3)
+                for name, region in detection.regions.items()
+            }
+            candidate.display = capture_display_metadata()
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not save automatically detected setup")
+            QMessageBox.warning(self, "Could not save detected setup", str(exc))
+            return
+        self.show_calibration_check.setChecked(True)
+        self._reload_profiles(self._current_profile.id)
+        self._refresh_profile_ui()
+        self._update_calibration_overlay()
+        missing = self._required_setup_missing()
+        if missing:
+            self.required_setup_button.setChecked(True)
+            self.required_setup_panel.setVisible(True)
+            message = "Detected what was visible; set " + ", ".join(missing) + " manually."
+        else:
+            message = (
+                "Rust setup detected. Check the on-screen outlines; drag an edge "
+                "or use Set area if anything is off."
+            )
+        self.statusBar().showMessage(message, 10000)
+
+    def _finish_manual_calibration(self, field: str, rectangle: Any) -> None:
         if rectangle is None:
             self.statusBar().showMessage("Calibration cancelled", 4000)
             self._update_calibration_overlay()
@@ -7071,6 +7241,7 @@ class MainWindow(QMainWindow):
             # count.
             candidate.metadata.pop("brush_size_model", None)
             candidate.metadata.pop("texel_grid", None)
+            candidate.metadata.pop("calibration_performance", None)
         try:
             candidate.display = current_display
             self._current_profile = self._profile_store.save(candidate)
@@ -7284,6 +7455,7 @@ class MainWindow(QMainWindow):
         if field == "canvas" and self._canvas_shape_changed(rectangle):
             candidate.metadata.pop("brush_size_model", None)
             candidate.metadata.pop("texel_grid", None)
+            candidate.metadata.pop("calibration_performance", None)
         try:
             self._current_profile = self._profile_store.save(candidate)
         except Exception as exc:
@@ -7768,9 +7940,15 @@ class MainWindow(QMainWindow):
             texture = f"a {cap[0]}×{cap[1]}-texel texture, by Rust's sign data"
         else:
             texture = f"about a {rows}-row texture, inferred from the brush"
+        next_run = (
+            "The next job checks the visible sign first and reuses this measurement "
+            "when it still matches; otherwise it measures fully."
+            if self.reuse_calibration_check.isChecked() and grid is not None
+            else "The next job measures again before it paints."
+        )
         self.brush_model_status.setText(
             f"Last measured: size 1 covers {model.smallest_fraction * 100:.2f}% of "
-            f"the sign ({texture}). Every job measures again before it paints."
+            f"the sign ({texture}). {next_run}"
         )
 
     def _canvas_shape_changed(self, rectangle: Any) -> bool:
@@ -7814,12 +7992,25 @@ class MainWindow(QMainWindow):
         stored = profile.metadata.get("brush_size_model")
         stored_grid = profile.metadata.get("texel_grid")
         stored_bare = profile.metadata.get("bare_sign_color")
+        stored_performance = profile.metadata.get("calibration_performance")
+        performance = dict(stored_performance) if isinstance(stored_performance, dict) else {}
+        for key, value in (
+            ("pressHoldSeconds", getattr(painter, "measured_press_hold_seconds", None)),
+            ("strokeGapSeconds", getattr(painter, "measured_stroke_gap_seconds", None)),
+            ("dragTexelsPerSecond", getattr(painter, "measured_drag_rate", None)),
+            ("detailSize", getattr(painter, "measured_detail_size", None)),
+        ):
+            if value is not None:
+                performance[key] = float(value)
+        if getattr(painter, "measured_detail_size", None) is not None:
+            performance["dabSweep"] = bool(getattr(painter, "measured_dab_sweep", False))
         grid_value = grid.to_dict() if grid is not None else None
         if (
             isinstance(stored, dict)
             and stored.get("slope") == model.slope
             and (grid is None or stored_grid == grid_value)
             and (bare_value is None or stored_bare == bare_value)
+            and stored_performance == performance
         ):
             return
         try:
@@ -7829,6 +8020,8 @@ class MainWindow(QMainWindow):
                 candidate.metadata["texel_grid"] = grid_value
             if bare_value is not None:
                 candidate.metadata["bare_sign_color"] = bare_value
+            if performance:
+                candidate.metadata["calibration_performance"] = performance
             self._current_profile = self._profile_store.save(candidate)
         except Exception:
             LOGGER.exception("Could not save the measured brush size model")
@@ -8162,8 +8355,8 @@ class MainWindow(QMainWindow):
             sizing = self._missing_sizing_rectangles()
             if sizing:
                 return (
-                    "Automatic brush sizing measures this sign's brush before "
-                    "every job and wipes the measurement off again, so it needs "
+                    "Automatic brush sizing validates or measures this sign "
+                    "before painting and clears any probe paint, so it needs "
                     "the " + " and ".join(sizing) + " calibrated. Turn automatic "
                     "brush sizing off to paint with whatever brush Rust has set."
                 )
@@ -8254,6 +8447,7 @@ class MainWindow(QMainWindow):
             self.press_hold_check,
             self.dab_size_check,
             self.apply_brush_check,
+            self.reuse_calibration_check,
             self.verify_passes_spin,
             self.verify_picks_check,
             self.confirm_strokes_check,
@@ -8274,6 +8468,7 @@ class MainWindow(QMainWindow):
             self.calibrate_hunger_button,
             self.calibrate_thirst_button,
             self.calibrate_download_button,
+            self.detect_setup_button,
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,

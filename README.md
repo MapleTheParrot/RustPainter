@@ -65,9 +65,9 @@ painting unattended. Everything below is detail you only need when tuning.
 - Undo and redo over the text layers alone (Ctrl+Z / Ctrl+Y anywhere in the window, mid-typing included), so a whole drag or a run of keystrokes steps back as one edit
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign layout; fixed UI/HUD targets (color box, hue bar, Size value, Clear, hunger, thirst, and Download) carry across profiles and remain individually recalibratable
-- Drag calibration for the canvas and shared UI targets, with an on-screen overlay to verify them
+- One-click Rust setup detection for the canvas, adaptive colour picker, Size field, Clear, Download, and Save controls, with an on-screen overlay for review and manual edge correction
 - An anti-AFK break (off by default): every so often the job saves the sign, jumps, reopens the sign, and carries on, so a server that kicks idle players sees one moving
-- Brush sizing measured from the sign itself at the start of every job: a few probe strokes fit what Rust's Size numbers really cover, the sign is wiped clean again, and only then does the artwork go down
+- Brush sizing measured from the sign itself and reused after a quick geometry check; a moved, changed, or uncertain sign automatically falls back to fresh probe strokes before painting
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
 - Every color pick read back off the game's own color panel before a stroke goes down in it, and clicked again when the game swallowed a click - a swallowed pick paints a whole color group in the previous group's color, which is what put the speckles on a nine-hour sign - and every color checked against a screen capture as soon as it is painted, its missing strokes repainted while the color is still selected
@@ -84,8 +84,8 @@ painting unattended. Everything below is detail you only need when tuning.
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
 2. Open the target sign's painting interface and leave it stationary.
 3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
-4. Calibrate the **canvas**, **color box**, and **hue bar**. Aim just inside each usable region; a pixel of overshoot is corrected automatically (see below). The color box is the large white/color/black square; the hue bar is only the narrow rainbow strip. Enable **Show calibration boxes on screen** to verify the stored rectangles as labeled red outlines over the game UI. Their interiors are click-through; while no job is active, hover an edge or corner and drag to resize a stored box without drawing it again. The outlines hide themselves while a job is actually painting and come back while it is paused so the boxes can be checked against Rust before letting it carry on.
-5. If automatic brush sizing is wanted, calibrate the numeric **Size value box** beside Rust's size slider and the **Clear button** (Rust's trash icon, which wipes the sign). There is nothing to run by hand: every paint job measures the brush itself, then clears the sign before it paints. Measuring paints a scout stroke to find the scale, then a few probe strokes bracketing the brush your resolution needs, and reads back how much of the sign each one actually covered. Only solid coverage counts - Rust's brush fades out over its last texture pixel, and a cell left under that fade still looks unpainted. Measuring every run rather than once is what removes the step that used to be missed: a stored measurement describes a sign you may since have re-framed, walked away from, or replaced, and a stale one paints the whole image at the wrong width.
+4. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
+5. With the numeric **Size value box** and **Clear button** detected or set, automatic brush sizing measures the sign on its first run. Later jobs first compare the visible sign with the stored texel grid. A match reuses the saved brush and timing measurements after a short check; a moved, changed, or uncertain sign automatically performs the full probe sequence and clears it before painting. Disable **Fast startup when the saved measurement still matches** in Settings to force a full measurement every time.
 6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 7. Inspect the paint simulation and plan statistics.
 8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
@@ -470,8 +470,9 @@ because stamps land on whole texels that fraction accumulates until a later
 neighbour's stamp eats a texel of the cell before it - visible as unevenly
 wide cells in a sign texture downloaded from the game.
 
-The grid is measured, not inferred, at the start of every job, right after
-the brush. Paint lands in texture space: wherever the cursor is inside a
+The grid is measured, not inferred, on the first full brush calibration and
+whenever the fast geometry check cannot safely reuse it. Paint lands in texture
+space: wherever the cursor is inside a
 texel, the stamp covers that whole texel. So the job stamps the smallest
 brush along a row one screen pixel at a time and watches the stamp stay put,
 stay put, then jump a whole texel - that staircase is the grid showing
@@ -519,9 +520,9 @@ centre, worst 0.4 px. The brush-derived inference the app used before put
 What comes out is the texture's size in texels (no table of sign sizes is
 consulted, so a sign of a size no table lists is counted just the same),
 exactly where each texel is drawn, and exactly where to click for each.
-Max quality plans one cell per counted texel. The measurement is absolute
-screen pixels, so a job that can measure never reuses a stored one: it
-describes where the sign sat on screen the day it was taken.
+Max quality plans one cell per counted texel. Before reusing a saved grid, the
+job captures the visible sign and checks its detected edges against that grid.
+A close match takes the fast path; a moved or uncertain sign is measured again.
 
 With **Automatic brush sizing** off the probe cannot run - it types the
 smallest brush and needs the sign wiped afterwards - so the job paints on the
@@ -869,7 +870,7 @@ Profiles, settings, calibration reference captures, timelapse frames, run report
 
 ## Known limitations
 
-- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient up front. Brush measurement infers the first two from probe strokes; the picker gradient still needs calibration and small test strokes.
+- The app cannot know Rust's internal brush radius, native sign resolution, or exact picker gradient up front. Brush measurement infers the first two from probe strokes; later jobs reuse it only after the visible sign passes a geometry check. The picker gradient still needs detection or calibration and small test strokes.
 - `SendInput` may be ignored by exclusive fullscreen, elevated, protected, or anti-cheat-managed windows. The utility does not work around those restrictions.
 - Horizontal runs are deliberately prioritized for reliability; complex images can still require many strokes.
 - Color accuracy is approximate because the displayed picker, monitor color, sign material, lighting, and in-game rendering can alter the result. Without a measured correction the preview shows the commanded RGB, which is what the picker is asked for and not what the lit sign returns.

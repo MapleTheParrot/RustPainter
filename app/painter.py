@@ -36,6 +36,7 @@ from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect, Stroke
 from .paint_timing import (
     BRUSH_CALIBRATION_SECONDS,
+    FAST_CALIBRATION_SECONDS,
     CHECK_CAPTURE_SECONDS_DEFAULT,
     CHECK_REPAINT_FRACTION_DEFAULT,
     CONFIRM_SETTLE_SECONDS,
@@ -218,6 +219,11 @@ class PaintingTarget:
     # read the wood from - so without this the touch-up pass cannot tell a
     # hole from a cell painted some other colour, and holes go unrepaired.
     bare_color: RGBColor | None = None
+    cached_press_hold_seconds: float | None = None
+    cached_stroke_gap_seconds: float | None = None
+    cached_drag_rate: float | None = None
+    cached_detail_size: float | None = None
+    cached_dab_sweep: bool = False
 
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
@@ -262,6 +268,23 @@ class PaintingTarget:
                 texel_grid = TexelGridModel.from_dict(grid_value)
             except (KeyError, TypeError, ValueError):
                 LOGGER.warning("The profile's stored texel grid is invalid", exc_info=True)
+        performance = (
+            metadata.get("calibration_performance")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        performance = performance if isinstance(performance, Mapping) else {}
+
+        def cached_number(name: str, low: float, high: float) -> float | None:
+            value = performance.get(name)
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return number if math.isfinite(number) and low <= number <= high else None
+
         return cls(
             canvas=canvas,
             color_box=color_box,
@@ -281,6 +304,11 @@ class PaintingTarget:
             brush_size_model=brush_size_model,
             texel_grid=texel_grid,
             bare_color=bare_color,
+            cached_press_hold_seconds=cached_number("pressHoldSeconds", 0.001, 1.0),
+            cached_stroke_gap_seconds=cached_number("strokeGapSeconds", 0.0, 1.0),
+            cached_drag_rate=cached_number("dragTexelsPerSecond", 1.0, 10000.0),
+            cached_detail_size=cached_number("detailSize", BRUSH_SIZE_MIN, BRUSH_SIZE_MAX),
+            cached_dab_sweep=bool(performance.get("dabSweep", False)),
         )
 
 
@@ -298,6 +326,9 @@ class PainterSettings:
     logical_pixel_spacing: float = 1.0
     brush_size: float = 1.0
     apply_brush_size: bool = False
+    # Prefer a passive sign-edge validation and the profile's saved model/grid.
+    # A missing or mismatched measurement automatically runs the full probes.
+    reuse_calibration: bool = True
     # Measure the sign's texel grid at the start of each job and lay the
     # strokes on it.  Needs the same calibration as brush sizing; a sign the
     # probe cannot read falls back to the brush-derived grid, so this is an
@@ -485,6 +516,7 @@ class PainterSettings:
             logical_pixel_spacing=float(pick(painting, "logical_pixel_spacing", 1.0)),
             brush_size=float(pick(painting, "brush_size", 1.0)),
             apply_brush_size=bool(pick(painting, "apply_brush_size", False)),
+            reuse_calibration=bool(pick(painting, "reuse_calibration", True)),
             measure_texel_grid=bool(pick(painting, "measure_texel_grid", True)),
             use_line_tool=bool(pick(painting, "use_line_tool", True)),
             measure_press_hold=bool(pick(painting, "measure_press_hold", True)),
@@ -2134,14 +2166,11 @@ class Painter:
         return best[1] if best is not None else cls._BRUSH_PROBE_COLORS[0]
 
     def _calibrate_brush_for_plan(self, job: _Job) -> None:
-        """Measure this sign's brush, wipe the probes, then let painting start.
+        """Validate or measure this sign's brush, then start from a clear sign.
 
-        Measuring on every run instead of once behind a button is what makes
-        the sign the only thing the user has to get right.  A stored model is
-        a promise about a sign the user may since have walked away from,
-        re-framed, or replaced, and a stale promise here paints the whole
-        image at the wrong brush width.  A fresh measurement costs a handful
-        of strokes that are erased before the artwork goes down.
+        A saved model is reused only when a passive edge check shows its texel
+        grid still fits the visible sign. Any missing or uncertain evidence
+        falls through to fresh probe strokes, which are erased before artwork.
         """
 
         settings = job.settings
@@ -2167,6 +2196,8 @@ class Painter:
         job.cell_fraction = self._brush_target_fraction(
             job.target, job.plan, 1, settings.logical_pixel_spacing
         )
+        if self._reuse_saved_calibration(job):
+            return
         for attempt in range(self._CALIBRATION_ATTEMPTS):
             try:
                 model = self._measure_brush_size_model(job)
@@ -2219,6 +2250,102 @@ class Painter:
         # Checked against the model that will actually be typed, so a sign the
         # plan cannot be painted on is refused before any artwork goes down.
         self._validate_brush_reach(job.plan, job.target, settings, model)
+
+    def _reuse_saved_calibration(self, job: _Job) -> bool:
+        """Use saved measurements only while visible sign edges still match."""
+
+        import numpy as np
+
+        settings = job.settings
+        target = job.target
+        model = target.brush_size_model
+        grid = target.texel_grid
+        if (
+            not settings.reuse_calibration
+            or model is None
+            or grid is None
+            or not grid.agrees_with(target.canvas)
+        ):
+            return False
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        margin = max(
+            self._EDGE_MARGIN_MIN_PIXELS,
+            int(round(self._EDGE_MARGIN_FRACTION * max(canvas.width, canvas.height))),
+        )
+        wide = ScreenRect(
+            canvas.left - margin,
+            canvas.top - margin,
+            canvas.width + 2 * margin,
+            canvas.height + 2 * margin,
+        )
+        park = (
+            int(round(target.color_box.left + target.color_box.width / 2.0)),
+            int(round(target.color_box.top + target.color_box.height / 2.0)),
+        )
+        epoch = self._pause_generation_value()
+        try:
+            self._update_progress_state(
+                PainterState.RUNNING,
+                "Checking the saved sign measurement",
+                phase="calibrate",
+            )
+            self._move(park, epoch)
+            if self.input.emits_real_input:
+                self._interruptible_sleep(
+                    self._CAPTURE_SETTLE_SECONDS, epoch=epoch, check_focus=True
+                )
+            capture = np.asarray(
+                self._screen_capture(wide).convert("RGB"), dtype=np.float32
+            )
+            registered = grid.registered_rect()
+            expected = (
+                registered.left - wide.left,
+                registered.top - wide.top,
+                registered.left + registered.width - wide.left,
+                registered.top + registered.height - wide.top,
+            )
+            found = find_quad_edges(capture, expected, max(4, margin - 2))
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.info("Saved calibration could not be checked (%s); measuring fully", exc)
+            return False
+        tolerance = max(4.0, 2.5 * max(grid.pitch_x, grid.pitch_y))
+        comparisons = [
+            abs(actual - wanted)
+            for actual, wanted in zip(found, expected)
+            if actual is not None
+        ]
+        if len(comparisons) < 3 or max(comparisons, default=float("inf")) > tolerance:
+            LOGGER.info(
+                "Saved calibration did not match the visible sign (%d edges, worst %s px); "
+                "measuring fully",
+                len(comparisons),
+                "?" if not comparisons else f"{max(comparisons):.1f}",
+            )
+            return False
+
+        job.texel_grid = grid
+        self._measured_brush_size_model = model
+        self._measured_texel_grid = grid
+        self._measured_press_hold_seconds = target.cached_press_hold_seconds
+        self._measured_stroke_gap_seconds = target.cached_stroke_gap_seconds
+        self._measured_drag_rate = target.cached_drag_rate
+        self._measured_detail_size = target.cached_detail_size
+        self._measured_dab_sweep = target.cached_dab_sweep
+        self._validate_brush_reach(job.plan, target, settings, model)
+        LOGGER.info(
+            "Saved brush and %dx%d texel grid match the visible sign; skipping full probes",
+            grid.columns,
+            grid.rows,
+        )
+        self._clear_canvas(job)
+        return True
 
     def _prepare_resumed_sign(self, job: _Job) -> None:
         """Take a half-painted sign as it is: no clear, no probe.
@@ -3665,7 +3792,13 @@ class Painter:
             and getattr(self.input, "emits_real_input", True)
             and job.target.brush_size_box is not None
         ):
-            total += BRUSH_CALIBRATION_SECONDS
+            reusable = bool(
+                job.settings.reuse_calibration
+                and job.target.brush_size_model is not None
+                and job.target.texel_grid is not None
+                and job.target.texel_grid.agrees_with(job.target.canvas)
+            )
+            total += FAST_CALIBRATION_SECONDS if reusable else BRUSH_CALIBRATION_SECONDS
         return total
 
     def _checks_estimate(self, job: _Job, paint_seconds: float) -> float:

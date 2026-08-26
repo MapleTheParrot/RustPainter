@@ -36,6 +36,7 @@ from app.gui.main_window import (
 from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
 from app.gui.tutorial import TUTORIAL_STEPS, TUTORIAL_VERSION
+from app.setup_detection import DetectedRegion, SetupDetection
 from app.input_controller import MockInputController
 from app.models import (
     ColorGroup,
@@ -1198,6 +1199,33 @@ def test_required_setup_summary_names_progress_in_plain_language(
     window._refresh_profile_ui()
     assert window.setup_state_label.text() == "Rust setup complete"
     assert window.setup_summary.property("state") == "ready"
+
+
+def test_detected_setup_populates_required_and_common_optional_regions(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(window, "_update_calibration_overlay", lambda: None)
+    regions = {
+        "canvas": DetectedRegion(ScreenRect(100, 100, 800, 400), 0.86, "test"),
+        "color_box": DetectedRegion(ScreenRect(1000, 300, 160, 160), 0.95, "test"),
+        "hue_bar": DetectedRegion(ScreenRect(1164, 300, 26, 160), 0.97, "test"),
+        "brush_size_box": DetectedRegion(ScreenRect(1200, 160, 40, 24), 0.68, "test"),
+        "clear_button": DetectedRegion(ScreenRect(20, 20, 50, 50), 0.66, "test"),
+        "save_button": DetectedRegion(ScreenRect(1000, 650, 240, 30), 0.62, "test"),
+        "download_button": DetectedRegion(ScreenRect(90, 20, 45, 50), 0.64, "test"),
+    }
+
+    window._save_detected_setup(SetupDetection(regions))
+
+    profile = window._current_profile
+    assert profile is not None
+    assert profile.canvas == regions["canvas"].rect
+    assert profile.color_box == regions["color_box"].rect
+    assert profile.hue_bar == regions["hue_bar"].rect
+    assert profile.brush_size_box == regions["brush_size_box"].rect
+    assert profile.clear_button == regions["clear_button"].rect
+    assert profile.metadata["auto_setup_confidence"]["canvas"] == 0.86
+    assert window.setup_state_label.text() == "Rust setup complete"
 
 
 def test_automatic_brush_sizing_marks_its_calibration_as_required(

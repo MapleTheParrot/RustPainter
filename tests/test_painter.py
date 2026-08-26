@@ -8,6 +8,7 @@ import time
 import pytest
 from PIL import Image, ImageDraw
 
+import app.painter as painter_module
 from app.color_calibration import ColorCorrectionModel
 from app.color_mapping import map_rgb_to_picker
 from app.input_controller import DryRunInputController, MockInputController
@@ -20,6 +21,7 @@ from app.paint_timing import (
 from app.painter import Painter, PainterSettings, PainterState, PaintingTarget
 from app.brush_calibration import fit_brush_size_model
 from app.profiles import CalibrationProfile
+from app.texel_grid import TexelGridModel
 
 
 def _profile(*, canvas_width: int = 400) -> CalibrationProfile:
@@ -2905,6 +2907,97 @@ def _painted_as_planned(cells, plan: PaintPlan) -> bool:
         max(abs(a - b) for a, b in zip(cells[cell], color)) <= 8
         for cell, color in expected.items()
     )
+
+
+def test_matching_saved_grid_skips_full_calibration_and_restores_cached_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    profile.brush_size_box = ScreenRect(800, 100, 60, 24)
+    profile.clear_button = ScreenRect(880, 100, 24, 24)
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(1, 1 / 20), (4, 4 / 20)]
+    ).to_dict()
+    profile.metadata["texel_grid"] = TexelGridModel(
+        columns=100,
+        rows=20,
+        pitch_x=4.0,
+        pitch_y=4.0,
+        origin_x=100.0,
+        origin_y=100.0,
+    ).to_dict()
+    profile.metadata["calibration_performance"] = {
+        "pressHoldSeconds": 0.03,
+        "strokeGapSeconds": 0.008,
+        "dragTexelsPerSecond": 900.0,
+        "detailSize": 1.5,
+        "dabSweep": True,
+    }
+    painter = Painter(
+        controller,
+        screen_capture=lambda rect: Image.new("RGB", (rect.width, rect.height), "gray"),
+    )
+    painter.configure(
+        _dot_plan(1),
+        profile,
+        _settings(apply_brush_size=True, reuse_calibration=True, verify_passes=0),
+    )
+    job = painter._job
+    assert job is not None
+    cleared: list[bool] = []
+    monkeypatch.setattr(painter, "_move", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(painter, "_interruptible_sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(painter, "_clear_canvas", lambda _job: cleared.append(True))
+    monkeypatch.setattr(painter, "_validate_brush_reach", lambda *_args: None)
+    monkeypatch.setattr(
+        painter_module, "find_quad_edges", lambda _capture, expected, _search: expected
+    )
+
+    assert painter._reuse_saved_calibration(job) is True
+    assert cleared == [True]
+    assert painter.measured_texel_grid is job.target.texel_grid
+    assert painter.measured_press_hold_seconds == pytest.approx(0.03)
+    assert painter.measured_stroke_gap_seconds == pytest.approx(0.008)
+    assert painter.measured_drag_rate == pytest.approx(900.0)
+    assert painter.measured_detail_size == pytest.approx(1.5)
+    assert painter.measured_dab_sweep is True
+
+
+def test_saved_grid_mismatch_falls_back_without_clearing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    profile.brush_size_box = ScreenRect(800, 100, 60, 24)
+    profile.clear_button = ScreenRect(880, 100, 24, 24)
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(1, 1 / 20), (4, 4 / 20)]
+    ).to_dict()
+    profile.metadata["texel_grid"] = TexelGridModel(
+        columns=100, rows=20, pitch_x=4.0, pitch_y=4.0, origin_x=100.0, origin_y=100.0
+    ).to_dict()
+    painter = Painter(
+        controller,
+        screen_capture=lambda rect: Image.new("RGB", (rect.width, rect.height), "gray"),
+    )
+    painter.configure(
+        _dot_plan(1), profile, _settings(apply_brush_size=True, reuse_calibration=True)
+    )
+    job = painter._job
+    assert job is not None
+    monkeypatch.setattr(painter, "_move", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(painter, "_interruptible_sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        painter_module,
+        "find_quad_edges",
+        lambda _capture, expected, _search: (expected[0] + 30, None, None, None),
+    )
+
+    assert painter._reuse_saved_calibration(job) is False
+    assert painter.measured_brush_size_model is None
 
 
 def test_every_color_is_read_back_off_the_panel_when_the_clicks_land() -> None:

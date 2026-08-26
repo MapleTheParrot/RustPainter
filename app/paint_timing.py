@@ -264,6 +264,8 @@ MAX_STROKE_OVERHEAD_SECONDS = 0.25
 # The brush measurement before a run: a scout stroke, five probes, and two
 # wipes of the sign.  Measured at 18 s on a real sign.
 BRUSH_CALIBRATION_SECONDS = 18.0
+# Passive edge validation plus the one clear click on a matching saved sign.
+FAST_CALIBRATION_SECONDS = 2.0
 
 # How many strokes a run must have painted before its timing is believed.
 # Each believed run measures the overhead on its own (its residual per
@@ -943,6 +945,7 @@ class TouchUpTiming:
 
 __all__ = [
     "BRUSH_CALIBRATION_SECONDS",
+    "FAST_CALIBRATION_SECONDS",
     "CHECK_CAPTURE_SECONDS_DEFAULT",
     "CHECK_REPAINT_FRACTION_DEFAULT",
     "DEFAULT_STROKE_OVERHEAD_SECONDS",
