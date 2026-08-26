@@ -187,7 +187,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "hotkeys": {
         "start_resume": "F8",
-        "pause": "F9",
         "abort": "F10",
     },
     "safety": {
@@ -200,7 +199,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "verify_calibrated_ui": False,
         # Every so often, save the sign, jump, and reopen it, so a server
         # that kicks idle players sees one moving.
-        "anti_afk_enabled": False,
+        "anti_afk_enabled": True,
         "anti_afk_interval_minutes": 30,
         # Pause when the painting UI's calibrated widgets leave the screen:
         # a kick, a server restart, or the sign closed by hand.
@@ -566,7 +565,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         )
 
     assert isinstance(hotkeys, Mapping)
-    for key in ("start_resume", "pause", "abort"):
+    for key in ("start_resume", "abort"):
         if not isinstance(hotkeys.get(key), str) or not str(hotkeys[key]).strip():
             raise SettingsError(f"hotkeys.{key} must be a non-empty string")
         if not is_supported_hotkey(hotkeys[key]):
@@ -574,10 +573,10 @@ def _validate(settings: Mapping[str, Any]) -> None:
                 f"hotkeys.{key} must be one of: " + ", ".join(SUPPORTED_HOTKEY_CHOICES)
             )
     normalized_hotkeys = {
-        normalize_hotkey(hotkeys[key]) for key in ("start_resume", "pause", "abort")
+        normalize_hotkey(hotkeys[key]) for key in ("start_resume", "abort")
     }
-    if len(normalized_hotkeys) != 3:
-        raise SettingsError("Start, pause, and abort hotkeys must be different")
+    if len(normalized_hotkeys) != 2:
+        raise SettingsError("Start/pause and abort hotkeys must be different")
 
     assert isinstance(safety, Mapping)
     countdown = safety.get("countdown_seconds")

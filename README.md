@@ -46,7 +46,7 @@ Paint a sign in five steps:
 5. **Paint.** Start with a small, low-color test image and focus Rust during
    the countdown.
 
-**Hotkeys:** `F8` start/resume, `F9` pause, `F10` stop. Stop immediately
+**Hotkeys:** `F8` starts, pauses, or resumes; `F10` stops. Stop immediately
 releases any held mouse button.
 
 Keep a hand near **F10** during your first runs, and do not leave the tool
@@ -66,7 +66,7 @@ painting unattended. Everything below is detail you only need when tuning.
 - Text sized as a fraction of the canvas, so a caption keeps its proportions when the quality preset changes the painting resolution
 - Named profiles per sign layout; fixed UI/HUD targets (color box, hue bar, Size value, Clear, hunger, thirst, and Download) carry across profiles and remain individually recalibratable
 - One-click Rust setup detection for the canvas, adaptive colour picker, Size field, Clear, Download, and Save controls, with an on-screen overlay for review and manual edge correction
-- An anti-AFK break (off by default): every so often the job saves the sign, jumps, reopens the sign, and carries on, so a server that kicks idle players sees one moving
+- An anti-AFK break (on by default): every so often the job saves the sign, jumps, reopens the sign, and carries on, so a server that kicks idle players sees one moving
 - Brush sizing measured from the sign itself and reused after a quick geometry check; a moved, changed, or uncertain sign automatically falls back to fresh probe strokes before painting
 - Optimization modes (Exact / Quality / Balanced / Fast) that plan like a painter: perceptually identical colors merge, insignificant specks are absorbed, and large areas are filled with the largest safe brush before details go on top, with the preview showing exactly what will be painted
 - Overpaint stroke merging that typically removes 10-40% of strokes without changing the finished image
@@ -311,7 +311,7 @@ Two steps of the pipeline exist purely to keep the sign faithful to the source:
 
 The current Rust picker layout is fixed in the application: hue runs bottom to top, saturation increases left to right, brightness decreases top to bottom, and brush size increases left to right.
 
-Default global hotkeys are **F8** start/resume, **F9** pause, and **F10** stop. Stop is designed to release any held mouse button immediately.
+Default global hotkeys are **F8** start/pause/resume and **F10** stop. Stop is designed to release any held mouse button immediately.
 
 Compact laptop keyboards often put F5-F12 behind an **Fn** key that the keyboard
 firmware handles itself, so those presses never reach the app and the hotkeys
@@ -778,9 +778,9 @@ The chart deliberately consumes paint on one test sign. Re-measure after changin
 
 - Starting uses a visible countdown so you can focus Rust.
 - With the foreground guard enabled, every populated selector must match: the configured window-title fragment and, when supplied, the executable name. The expected process defaults to `RustClient.exe`. Loss of focus pauses and releases the mouse.
-- F9 pauses at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, the per-color check and touch-up passes, the safety guards, and the timelapse controls stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
+- F8 toggles start, pause, and resume at the next short cancellation checkpoint. While a job is paused the speed preset, the advanced timing, the per-color check and touch-up passes, the safety guards, and the timelapse controls stay editable; the job resumes on the new values. Everything that shaped the job (image, plan, calibration, brush sizing) stays locked until it finishes.
 - F10 aborts, clears pending work, and releases the mouse.
-- **Anti-AFK** (off by default, Settings > Safety): every N minutes (adjustable, 30 by default) the job clicks Rust's **Save changes** button to leave the painting UI, presses Space to jump, waits a second, clicks to open the sign again, and continues from the same stroke - re-selecting its color and brush size first. It relies on your character still facing the sign, which it is if you were looking at it when the job started and have not touched the mouse since. Turning it on makes the **Save button** calibration needed (drag just inside Rust's Save changes button), and Start says so until it is set. Closing the UI with Save keeps everything painted so far.
+- **Anti-AFK** (on by default, Settings > Safety): every N minutes (adjustable, 30 by default) the job clicks Rust's **Save changes** button to leave the painting UI, presses Space to jump, waits a second, clicks to open the sign again, and continues from the same stroke - re-selecting its color and brush size first. It relies on your character still facing the sign, which it is if you were looking at it when the job started and have not touched the mouse since. With it on, the **Save button** calibration is needed (drag just inside Rust's Save changes button), and Start says so until it is set. Closing the UI with Save keeps everything painted so far.
 - **UI guard** (on by default, Settings > Safety): once a second the job looks at the calibrated **colour box**, **hue bar**, and - when calibrated - the **Clear** and **Save** buttons, and pauses when they are no longer on the screen: a server restart, a kick, a disconnect, or the sign closed by hand, none of which the other guards notice because the Rust window is still in front and the cursor still goes where it is sent. Each widget is fingerprinted as the job starts (the colour box on saturation and value only, since its hue follows the colour being painted) and recognised by structure, so a highlight or a tint does not count and a dark wall where a dark button was does not pass. The UI counts as gone when more of the widgets are missing than present, and only after two looks half a second apart. The job also refuses to start painting unless the hue bar is where it was calibrated, which catches a countdown that ran out before the sign was open. Open the sign again and resume to continue from the same stroke; the anti-AFK break closes the sign on purpose and is exempt, but if the sign has not reopened a few seconds after its E press the job pauses instead of painting into the game world.
 - **A screenshot of every automatic pause.** Whenever the painter pauses on its own - the UI guard, a sign that did not reopen, the focus guard, the mouse guard - the app captures the whole screen that moment and saves it under the data folder (`runs`, then `pauses`), so what tripped the guard can be seen rather than guessed. **See what stopped it** in the progress panel opens it while the job is paused, with the painter's reason and the time above the picture; the resume record keeps the path, so the Resume control offers the same button in a later session. A pause you asked for takes no screenshot.
 - **Mouse guard** (on by default, Settings > Safety): taking the mouse back mid-job pauses it instead of letting your hand fight the painter. The button is released within milliseconds, and resuming with F8 re-selects the color and repeats the interrupted stroke, so a bump costs one stroke rather than the whole sign. Movement is detected from the gap between where the painter put the cursor and where the cursor actually is; no input hook is installed. If a job pauses repeatedly on its own, the calibrated canvas is likely outside where the game lets the cursor go - recalibrate, or turn the guard off.

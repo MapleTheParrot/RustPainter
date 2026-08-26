@@ -107,13 +107,11 @@ def is_supported_hotkey(value: object) -> bool:
 @dataclass(frozen=True, slots=True)
 class HotkeyBindings:
     start_resume: HotkeySpec | int | str = "F8"
-    pause: HotkeySpec | int | str = "F9"
     abort: HotkeySpec | int | str = "F10"
 
     def normalized(self) -> "HotkeyBindings":
         return HotkeyBindings(
             HotkeySpec.parse(self.start_resume),
-            HotkeySpec.parse(self.pause),
             HotkeySpec.parse(self.abort),
         )
 
@@ -121,7 +119,6 @@ class HotkeyBindings:
     def from_mapping(cls, values: Mapping[str, int | str | HotkeySpec]) -> "HotkeyBindings":
         return cls(
             start_resume=values.get("start_resume", "F8"),
-            pause=values.get("pause", "F9"),
             abort=values.get("abort", "F10"),
         )
 
@@ -145,18 +142,17 @@ if os.name == "nt":
 
 
 class GlobalHotkeyManager:
-    """Own a small Win32 message-loop thread for start/pause/abort hotkeys.
+    """Own a small Win32 message-loop thread for start/pause and abort hotkeys.
 
     Callbacks run on the hotkey thread. Qt clients should emit a signal (or use
     another queued bridge) instead of touching widgets directly.
     """
 
-    _IDS = {"start_resume": 0xB100, "pause": 0xB101, "abort": 0xB102}
+    _IDS = {"start_resume": 0xB100, "abort": 0xB102}
 
     def __init__(
         self,
         on_start_resume: Callable[[], None] | None = None,
-        on_pause: Callable[[], None] | None = None,
         on_abort: Callable[[], None] | None = None,
         *,
         bindings: HotkeyBindings | Mapping[str, int | str | HotkeySpec] | None = None,
@@ -171,7 +167,6 @@ class GlobalHotkeyManager:
         self.bindings = resolved_bindings.normalized()
         self._callbacks: dict[str, Callable[[], None] | None] = {
             "start_resume": on_start_resume,
-            "pause": on_pause,
             "abort": on_abort,
         }
         self._on_error = on_error
@@ -200,13 +195,11 @@ class GlobalHotkeyManager:
         self,
         *,
         on_start_resume: Callable[[], None] | None = None,
-        on_pause: Callable[[], None] | None = None,
         on_abort: Callable[[], None] | None = None,
     ) -> None:
         with self._lock:
             self._callbacks.update(
                 start_resume=on_start_resume,
-                pause=on_pause,
                 abort=on_abort,
             )
 
@@ -276,7 +269,6 @@ class GlobalHotkeyManager:
         normalized = self.bindings.normalized()
         return (
             ("start_resume", normalized.start_resume),
-            ("pause", normalized.pause),
             ("abort", normalized.abort),
         )  # type: ignore[return-value]
 
@@ -313,9 +305,8 @@ class GlobalHotkeyManager:
             with self._lock:
                 self._running = True
             LOGGER.info(
-                "Global hotkeys registered: start/resume=%s pause=%s abort=%s",
+                "Global hotkeys registered: start/pause=%s abort=%s",
                 self.bindings.start_resume,
-                self.bindings.pause,
                 self.bindings.abort,
             )
             self._started.set()

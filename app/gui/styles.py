@@ -385,15 +385,15 @@ QTabBar::tab:selected {{
 }}
 QProgressBar {{
     {_INSET}
-    border: 1px solid {BORDER};
-    border-radius: 7px;
+    border: 1px solid {BORDER_LIGHT};
+    border-radius: 8px;
     text-align: center;
-    min-height: 20px;
+    min-height: 22px;
     color: {TEXT};
 }}
 QProgressBar::chunk {{
     {_PROGRESS}
-    border-radius: 6px;
+    border-radius: 7px;
 }}
 QSlider::groove:horizontal {{ height: 5px; background: #0e0c0b; border-radius: 2px; }}
 QSlider::handle:horizontal {{

@@ -83,6 +83,35 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
     assert not window.start_button.isEnabled()
 
 
+def test_start_calculates_a_deferred_plan_without_preview_click(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window.dry_run_check.setChecked(True)
+    window._original_image = Image.new("RGB", (8, 4), (180, 80, 30))
+    window._plan = None
+    window._plan_deferred = True
+    started: list[bool] = []
+    monkeypatch.setattr(window, "_start_processing", lambda: started.append(True))
+
+    window._update_start_availability()
+    assert window.start_button.isEnabled()
+    window._start_or_resume()
+
+    assert window._start_after_processing is True
+    assert started == [True]
+    assert not window.start_button.isEnabled()
+
+    window._abort_painting()
+    assert window._start_after_processing is False
+
+
+def test_history_is_an_icon_button_beside_start(window: MainWindow) -> None:
+    assert window.sessions_button.text() == ""
+    assert not window.sessions_button.icon().isNull()
+    assert window.sessions_button.accessibleName() == "Painting history"
+    assert window.sessions_button.height() == window.start_button.minimumHeight()
+
+
 def test_optimization_mode_merges_colors_and_gates_controls(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
@@ -2476,6 +2505,56 @@ def test_progress_updates_fill_the_large_readout(window: MainWindow) -> None:
     assert window.active_paint_progress.value() == 425
 
 
+def test_calibration_has_its_own_progress_bar_and_eta(window: MainWindow) -> None:
+    from types import SimpleNamespace
+
+    generation = window._paint_generation
+    window._paint_job_snapshot = SimpleNamespace(
+        profile=SimpleNamespace(metadata={}),
+        settings={"painting": {"reuse_calibration": False}},
+    )
+    calibrating = PaintProgress(
+        PainterState.RUNNING,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        0.0,
+        9.0,
+        None,
+        "Measuring brush",
+        "calibrate",
+    )
+
+    window._calibration_started_elapsed = 0.0
+    window._on_paint_progress(generation, calibrating)
+
+    assert window.active_phase_progress.currentWidget() is window.active_calibration_progress
+    assert 450 <= window.active_calibration_progress.value() <= 550
+    assert window.active_progress_title.text() == "CALIBRATING BRUSH"
+    assert "remaining" in window.active_remaining_label.text()
+
+    painting = replace(calibrating, phase="paint", percent=10.0)
+    window._on_paint_progress(generation, painting)
+    assert window.active_phase_progress.currentWidget() is window.active_paint_progress
+
+
+def test_start_hotkey_toggles_a_running_job_to_paused(window: MainWindow) -> None:
+    from types import SimpleNamespace
+
+    paused: list[str] = []
+    window._painter = SimpleNamespace(
+        state=SimpleNamespace(value="running"),
+        pause=lambda reason: paused.append(reason),
+    )
+
+    window._hotkey_toggle_immediate()
+
+    assert paused == ["global start/pause hotkey"]
+
+
 def test_plan_recalculation_shows_pending_feedback(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
@@ -4001,8 +4080,9 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     are saved, and reach the painter in seconds.
     """
 
-    assert not window.anti_afk_check.isChecked()
+    assert window.anti_afk_check.isChecked()
     window._current_profile.save_button = None
+    window.anti_afk_check.setChecked(False)
     window._refresh_profile_ui()
     assert window.save_button_status._value.text() == "Optional"
 

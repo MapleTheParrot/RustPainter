@@ -973,7 +973,6 @@ class _PainterBridge(QObject):
     error = Signal(int, str)
     pause_screenshot = Signal(int, str, str, str)
     start_requested = Signal()
-    pause_requested = Signal()
     abort_requested = Signal()
     hotkey_error = Signal(str)
     debug_finished = Signal(str, str)
@@ -1026,6 +1025,10 @@ class MainWindow(QMainWindow):
         # held here instead of run, so the busy overlay never lands on top of
         # an edit in progress; switching to the Rust preview runs it.
         self._plan_deferred = False
+        # Start is allowed while a changed image is still waiting for its
+        # plan.  This flag carries that intent across the worker boundary so
+        # the completed plan flows straight into the ordinary start checks.
+        self._start_after_processing = False
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(350)
@@ -1098,11 +1101,12 @@ class MainWindow(QMainWindow):
         self._paint_generation = 0
         self._pending_paint: _PendingPaint | None = None
         self._pending_start_cancelled = False
+        self._calibration_started_elapsed: float | None = None
         self._color_chart_profile_id: str | None = None
         self._color_chart_path: Path | None = None
         self._hotkeys: Any = None
         self._hotkeys_ready = False
-        self._last_hotkey_bindings: tuple[str, str, str] | None = None
+        self._last_hotkey_bindings: tuple[str, str] | None = None
         self._countdown: CountdownDialog | None = None
         self._countdown_callback_running = False
         self._debug_running = False
@@ -1152,7 +1156,6 @@ class MainWindow(QMainWindow):
         self._painter_bridge.error.connect(self._on_paint_error)
         self._painter_bridge.start_requested.connect(self._start_or_resume)
         self._painter_bridge.pause_screenshot.connect(self._on_pause_screenshot)
-        self._painter_bridge.pause_requested.connect(self._pause_painting)
         self._painter_bridge.abort_requested.connect(self._abort_painting)
         self._painter_bridge.hotkey_error.connect(self._on_hotkey_error)
         self._painter_bridge.debug_finished.connect(self._on_debug_finished)
@@ -1975,7 +1978,17 @@ class MainWindow(QMainWindow):
         self.active_paint_progress.setValue(0)
         self.active_paint_progress.setMinimumHeight(22)
         self.active_paint_progress.setTextVisible(False)
-        active_layout.addWidget(self.active_paint_progress)
+        self.active_paint_progress.setAccessibleName("Painting progress")
+        self.active_calibration_progress = QProgressBar()
+        self.active_calibration_progress.setRange(0, 1000)
+        self.active_calibration_progress.setValue(0)
+        self.active_calibration_progress.setMinimumHeight(22)
+        self.active_calibration_progress.setTextVisible(False)
+        self.active_calibration_progress.setAccessibleName("Calibration progress")
+        self.active_phase_progress = QStackedWidget()
+        self.active_phase_progress.addWidget(self.active_paint_progress)
+        self.active_phase_progress.addWidget(self.active_calibration_progress)
+        active_layout.addWidget(self.active_phase_progress)
         self.active_detail_label = QLabel("")
         self.active_detail_label.setObjectName("muted")
         active_layout.addWidget(self.active_detail_label)
@@ -2883,9 +2896,12 @@ class MainWindow(QMainWindow):
             resume_panel,
             "Resume a previous painting",
         )
-        sessions_row = QHBoxLayout()
-        self.sessions_button = QPushButton("Sessions…")
+        self.sessions_button = QPushButton()
         self.sessions_button.setObjectName("compactButton")
+        self.sessions_button.setAccessibleName("Painting history")
+        self.sessions_button.setFixedSize(44, 44)
+        self.sessions_button.setIcon(vector_icon("history", 64, TEXT))
+        self.sessions_button.setIconSize(QSize(22, 22))
         self.sessions_button.setToolTip(
             "Every real painting run keeps its place as a session.  Open one\n"
             "to switch back to its image and settings - pause a long sign for\n"
@@ -2893,22 +2909,20 @@ class MainWindow(QMainWindow):
             "done with."
         )
         self.sessions_button.clicked.connect(self._show_sessions_dialog)
-        sessions_row.addStretch(1)
-        sessions_row.addWidget(self.sessions_button)
-        run_layout.addLayout(sessions_row)
         self.start_button = QPushButton("START PAINTING  •  F8")
         self.start_button.setObjectName("accent")
         self.start_button.setMinimumHeight(44)
         self._set_icon(self.start_button, "play", ON_ACCENT, size=22)
+        start_row = QHBoxLayout()
+        start_row.setSpacing(8)
+        start_row.addWidget(self.start_button, 1)
+        start_row.addWidget(self.sessions_button)
         run_buttons = QHBoxLayout()
-        self.pause_button = QPushButton("Pause  •  F9")
         self.abort_button = QPushButton("Stop  •  F10")
         self.abort_button.setObjectName("danger")
-        self._set_icon(self.pause_button, "pause", TEXT, size=16)
         self._set_icon(self.abort_button, "abort", ON_ACCENT, size=16)
-        run_buttons.addWidget(self.pause_button)
         run_buttons.addWidget(self.abort_button)
-        run_layout.addWidget(self.start_button)
+        run_layout.addLayout(start_row)
         run_layout.addLayout(run_buttons)
         layout.addWidget(run_group)
         layout.addStretch(1)
@@ -3526,7 +3540,6 @@ class MainWindow(QMainWindow):
             "The anti-AFK break closes the sign on purpose and is exempt."
         )
         self.start_hotkey_combo = self._hotkey_combo("F8")
-        self.pause_hotkey_combo = self._hotkey_combo("F9")
         self.abort_hotkey_combo = self._hotkey_combo("F10")
         safety_form.addRow("Countdown", self.countdown_spin)
         safety_form.addRow("Focus guard", self.focus_guard_check)
@@ -3535,8 +3548,7 @@ class MainWindow(QMainWindow):
         safety_form.addRow("Mouse guard", self.mouse_pause_check)
         safety_form.addRow("UI check", self.verify_ui_check)
         safety_form.addRow("UI guard", self.ui_guard_check)
-        safety_form.addRow("Start / resume", self.start_hotkey_combo)
-        safety_form.addRow("Pause", self.pause_hotkey_combo)
+        safety_form.addRow("Start / pause", self.start_hotkey_combo)
         safety_form.addRow("Stop", self.abort_hotkey_combo)
         layout.addWidget(safety_group)
 
@@ -5654,6 +5666,7 @@ class MainWindow(QMainWindow):
         if (
             self.preview_tabs.currentIndex() == 0
             and not self._show_preview_after_processing
+            and not self._start_after_processing
         ):
             # The Source tab is where text is edited, and the recalculation's
             # busy overlay would cover the editing in progress.  Hold the
@@ -5776,6 +5789,11 @@ class MainWindow(QMainWindow):
         )
         self._refresh_statistics()
         self._update_start_availability()
+        if self._start_after_processing:
+            # Clear first so a validation warning or a cancelled countdown
+            # does not accidentally start again after some later recalculation.
+            self._start_after_processing = False
+            QTimer.singleShot(0, self._start_or_resume)
 
     @Slot(int, str)
     def _on_processing_failed(self, serial: int, message: str) -> None:
@@ -5790,6 +5808,7 @@ class MainWindow(QMainWindow):
         self._plan_simulation = None
         self._refresh_resume_offer()
         self._refresh_statistics()
+        self._start_after_processing = False
         self._update_start_availability()
 
     def _refresh_statistics(self, *_args: Any) -> None:
@@ -6157,7 +6176,6 @@ class MainWindow(QMainWindow):
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
         self.start_button.clicked.connect(self._start_or_resume)
-        self.pause_button.clicked.connect(self._pause_painting)
         self.abort_button.clicked.connect(self._abort_painting)
         self.capture_reference_button.clicked.connect(self._capture_reference)
         for name, button in self.debug_buttons.items():
@@ -6256,7 +6274,6 @@ class MainWindow(QMainWindow):
             self.anti_afk_check,
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
-            self.pause_hotkey_combo,
             self.abort_hotkey_combo,
         )
         for control in settings_controls:
@@ -6272,7 +6289,6 @@ class MainWindow(QMainWindow):
                 control.colorChanged.connect(self._schedule_settings_save)
 
         self.start_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
-        self.pause_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
         self.abort_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
         self.dry_run_check.toggled.connect(self._update_start_availability)
 
@@ -6573,13 +6589,12 @@ class MainWindow(QMainWindow):
             )
             self.verify_ui_check.setChecked(bool(safety.get("verify_calibrated_ui", False)))
             self.ui_guard_check.setChecked(bool(safety.get("ui_guard_enabled", True)))
-            self.anti_afk_check.setChecked(bool(safety.get("anti_afk_enabled", False)))
+            self.anti_afk_check.setChecked(bool(safety.get("anti_afk_enabled", True)))
             self.anti_afk_interval_spin.setValue(
                 int(safety.get("anti_afk_interval_minutes", 30))
             )
             self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
             self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
-            self.pause_hotkey_combo.setCurrentText(str(hotkeys.get("pause", "F9")))
             self.abort_hotkey_combo.setCurrentText(str(hotkeys.get("abort", "F10")))
         finally:
             for control in controls:
@@ -6685,9 +6700,7 @@ class MainWindow(QMainWindow):
             "sort_order": str(self.timelapse_sort_combo.currentData() or "recent"),
         }
         current["hotkeys"] = {
-            **current.get("hotkeys", {}),
             "start_resume": self.start_hotkey_combo.currentText(),
-            "pause": self.pause_hotkey_combo.currentText(),
             "abort": self.abort_hotkey_combo.currentText(),
         }
         current["safety"] = {
@@ -8051,7 +8064,6 @@ class MainWindow(QMainWindow):
             return
         requested = (
             self.start_hotkey_combo.currentText(),
-            self.pause_hotkey_combo.currentText(),
             self.abort_hotkey_combo.currentText(),
         )
         if len({value.upper() for value in requested}) != len(requested):
@@ -8059,7 +8071,7 @@ class MainWindow(QMainWindow):
             self._hotkeys_ready = bool(
                 self._hotkeys is not None and getattr(self._hotkeys, "running", False)
             )
-            self._on_hotkey_error("Start, pause, and stop hotkeys must be different.")
+            self._on_hotkey_error("Start/pause and stop hotkeys must be different.")
             self._update_start_availability()
             return
         previous = self._hotkeys
@@ -8068,12 +8080,10 @@ class MainWindow(QMainWindow):
 
             bindings = HotkeyBindings(
                 start_resume=requested[0],
-                pause=requested[1],
-                abort=requested[2],
+                abort=requested[1],
             )
             candidate = GlobalHotkeyManager(
-                on_start_resume=self._painter_bridge.start_requested.emit,
-                on_pause=self._hotkey_pause_immediate,
+                on_start_resume=self._hotkey_toggle_immediate,
                 on_abort=self._hotkey_abort_immediate,
                 bindings=bindings,
                 on_error=self._hotkey_failure_immediate,
@@ -8112,7 +8122,6 @@ class MainWindow(QMainWindow):
             return
         combos = (
             self.start_hotkey_combo,
-            self.pause_hotkey_combo,
             self.abort_hotkey_combo,
         )
         for combo, value in zip(combos, self._last_hotkey_bindings, strict=True):
@@ -8121,11 +8130,14 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
         self._refresh_hotkey_labels()
 
-    def _hotkey_pause_immediate(self) -> None:
+    def _hotkey_toggle_immediate(self) -> None:
+        """Pause immediately on the hotkey thread, otherwise queue start/resume."""
+
         painter = self._painter
-        if painter is not None:
-            painter.pause("global hotkey")
-        self._painter_bridge.pause_requested.emit()
+        if painter is not None and self._painter_state_value() == "running":
+            painter.pause("global start/pause hotkey")
+            return
+        self._painter_bridge.start_requested.emit()
 
     def _hotkey_abort_immediate(self) -> None:
         # This runs on the Win32 hotkey thread. Painter.abort is thread-safe and
@@ -8169,9 +8181,6 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_hotkey_labels(self) -> None:
-        self.pause_button.setText(
-            f"Pause  •  {self.pause_hotkey_combo.currentText()}"
-        )
         self.abort_button.setText(
             f"Stop  •  {self.abort_hotkey_combo.currentText()}"
         )
@@ -8235,15 +8244,25 @@ class MainWindow(QMainWindow):
             and not self._missing_sizing_rectangles()
             and not self._missing_anti_afk_rectangles()
         )
-        can_dry_run = self.dry_run_check.isChecked() and self._plan is not None
-        can_start = (self._plan is not None and profile_ready) or can_dry_run or paused
+        has_source = self._original_image is not None
+        has_plan_or_source = self._plan is not None or has_source
+        can_dry_run = self.dry_run_check.isChecked() and has_plan_or_source
+        can_start = (has_plan_or_source and profile_ready) or can_dry_run or paused
         if (
             not self.dry_run_check.isChecked()
             and not self._emergency_hotkey_available()
             and not paused
         ):
             can_start = False
-        enabled = can_start and not countdown_active and (not active or paused)
+        # The same control pauses an active job; there is no second command or
+        # key to remember.  During planning it stays disabled only after the
+        # user's start intent has already been recorded.
+        enabled = (active and not paused) or (
+            can_start
+            and not countdown_active
+            and not self._start_after_processing
+            and (not active or paused)
+        )
         self.start_button.setEnabled(enabled)
         # A disabled button with no explanation reads as a broken app.  Name the
         # blocker instead, because the two common ones -- unfinished calibration
@@ -8253,13 +8272,14 @@ class MainWindow(QMainWindow):
         )
         resume_at = 0 if active or paused else self._resume_start_stroke()
         self.start_button.setText(
-            f"RESUME PAINTING  •  {self.start_hotkey_combo.currentText()}"
+            f"PAUSE PAINTING  •  {self.start_hotkey_combo.currentText()}"
+            if active and not paused
+            else f"RESUME PAINTING  •  {self.start_hotkey_combo.currentText()}"
             if paused
             else f"RESUME FROM STROKE {resume_at:,}  •  {self.start_hotkey_combo.currentText()}"
             if resume_at
             else f"START PAINTING  •  {self.start_hotkey_combo.currentText()}"
         )
-        self.pause_button.setEnabled(active and not paused)
         self.abort_button.setEnabled(
             active
             or paused
@@ -8334,12 +8354,9 @@ class MainWindow(QMainWindow):
         if self._countdown and self._countdown.isVisible():
             return "Waiting for the countdown to finish."
         if self._plan is None:
-            if self._plan_deferred:
-                return (
-                    "The paint plan is waiting on your edits - switch to the "
-                    "Rust preview tab to recalculate it."
-                )
-            return "Load an image and wait for its paint plan to finish."
+            if self._original_image is not None:
+                return "The paint plan will be calculated automatically when you start."
+            return "Load an image to start painting."
         if not profile_ready and not self.dry_run_check.isChecked():
             missing = [
                 label
@@ -8480,7 +8497,6 @@ class MainWindow(QMainWindow):
             self.anti_afk_check,
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
-            self.pause_hotkey_combo,
             self.abort_hotkey_combo,
             self.capture_reference_button,
             self.prepare_color_chart_button,
@@ -8594,13 +8610,25 @@ class MainWindow(QMainWindow):
                     self._painter.resume()
                     return
                 if self._painter_is_active():
+                    self._pause_painting()
                     return
             except Exception:
                 pass
         if self._countdown is not None and self._countdown.isVisible():
             return
         if self._plan is None:
-            self.statusBar().showMessage("Load an image and wait for its paint plan.", 5000)
+            if self._original_image is None:
+                self.statusBar().showMessage("Load an image to start painting.", 5000)
+                return
+            self._start_after_processing = True
+            self.statusBar().showMessage(
+                "Calculating the latest paint plan, then painting will start…",
+                5000,
+            )
+            if not self._plan_processing:
+                self._process_timer.stop()
+                self._start_processing()
+            self._update_start_availability()
             return
         if (
             not self.dry_run_check.isChecked()
@@ -8610,7 +8638,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Emergency hotkey unavailable",
                 "Real painting is disabled because the global stop hotkey is not active. "
-                "Choose three distinct, available hotkeys and try again.",
+                "Choose distinct, available start/pause and stop hotkeys and try again.",
             )
             return
         if not self.dry_run_check.isChecked() and not (
@@ -8863,6 +8891,21 @@ class MainWindow(QMainWindow):
                 return
             self._paint_generation = generation
             self._painter = painter
+            self._calibration_started_elapsed = None
+            self.active_calibration_progress.setValue(0)
+            self.active_paint_progress.setValue(0)
+            needs_calibration = bool(
+                not dry_run
+                and pending.start_stroke == 0
+                and pending.settings.get("painting", {}).get("apply_brush_size", False)
+            )
+            self.active_phase_progress.setCurrentIndex(1 if needs_calibration else 0)
+            if needs_calibration:
+                self.active_progress_title.setText("CALIBRATING BRUSH")
+                self.active_percent_label.setText("0%")
+                self.active_remaining_label.setText(
+                    f"About {self._format_duration(self._calibration_estimate_seconds())} remaining"
+                )
             self._open_resume_record(pending)
             if self._pending_start_cancelled:
                 painter.shutdown(timeout=0.5)
@@ -8971,6 +9014,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _abort_painting(self) -> None:
         self._pending_start_cancelled = True
+        self._start_after_processing = False
         self._pending_paint = None
         self._debug_abort_event.set()
         with self._debug_input_gate:
@@ -9017,8 +9061,37 @@ class MainWindow(QMainWindow):
             f"Color {progress.color_index:,} / {progress.total_colors:,}  •  "
             f"Stroke {progress.completed_strokes:,} / {progress.total_strokes:,}"
         )
+        phase = getattr(progress, "phase", "paint")
         self.progress_detail_label.setText(f"{detail}  •  {percent:.1f}%{remaining}")
-        if getattr(progress, "phase", "paint") == "verify":
+        if phase == "calibrate":
+            if self._calibration_started_elapsed is None:
+                self._calibration_started_elapsed = float(progress.elapsed_seconds)
+            elapsed = max(
+                0.0,
+                float(progress.elapsed_seconds) - self._calibration_started_elapsed,
+            )
+            estimate = self._calibration_estimate_seconds()
+            calibration_percent = min(95.0, elapsed * 100.0 / max(estimate, 0.1))
+            calibration_remaining = max(0.0, estimate - elapsed)
+            self.active_phase_progress.setCurrentIndex(1)
+            self.active_calibration_progress.setValue(round(calibration_percent * 10))
+            self.active_progress_title.setText("CALIBRATING BRUSH")
+            self.active_percent_label.setText(f"{calibration_percent:.0f}%")
+            self.active_remaining_label.setText(
+                f"About {self._format_duration(calibration_remaining)} remaining"
+                if calibration_remaining > 0.0
+                else "Finishing calibration…"
+            )
+            self._active_detail = (
+                f"Calibration  •  {self._format_duration(elapsed)} elapsed"
+            )
+            self.active_detail_label.setText(self._active_detail)
+            return
+
+        if self._calibration_started_elapsed is not None:
+            self.active_calibration_progress.setValue(1000)
+        self.active_phase_progress.setCurrentIndex(0)
+        if phase == "verify":
             # The touch-up pass restarts the bar for its own, smaller plan;
             # titled anything less specific, it reads as the job starting over.
             self.active_progress_title.setText("TOUCHING UP")
@@ -9058,6 +9131,23 @@ class MainWindow(QMainWindow):
                 timelapse_frame=int(getattr(recorder, "frame_count", 0) or 0),
             )
         self._note_resume_progress(progress)
+
+    def _calibration_estimate_seconds(self) -> float:
+        """A stable ETA for the distinct pre-paint brush calibration phase."""
+
+        snapshot = self._paint_job_snapshot
+        if snapshot is None:
+            return BRUSH_CALIBRATION_SECONDS
+        profile = getattr(snapshot, "profile", None)
+        metadata = getattr(profile, "metadata", {})
+        painting = getattr(snapshot, "settings", {}).get("painting", {})
+        reusable = bool(
+            painting.get("reuse_calibration", True)
+            and isinstance(metadata, Mapping)
+            and metadata.get("brush_size_model")
+            and metadata.get("texel_grid")
+        )
+        return FAST_CALIBRATION_SECONDS if reusable else BRUSH_CALIBRATION_SECONDS
 
     _PAUSED_VIEWFINDER_NOTICE = (
         "Paused.  Slide to see the picture as far as any stroke and check "
@@ -9115,6 +9205,16 @@ class MainWindow(QMainWindow):
             if painter is None:
                 return
             progress = painter.progress
+        if getattr(progress, "phase", "paint") == "calibrate":
+            started = self._calibration_started_elapsed
+            elapsed = max(
+                0.0,
+                float(progress.elapsed_seconds) - (started or 0.0),
+            )
+            self.active_detail_label.setText(
+                f"Calibration  •  {self._format_duration(elapsed)} elapsed"
+            )
+            return
         parts = [self._active_detail, f"{self._format_duration(progress.elapsed_seconds)} elapsed"]
         until_break = None
         if painter is not None:
@@ -9174,6 +9274,7 @@ class MainWindow(QMainWindow):
             self.pause_screenshot_button.setVisible(False)
             self._withdraw_paused_viewfinder()
         if value in {"completed", "aborted", "error"}:
+            self._calibration_started_elapsed = None
             self._withdraw_paused_viewfinder()
             self._status_overlay_linger.start()
         if value in {"completed", "aborted", "error"}:
@@ -9196,6 +9297,7 @@ class MainWindow(QMainWindow):
         if generation != self._paint_generation:
             return
         self.paint_progress.setValue(1000)
+        self._calibration_started_elapsed = None
         self.progress_state_label.setText("Completed")
         self._set_active_progress_visible(False)
         self._set_state_badge("completed", "COMPLETE")
@@ -9213,6 +9315,7 @@ class MainWindow(QMainWindow):
         if generation != self._paint_generation:
             return
         self.progress_state_label.setText("Error")
+        self._calibration_started_elapsed = None
         self.progress_detail_label.setText(message)
         self._set_active_progress_visible(False)
         self._set_state_badge("error", "ERROR")

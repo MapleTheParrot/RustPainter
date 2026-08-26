@@ -130,6 +130,12 @@ def vector_icon(name: str, size: int = 64, color: str = "#f27a22") -> QIcon:
         painter.drawArc(QRectF(10, 10, 44, 44), 35 * 16, 285 * 16)
         painter.drawLine(QPointF(49, 11), QPointF(54, 25))
         painter.drawLine(QPointF(54, 25), QPointF(40, 22))
+    elif name == "history":
+        painter.drawArc(QRectF(10, 10, 44, 44), 48 * 16, 300 * 16)
+        painter.drawLine(QPointF(11, 14), QPointF(12, 29))
+        painter.drawLine(QPointF(12, 29), QPointF(26, 25))
+        painter.drawLine(QPointF(32, 19), QPointF(32, 33))
+        painter.drawLine(QPointF(32, 33), QPointF(42, 39))
     elif name == "delete":
         painter.drawRoundedRect(QRectF(17, 19, 30, 36), 3, 3)
         painter.drawLine(QPointF(13, 17), QPointF(51, 17))

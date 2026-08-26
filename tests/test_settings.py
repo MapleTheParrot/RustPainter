@@ -191,6 +191,7 @@ def test_expected_process_defaults_to_the_rust_client() -> None:
     safety = DEFAULT_SETTINGS["safety"]
     assert safety["expected_window_title_contains"] == "Rust"
     assert safety["expected_process_name"] == "RustClient.exe"
+    assert safety["anti_afk_enabled"] is True
 
 
 def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(

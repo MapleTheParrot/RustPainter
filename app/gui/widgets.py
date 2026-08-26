@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -369,8 +370,15 @@ class BusyOverlay(QWidget):
         # far more plainly than a bar frozen at zero would.
         self._bar.setRange(0, 0)
         self._bar.setTextVisible(False)
-        self._bar.setFixedHeight(6)
+        self._bar.setFixedHeight(10)
+        self._bar.setMinimumWidth(260)
+        self._bar.setAccessibleName("Paint plan calculation progress")
         card_layout.addWidget(self._bar)
+        self._base_detail = ""
+        self._elapsed_started = 0.0
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
         self._delay = QTimer(self)
         self._delay.setSingleShot(True)
         self._delay.setInterval(max(0, delay_ms))
@@ -382,7 +390,9 @@ class BusyOverlay(QWidget):
         """Arm the overlay; it appears only if the work outlasts the delay."""
 
         self._title.setText(title)
-        self._detail.setText(detail)
+        self._base_detail = detail
+        self._elapsed_started = time.monotonic()
+        self._refresh_elapsed()
         self._detail.setVisible(bool(detail))
         if self.isVisible():
             self._layout_card()
@@ -391,6 +401,7 @@ class BusyOverlay(QWidget):
 
     def end(self) -> None:
         self._delay.stop()
+        self._elapsed_timer.stop()
         self._spinner.stop()
         self.hide()
 
@@ -412,9 +423,16 @@ class BusyOverlay(QWidget):
         if parent is None or not parent.isVisible():
             return
         self._spinner.start()
+        self._elapsed_timer.start()
+        self._refresh_elapsed()
         self._layout_card()
         self.show()
         self.raise_()
+
+    def _refresh_elapsed(self) -> None:
+        elapsed = max(0, int(time.monotonic() - self._elapsed_started))
+        suffix = f"  •  {elapsed}s elapsed" if elapsed else ""
+        self._detail.setText(self._base_detail + suffix)
 
     def _layout_card(self) -> None:
         parent = self.parentWidget()
