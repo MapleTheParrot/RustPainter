@@ -84,6 +84,10 @@ QLabel#appTitle {{
     font-weight: 700;
     letter-spacing: 0.5px;
 }}
+QLabel#appSubtitle {{
+    color: {MUTED};
+    font-size: 8.5pt;
+}}
 QLabel#appMark {{
     background: transparent;
     border: 1px solid {BORDER_LIGHT};
@@ -99,6 +103,42 @@ QFrame#inlinePanel {{
     border: 1px solid {BORDER};
     border-radius: 8px;
 }}
+QFrame#welcomeCard {{
+    {_SELECTED}
+    border: 1px solid {BORDER_LIGHT};
+    border-left: 3px solid {ACCENT_SOFT};
+    border-radius: 9px;
+}}
+QLabel#welcomeTitle {{
+    color: {TEXT};
+    font-size: 10.5pt;
+    font-weight: 700;
+}}
+QFrame#detailsPanel {{
+    {_INSET}
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+QFrame#detailsPanel QWidget {{ background: transparent; }}
+QFrame#recommendationCard {{
+    background: #182015;
+    border: 1px solid #3f5a2a;
+    border-radius: 8px;
+}}
+QFrame#readinessCard {{
+    {_RAISED}
+    border: 1px solid {BORDER_LIGHT};
+    border-radius: 8px;
+}}
+QFrame#readinessCard[state="ready"] {{
+    background: #182015;
+    border-color: #3f5a2a;
+}}
+QFrame#readinessCard[state="attention"] {{
+    background: #241b10;
+    border-color: #6b4318;
+}}
+QLabel#readinessTitle {{ color: {TEXT}; font-weight: 700; }}
 /* Floating over a preview rather than sitting in the layout, so both of
    these carry their own plate and a rust edge that reads as "on top". */
 QFrame#inlineNotice {{
@@ -214,6 +254,24 @@ QPushButton#flat:hover, QPushButton#iconButton:hover {{
     border-color: {BORDER};
 }}
 QPushButton#compactButton {{ padding: 4px 8px; min-height: 18px; }}
+QPushButton#disclosureButton {{
+    color: #d6c5b5;
+    background: transparent;
+    border-color: {BORDER};
+    padding: 6px 9px;
+    text-align: left;
+    font-weight: 600;
+}}
+QPushButton#disclosureButton:hover {{
+    color: {TEXT};
+    background-color: #241a12;
+    border-color: {BORDER_LIGHT};
+}}
+QPushButton#disclosureButton:checked {{
+    color: #ffc793;
+    background-color: #21160f;
+    border-color: {BORDER_LIGHT};
+}}
 QPushButton#navButton {{
     color: {MUTED};
     background-color: transparent;

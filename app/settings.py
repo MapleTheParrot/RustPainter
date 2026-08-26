@@ -68,10 +68,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # margin it gives away.  ``null`` follows crop_alignment; dragging the
         # crop on the Source tab stores the exact pair it was left at.
         "crop_focus": None,
-        "quality_preset": "balanced",
+        # New installs begin at the sign's highest practical detail. The GUI
+        # adapts Max to the calibrated sign rather than promising pixels it
+        # cannot display.
+        "quality_preset": "max",
         # How boldly planning may simplify the image to paint faster; "exact"
         # reproduces the raw quantized image with the classic pipeline.
-        "paint_mode": "balanced",
+        "paint_mode": "quality",
         "logical_width": 256,
         "logical_height": 128,
         "color_count": DEFAULT_COLOR_COUNT,
@@ -105,15 +108,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                     # Font height as a fraction of the logical canvas height.
                     # The GUI keeps this fixed and re-derives font_size, so text
                     # stays the same size when the quality preset changes.
-                    "size_ratio": 0.1875,
+                    "size_ratio": 0.09375,
                     "color": "#FFFFFF",
                     "x": 0.5,
                     "y": 0.5,
                     "bold": False,
                     "italic": False,
                     # Blend the glyph edge colors without filtering the image
-                    # underneath. Off preserves the original crisp text mode.
-                    "smooth": False,
+                    # underneath. This is the default for newly created text;
+                    # saved layers can still opt into the crisp mode.
+                    "smooth": True,
                     # A gradient runs from "color" into "gradient_color" over
                     # the text's own box; an outline rings every letter with
                     # that many logical pixels of "outline_color".

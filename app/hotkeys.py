@@ -307,7 +307,7 @@ class GlobalHotkeyManager:
                     raise HotkeyRegistrationError(
                         f"Could not register {name} hotkey {spec}: "
                         f"{_registration_failure_detail(error_code)}. "
-                        "Choose a different hotkey in Settings."
+                        "Choose a different hotkey in Preferences."
                     )
                 registered_ids.append(identifier)
             with self._lock:

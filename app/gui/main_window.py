@@ -148,7 +148,15 @@ from .assets import (
     tinted_pixmap,
     vector_icon,
 )
-from .styles import DANGER, ON_ACCENT, TEXT, badge_foreground, state_badge_style
+from .styles import (
+    DANGER,
+    ON_ACCENT,
+    SUCCESS,
+    TEXT,
+    WARNING,
+    badge_foreground,
+    state_badge_style,
+)
 from .text_render import (
     GRADIENT_DIRECTIONS,
     MAX_OUTLINE_WIDTH,
@@ -310,6 +318,52 @@ SPEED_PRESETS: dict[str, dict[str, float]] = {
     },
 }
 
+# Plain-language, outcome-led choices for someone who does not want to tune the
+# painter. They only drive controls that already exist, so choosing Custom or
+# opening the detailed controls still exposes the full application model.
+EXPERIENCE_PRESETS: dict[str, dict[str, Any]] = {
+    "Standard": {
+        "quality": "Balanced",
+        "paint_mode": PaintMode.BALANCED.value,
+        "colors": DEFAULT_COLOR_COUNT,
+        "sharpen": SharpenMode.LIGHT.value,
+        "dither": False,
+        "speed": "Standard",
+    },
+    "Faster": {
+        "quality": "Fast",
+        "paint_mode": PaintMode.FAST.value,
+        "colors": 64,
+        "sharpen": SharpenMode.LIGHT.value,
+        "dither": False,
+        "speed": "Fast",
+    },
+    "Best quality": {
+        "quality": MAX_QUALITY_PRESET,
+        "paint_mode": PaintMode.QUALITY.value,
+        "colors": DEFAULT_COLOR_COUNT,
+        "sharpen": SharpenMode.LIGHT.value,
+        "dither": False,
+        "speed": "Standard",
+    },
+}
+
+EXPERIENCE_DESCRIPTIONS: dict[str, str] = {
+    "Standard": (
+        "A polished result with sensible detail and automatic optimization. "
+        "This is the best starting point for most signs."
+    ),
+    "Faster": (
+        "Finishes substantially sooner by reducing detail and color complexity. "
+        "Use it when speed matters more than a faithful image."
+    ),
+    "Best quality": (
+        "Keeps more fine detail and uses gentler optimization. Choose this "
+        "when finish quality matters more than paint time."
+    ),
+    "Custom": "Your detailed artwork or painting settings differ from a preset.",
+}
+
 
 def _floored_speed_values(values: dict[str, float]) -> dict[str, float]:
     """Preset values as the painter would run them."""
@@ -404,7 +458,7 @@ class _TextOverlayOptions:
     y: float = 0.5
     bold: bool = False
     italic: bool = False
-    smooth: bool = False
+    smooth: bool = True
     size_ratio: float = 0.0
     gradient: bool = False
     gradient_color: tuple[int, int, int] = (255, 255, 255)
@@ -928,8 +982,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("RustPainter")
-        self.resize(1380, 860)
-        self.setMinimumSize(1040, 680)
+        self.resize(1440, 900)
+        self.setMinimumSize(1080, 720)
         self.setAcceptDrops(True)
 
         self._original_image: Image.Image | None = None
@@ -1055,10 +1109,11 @@ class MainWindow(QMainWindow):
         self._calibration_overlay_decision: tuple[Any, ...] | None = None
         self._calibration_preview: CalibrationPreviewOverlay | None = None
         self._applying_speed_preset = False
+        self._applying_experience_preset = False
         # Seeded before the resolution controls exist, so this ratio is spelled
-        # out against the default 256x128 canvas.
+        # out against the default Max-quality 512x256 canvas.
         self._text_layers = [
-            _TextOverlayOptions("", "", 24, (255, 255, 255), size_ratio=24 / 128)
+            _TextOverlayOptions("", "", 24, (255, 255, 255), size_ratio=24 / 256)
         ]
         self._selected_text_layer = 0
         # Which layers the side panel writes to; a canvas selection fills it
@@ -1159,21 +1214,27 @@ class MainWindow(QMainWindow):
             mark.setText("RB")
         mark.setFixedSize(38, 38)
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand = QVBoxLayout()
+        brand.setSpacing(0)
         title = QLabel("RustPainter")
         title.setObjectName("appTitle")
+        subtitle = QLabel("Turn any image into a finished Rust sign")
+        subtitle.setObjectName("appSubtitle")
+        brand.addWidget(title)
+        brand.addWidget(subtitle)
 
-        self.workspace_nav_button = QPushButton("Workspace")
+        self.workspace_nav_button = QPushButton("Create")
         self.workspace_nav_button.setObjectName("navButton")
         self.workspace_nav_button.setCheckable(True)
         self.workspace_nav_button.setAutoExclusive(True)
         self.workspace_nav_button.setChecked(True)
         self._set_icon(self.workspace_nav_button, "workspace", size=17)
-        self.timelapse_nav_button = QPushButton("Timelapse")
+        self.timelapse_nav_button = QPushButton("Recordings")
         self.timelapse_nav_button.setObjectName("navButton")
         self.timelapse_nav_button.setCheckable(True)
         self.timelapse_nav_button.setAutoExclusive(True)
         self._set_icon(self.timelapse_nav_button, "clock", size=17)
-        self.settings_nav_button = QPushButton("Settings")
+        self.settings_nav_button = QPushButton("Preferences")
         self.settings_nav_button.setObjectName("navButton")
         self.settings_nav_button.setCheckable(True)
         self.settings_nav_button.setAutoExclusive(True)
@@ -1196,7 +1257,7 @@ class MainWindow(QMainWindow):
         self._set_state_badge("idle", "IDLE")
 
         layout.addWidget(mark)
-        layout.addWidget(title)
+        layout.addLayout(brand)
         layout.addStretch(1)
         layout.addWidget(self.workspace_nav_button)
         layout.addWidget(self.timelapse_nav_button)
@@ -1262,6 +1323,35 @@ class MainWindow(QMainWindow):
         body.setSpacing(8)
         outer.addLayout(body)
         return frame, body
+
+    @staticmethod
+    def _set_disclosure(
+        button: QPushButton, panel: QWidget, label: str, expanded: bool
+    ) -> None:
+        """Keep a progressive-disclosure button and its content in sync."""
+
+        button.blockSignals(True)
+        button.setChecked(expanded)
+        button.setText(f"{'▾' if expanded else '▸'}  {label}")
+        button.blockSignals(False)
+        panel.setVisible(expanded)
+
+    @classmethod
+    def _wire_disclosure(
+        cls,
+        button: QPushButton,
+        panel: QWidget,
+        label: str,
+        *,
+        expanded: bool = False,
+    ) -> None:
+        button.setObjectName("disclosureButton")
+        button.setCheckable(True)
+        button.setAccessibleName(label)
+        button.toggled.connect(
+            lambda checked: cls._set_disclosure(button, panel, label, checked)
+        )
+        cls._set_disclosure(button, panel, label, expanded)
 
     @staticmethod
     def _wrap_scroll(content: QWidget, minimum_width: int) -> QScrollArea:
@@ -1723,7 +1813,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         heading = QHBoxLayout()
-        title = QLabel("PREVIEW")
+        title = QLabel("YOUR ARTWORK")
         title.setObjectName("pageTitle")
         # The hint follows the tab and the scaling mode, because the one
         # gesture worth advertising is different on each of them.
@@ -1814,7 +1904,7 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(9)
         analysis_head = QHBoxLayout()
         analysis_head.setSpacing(8)
-        title = QLabel("PAINT PLAN")
+        title = QLabel("READY RESULT")
         title.setObjectName("pageTitle")
         self.processing_spinner = Spinner(16)
         self.processing_spinner.setToolTip("Recalculating the paint plan…")
@@ -1822,10 +1912,10 @@ class MainWindow(QMainWindow):
         analysis_head.addWidget(self.processing_spinner)
         analysis_head.addStretch(1)
         grid.addLayout(analysis_head, 0, 0, 1, 4)
-        self.analysis_resolution = self._metric("Resolution", "—", "resolution")
-        self.analysis_colors = self._metric("Colors", "—", "palette")
-        self.analysis_strokes = self._metric("Strokes", "—", "brush")
-        self.analysis_time = self._metric("Est. time", "—", "clock", clickable=True)
+        self.analysis_resolution = self._metric("Output size", "—", "resolution")
+        self.analysis_colors = self._metric("Paint colors", "—", "palette")
+        self.analysis_strokes = self._metric("Brush strokes", "—", "brush")
+        self.analysis_time = self._metric("Estimated time", "—", "clock", clickable=True)
         self.analysis_time.clicked.connect(self._show_estimate_breakdown)  # type: ignore[attr-defined]
         for column, widget in enumerate(
             (
@@ -1988,8 +2078,32 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(4, 4, 8, 4)
         layout.setSpacing(12)
 
-        image_group, image_layout = self._step_panel(1, "Image")
-        self.browse_button = QPushButton("Choose image")
+        welcome = QFrame()
+        welcome.setObjectName("welcomeCard")
+        welcome_layout = QVBoxLayout(welcome)
+        welcome_layout.setContentsMargins(14, 11, 14, 11)
+        welcome_layout.setSpacing(3)
+        welcome_title = QLabel("Create a finished sign in three steps")
+        welcome_title.setObjectName("welcomeTitle")
+        welcome_note = QLabel(
+            "Best-quality settings are already chosen. Add an image, line up "
+            "Rust once, then start painting."
+        )
+        welcome_note.setObjectName("muted")
+        welcome_note.setWordWrap(True)
+        welcome_layout.addWidget(welcome_title)
+        welcome_layout.addWidget(welcome_note)
+        layout.addWidget(welcome)
+
+        image_group, image_layout = self._step_panel(1, "Choose your artwork")
+        image_note = QLabel(
+            "Pick the picture you want on the sign. You can crop it and add text "
+            "in the preview."
+        )
+        image_note.setObjectName("muted")
+        image_note.setWordWrap(True)
+        image_layout.addWidget(image_note)
+        self.browse_button = QPushButton("Choose an image")
         self.browse_button.setObjectName("accent")
         self.browse_button.setMinimumHeight(36)
         self._set_icon(self.browse_button, "choose-image", ON_ACCENT, size=20)
@@ -2004,9 +2118,47 @@ class MainWindow(QMainWindow):
         image_layout.addWidget(self.browse_button)
         image_layout.addLayout(image_info)
 
-        quick_title = QLabel("Quick settings")
+        result_row = QHBoxLayout()
+        result_label = QLabel("Result")
+        result_label.setObjectName("sectionTitle")
+        self.experience_combo = NoWheelComboBox()
+        self.experience_combo.addItems([*EXPERIENCE_PRESETS.keys(), "Custom"])
+        self.experience_combo.setCurrentText("Best quality")
+        self.experience_combo.setMinimumContentsLength(18)
+        self.experience_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.experience_combo.setToolTip(
+            "Choose an outcome and RustPainter will set image detail, color count, "
+            "optimization, and paint speed together."
+        )
+        result_row.addWidget(result_label)
+        result_row.addWidget(self.experience_combo, 1)
+        image_layout.addLayout(result_row)
+
+        self.experience_summary = QFrame()
+        self.experience_summary.setObjectName("recommendationCard")
+        experience_summary_layout = QHBoxLayout(self.experience_summary)
+        experience_summary_layout.setContentsMargins(10, 8, 10, 8)
+        experience_summary_layout.setSpacing(8)
+        experience_summary_layout.addWidget(_glyph_label("check", 18))
+        self.experience_summary_label = QLabel(
+            EXPERIENCE_DESCRIPTIONS["Best quality"]
+        )
+        self.experience_summary_label.setWordWrap(True)
+        experience_summary_layout.addWidget(self.experience_summary_label, 1)
+        image_layout.addWidget(self.experience_summary)
+
+        self.customize_image_button = QPushButton()
+        self.customize_image_panel = QFrame()
+        self.customize_image_panel.setObjectName("detailsPanel")
+        custom_image_layout = QVBoxLayout(self.customize_image_panel)
+        custom_image_layout.setContentsMargins(10, 10, 10, 10)
+        custom_image_layout.setSpacing(9)
+
+        quick_title = QLabel("Artwork details")
         quick_title.setObjectName("sectionTitle")
-        image_layout.addWidget(quick_title)
+        custom_image_layout.addWidget(quick_title)
         quick_grid = QGridLayout()
         quick_grid.setContentsMargins(0, 0, 0, 0)
         quick_grid.setHorizontalSpacing(10)
@@ -2244,7 +2396,7 @@ class MainWindow(QMainWindow):
         quick_grid.addWidget(self.background_removal_panel, 9, 0, 1, 2)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
-        image_layout.addLayout(quick_grid)
+        custom_image_layout.addLayout(quick_grid)
 
         # Text is edited on the Source tab and only there, so its controls
         # come and go with that tab: on the Rust preview they would describe
@@ -2318,6 +2470,7 @@ class MainWindow(QMainWindow):
         self.text_bold_check = QCheckBox("Bold")
         self.text_italic_check = QCheckBox("Italic")
         self.text_smooth_check = QCheckBox("Smooth edges")
+        self.text_smooth_check.setChecked(True)
         self.text_smooth_check.setToolTip(
             "Blend only the edge pixels of the selected text. The underlying "
             "image keeps its original hard logical pixels."
@@ -2433,10 +2586,28 @@ class MainWindow(QMainWindow):
         text_grid.setColumnStretch(1, 1)
         text_grid.setColumnStretch(3, 1)
         text_section_layout.addWidget(self.text_options_panel)
-        image_layout.addWidget(self.text_section)
+        custom_image_layout.addWidget(self.text_section)
+        image_layout.addWidget(self.customize_image_button)
+        image_layout.addWidget(self.customize_image_panel)
+        self._wire_disclosure(
+            self.customize_image_button,
+            self.customize_image_panel,
+            "Customize artwork and quality",
+        )
         layout.addWidget(image_group)
 
-        profile_group, profile_layout = self._step_panel(2, "Rust setup")
+        profile_group, profile_layout = self._step_panel(2, "Prepare Rust")
+        setup_note = QLabel(
+            "Open the sign's painting screen in Rust. Then mark the three areas "
+            "RustPainter needs so it knows exactly where to work."
+        )
+        setup_note.setObjectName("muted")
+        setup_note.setWordWrap(True)
+        profile_layout.addWidget(setup_note)
+
+        profile_label = QLabel("Sign profile")
+        profile_label.setObjectName("sectionTitle")
+        profile_layout.addWidget(profile_label)
         self.profile_combo = NoWheelComboBox()
         self.profile_combo.setToolTip(
             "Each profile stores one sign's canvas and setup. Fixed Rust UI/HUD "
@@ -2466,18 +2637,29 @@ class MainWindow(QMainWindow):
         self.delete_profile_button.setAccessibleName("Delete profile")
         profile_layout.addLayout(profile_row)
 
-        calibration_title = QLabel("Calibration")
-        calibration_title.setObjectName("sectionTitle")
-        calibration_title.setToolTip(
-            "Color box, hue bar, Size value, Clear, hunger, thirst, and Download "
-            "are shared. Every Set button remains available for recalibration."
+        self.setup_summary = QFrame()
+        self.setup_summary.setObjectName("readinessCard")
+        setup_summary_layout = QHBoxLayout(self.setup_summary)
+        setup_summary_layout.setContentsMargins(10, 8, 10, 8)
+        setup_summary_layout.setSpacing(8)
+        self.setup_summary_icon = _glyph_label("target", 18)
+        setup_summary_text = QVBoxLayout()
+        setup_summary_text.setSpacing(1)
+        self.setup_state_label = QLabel("3 required areas remaining")
+        self.setup_state_label.setObjectName("readinessTitle")
+        self.setup_hint_label = QLabel(
+            "Set each area once. RustPainter remembers it for this sign profile."
         )
-        profile_layout.addWidget(calibration_title)
+        self.setup_hint_label.setObjectName("muted")
+        self.setup_hint_label.setWordWrap(True)
+        setup_summary_text.addWidget(self.setup_state_label)
+        setup_summary_text.addWidget(self.setup_hint_label)
+        setup_summary_layout.addWidget(
+            self.setup_summary_icon, 0, Qt.AlignmentFlag.AlignTop
+        )
+        setup_summary_layout.addLayout(setup_summary_text, 1)
+        profile_layout.addWidget(self.setup_summary)
 
-        calibration_grid = QGridLayout()
-        calibration_grid.setVerticalSpacing(5)
-        calibration_grid.setHorizontalSpacing(8)
-        calibration_grid.setColumnStretch(0, 1)
         self.canvas_status = CalibrationStatus("Canvas")
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
@@ -2487,15 +2669,15 @@ class MainWindow(QMainWindow):
         self.hunger_status = CalibrationStatus("Hunger number", optional=True)
         self.thirst_status = CalibrationStatus("Thirst number", optional=True)
         self.download_button_status = CalibrationStatus("Download button", optional=True)
-        self.calibrate_canvas_button = QPushButton("Set")
-        self.calibrate_color_box_button = QPushButton("Set")
-        self.calibrate_hue_bar_button = QPushButton("Set")
-        self.calibrate_brush_button = QPushButton("Set")
-        self.calibrate_clear_button = QPushButton("Set")
-        self.calibrate_save_button = QPushButton("Set")
-        self.calibrate_hunger_button = QPushButton("Set")
-        self.calibrate_thirst_button = QPushButton("Set")
-        self.calibrate_download_button = QPushButton("Set")
+        self.calibrate_canvas_button = QPushButton("Set area")
+        self.calibrate_color_box_button = QPushButton("Set area")
+        self.calibrate_hue_bar_button = QPushButton("Set area")
+        self.calibrate_brush_button = QPushButton("Set area")
+        self.calibrate_clear_button = QPushButton("Set area")
+        self.calibrate_save_button = QPushButton("Set area")
+        self.calibrate_hunger_button = QPushButton("Set area")
+        self.calibrate_thirst_button = QPushButton("Set area")
+        self.calibrate_download_button = QPushButton("Set area")
         entries = (
             (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
             (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
@@ -2538,14 +2720,62 @@ class MainWindow(QMainWindow):
                 "of guessing from a screenshot; each file is removed again.",
             ),
         )
-        for row, (status, button, tooltip) in enumerate(entries):
+        for status, button, tooltip in entries:
             button.setObjectName("compactButton")
             button.setToolTip(tooltip)
-            button.setFixedWidth(68)
+            button.setFixedWidth(88)
             self._set_icon(button, "target", size=15)
-            calibration_grid.addWidget(status, row, 0)
-            calibration_grid.addWidget(button, row, 1)
-        profile_layout.addLayout(calibration_grid)
+
+        self.required_setup_button = QPushButton()
+        self.required_setup_panel = QFrame()
+        self.required_setup_panel.setObjectName("detailsPanel")
+        required_layout = QVBoxLayout(self.required_setup_panel)
+        required_layout.setContentsMargins(10, 9, 10, 9)
+        required_layout.setSpacing(8)
+        required_instruction = QLabel(
+            "Click Set area, then drag tightly around the matching part of "
+            "Rust's painting UI. Press Esc if you need to cancel."
+        )
+        required_instruction.setObjectName("muted")
+        required_instruction.setWordWrap(True)
+        required_layout.addWidget(required_instruction)
+        required_grid = QGridLayout()
+        required_grid.setVerticalSpacing(6)
+        required_grid.setHorizontalSpacing(8)
+        required_grid.setColumnStretch(0, 1)
+        for row, (status, button, _tooltip) in enumerate(entries[:3]):
+            required_grid.addWidget(status, row, 0)
+            required_grid.addWidget(button, row, 1)
+        required_layout.addLayout(required_grid)
+        profile_layout.addWidget(self.required_setup_button)
+        profile_layout.addWidget(self.required_setup_panel)
+        self._wire_disclosure(
+            self.required_setup_button,
+            self.required_setup_panel,
+            "Required setup",
+        )
+
+        self.optional_setup_button = QPushButton()
+        self.optional_setup_panel = QFrame()
+        self.optional_setup_panel.setObjectName("detailsPanel")
+        optional_layout = QVBoxLayout(self.optional_setup_panel)
+        optional_layout.setContentsMargins(10, 9, 10, 9)
+        optional_layout.setSpacing(8)
+        optional_note = QLabel(
+            "Extra automation for brush sizing, anti-AFK, verification, and "
+            "on-screen status. These are not needed for a first paint."
+        )
+        optional_note.setObjectName("muted")
+        optional_note.setWordWrap(True)
+        optional_layout.addWidget(optional_note)
+        optional_grid = QGridLayout()
+        optional_grid.setVerticalSpacing(6)
+        optional_grid.setHorizontalSpacing(8)
+        optional_grid.setColumnStretch(0, 1)
+        for row, (status, button, _tooltip) in enumerate(entries[3:]):
+            optional_grid.addWidget(status, row, 0)
+            optional_grid.addWidget(button, row, 1)
+        optional_layout.addLayout(optional_grid)
 
         self.apply_brush_check = QCheckBox("Automatic brush sizing")
         self.apply_brush_check.setToolTip(
@@ -2561,12 +2791,12 @@ class MainWindow(QMainWindow):
             "or corner and drag to resize it; the interiors stay click-through.\n"
             "The boxes cannot be edited while a paint job is active."
         )
-        profile_layout.addWidget(self.apply_brush_check)
+        optional_layout.addWidget(self.apply_brush_check)
         self.brush_model_status = QLabel("Brush size measured at the start of each job")
         self.brush_model_status.setObjectName("muted")
         self.brush_model_status.setWordWrap(True)
-        profile_layout.addWidget(self.brush_model_status)
-        profile_layout.addWidget(self.show_calibration_check)
+        optional_layout.addWidget(self.brush_model_status)
+        optional_layout.addWidget(self.show_calibration_check)
         self.show_status_check = QCheckBox("Show status on screen")
         self.show_status_check.setToolTip(
             "Writes the job's state - PAINTING, PAUSED, ABORTED - in big\n"
@@ -2575,10 +2805,17 @@ class MainWindow(QMainWindow):
             "only by you: the app's own screen captures look straight\n"
             "through it, so it never reaches a verification or a timelapse."
         )
-        profile_layout.addWidget(self.show_status_check)
+        optional_layout.addWidget(self.show_status_check)
         self.canvas_geometry_label = QLabel("Canvas: not calibrated  •  Aspect: —")
         self.canvas_geometry_label.setObjectName("muted")
-        profile_layout.addWidget(self.canvas_geometry_label)
+        optional_layout.addWidget(self.canvas_geometry_label)
+        profile_layout.addWidget(self.optional_setup_button)
+        profile_layout.addWidget(self.optional_setup_panel)
+        self._wire_disclosure(
+            self.optional_setup_button,
+            self.optional_setup_panel,
+            "Optional automation and overlays",
+        )
         self.display_warning_label = QLabel("")
         self.display_warning_label.setWordWrap(True)
         self.display_warning_label.setStyleSheet("color: #e0a34b;")
@@ -2597,8 +2834,29 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(self.move_to_rust_button)
         layout.addWidget(profile_group)
 
-        run_group, run_layout = self._step_panel(3, "Paint")
-        run_layout.addWidget(self._build_resume_panel())
+        run_group, run_layout = self._step_panel(3, "Start painting")
+        self.run_readiness = QFrame()
+        self.run_readiness.setObjectName("readinessCard")
+        run_readiness_layout = QHBoxLayout(self.run_readiness)
+        run_readiness_layout.setContentsMargins(10, 8, 10, 8)
+        run_readiness_layout.setSpacing(8)
+        self.run_readiness_icon = _glyph_label("status", 18)
+        self.run_readiness_label = QLabel(
+            "Choose an image and finish the required Rust setup."
+        )
+        self.run_readiness_label.setWordWrap(True)
+        run_readiness_layout.addWidget(self.run_readiness_icon)
+        run_readiness_layout.addWidget(self.run_readiness_label, 1)
+        run_layout.addWidget(self.run_readiness)
+        self.resume_disclosure_button = QPushButton()
+        resume_panel = self._build_resume_panel()
+        run_layout.addWidget(self.resume_disclosure_button)
+        run_layout.addWidget(resume_panel)
+        self._wire_disclosure(
+            self.resume_disclosure_button,
+            resume_panel,
+            "Resume a previous painting",
+        )
         sessions_row = QHBoxLayout()
         self.sessions_button = QPushButton("Sessions…")
         self.sessions_button.setObjectName("compactButton")
@@ -2745,6 +3003,12 @@ class MainWindow(QMainWindow):
                 and Path(self._offered_record.screenshot_path).exists()
             )
             if record is not None and record.resumable:
+                self._set_disclosure(
+                    self.resume_disclosure_button,
+                    self.resume_panel,
+                    "Resume a previous painting",
+                    True,
+                )
                 # The tick belongs to the user once they have seen this
                 # offer: re-planning the same picture (a brush or picture
                 # setting changed) must not re-tick a box they unticked, or
@@ -3168,7 +3432,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         heading = QHBoxLayout()
-        title = QLabel("Settings")
+        title = QLabel("Preferences")
         title.setObjectName("pageTitle")
         note = QLabel("Saved automatically")
         note.setObjectName("muted")
@@ -3446,6 +3710,9 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------- image processing
 
     def _connect_processing_controls(self) -> None:
+        self.experience_combo.currentIndexChanged.connect(
+            self._apply_experience_preset
+        )
         self.scale_mode_combo.currentIndexChanged.connect(self._on_scale_mode_changed)
         self.crop_alignment_combo.currentIndexChanged.connect(
             self._on_crop_alignment_changed
@@ -3475,6 +3742,15 @@ class MainWindow(QMainWindow):
         self.sharpen_combo.currentIndexChanged.connect(self._schedule_processing)
         self.merge_combo.currentIndexChanged.connect(self._on_merge_mode_changed)
         self.paint_mode_combo.currentIndexChanged.connect(self._on_paint_mode_changed)
+        for control in (
+            self.quality_combo,
+            self.paint_mode_combo,
+            self.color_count_combo,
+            self.sharpen_combo,
+            self.speed_preset_combo,
+        ):
+            control.currentIndexChanged.connect(self._sync_experience_preset)
+        self.dither_check.toggled.connect(self._sync_experience_preset)
         self.add_text_button.clicked.connect(self._add_text_layer)
         self.undo_text_button.clicked.connect(self._undo_text_edit)
         self.redo_text_button.clicked.connect(self._redo_text_edit)
@@ -4933,6 +5209,12 @@ class MainWindow(QMainWindow):
                 f"This sign holds {about}{cap_width}×{cap_height} texels{basis} — "
                 "as fine as a custom resolution can go here."
             )
+            self._set_disclosure(
+                self.customize_image_button,
+                self.customize_image_panel,
+                "Customize artwork and quality",
+                True,
+            )
             self.resolution_cap_panel.setVisible(True)
             return
         # Only while the ceiling is actually in the way - on a coarser
@@ -4949,6 +5231,12 @@ class MainWindow(QMainWindow):
             f"{cap_height} texels. {self._join_names(unavailable)} "
             f"{'ask' if len(unavailable) > 1 else 'asks'} for more than the "
             "sign holds, so they are greyed out."
+        )
+        self._set_disclosure(
+            self.customize_image_button,
+            self.customize_image_panel,
+            "Customize artwork and quality",
+            True,
         )
         self.resolution_cap_panel.setVisible(True)
 
@@ -5935,6 +6223,58 @@ class MainWindow(QMainWindow):
         if index >= 0:
             combo.setCurrentIndex(index)
 
+    def _current_experience_values(self) -> dict[str, Any]:
+        return {
+            "quality": self.quality_combo.currentText(),
+            "paint_mode": self.paint_mode_combo.currentData(),
+            "colors": self.color_count_combo.currentData(),
+            "sharpen": self.sharpen_combo.currentData(),
+            "dither": self.dither_check.isChecked(),
+            "speed": self.speed_preset_combo.currentText(),
+        }
+
+    def _apply_experience_preset(self, *_args: Any) -> None:
+        """Apply one product-level choice through the existing expert controls."""
+
+        name = self.experience_combo.currentText()
+        values = EXPERIENCE_PRESETS.get(name)
+        if values is None or self._applying_experience_preset:
+            self.experience_summary_label.setText(
+                EXPERIENCE_DESCRIPTIONS.get(name, EXPERIENCE_DESCRIPTIONS["Custom"])
+            )
+            return
+        self._applying_experience_preset = True
+        try:
+            self.quality_combo.setCurrentText(str(values["quality"]))
+            self._set_combo_data(self.paint_mode_combo, values["paint_mode"])
+            self._set_combo_data(self.color_count_combo, values["colors"])
+            self._set_combo_data(self.sharpen_combo, values["sharpen"])
+            self.dither_check.setChecked(bool(values["dither"]))
+            self.speed_preset_combo.setCurrentText(str(values["speed"]))
+        finally:
+            self._applying_experience_preset = False
+        self.experience_summary_label.setText(EXPERIENCE_DESCRIPTIONS[name])
+        self._schedule_settings_save()
+
+    def _sync_experience_preset(self, *_args: Any) -> None:
+        """Name the product preset represented by the detailed controls."""
+
+        if self._applying_experience_preset:
+            return
+        current = self._current_experience_values()
+        name = next(
+            (
+                candidate
+                for candidate, values in EXPERIENCE_PRESETS.items()
+                if current == values
+            ),
+            "Custom",
+        )
+        self.experience_combo.blockSignals(True)
+        self.experience_combo.setCurrentText(name)
+        self.experience_combo.blockSignals(False)
+        self.experience_summary_label.setText(EXPERIENCE_DESCRIPTIONS[name])
+
     def _apply_settings(self, settings: dict[str, Any]) -> None:
         image = settings.get("image", {})
         painting = settings.get("painting", {})
@@ -6045,7 +6385,7 @@ class MainWindow(QMainWindow):
                         y=float(layer_value.get("y", 0.5)),
                         bold=bool(layer_value.get("bold", False)),
                         italic=bool(layer_value.get("italic", False)),
-                        smooth=bool(layer_value.get("smooth", False)),
+                        smooth=bool(layer_value.get("smooth", True)),
                         size_ratio=float(layer_value.get("size_ratio", 0.0))
                         or self._text_size_ratio(font_size),
                         gradient=bool(layer_value.get("gradient", False)),
@@ -6182,6 +6522,7 @@ class MainWindow(QMainWindow):
         finally:
             for control in controls:
                 control.blockSignals(False)
+        self._sync_experience_preset()
         logging.getLogger("rust_painter.input").setLevel(
             logging.DEBUG
             if bool(execution.get("debug_mouse_logging", False))
@@ -6394,8 +6735,13 @@ class MainWindow(QMainWindow):
         self.hunger_status.set_calibrated(bool(status.get("hunger")), True)
         self.thirst_status.set_calibrated(bool(status.get("thirst")), True)
         self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
+        self._refresh_setup_summary()
         self._refresh_brush_model_status()
-        if self._refresh_quality_preset_availability():
+        quality_preset_moved = self._refresh_quality_preset_availability()
+        # Max is adaptive rather than fixed: when a canvas or measurement
+        # arrives, it must re-read the new ceiling even if the combo's text
+        # did not change.
+        if quality_preset_moved or self.quality_combo.currentText() == MAX_QUALITY_PRESET:
             self._update_quality_dimensions()
         self._refresh_resolution_cap_notice()
         correction = (
@@ -6438,6 +6784,52 @@ class MainWindow(QMainWindow):
         self._refresh_max_quality_hint()
         self._refresh_display_warning()
         self._update_start_availability()
+
+    @staticmethod
+    def _set_card_state(card: QWidget, state: str) -> None:
+        """Refresh a dynamic stylesheet state without replacing app styling."""
+
+        if card.property("state") == state:
+            return
+        card.setProperty("state", state)
+        style = card.style()
+        style.unpolish(card)
+        style.polish(card)
+        card.update()
+
+    def _required_setup_missing(self) -> list[str]:
+        profile = self._current_profile
+        if profile is None:
+            return ["canvas", "color box", "hue bar"]
+        return [
+            label
+            for label, rectangle in (
+                ("canvas", profile.canvas),
+                ("color box", profile.color_box),
+                ("hue bar", profile.hue_bar),
+            )
+            if rectangle is None
+        ]
+
+    def _refresh_setup_summary(self) -> None:
+        missing = self._required_setup_missing()
+        if missing:
+            count = len(missing)
+            self.setup_state_label.setText(
+                f"{count} required area{'s' if count != 1 else ''} remaining"
+            )
+            self.setup_hint_label.setText(
+                "Next: set " + ", ".join(missing) + "."
+            )
+            self.setup_summary_icon.setPixmap(tinted_pixmap("target", WARNING, 32))
+            self._set_card_state(self.setup_summary, "attention")
+        else:
+            self.setup_state_label.setText("Rust setup complete")
+            self.setup_hint_label.setText(
+                "All required areas are saved for this sign profile."
+            )
+            self.setup_summary_icon.setPixmap(tinted_pixmap("check", SUCCESS, 32))
+            self._set_card_state(self.setup_summary, "ready")
 
     def _refresh_max_quality_hint(self) -> None:
         """Say what grid Max quality will plan against right now.
@@ -7625,6 +8017,34 @@ class MainWindow(QMainWindow):
             or self._debug_running
         )
         self._set_job_controls_locked(job_locked, retunable=paused)
+        self._refresh_setup_summary()
+        if active and not paused:
+            self.run_readiness_label.setText(
+                "Painting is in progress. RustPainter will pause safely if it "
+                "loses the painting screen."
+            )
+            self.run_readiness_icon.setPixmap(tinted_pixmap("play", SUCCESS, 32))
+            self._set_card_state(self.run_readiness, "ready")
+        elif paused:
+            self.run_readiness_label.setText(
+                "Painting is paused. Check Rust, then resume when you are ready."
+            )
+            self.run_readiness_icon.setPixmap(tinted_pixmap("pause", WARNING, 32))
+            self._set_card_state(self.run_readiness, "attention")
+        elif enabled:
+            self.run_readiness_label.setText(
+                "Everything is ready. Leave Rust's painting screen open, then "
+                "start—the app handles the rest."
+            )
+            self.run_readiness_icon.setPixmap(tinted_pixmap("check", SUCCESS, 32))
+            self._set_card_state(self.run_readiness, "ready")
+        else:
+            self.run_readiness_label.setText(
+                self.start_button.toolTip()
+                or "Choose an image and finish the required Rust setup."
+            )
+            self.run_readiness_icon.setPixmap(tinted_pixmap("status", WARNING, 32))
+            self._set_card_state(self.run_readiness, "attention")
         self._update_calibration_overlay()
 
     def _missing_sizing_rectangles(self) -> list[str]:
@@ -7693,7 +8113,7 @@ class MainWindow(QMainWindow):
                 return (
                     "The anti-AFK break leaves the painting UI through Rust's "
                     "Save button, so it needs the Save button calibrated. Turn "
-                    "Anti-AFK off under Settings to paint without it."
+                    "Anti-AFK off under Preferences to paint without it."
                 )
             return "Finish calibrating this profile before painting."
         if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
@@ -8484,6 +8904,12 @@ class MainWindow(QMainWindow):
                 {"countdown": "GET READY", "paused": "PAUSED"}.get(value, "PAINTING")
             )
         if value == "paused":
+            self._set_disclosure(
+                self.resume_disclosure_button,
+                self.resume_panel,
+                "Resume a previous painting",
+                True,
+            )
             # Where the job stopped, and why, written the moment it does:
             # a pause the UI guard called is the one a resume is for, and
             # the app may well be closed before the job is resumed.

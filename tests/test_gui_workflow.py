@@ -73,8 +73,8 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
 
     assert window._plan is not None
-    assert (window._plan.width, window._plan.height) == (256, 128)
-    assert len(window._plan.color_groups) <= 32
+    assert (window._plan.width, window._plan.height) == (512, 256)
+    assert len(window._plan.color_groups) <= 256
     assert window._plan.stroke_count > 0
     assert not window.paint_preview._source.isNull()
     assert not window.dry_run_check.isChecked()
@@ -84,8 +84,8 @@ def test_image_to_preview_and_plan(window: MainWindow, tmp_path: Path, qtbot) ->
 def test_optimization_mode_merges_colors_and_gates_controls(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
-    # Balanced is the recommended default, and it supersedes stroke merging.
-    assert window.paint_mode_combo.currentData() == "balanced"
+    # Quality is the default, and it supersedes stroke merging.
+    assert window.paint_mode_combo.currentData() == "quality"
     assert not window.merge_combo.isEnabled()
     window._set_combo_data(window.paint_mode_combo, "exact")
     assert window.merge_combo.isEnabled()
@@ -115,11 +115,14 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
     window.logical_width_spin.setValue(128)
     assert window.text_edit.isEnabled()
     assert not window.text_font_combo.isEditable()
+    assert window.text_smooth_check.isChecked()
+    assert window._text_layers[0].smooth is True
     window.text_edit.setText("RUST")
     window.text_size_spin.setValue(30)
     window.text_color_button.set_color("#FFFFFF", emit=True)
     window.text_bold_check.setChecked(True)
     window.add_text_button.click()
+    assert all(layer.smooth for layer in window._text_layers)
     window.text_edit.setText("BIRD")
     window.text_color_button.set_color("#55FF55", emit=True)
 
@@ -1107,6 +1110,53 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert not window.custom_resolution_panel.isHidden()
     assert window.logical_width_spin.isEnabled()
     assert window.logical_height_spin.isEnabled()
+
+
+def test_new_user_path_starts_simple_and_presets_drive_expert_controls(
+    window: MainWindow,
+) -> None:
+    """The first screen is outcome-led, while every detailed control remains."""
+
+    assert window.experience_combo.currentText() == "Best quality"
+    assert window.customize_image_panel.isHidden()
+    assert window.optional_setup_panel.isHidden()
+    assert window.required_setup_panel.isHidden()
+    assert window.resume_panel.isHidden()
+
+    window.experience_combo.setCurrentText("Faster")
+    assert window.quality_combo.currentText() == "Fast"
+    assert window.paint_mode_combo.currentData() == "fast"
+    assert window.color_count_combo.currentData() == 64
+    assert window.speed_preset_combo.currentText() == "Fast"
+
+    # Editing one of the detailed choices never gets overwritten; the plain
+    # selector honestly names the combination Custom instead.
+    window.dither_check.setChecked(True)
+    assert window.experience_combo.currentText() == "Custom"
+
+    window.customize_image_button.click()
+    assert not window.customize_image_panel.isHidden()
+    assert window.quality_combo.isVisibleTo(window)
+
+
+def test_required_setup_summary_names_progress_in_plain_language(
+    window: MainWindow,
+) -> None:
+    profile = window._current_profile
+    assert profile is not None
+    profile.canvas = None
+    profile.color_box = None
+    profile.hue_bar = None
+    window._refresh_profile_ui()
+    assert window.setup_state_label.text() == "3 required areas remaining"
+    assert "canvas" in window.setup_hint_label.text()
+
+    profile.canvas = ScreenRect(10, 10, 400, 200)
+    profile.color_box = ScreenRect(600, 100, 120, 120)
+    profile.hue_bar = ScreenRect(730, 100, 20, 120)
+    window._refresh_profile_ui()
+    assert window.setup_state_label.text() == "Rust setup complete"
+    assert window.setup_summary.property("state") == "ready"
 
 
 def test_automatic_brush_sizing_marks_its_calibration_as_required(
@@ -2775,15 +2825,15 @@ def test_a_plan_already_computed_comes_straight_back(
     Image.new("RGB", (48, 24), (40, 160, 210)).save(source_path)
     window.load_image(source_path)
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
-    balanced = window._plan
+    original = window._plan
 
     window.quality_combo.setCurrentText("Very Fast")
-    qtbot.waitUntil(lambda: window._plan not in (None, balanced), timeout=5000)
+    qtbot.waitUntil(lambda: window._plan not in (None, original), timeout=5000)
     fast = window._plan
 
-    window.quality_combo.setCurrentText("Balanced")
+    window.quality_combo.setCurrentText(MAX_QUALITY_PRESET)
     # No wait: a cached plan is applied inside the settings change itself.
-    assert window._plan is balanced
+    assert window._plan is original
     assert not window.processing_spinner.is_spinning
     assert not window.plan_busy.is_pending
 
@@ -2881,7 +2931,7 @@ def test_recalculating_covers_the_preview_it_is_recalculating(
     window._start_processing()
     assert window.plan_busy.is_pending
     summary = window._plan_summary()
-    assert "Balanced quality" in summary
+    assert "Max quality" in summary
     assert "Fast optimization" in summary
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
     assert not window.plan_busy.is_pending
@@ -3692,9 +3742,9 @@ def test_merge_box_says_it_is_automatic_outside_exact_mode_and_keeps_the_choice(
 ) -> None:
     from app.gui.main_window import MERGE_MODE_OPTIMIZER
 
-    # Balanced paint mode: the box is disabled and says why, rather than
+    # Quality paint mode: the box is disabled and says why, rather than
     # showing a greyed-out choice that reads as merging being off.
-    assert window.paint_mode_combo.currentData() == "balanced"
+    assert window.paint_mode_combo.currentData() == "quality"
     assert not window.merge_combo.isEnabled()
     assert window.merge_combo.currentData() == MERGE_MODE_OPTIMIZER
     assert "optimizer" in window.merge_combo.currentText()
@@ -3916,6 +3966,12 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
 
     profile.save_button = ScreenRect(300, 130, 90, 30)
     window._refresh_profile_ui()
+    qtbot.waitUntil(
+        lambda: window._plan is not None
+        and not window._plan_pending
+        and not window._plan_processing,
+        timeout=5000,
+    )
     assert window.save_button_status._value.text() == "Ready"
     assert window.start_button.isEnabled()
 
