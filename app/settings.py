@@ -214,6 +214,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "show_calibration_overlay": True,
         "show_status_overlay": True,
         "smooth_rust_preview": True,
+        # Zero until the first-run guide has been displayed. Keeping a version
+        # instead of a boolean leaves room for a deliberately revised guide.
+        "tutorial_version_seen": 0,
     },
 }
 
@@ -619,6 +622,13 @@ def _validate(settings: Mapping[str, Any]) -> None:
     for key in ("selected_profile_id", "last_image_path"):
         if ui.get(key) is not None and not isinstance(ui.get(key), str):
             raise SettingsError(f"ui.{key} must be a string or null")
+    tutorial_version = ui.get("tutorial_version_seen")
+    if (
+        isinstance(tutorial_version, bool)
+        or not isinstance(tutorial_version, int)
+        or tutorial_version < 0
+    ):
+        raise SettingsError("ui.tutorial_version_seen must be a non-negative integer")
 
 
 class SettingsStore:

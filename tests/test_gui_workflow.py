@@ -35,6 +35,7 @@ from app.gui.main_window import (
 )
 from app.color_calibration import ColorCorrectionModel
 from app.gui.widgets import ColorButton, CountdownDialog
+from app.gui.tutorial import TUTORIAL_STEPS, TUTORIAL_VERSION
 from app.input_controller import MockInputController
 from app.models import (
     ColorGroup,
@@ -1110,6 +1111,46 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert not window.custom_resolution_panel.isHidden()
     assert window.logical_width_spin.isEnabled()
     assert window.logical_height_spin.isEnabled()
+
+
+def test_first_install_shows_replayable_getting_started_guide(
+    window: MainWindow, qtbot
+) -> None:
+    assert window._first_run_tutorial_pending is True
+
+    window.show()
+    qtbot.waitUntil(lambda: window._tutorial_dialog is not None)
+    dialog = window._tutorial_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert window._settings_document()["ui"]["tutorial_version_seen"] == TUTORIAL_VERSION
+    assert window._settings_store.path.is_file()
+    assert "Adaptive Palette" in " ".join(step.body for step in TUTORIAL_STEPS)
+
+    dialog.accept()
+    qtbot.waitUntil(lambda: window._tutorial_dialog is None)
+    window.show_tutorial_button.click()
+    qtbot.waitUntil(lambda: window._tutorial_dialog is not None)
+    replay = window._tutorial_dialog
+    assert replay is not None and replay.isVisible()
+    replay.accept()
+
+
+def test_existing_install_does_not_interrupt_with_tutorial(
+    window: MainWindow, qtbot
+) -> None:
+    window._show_first_run_tutorial()
+    dialog = window._tutorial_dialog
+    assert dialog is not None
+    dialog.accept()
+
+    reopened = MainWindow()
+    qtbot.addWidget(reopened)
+    assert reopened._first_run_tutorial_pending is False
+    reopened.show()
+    qtbot.wait(10)
+    assert reopened._tutorial_dialog is None
+    reopened.close()
 
 
 def test_new_user_path_starts_simple_and_presets_drive_expert_controls(

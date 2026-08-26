@@ -157,6 +157,7 @@ from .styles import (
     badge_foreground,
     state_badge_style,
 )
+from .tutorial import GettingStartedDialog, TUTORIAL_VERSION
 from .text_render import (
     GRADIENT_DIRECTIONS,
     MAX_OUTLINE_WIDTH,
@@ -1087,6 +1088,8 @@ class MainWindow(QMainWindow):
         self._profile_store: Any = None
         self._settings_store: Any = None
         self._settings: dict[str, Any] = default_settings()
+        self._first_run_tutorial_pending = False
+        self._tutorial_dialog: GettingStartedDialog | None = None
         self._current_profile: Any = None
         self._preview_correction: Any = None
         self._painter: Any = None
@@ -3436,8 +3439,15 @@ class MainWindow(QMainWindow):
         title.setObjectName("pageTitle")
         note = QLabel("Saved automatically")
         note.setObjectName("muted")
+        self.show_tutorial_button = QPushButton("Show tutorial again")
+        self.show_tutorial_button.setObjectName("compactButton")
+        self.show_tutorial_button.setToolTip(
+            "Open the short first-paint guide, including Rust's Adaptive Palette step."
+        )
+        self.show_tutorial_button.clicked.connect(self._show_getting_started)
         heading.addWidget(title)
         heading.addStretch(1)
+        heading.addWidget(self.show_tutorial_button)
         heading.addWidget(note)
         layout.addLayout(heading)
 
@@ -6024,6 +6034,7 @@ class MainWindow(QMainWindow):
         data = self._local_data_directory()
         self._profile_store = ProfileStore(data / "profiles")
         self._settings_store = SettingsStore(data / "settings.json")
+        first_install = not self._settings_store.path.exists()
         self._resume_store = ResumeRecordStore(data / "runs" / "resume")
         try:
             self._settings = self._settings_store.load()
@@ -6034,6 +6045,17 @@ class MainWindow(QMainWindow):
                 self,
                 "Settings could not be loaded",
                 f"Defaults will be used for this session.\n\n{exc}",
+            )
+        ui_settings = self._settings.setdefault("ui", {})
+        if first_install:
+            self._first_run_tutorial_pending = (
+                int(ui_settings.get("tutorial_version_seen", 0)) < TUTORIAL_VERSION
+            )
+        else:
+            # Existing installations are not interrupted by a newly introduced
+            # tutorial. They can still open it from Preferences at any time.
+            ui_settings["tutorial_version_seen"] = max(
+                int(ui_settings.get("tutorial_version_seen", 0)), TUTORIAL_VERSION
             )
         self._apply_settings(self._settings)
         stored_geometry = self._settings.get("ui", {}).get("window_geometry")
@@ -6653,6 +6675,42 @@ class MainWindow(QMainWindow):
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
         }
         return current
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        """Present first-run help only after the main window is visible."""
+
+        super().showEvent(event)
+        if self._first_run_tutorial_pending:
+            QTimer.singleShot(0, self._show_first_run_tutorial)
+
+    @Slot()
+    def _show_first_run_tutorial(self) -> None:
+        if not self._first_run_tutorial_pending:
+            return
+        self._first_run_tutorial_pending = False
+        self._settings.setdefault("ui", {})[
+            "tutorial_version_seen"
+        ] = TUTORIAL_VERSION
+        # Save before presenting the non-blocking dialog. A crash or forced close
+        # should not make the tutorial reappear on every subsequent launch.
+        self._save_settings()
+        self._show_getting_started()
+
+    @Slot()
+    def _show_getting_started(self) -> None:
+        dialog = self._tutorial_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = GettingStartedDialog(self)
+        self._tutorial_dialog = dialog
+        dialog.finished.connect(lambda _result: self._clear_tutorial_dialog(dialog))
+        dialog.show()
+
+    def _clear_tutorial_dialog(self, dialog: GettingStartedDialog) -> None:
+        if self._tutorial_dialog is dialog:
+            self._tutorial_dialog = None
 
     @Slot()
     def _schedule_settings_save(self, *_args: Any) -> None:

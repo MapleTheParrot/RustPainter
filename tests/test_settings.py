@@ -70,6 +70,7 @@ def test_default_settings_returns_independent_documents() -> None:
     first["image"]["color_count"] = 8
     assert second["image"]["color_count"] == DEFAULT_COLOR_COUNT
     assert second["execution"]["dry_run"] is False
+    assert second["ui"]["tutorial_version_seen"] == 0
     assert second["image"]["text_overlay"] == {
         "layers": [
             {
@@ -110,6 +111,9 @@ def test_settings_store_surfaces_corruption_and_invalid_values(tmp_path) -> None
         SettingsStore(path).save(
             {"hotkeys": {"start_resume": "F8", "pause": "F9", "abort": "F8"}}
         )
+
+    with pytest.raises(SettingsError, match="tutorial_version_seen"):
+        SettingsStore(path).save({"ui": {"tutorial_version_seen": -1}})
 
 
 def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
