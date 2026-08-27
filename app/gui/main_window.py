@@ -2225,17 +2225,18 @@ class MainWindow(QMainWindow):
         # that shows the change; the settings pages hold what changes only
         # how it is painted.
         self.color_count_combo = NoWheelComboBox()
-        for value in (8, 16, 24, 32, 48, 64, 96, 128, 256):
+        for value in (8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512, 768, 1024):
             self.color_count_combo.addItem(str(value), value)
         self.color_count_combo.addItem("Unlimited", 0)
         self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
         self.color_count_combo.setToolTip(
             "The most colors the plan may use.  Fewer colors mean fewer\n"
             "picker trips and fewer strokes; more keep gradients and shading.\n"
-            "Unlimited removes the cap entirely: every distinct color paints\n"
-            "separately, at a picker trip (a second or two) per color - on a\n"
-            "photo or soft gradient that is tens of thousands of trips, so\n"
-            "watch the time estimate before starting."
+            "Every color is a picker trip of a second or two, so past 256 the\n"
+            "switching time grows real - watch the time estimate.  Dithering\n"
+            "applies up to 256 colors; above that the bands it would hide are\n"
+            "already a few levels apart.  Unlimited removes the cap entirely:\n"
+            "on a photo or soft gradient that is tens of thousands of trips."
         )
         self.sharpen_combo = NoWheelComboBox()
         self.sharpen_combo.addItem("Off", SharpenMode.OFF.value)

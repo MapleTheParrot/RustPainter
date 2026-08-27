@@ -806,6 +806,48 @@ def _snap_near_neutrals(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return snapped
 
 
+def _median_cut_colors(painted_colors: np.ndarray, color_count: int) -> np.ndarray:
+    """Reduce ``painted_colors`` (N, 3) to at most ``color_count`` colors.
+
+    Classic median cut for the budgets Pillow cannot take: the bucket with
+    the widest channel spread splits at that channel's median until the
+    budget is reached or every bucket is a single color, and each pixel
+    takes its bucket's median.  Returns the mapped colors in input order.
+    """
+
+    import heapq
+
+    values = painted_colors.reshape(-1, 3).astype(np.int16)
+
+    def bucket(indices: np.ndarray, order: int) -> tuple[int, int, int, np.ndarray]:
+        sub = values[indices]
+        extent = sub.max(axis=0) - sub.min(axis=0)
+        channel = int(extent.argmax())
+        return (-int(extent[channel]), order, channel, indices)
+
+    counter = 0
+    heap = [bucket(np.arange(len(values)), counter)]
+    while len(heap) < color_count:
+        negative_extent, _, channel, indices = heapq.heappop(heap)
+        if negative_extent >= 0:
+            heapq.heappush(heap, (negative_extent, counter + 1, channel, indices))
+            break
+        channel_values = values[indices, channel]
+        median = np.median(channel_values)
+        left = indices[channel_values <= median]
+        right = indices[channel_values > median]
+        if len(right) == 0:
+            left = indices[channel_values < median]
+            right = indices[channel_values >= median]
+        counter += 2
+        heapq.heappush(heap, bucket(left, counter - 1))
+        heapq.heappush(heap, bucket(right, counter))
+    mapped = np.empty_like(values, dtype=np.uint8)
+    for _, _, _, indices in heap:
+        mapped[indices] = np.rint(np.median(values[indices], axis=0)).astype(np.uint8)
+    return mapped
+
+
 def quantize_image(
     image: Image.Image,
     color_count: int,
@@ -822,8 +864,8 @@ def quantize_image(
     time estimate prices honestly.
     """
 
-    if color_count != 0 and not 1 <= color_count <= 256:
-        raise ValueError("Color count must be 0 (unlimited) or between 1 and 256")
+    if color_count != 0 and not 1 <= color_count <= 4096:
+        raise ValueError("Color count must be 0 (unlimited) or between 1 and 4096")
     rgba = image.convert("RGBA")
     array = np.asarray(rgba, dtype=np.uint8)
     if paint_mask is None:
@@ -844,6 +886,13 @@ def quantize_image(
     unique_count = len(np.unique(painted_colors, axis=0))
     if color_count == 0 or unique_count <= color_count:
         mapped_rgb = rgb.copy()
+    elif color_count > 256:
+        # Pillow's quantizers stop at 256 palette entries; larger budgets
+        # are cut here.  Error-diffusion dithering needs the palette-image
+        # machinery, so it does not apply past 256 - at these budgets the
+        # bands it would hide are already a few levels apart.
+        mapped_rgb = rgb.copy()
+        mapped_rgb[mask] = _median_cut_colors(painted_colors, color_count)
     else:
         # Build the palette from painted pixels only.  Otherwise transparent Fit
         # padding can consume a requested palette entry (usually as black).

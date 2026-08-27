@@ -720,3 +720,19 @@ def test_quantize_image_unlimited_keeps_every_color() -> None:
     capped = quantize_image(image, 32)
     capped_out = np.asarray(capped.convert("RGB"), dtype=np.uint8)
     assert len(np.unique(capped_out.reshape(-1, 3), axis=0)) <= 32
+
+
+def test_quantize_image_cuts_palettes_past_pillows_limit() -> None:
+    from app.image_processing import quantize_image
+
+    rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    for y in range(20):
+        for x in range(20):
+            i = y * 20 + x
+            rgb[y, x] = (i % 200, 100 + (i // 200) * 40, 200)  # 400 unique colors
+    image = Image.fromarray(rgb, mode="RGB")
+    reduced = quantize_image(image, 300)
+    out = np.asarray(reduced.convert("RGB"), dtype=np.uint8)
+    unique = len(np.unique(out.reshape(-1, 3), axis=0))
+    assert 200 <= unique <= 300
+    assert np.all(np.asarray(reduced)[:, :, 3] == 255)

@@ -42,15 +42,16 @@ QUALITY_PRESETS: dict[str, dict[str, int]] = {
 }
 
 # 0 is "Unlimited": no palette cap at all - every distinct color the picker
-# can reach paints separately, at a picker trip per color.
-SUPPORTED_COLOR_COUNTS = {0, 8, 16, 24, 32, 48, 64, 96, 128, 256}
+# can reach paints separately, at a picker trip per color.  Counts past 256
+# are cut by the app's own median cut; Pillow's quantizers stop at 256.
+SUPPORTED_COLOR_COUNTS = {0, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512, 768, 1024}
 
-# New installs start at the richest capped palette Rust can be asked for.
-# Fewer colors is a deliberate trade for speed, and someone who wants that
-# trade will go and make it; someone who never opens the setting should not
-# have their artwork quietly posterized on the way in.  Unlimited stays a
-# deliberate choice too - its cost explodes with the image's unique colors.
-DEFAULT_COLOR_COUNT = max(SUPPORTED_COLOR_COUNTS)
+# New installs start at 256: the richest palette whose picker-trip cost
+# stays a rounding error of the paint time.  Fewer colors is a deliberate
+# trade for speed; more (or Unlimited) is a deliberate trade the other way,
+# whose cost the time estimate prices - neither is quietly chosen for
+# someone who never opens the setting.
+DEFAULT_COLOR_COUNT = 256
 
 # Containers a recorded timelapse can be saved as.  Kept here rather than
 # imported from the exporter so validating a settings file never has to

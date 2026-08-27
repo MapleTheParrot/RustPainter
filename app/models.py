@@ -233,8 +233,10 @@ class ImageProcessOptions:
     def __post_init__(self) -> None:
         if self.logical_width <= 0 or self.logical_height <= 0:
             raise ValueError("Logical image dimensions must be positive")
-        if not 1 <= self.color_count <= 256:
-            raise ValueError("Color count must be between 1 and 256")
+        if self.color_count != 0 and not 1 <= self.color_count <= 4096:
+            raise ValueError(
+                "Color count must be 0 (unlimited) or between 1 and 4096"
+            )
         if not 0 <= self.alpha_threshold <= 255:
             raise ValueError("Alpha threshold must be between 0 and 255")
         if not 0.0 <= float(self.background_removal_tolerance) <= 100.0:
