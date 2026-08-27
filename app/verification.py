@@ -390,6 +390,7 @@ def classify_export(
     palette: np.ndarray,
     *,
     tolerance: float = 40.0,
+    recolor: bool = True,
 ) -> Mismatch:
     """Decide which cells need repainting from the sign's exported texture.
 
@@ -399,8 +400,12 @@ def classify_export(
     whose colour is not its own colour's rendering is wrong.  Each colour's
     rendering is read off the export itself (the median of its cells), so
     the picker's small deviations from the requested colour never count.
-    Every verdict is repainted: a point press paints exactly one texel, so
-    recolouring a single cell is safe at any resolution.
+    With ``recolor`` the wrong-colour cells are repainted too; without it -
+    the caller's one-cell brush spills past its cell, so "correcting" a
+    cell would discolour the neighbours it was read from - they are counted
+    but left alone, and only holes are filled.  A sign measured live spent
+    hours repainting 35,000 such cells to no effect, each wide dab minting
+    the next pass's wrong-colour neighbours.
     """
 
     covered = indices >= 0
@@ -418,7 +423,7 @@ def classify_export(
     blank = covered & ~painted
     wrong = covered & painted & (own > tolerance)
     return Mismatch(
-        cells=blank | wrong,
+        cells=(blank | wrong) if recolor else blank,
         blank=int(blank.sum()),
         wrong_color=int(wrong.sum()),
         unexplained=0,

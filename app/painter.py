@@ -5058,9 +5058,14 @@ class Painter:
             export = self._export_sign(job, epoch, why=why)
             if export is not None:
                 # Texel-exact: what was never painted, and what is the
-                # wrong colour, straight from the game's own texture.
+                # wrong colour, straight from the game's own texture.  The
+                # recolor gate applies here as on the screen path: a
+                # one-cell brush wider than a cell must not "correct"
+                # wrong-colour cells, it would smear the neighbours.
                 return (
-                    classify_export(export.rgb, export.painted, indices, palette),
+                    classify_export(
+                        export.rgb, export.painted, indices, palette, recolor=recolor
+                    ),
                     export.rgb,
                     export,
                 )
