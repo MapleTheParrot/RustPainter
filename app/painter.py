@@ -364,6 +364,12 @@ class PainterSettings:
     # repainting them.  The picks are read back instead (below).
     confirm_strokes: bool = False
     confirm_max_rounds: int = 4
+    # Between color groups, every this many seconds of the main plan, the
+    # sign's exported texture is read and the holes in what is already final
+    # are refilled while the paint is fresh - so a long run learns of the
+    # game's dropped dabs in minutes instead of at the end.  Zero disables;
+    # needs the download button calibrated.
+    interim_audit_seconds: float = 600.0
     # Read the selected color back off the panel after every pick, and
     # pick again when the clicks did not take.
     verify_color_picks: bool = True
@@ -525,6 +531,7 @@ class PainterSettings:
             verify_passes=int(pick(painting, "verify_passes", 2)),
             confirm_strokes=bool(pick(painting, "confirm_strokes", False)),
             confirm_max_rounds=int(pick(painting, "confirm_max_rounds", 4)),
+            interim_audit_seconds=float(pick(painting, "interim_audit_seconds", 600.0)),
             verify_color_picks=bool(pick(painting, "verify_color_picks", True)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
@@ -4126,7 +4133,44 @@ class Painter:
         applied_epoch: int | None = None
         selected: tuple[RGBColor, int] | None = None
         confirmation = self._confirmation_for(job, plan, reference=reference)
+        # Interim export audits: every settings.interim_audit_seconds of the
+        # main plan, between color groups, the sign's texture is read and
+        # the holes in what is already final are refilled while the paint
+        # is fresh - a long run learns of the game's dropped dabs in
+        # minutes, instead of after hours at the final verification.
+        audit_enabled = (
+            main_plan
+            and settings.interim_audit_seconds > 0
+            and target.download_button is not None
+            and getattr(self.input, "emits_real_input", True)
+        )
+        audit_layers: Any = None
+        last_audit = phase_started
+        painted_at_audit = 0
         for color_index, group in enumerate(plan.color_groups, start=1):
+            if (
+                audit_enabled
+                and color_index > 1
+                and completed >= skip
+                and painted - painted_at_audit >= self._INTERIM_AUDIT_MIN_STROKES
+                and self._active_elapsed() - last_audit >= settings.interim_audit_seconds
+            ):
+                if audit_layers is None:
+                    from .verification import plan_layers
+
+                    audit_indices, _underpaint, audit_palette = plan_layers(plan)
+                    audit_layers = (
+                        audit_indices,
+                        audit_palette,
+                        self._final_group_map(plan),
+                    )
+                if self._interim_audit(job, color_index - 1, audit_layers):
+                    # The repaint selected its own colors and Size; what the
+                    # loop believed applied no longer is.
+                    selected = None
+                    applied_diameter = None
+                last_audit = self._active_elapsed()
+                painted_at_audit = painted
             if skip > completed and skip - completed >= len(group.strokes):
                 # The whole group is behind the offset.
                 skipped_work += schedule.group_cost(color_index - 1) + sum(
@@ -4933,6 +4977,108 @@ class Painter:
         guard.disarm()
         self.pause(self._UI_NOT_FOUND_REASON)
         return True
+
+    # An interim audit is worth its export only after this many fresh
+    # strokes: fewer can have missed at most a few cells, and the final
+    # verification covers them.
+    _INTERIM_AUDIT_MIN_STROKES = 500
+
+    @staticmethod
+    def _final_group_map(plan: PaintPlan) -> Any:
+        """Which color group, by painting order, gives each cell its final color.
+
+        The same replay :func:`plan_layers` runs, keeping the group ordinal
+        instead of the palette row: a cell is only judgeable mid-paint once
+        the group that finishes it has been painted.  ``-1`` where no stroke
+        reaches.
+        """
+
+        import numpy as np
+
+        final = np.full((plan.height, plan.width), -1, dtype=np.int32)
+        for number, group in enumerate(plan.color_groups):
+            radius = (max(1, group.brush_diameter) - 1) // 2
+            for stroke in group.strokes:
+                x0 = min(stroke.start_x, stroke.end_x)
+                x1 = max(stroke.start_x, stroke.end_x)
+                y0 = min(stroke.start_y, stroke.end_y)
+                y1 = max(stroke.start_y, stroke.end_y)
+                final[
+                    max(0, y0 - radius) : min(plan.height, y1 + radius + 1),
+                    max(0, x0) : min(plan.width, x1 + 1),
+                ] = number
+        return final
+
+    def _interim_audit(self, job: _Job, groups_done: int, layers: Any) -> bool:
+        """Read the export mid-paint and refill the holes in what is final.
+
+        Only cells whose final color group is already painted are judged,
+        and only holes are refilled - a hole is a dab the game dropped, the
+        one mistake that compounds silently for hours.  Wrong-color
+        verdicts wait for the end, where the recolor gate decides whether
+        touching them helps at all.  Runs between color groups, so the
+        repaint's own color and Size changes cannot desynchronise a group
+        mid-paint; the caller re-applies both after a repaint.  A pause
+        during the audit abandons it - the next due audit sees the same
+        holes - but still reports the brush state unknown.
+
+        Returns whether the loop's applied color and Size may have changed.
+        """
+
+        import numpy as np
+
+        from .verification import touch_up_plan
+
+        indices, palette, final_group = layers
+        started = self._active_elapsed()
+        try:
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Auditing the painting so far ({groups_done} colors down)",
+                phase="audit",
+            )
+            epoch = self._pause_generation_value()
+            export = self._export_sign(
+                job, epoch, why=f"interim audit after {groups_done} colors"
+            )
+            if export is None:
+                return False
+            judgeable = (final_group >= 0) & (final_group < groups_done)
+            miss = judgeable & ~np.asarray(export.painted, dtype=np.bool_)
+            count = int(miss.sum())
+            if count == 0:
+                LOGGER.info(
+                    "Interim audit after %d colors: everything painted so far "
+                    "is on the sign",
+                    groups_done,
+                )
+                return False
+            repaint = touch_up_plan(miss, indices, palette)
+            LOGGER.info(
+                "Interim audit after %d colors: refilling %d missed cells in "
+                "%d strokes while the paint is fresh",
+                groups_done,
+                count,
+                repaint.stroke_count,
+            )
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Refilling {count:,} missed cells the interim audit found",
+                phase="audit",
+            )
+            self._execute_plan(job, plan=repaint, reference=export.rgb)
+            return True
+        except _RetryAction:
+            LOGGER.info(
+                "The interim audit was interrupted by a pause; painting goes "
+                "on and the next due audit will see the same holes"
+            )
+            return True
+        finally:
+            # Audit time is checking, not stroking: kept out of the learned
+            # per-stroke overhead the way the color checks are.
+            self._confirmation_seconds += max(0.0, self._active_elapsed() - started)
+            self._update_progress_state(PainterState.RUNNING, "Painting", phase="paint")
 
     def _verify_and_touch_up(self, job: _Job) -> None:
         """Read the sign back and repaint the cells that missed their color.

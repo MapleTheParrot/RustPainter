@@ -3169,3 +3169,57 @@ def test_above_normal_priority_context_restores_the_previous_class() -> None:
         inside = int(kernel32.GetPriorityClass(handle))
         assert inside == ABOVE_NORMAL_PRIORITY_CLASS
     assert int(kernel32.GetPriorityClass(handle)) == before
+
+
+def test_final_group_map_tracks_the_last_group_to_touch_each_cell() -> None:
+    plan = PaintPlan(
+        4,
+        2,
+        (
+            ColorGroup((10, 10, 10), (Stroke(0, 0, 3, 0),), 4),
+            ColorGroup((200, 30, 30), (Stroke(2, 0, 2, 0), Stroke(0, 1, 1, 1)), 3),
+        ),
+    )
+    final = Painter._final_group_map(plan)
+    assert final[0, 0] == 0 and final[0, 1] == 0 and final[0, 3] == 0
+    assert final[0, 2] == 1  # repainted by the second group
+    assert final[1, 0] == 1 and final[1, 1] == 1
+    assert final[1, 2] == -1 and final[1, 3] == -1  # never painted
+
+
+def test_interim_audit_refills_only_holes_in_finished_groups() -> None:
+    import numpy as np
+
+    from app.verification import plan_layers
+
+    plan = PaintPlan(
+        4,
+        2,
+        (
+            ColorGroup((10, 10, 10), (Stroke(0, 0, 3, 0),), 4),
+            ColorGroup((200, 30, 30), (Stroke(0, 1, 3, 1),), 4),
+        ),
+    )
+    painter = Painter(MockInputController())
+    indices, _underpaint, palette = plan_layers(plan)
+    layers = (indices, palette, Painter._final_group_map(plan))
+
+    class Export:
+        rgb = np.zeros((2, 4, 3), dtype=np.float32)
+        painted = np.ones((2, 4), dtype=bool)
+
+    Export.painted[0, 2] = False  # a hole in the finished first group
+    Export.painted[1, 1] = False  # the second group has not painted yet
+    executed: list[PaintPlan] = []
+    painter._export_sign = lambda job, epoch, *, why: Export  # type: ignore[method-assign]
+    painter._execute_plan = lambda job, plan=None, reference=None: executed.append(plan)  # type: ignore[method-assign]
+    painter._update_progress_state = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    painter._pause_generation_value = lambda: 0  # type: ignore[method-assign]
+
+    assert painter._interim_audit(None, 1, layers) is True
+    assert len(executed) == 1
+    repaint = executed[0]
+    assert repaint.stroke_count == 1
+    stroke = repaint.color_groups[0].strokes[0]
+    assert (stroke.start_x, stroke.start_y) == (2, 0)
+    assert repaint.color_groups[0].color == (10, 10, 10)
