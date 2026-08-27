@@ -2390,6 +2390,44 @@ class Painter:
                 "about half a texel, which can leave whole rows bare. A fresh "
                 "job with automatic brush sizing on measures and stores one."
             )
+        target = job.target
+        if settings.measure_press_hold:
+            # The press hold, stroke gap and drag rate an earlier job proved
+            # are the sign's and the machine's, not this painting's - the
+            # same trust the stored grid and brush model above are extended -
+            # and without them every resumed stroke pays the full frame-floor
+            # timings, which on a dab-heavy touch-up more than doubles it.
+            adopted = []
+            if target.cached_press_hold_seconds is not None:
+                self._measured_press_hold_seconds = target.cached_press_hold_seconds
+                adopted.append(f"{target.cached_press_hold_seconds * 1000.0:.0f} ms press hold")
+            if target.cached_stroke_gap_seconds is not None:
+                self._measured_stroke_gap_seconds = target.cached_stroke_gap_seconds
+                adopted.append(f"{target.cached_stroke_gap_seconds * 1000.0:.0f} ms stroke gap")
+            if target.cached_drag_rate is not None:
+                self._measured_drag_rate = target.cached_drag_rate
+                adopted.append(f"{target.cached_drag_rate:.0f} texels/s drags")
+            if adopted:
+                LOGGER.info(
+                    "Resuming with the timings an earlier job proved on this "
+                    "sign: %s",
+                    ", ".join(adopted),
+                )
+        if settings.measure_dab_size and target.cached_detail_size is not None:
+            # Likewise the one-cell brush: the dab probe cannot run on a sign
+            # that must not be wiped, and starting at Size 1 where an earlier
+            # job already proved it misses costs a whole touch-up pass to
+            # rediscover.
+            self._measured_detail_size = target.cached_detail_size
+            self._measured_dab_sweep = target.cached_dab_sweep
+            LOGGER.info(
+                "Resuming with the one-cell brush an earlier job proved on this "
+                "sign: Size %s, %s",
+                format_brush_size(target.cached_detail_size),
+                "swept across each texel"
+                if target.cached_dab_sweep
+                else "pressed at a point",
+            )
         if not settings.apply_brush_size:
             return
         model = job.target.brush_size_model
