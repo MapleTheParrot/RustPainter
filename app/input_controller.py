@@ -78,6 +78,10 @@ class InputController(Protocol):
 
     def key_up(self, key: int | str) -> None: ...
 
+    def type_text(
+        self, text: str, *, hold_seconds: float = 0.01, gap_seconds: float = 0.0
+    ) -> None: ...
+
     def release_all(self) -> None: ...
 
     def get_cursor_position(self) -> tuple[int, int]: ...
@@ -251,6 +255,7 @@ class SendInputController(BaseInputController):
     _INPUT_KEYBOARD = 1
     _KEYEVENTF_EXTENDEDKEY = 0x0001
     _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_UNICODE = 0x0004
     _KEYEVENTF_SCANCODE = 0x0008
     _MAPVK_VK_TO_VSC = 0
     # Virtual keys whose scan code carries the 0xE0 prefix on a PC keyboard.
@@ -429,6 +434,57 @@ class SendInputController(BaseInputController):
             self._send(self._key_input(vk, up=True))
             self._held_keys.remove(vk)
 
+    def _unicode_input(self, code_unit: int, *, up: bool) -> "_INPUT":
+        """Build a key event that delivers one UTF-16 code unit as text.
+
+        The virtual-key path above depends on the keyboard layout: the OEM
+        key that types ``.`` on a US layout types something else on a German
+        or French one, and ``#`` and ``"`` move around even more.  A console
+        command such as ``paint.favcolours "#FFFFFF"`` needs those exact
+        characters, so text is sent as Unicode, which Windows delivers as
+        the character itself whatever the layout.  Rust's console is an
+        ordinary text field and takes it; the game's raw-input hotbar does
+        not see it, which is exactly right for text meant for a text box.
+        """
+
+        flags = self._KEYEVENTF_UNICODE | (self._KEYEVENTF_KEYUP if up else 0)
+        native_input = _INPUT(type=self._INPUT_KEYBOARD)
+        native_input.ki = _KEYBDINPUT(0, code_unit, flags, 0, 0)
+        return native_input
+
+    def type_text(
+        self, text: str, *, hold_seconds: float = 0.01, gap_seconds: float = 0.0
+    ) -> None:
+        """Type ``text`` into whatever has the keyboard focus, as Unicode.
+
+        Each character is pressed and released on its own, held across the
+        same frame boundary the Size-field digits are, so a text box in a
+        game running its UI at a low frame rate never samples two presses
+        as one.  Characters outside the BMP are sent as surrogate pairs,
+        the way a keyboard driver delivers them.
+        """
+
+        if hold_seconds < 0 or gap_seconds < 0:
+            raise ValueError("hold_seconds and gap_seconds cannot be negative")
+        for character in text:
+            encoded = character.encode("utf-16-le")
+            units = [
+                int.from_bytes(encoded[index : index + 2], "little")
+                for index in range(0, len(encoded), 2)
+            ]
+            with self._lock:
+                for unit in units:
+                    self._send(self._unicode_input(unit, up=False))
+            try:
+                if hold_seconds:
+                    time.sleep(hold_seconds)
+            finally:
+                with self._lock:
+                    for unit in units:
+                        self._send(self._unicode_input(unit, up=True))
+            if gap_seconds:
+                time.sleep(gap_seconds)
+
     def release_all(self) -> None:
         """Release every mouse button and key this controller believes it holds."""
 
@@ -562,6 +618,16 @@ class MockInputController(BaseInputController):
             self._held_keys.remove(value)
             if self._record_events:
                 self.events.append(InputEvent("key_up", value=value))
+        self._delay()
+
+    def type_text(
+        self, text: str, *, hold_seconds: float = 0.01, gap_seconds: float = 0.0
+    ) -> None:
+        if hold_seconds < 0 or gap_seconds < 0:
+            raise ValueError("hold_seconds and gap_seconds cannot be negative")
+        with self._lock:
+            if self._record_events:
+                self.events.append(InputEvent("type_text", value=text))
         self._delay()
 
     @property

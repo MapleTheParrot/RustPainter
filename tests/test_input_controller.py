@@ -135,3 +135,51 @@ def test_mock_controller_records_held_keys_and_releases_them() -> None:
         "mouse_up",
         "key_up",
     ]
+
+
+def test_type_text_sends_characters_as_unicode_regardless_of_layout() -> None:
+    """Console commands need ``.``, ``#`` and ``"``, whose keys move between
+    keyboard layouts; Unicode events deliver the character itself."""
+
+    controller = object.__new__(SendInputController)
+    controller._lock = threading.RLock()
+    sent: list[tuple[int, int, int]] = []
+    controller._send = lambda native: sent.append(
+        (native.ki.wVk, native.ki.wScan, native.ki.dwFlags)
+    )
+
+    controller.type_text('p."#', hold_seconds=0)
+
+    unicode, keyup = 0x0004, 0x0002
+    assert sent == [
+        (0, ord("p"), unicode),
+        (0, ord("p"), unicode | keyup),
+        (0, ord("."), unicode),
+        (0, ord("."), unicode | keyup),
+        (0, ord('"'), unicode),
+        (0, ord('"'), unicode | keyup),
+        (0, ord("#"), unicode),
+        (0, ord("#"), unicode | keyup),
+    ]
+
+
+def test_type_text_splits_astral_characters_into_surrogate_pairs() -> None:
+    controller = object.__new__(SendInputController)
+    controller._lock = threading.RLock()
+    sent: list[tuple[int, int]] = []
+    controller._send = lambda native: sent.append((native.ki.wScan, native.ki.dwFlags))
+
+    controller.type_text("\U0001F3A8", hold_seconds=0)
+
+    assert [unit for unit, _flags in sent] == [0xD83C, 0xDFA8, 0xD83C, 0xDFA8]
+    assert [flags for _unit, flags in sent] == [0x4, 0x4, 0x6, 0x6]
+
+
+def test_mock_type_text_records_one_event_per_string() -> None:
+    controller = MockInputController()
+    controller.type_text("paint.brushopacity 1")
+    assert [(event.kind, event.value) for event in controller.events] == [
+        ("type_text", "paint.brushopacity 1")
+    ]
+    with pytest.raises(ValueError):
+        controller.type_text("x", hold_seconds=-1)
