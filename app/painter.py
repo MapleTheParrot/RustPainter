@@ -5162,13 +5162,21 @@ class Painter:
                         covered,
                     )
                     return
-                if previous_repaint is not None and (not native or export is None):
+                if previous_repaint is not None and (
+                    not native or export is None or audit_number >= 3
+                ):
                     # A bigger brush covers a logical cell of several texels
                     # that the smallest missed.  On a native plan a cell is
-                    # one texel and Size 1.25 already paints two to four of
-                    # them (measured on the sign's export), so an exact export
-                    # answers a native miss by re-aiming. Without an export,
-                    # repeated screen-visible holes need the wider stamp.
+                    # one texel and Size 1.25 paints two to four of them
+                    # (measured on the sign's export), so an exact export
+                    # first answers a native miss by re-aiming - but only
+                    # for one pass: a cell still missed at its corrected aim
+                    # is one the stamp cannot reach (a sign measured live
+                    # spent hours of re-aimed Size-1 passes landing 3% of
+                    # such cells), and from the third audit the wider stamp
+                    # is allowed; the audit repaints any neighbour it
+                    # discolours.  Without an export, repeated
+                    # screen-visible holes need the wider stamp at once.
                     self._escalate_touch_up_brush(
                         job, audit_number, mismatch, previous_repaint
                     )
@@ -5258,10 +5266,14 @@ class Painter:
         the pass proceed as it is; one that mostly missed raises the
         one-cell brush a ladder step (the reaction a whole failed pass used
         to buy) and tests another batch at the new Size.  On a native plan
-        read from an exact export a miss is an aiming error, not a Size
-        error, so the batch's misses are re-aimed from the export instead
-        and batching stops - the remaining cells are first-touch work no
-        Size can avoid.
+        read from an exact export a miss is first treated as an aiming
+        error: the batch's misses are re-aimed from the export and pressed
+        once more.  But only once - a sign was measured live spending hours
+        of re-aimed Size-1 passes to land 3% of its leftover holes, the
+        cells no whole-pixel aim reaches - so re-aimed dabs that still miss
+        escalate the Size like any others.  The wider stamp can touch a
+        neighbour, but the neighbours are ordinary reachable cells and the
+        audit that follows repaints any it discolours.
 
         Returns the mismatch and the reference reading as the batches leave
         them, for the rest of the pass to paint from.
@@ -5289,6 +5301,7 @@ class Painter:
         ordered = [cell for start in range(stride) for cell in lone[start::stride]]
         batch_number = 0
         offset = 0
+        aim_retried = False
         while offset < len(ordered):
             batch = ordered[offset : offset + self._TOUCH_UP_PROBE_BATCH_DABS]
             offset += len(batch)
@@ -5339,17 +5352,65 @@ class Painter:
                     len(batch),
                 )
                 break
-            if native and export is not None:
+            if native and export is not None and not aim_retried:
+                # One chance for the re-aims just learned: press the same
+                # still-wrong cells again at their corrected aims.  Mostly
+                # landing proves the misses were aim and the pass can trust
+                # Size as it is; mostly missing again proves the stamp
+                # itself cannot reach these cells and the ladder is next.
+                aim_retried = True
+                retry_mask = mismatch & batch_mask
+                retried = int(retry_mask.sum())
+                if retried == 0:
+                    break
                 LOGGER.info(
                     "Touch-up batch %d: %d of %d dabs missed on the native "
-                    "plan; their aims were corrected from the export, and a "
-                    "wider stamp would smear the neighbours, so the pass "
-                    "continues as it is",
+                    "plan; pressing the %d still-wrong cells once more at "
+                    "their corrected aims",
                     batch_number,
                     stubborn,
                     len(batch),
+                    retried,
                 )
-                break
+                self._update_progress_state(
+                    PainterState.RUNNING,
+                    f"Retrying {retried} re-aimed cells "
+                    f"(audit {audit_number}, batch {batch_number})",
+                    phase="verify",
+                )
+                self._execute_plan(
+                    job,
+                    plan=touch_up_plan(retry_mask, indices, palette),
+                    reference=sampled,
+                )
+                verdict, read, export = read_sign(
+                    f"re-aimed retry of touch-up batch {batch_number}"
+                )
+                mismatch, sampled = verdict.cells, read
+                still = int((mismatch & retry_mask).sum())
+                if export is not None:
+                    self._learn_cell_nudges(
+                        export, indices, palette, retry_mask, mismatch
+                    )
+                if still < max(
+                    6, math.ceil(self._TOUCH_UP_STUBBORN_FRACTION * retried)
+                ):
+                    LOGGER.info(
+                        "Touch-up batch %d: %d of %d re-aimed dabs landed; "
+                        "the misses were aim, not Size, and the pass proceeds",
+                        batch_number,
+                        retried - still,
+                        retried,
+                    )
+                    break
+                LOGGER.info(
+                    "Touch-up batch %d: %d of %d dabs still miss at their "
+                    "corrected aims; the stamp cannot reach these cells at "
+                    "this Size",
+                    batch_number,
+                    still,
+                    retried,
+                )
             current, adopted = self._raise_one_cell_brush()
             if adopted is None:
                 LOGGER.info(
