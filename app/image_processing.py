@@ -813,10 +813,17 @@ def quantize_image(
     dither: bool = False,
     paint_mask: np.ndarray | None = None,
 ) -> Image.Image:
-    """Quantize painted RGB pixels while keeping unpainted pixels transparent."""
+    """Quantize painted RGB pixels while keeping unpainted pixels transparent.
 
-    if not 1 <= color_count <= 256:
-        raise ValueError("Color count must be between 1 and 256")
+    ``color_count`` 0 lifts the palette cap entirely: every distinct color
+    survives to the plan (the near-neutral snap and the picker snap still
+    collapse what Rust cannot tell apart).  Painting time then scales with
+    the image's unique colors - each is its own picker trip - which the
+    time estimate prices honestly.
+    """
+
+    if color_count != 0 and not 1 <= color_count <= 256:
+        raise ValueError("Color count must be 0 (unlimited) or between 1 and 256")
     rgba = image.convert("RGBA")
     array = np.asarray(rgba, dtype=np.uint8)
     if paint_mask is None:
@@ -835,7 +842,7 @@ def quantize_image(
         return Image.fromarray(empty, mode="RGBA")
 
     unique_count = len(np.unique(painted_colors, axis=0))
-    if unique_count <= color_count:
+    if color_count == 0 or unique_count <= color_count:
         mapped_rgb = rgb.copy()
     else:
         # Build the palette from painted pixels only.  Otherwise transparent Fit

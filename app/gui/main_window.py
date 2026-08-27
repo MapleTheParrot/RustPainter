@@ -2227,10 +2227,15 @@ class MainWindow(QMainWindow):
         self.color_count_combo = NoWheelComboBox()
         for value in (8, 16, 24, 32, 48, 64, 96, 128, 256):
             self.color_count_combo.addItem(str(value), value)
+        self.color_count_combo.addItem("Unlimited", 0)
         self._set_combo_data(self.color_count_combo, DEFAULT_COLOR_COUNT)
         self.color_count_combo.setToolTip(
             "The most colors the plan may use.  Fewer colors mean fewer\n"
-            "picker trips and fewer strokes; more keep gradients and shading."
+            "picker trips and fewer strokes; more keep gradients and shading.\n"
+            "Unlimited removes the cap entirely: every distinct color paints\n"
+            "separately, at a picker trip (a second or two) per color - on a\n"
+            "photo or soft gradient that is tens of thousands of trips, so\n"
+            "watch the time estimate before starting."
         )
         self.sharpen_combo = NoWheelComboBox()
         self.sharpen_combo.addItem("Off", SharpenMode.OFF.value)

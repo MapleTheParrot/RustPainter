@@ -350,11 +350,17 @@ def observed_palette_lab(
     observed = palette_lab.astype(np.float64).copy()
     flat_indices = indices.reshape(-1)
     flat_samples = sampled_lab.reshape(-1, 3)
-    for index in range(len(palette_lab)):
-        cells = flat_samples[flat_indices == index]
-        if len(cells) < min_cells:
+    # Grouped by one sort, so the cost scales with the cells rather than
+    # with cells times palette: an unlimited-palette plan holds tens of
+    # thousands of colors.
+    order = np.argsort(flat_indices, kind="stable")
+    sorted_indices = flat_indices[order]
+    present, starts = np.unique(sorted_indices, return_index=True)
+    boundaries = np.append(starts[1:], len(sorted_indices))
+    for index, start, end in zip(present, starts, boundaries):
+        if index < 0 or end - start < min_cells:
             continue
-        median = np.median(cells, axis=0)
+        median = np.median(flat_samples[order[start:end]], axis=0)
         if np.linalg.norm(median - palette_lab[index]) <= trust_delta_e:
             observed[index] = median
     return observed
@@ -414,10 +420,18 @@ def classify_export(
     rgb = np.asarray(rgb, dtype=np.float32)
     painted = np.asarray(painted, dtype=np.bool_)
     observed = np.asarray(palette, dtype=np.float32).copy()
-    for index in range(len(palette)):
-        cells = rgb[(indices == index) & painted]
-        if len(cells) >= OBSERVED_COLOR_MIN_CELLS:
-            observed[index] = np.median(cells, axis=0)
+    # Grouped by one sort rather than a full-image mask per color, so an
+    # unlimited palette of tens of thousands stays affordable.
+    flat_rgb = rgb.reshape(-1, 3)
+    keys = np.where(painted, indices, -1).reshape(-1)
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    present, starts = np.unique(sorted_keys, return_index=True)
+    boundaries = np.append(starts[1:], len(sorted_keys))
+    for index, start, end in zip(present, starts, boundaries):
+        if index < 0 or end - start < OBSERVED_COLOR_MIN_CELLS:
+            continue
+        observed[index] = np.median(flat_rgb[order[start:end]], axis=0)
     own_index = np.where(covered, indices, 0)
     own = np.sqrt(((rgb - observed[own_index]) ** 2).sum(axis=2))
     blank = covered & ~painted
@@ -941,20 +955,41 @@ def touch_up_plan(
     """
 
     height, width = indices.shape
-    groups: list[ColorGroup] = []
-    for index in np.unique(indices[mismatch]):
-        must = mismatch & (indices == index)
-        strokes = merge_runs_across_gaps(must, None, 0)
-        if not strokes:
-            continue
-        color: RGBColor = tuple(int(channel) for channel in palette[index])  # type: ignore[assignment]
-        groups.append(
-            ColorGroup(
-                color=color,
-                strokes=tuple(strokes),
-                pixel_count=int(must.sum()),
-            )
+    rows, cols = np.nonzero(np.asarray(mismatch, dtype=np.bool_))
+    color = indices[rows, cols]
+    keep = color >= 0
+    rows, cols, color = rows[keep], cols[keep], color[keep]
+    if len(rows) == 0:
+        return PaintPlan(width=width, height=height, color_groups=())
+    # One sort by (color, row, column) finds every same-color run of
+    # consecutive cells - the cost scales with the mismatched cells, not
+    # with cells times palette, which an unlimited-palette plan would pay.
+    order = np.lexsort((cols, rows, color))
+    rows, cols, color = rows[order], cols[order], color[order]
+    breaks = np.ones(len(rows), dtype=np.bool_)
+    breaks[1:] = (
+        (color[1:] != color[:-1])
+        | (rows[1:] != rows[:-1])
+        | (cols[1:] != cols[:-1] + 1)
+    )
+    starts = np.flatnonzero(breaks)
+    ends = np.append(starts[1:], len(rows)) - 1
+    strokes_by_color: dict[int, list[Stroke]] = {}
+    cells_by_color: dict[int, int] = {}
+    for start, end in zip(starts, ends):
+        index = int(color[start])
+        strokes_by_color.setdefault(index, []).append(
+            Stroke(int(cols[start]), int(rows[start]), int(cols[end]), int(rows[end]))
         )
+        cells_by_color[index] = cells_by_color.get(index, 0) + int(end - start + 1)
+    groups = [
+        ColorGroup(
+            color=tuple(int(channel) for channel in palette[index]),  # type: ignore[arg-type]
+            strokes=tuple(strokes),
+            pixel_count=cells_by_color[index],
+        )
+        for index, strokes in strokes_by_color.items()
+    ]
     groups.sort(key=lambda group: -group.pixel_count)
     return PaintPlan(width=width, height=height, color_groups=tuple(groups))
 

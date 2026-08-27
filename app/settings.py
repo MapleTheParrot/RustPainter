@@ -41,12 +41,15 @@ QUALITY_PRESETS: dict[str, dict[str, int]] = {
     "very_high": {"logical_width": 512, "color_count": 96},
 }
 
-SUPPORTED_COLOR_COUNTS = {8, 16, 24, 32, 48, 64, 96, 128, 256}
+# 0 is "Unlimited": no palette cap at all - every distinct color the picker
+# can reach paints separately, at a picker trip per color.
+SUPPORTED_COLOR_COUNTS = {0, 8, 16, 24, 32, 48, 64, 96, 128, 256}
 
-# New installs start at the richest palette Rust can be asked for.  Fewer
-# colors is a deliberate trade for speed, and someone who wants that trade
-# will go and make it; someone who never opens the setting should not have
-# their artwork quietly posterized on the way in.
+# New installs start at the richest capped palette Rust can be asked for.
+# Fewer colors is a deliberate trade for speed, and someone who wants that
+# trade will go and make it; someone who never opens the setting should not
+# have their artwork quietly posterized on the way in.  Unlimited stays a
+# deliberate choice too - its cost explodes with the image's unique colors.
 DEFAULT_COLOR_COUNT = max(SUPPORTED_COLOR_COUNTS)
 
 # Containers a recorded timelapse can be saved as.  Kept here rather than

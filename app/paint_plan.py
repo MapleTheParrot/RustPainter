@@ -257,6 +257,67 @@ def _runs_for_color(
     return merge_runs_across_gaps(must, barrier_cumulative, max_gap)
 
 
+# Above this many colors the per-color gap-merge scans cost more than the
+# strokes they could save - each color walks (and, with a gap, cumsums) the
+# whole index map, so a palette of tens of thousands would spend hours
+# building the plan - and runs are built in one vectorized sweep instead,
+# never crossing other colors.  Unlimited-palette plans land here.
+GAP_MERGE_MAX_COLORS = 2048
+
+
+def _maximal_runs_grouped(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    index_map: np.ndarray,
+    colors: list[RGBColor],
+    pixel_counts: np.ndarray,
+) -> tuple[ColorGroup, ...]:
+    """Every color's maximal runs from one vectorized sweep of the image.
+
+    Identical to ``overpaint_gap=0`` grouping: a run never crosses another
+    color or an unpainted cell.  One pass finds every run's start and end -
+    both fall in the same scan order, so the k-th start pairs with the k-th
+    end - and slices them per color, so the cost scales with the image
+    rather than with the palette.
+    """
+
+    continues_run = np.zeros(mask.shape, dtype=np.bool_)
+    continues_run[:, 1:] = (
+        mask[:, 1:] & mask[:, :-1] & np.all(rgb[:, 1:] == rgb[:, :-1], axis=2)
+    )
+    starts = mask & ~continues_run
+    ends = np.zeros_like(mask)
+    ends[:, :-1] = mask[:, :-1] & ~continues_run[:, 1:]
+    ends[:, -1] = mask[:, -1]
+    start_y, start_x = np.nonzero(starts)
+    _, end_x = np.nonzero(ends)
+    run_color = index_map[start_y, start_x]
+    order = np.argsort(run_color, kind="stable")  # scan order kept per color
+    start_y, start_x, end_x = start_y[order], start_x[order], end_x[order]
+    boundaries = np.searchsorted(
+        run_color[order], np.arange(len(colors) + 1, dtype=np.int64)
+    )
+    groups = []
+    for color_index, color in enumerate(colors):
+        low, high = int(boundaries[color_index]), int(boundaries[color_index + 1])
+        groups.append(
+            ColorGroup(
+                color=color,
+                strokes=tuple(
+                    Stroke(
+                        int(start_x[i]),
+                        int(start_y[i]),
+                        int(end_x[i]),
+                        int(start_y[i]),
+                    )
+                    for i in range(low, high)
+                ),
+                pixel_count=int(pixel_counts[color_index]),
+            )
+        )
+    return tuple(groups)
+
+
 def count_unmerged_strokes(
     source: PlanImage,
     paint_mask: np.ndarray | None = None,
@@ -291,6 +352,8 @@ def generate_merged_color_groups(
 
     rgb, mask = _as_rgb_and_mask(source, paint_mask)
     index_map, colors, pixel_counts = _ordered_color_index_map(rgb, mask, color_order)
+    if len(colors) > GAP_MERGE_MAX_COLORS:
+        return _maximal_runs_grouped(rgb, mask, index_map, colors, pixel_counts)
     max_gap = int(mask.shape[1]) if overpaint_gap is None else max(0, int(overpaint_gap))
     groups = []
     for color_index, color in enumerate(colors):

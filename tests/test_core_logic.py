@@ -679,3 +679,44 @@ class SharpenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_huge_palettes_use_the_vectorized_run_sweep(monkeypatch) -> None:
+    """Past the color threshold, grouping must match exact (gap 0) plans."""
+
+    import app.paint_plan as paint_plan_module
+    from app.paint_plan import generate_merged_color_groups
+
+    height, width = 12, 16
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    for y in range(height):
+        for x in range(width):
+            rgb[y, x] = ((x * 29) % 5 * 40, (y * 13) % 7 * 30, 180)
+    mask = np.ones((height, width), dtype=bool)
+    mask[3, 4:9] = False
+    classic = generate_merged_color_groups(
+        Image.fromarray(rgb, mode="RGB"), mask, overpaint_gap=0
+    )
+    monkeypatch.setattr(paint_plan_module, "GAP_MERGE_MAX_COLORS", 0)
+    fast = generate_merged_color_groups(
+        Image.fromarray(rgb, mode="RGB"), mask, overpaint_gap=5
+    )
+    assert fast == classic
+
+
+def test_quantize_image_unlimited_keeps_every_color() -> None:
+    from app.image_processing import quantize_image
+
+    rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    for y in range(20):
+        for x in range(20):
+            rgb[y, x] = ((y * 20 + x) % 250, 60, 200)  # 250 saturated colors
+    image = Image.fromarray(rgb, mode="RGB")
+    unlimited = quantize_image(image, 0)
+    out = np.asarray(unlimited.convert("RGB"), dtype=np.uint8)
+    assert len(np.unique(out.reshape(-1, 3), axis=0)) == len(
+        np.unique(rgb.reshape(-1, 3), axis=0)
+    )
+    capped = quantize_image(image, 32)
+    capped_out = np.asarray(capped.convert("RGB"), dtype=np.uint8)
+    assert len(np.unique(capped_out.reshape(-1, 3), axis=0)) <= 32
