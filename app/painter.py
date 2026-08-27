@@ -4941,7 +4941,10 @@ class Painter:
         color sits decisively closer to a *different* plan color than to its
         own - so lighting and the sign's material shift, which move every
         color together, never trigger a repaint.  Each pass captures, decides,
-        and repaints. Every repaint is audited, including the final allowed
+        and repaints; a repaint that is mostly lone dabs opens with probing
+        batches (:meth:`_touch_up_probe_batches`) so a stamp that cannot land
+        is corrected within a batch rather than after the whole pass.  Every
+        repaint is audited, including the final allowed
         one; a clean capture or an implausible one ends the loop. With a Rust
         export, covered texels that remain untouched after the repair budget
         are an error. Plan-uncovered (for example transparent) texels are never
@@ -5047,44 +5050,53 @@ class Painter:
 
         native = self._aiming(job, plan).native
         previous_targets: Any = None
+
+        def read_sign(why: str) -> tuple[Any, Any, SignExport | None]:
+            """One reading of the sign: the exact export, or the screen."""
+
+            epoch = self._pause_generation_value()
+            export = self._export_sign(job, epoch, why=why)
+            if export is not None:
+                # Texel-exact: what was never painted, and what is the
+                # wrong colour, straight from the game's own texture.
+                return (
+                    classify_export(export.rgb, export.painted, indices, palette),
+                    export.rgb,
+                    export,
+                )
+            self._move(park, epoch)
+            self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
+            self._checkpoint(epoch=epoch, check_focus=True)
+            capture = self._screen_capture(canvas)
+            sampled = sample_cell_colors(
+                np.asarray(capture.convert("RGB"), dtype=np.float32),
+                plan.width,
+                plan.height,
+                centers=self._grid_cell_centers(job, plan, canvas),
+            )
+            verdict = classify_cells(
+                sampled,
+                indices,
+                palette,
+                bare_sampled=bare_sampled,
+                underpaint=underpaint,
+                recolor=recolor,
+            )
+            return verdict, sampled, None
+
         while True:
             try:
-                epoch = self._pause_generation_value()
                 self._update_progress_state(
                     PainterState.RUNNING,
                     f"Verifying the painted sign (audit {audit_number})",
                     phase="verify",
                 )
-                export = self._export_sign(
-                    job, epoch, why=f"verification audit {audit_number}"
+                verdict, sampled, export = read_sign(
+                    f"verification audit {audit_number}"
                 )
-                if export is not None:
-                    # Texel-exact: what was never painted, and what is the
-                    # wrong colour, straight from the game's own texture.
-                    verdict = classify_export(export.rgb, export.painted, indices, palette)
-                    sampled = export.rgb
-                    if previous_targets is not None:
-                        self._learn_cell_nudges(
-                            export, indices, palette, previous_targets, verdict.cells
-                        )
-                else:
-                    self._move(park, epoch)
-                    self._interruptible_sleep(0.35, epoch=epoch, check_focus=True)
-                    self._checkpoint(epoch=epoch, check_focus=True)
-                    capture = self._screen_capture(canvas)
-                    sampled = sample_cell_colors(
-                        np.asarray(capture.convert("RGB"), dtype=np.float32),
-                        plan.width,
-                        plan.height,
-                        centers=self._grid_cell_centers(job, plan, canvas),
-                    )
-                    verdict = classify_cells(
-                        sampled,
-                        indices,
-                        palette,
-                        bare_sampled=bare_sampled,
-                        underpaint=underpaint,
-                        recolor=recolor,
+                if export is not None and previous_targets is not None:
+                    self._learn_cell_nudges(
+                        export, indices, palette, previous_targets, verdict.cells
                     )
                 mismatch = verdict.cells
                 wrong = verdict.count
@@ -5162,6 +5174,24 @@ class Painter:
                     )
                 previous_repaint = mismatch.copy()
                 previous_targets = mismatch.copy()
+                mismatch, sampled = self._touch_up_probe_batches(
+                    job,
+                    mismatch,
+                    indices,
+                    palette,
+                    sampled,
+                    covered=covered,
+                    native=native,
+                    audit_number=audit_number,
+                    read_sign=read_sign,
+                )
+                wrong = int(mismatch.sum())
+                if wrong == 0:
+                    # The batches alone repaired everything they saw; the
+                    # next audit confirms the sign whole and ends the loop.
+                    repairs += 1
+                    audit_number += 1
+                    continue
                 repaint = touch_up_plan(mismatch, indices, palette)
                 predicted = self._work_schedule(repaint, target, settings).total
                 LOGGER.info(
@@ -5196,6 +5226,152 @@ class Painter:
     # repainted last pass still wrong raises the one-cell brush a step.
     _TOUCH_UP_STUBBORN_MIN = 10
     _TOUCH_UP_STUBBORN_FRACTION = 0.25
+
+    # A big touch-up is tested before it is trusted: batches of this many of
+    # its lone dabs go down first, each read back, so a stamp that cannot
+    # land is caught within a batch instead of after the whole pass.  Below
+    # the minimum the pass itself is cheaper than the extra readings.
+    _TOUCH_UP_PROBE_BATCH_DABS = 96
+    _TOUCH_UP_PROBE_MIN_DABS = 200
+
+    def _touch_up_probe_batches(
+        self,
+        job: _Job,
+        mismatch: Any,
+        indices: Any,
+        palette: Any,
+        sampled: Any,
+        *,
+        covered: int,
+        native: bool,
+        audit_number: int,
+        read_sign: Any,
+    ) -> tuple[Any, Any]:
+        """Paint a large touch-up's opening dabs in probing batches.
+
+        A touch-up pass used to paint every missing cell and only then read
+        the sign back, so a one-cell stamp that cannot land - a resumed sign
+        whose Size was never probed - cost a whole pass to discover, and at
+        the flat frame-hold every dab pays such a pass runs to hours.  When
+        the repaint is mostly lone dabs, a spread batch of them goes down
+        first and is read back: a batch that mostly landed lets the rest of
+        the pass proceed as it is; one that mostly missed raises the
+        one-cell brush a ladder step (the reaction a whole failed pass used
+        to buy) and tests another batch at the new Size.  On a native plan
+        read from an exact export a miss is an aiming error, not a Size
+        error, so the batch's misses are re-aimed from the export instead
+        and batching stops - the remaining cells are first-touch work no
+        Size can avoid.
+
+        Returns the mismatch and the reference reading as the batches leave
+        them, for the rest of the pass to paint from.
+        """
+
+        import numpy as np
+
+        from .verification import UNRELIABLE_CAPTURE_FRACTION, touch_up_plan
+
+        settings = job.settings
+        if not settings.measure_dab_size or not settings.apply_brush_size:
+            return mismatch, sampled
+        lone = [
+            (int(stroke.start_x), int(stroke.start_y))
+            for group in touch_up_plan(mismatch, indices, palette).color_groups
+            for stroke in group.strokes
+            if int(stroke.pixel_count) <= 1
+        ]
+        if len(lone) < self._TOUCH_UP_PROBE_MIN_DABS:
+            return mismatch, sampled
+        # The cells arrive in row-major order; striding through them spreads
+        # every batch across the sign, so one odd region cannot pass or fail
+        # a stamp the rest of the sign would judge the other way.
+        stride = max(1, len(lone) // self._TOUCH_UP_PROBE_BATCH_DABS)
+        ordered = [cell for start in range(stride) for cell in lone[start::stride]]
+        batch_number = 0
+        offset = 0
+        while offset < len(ordered):
+            batch = ordered[offset : offset + self._TOUCH_UP_PROBE_BATCH_DABS]
+            offset += len(batch)
+            if len(batch) < max(12, self._TOUCH_UP_PROBE_BATCH_DABS // 4):
+                break
+            batch_number += 1
+            batch_mask = np.zeros_like(mismatch)
+            batch_mask[
+                np.array([cell[1] for cell in batch]),
+                np.array([cell[0] for cell in batch]),
+            ] = True
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Testing the touch-up stamp on {len(batch)} cells "
+                f"(audit {audit_number}, batch {batch_number})",
+                phase="verify",
+            )
+            self._execute_plan(
+                job,
+                plan=touch_up_plan(batch_mask, indices, palette),
+                reference=sampled,
+            )
+            verdict, read, export = read_sign(
+                f"touch-up batch {batch_number} of audit {audit_number}"
+            )
+            if export is None and verdict.count > covered * UNRELIABLE_CAPTURE_FRACTION:
+                LOGGER.warning(
+                    "The reading after touch-up batch %d looks unreliable (%d of "
+                    "%d cells wrong); the rest of the pass is painted without "
+                    "batching",
+                    batch_number,
+                    verdict.count,
+                    covered,
+                )
+                return mismatch & ~batch_mask, sampled
+            mismatch, sampled = verdict.cells, read
+            stubborn = int((mismatch & batch_mask).sum())
+            if export is not None:
+                self._learn_cell_nudges(export, indices, palette, batch_mask, mismatch)
+            if stubborn < max(
+                6, math.ceil(self._TOUCH_UP_STUBBORN_FRACTION * len(batch))
+            ):
+                LOGGER.info(
+                    "Touch-up batch %d: %d of %d dabs landed; the stamp works "
+                    "and the rest of the pass proceeds",
+                    batch_number,
+                    len(batch) - stubborn,
+                    len(batch),
+                )
+                break
+            if native and export is not None:
+                LOGGER.info(
+                    "Touch-up batch %d: %d of %d dabs missed on the native "
+                    "plan; their aims were corrected from the export, and a "
+                    "wider stamp would smear the neighbours, so the pass "
+                    "continues as it is",
+                    batch_number,
+                    stubborn,
+                    len(batch),
+                )
+                break
+            current, adopted = self._raise_one_cell_brush()
+            if adopted is None:
+                LOGGER.info(
+                    "Touch-up batch %d: %d of %d dabs missed, but the one-cell "
+                    "brush is already at Size %s, the largest the painter will "
+                    "try",
+                    batch_number,
+                    stubborn,
+                    len(batch),
+                    format_brush_size(current),
+                )
+                break
+            LOGGER.info(
+                "Touch-up batch %d: %d of %d dabs missed at Size %s; raising "
+                "the one-cell brush to Size %s and testing another batch",
+                batch_number,
+                stubborn,
+                len(batch),
+                format_brush_size(current),
+                format_brush_size(adopted),
+            )
+        return mismatch, sampled
 
     # A dab that missed its cell is re-aimed this many pixels the other way
     # on the next pass; a miss the export cannot place is searched upward
@@ -5295,9 +5471,8 @@ class Painter:
             self._TOUCH_UP_STUBBORN_MIN, self._TOUCH_UP_STUBBORN_FRACTION * repainted
         ):
             return
-        current = self._measured_detail_size or BRUSH_SIZE_MIN
-        larger = [size for size in self._DAB_PROBE_SIZES if size > current + 1e-9]
-        if not larger:
+        current, adopted = self._raise_one_cell_brush()
+        if adopted is None:
             LOGGER.info(
                 "Verification pass %d: %d of the %d cells repainted last pass are "
                 "still wrong, and the one-cell brush is already at Size %s, the "
@@ -5308,7 +5483,6 @@ class Painter:
                 format_brush_size(current),
             )
             return
-        self._measured_detail_size = float(larger[0])
         LOGGER.info(
             "Verification pass %d: %d of the %d cells repainted last pass are "
             "still wrong; raising the one-cell brush from Size %s to %s for "
@@ -5317,8 +5491,23 @@ class Painter:
             stubborn,
             repainted,
             format_brush_size(current),
-            format_brush_size(larger[0]),
+            format_brush_size(adopted),
         )
+
+    def _raise_one_cell_brush(self) -> tuple[float, float | None]:
+        """Raise the one-cell brush one ladder step; the old Size and the new.
+
+        The ladder is the dab probe's (:data:`DAB_PROBE_SIZES`).  Returns
+        ``(current, adopted)``; ``adopted`` is None, and nothing changes,
+        when the brush already stands at the top.
+        """
+
+        current = self._measured_detail_size or BRUSH_SIZE_MIN
+        larger = [size for size in self._DAB_PROBE_SIZES if size > current + 1e-9]
+        if not larger:
+            return current, None
+        self._measured_detail_size = float(larger[0])
+        return current, float(larger[0])
 
     _PICK_ATTEMPTS = 3
     _PICK_ATTEMPTS_AFTER_RELOCATE = 2
