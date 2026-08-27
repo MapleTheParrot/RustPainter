@@ -1588,14 +1588,14 @@ class MainWindow(QMainWindow):
         self.verify_passes_spin.setToolTip(
             "After the artwork is down, the sign is captured and compared with\n"
             "the plan, and cells that stayed bare or took the wrong color are\n"
-            "repainted.  Each pass is one capture and repaint; the next pass\n"
-            "checks the previous one, since the game can drop a touch-up\n"
-            "stroke exactly as it dropped the original.  0 turns it off."
+            "repainted up to this many times.  Every repair is captured again,\n"
+            "including the last one.  A clean first audit paints nothing.\n"
+            "Transparent cells are ignored.  0 turns the audit off."
         )
-        touch_up_form.addRow("Passes at the end", self.verify_passes_spin)
+        touch_up_form.addRow("Repairs at the end", self.verify_passes_spin)
         touch_up_note = QLabel(
             "Checking each color catches the presses the game never saw, while "
-            "the color is still selected.  The passes at the end read the whole "
+            "the color is still selected.  The repairs at the end read the whole "
             "sign back once more; on a plan finer than Rust's smallest brush "
             "they fill holes only."
         )

@@ -130,7 +130,8 @@ PRESS_HOLD_PROBE_MIN_STROKES = 200
 # first Size that lands all but DAB_PROBE_MAX_MISSES of its dots is what the
 # job types for its one-cell strokes.  Spill into the neighbours is counted
 # and logged: a stamp wide enough never to miss can also be wide enough to
-# smear, and the log is where that trade shows.
+# smear, so smaller point presses are always tried first and final verification
+# catches collateral color. If the whole ladder fails, artwork does not start.
 DAB_PROBE_SIZES = (1.0, 1.25, 1.5, 1.75, 2.0)
 DAB_PROBE_DOTS = 96
 DAB_PROBE_MAX_MISSES = 1

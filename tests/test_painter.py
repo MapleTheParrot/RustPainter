@@ -1826,8 +1826,9 @@ def test_the_touch_up_pass_uses_the_cleared_sign_to_see_holes() -> None:
         image = Image.new("RGB", (rect.width, rect.height), bare)
         if artwork_strokes:
             image.paste(dark, (0, 0, rect.width, rect.height))
-            x, y = hole
-            image.paste(bare, (x * 10, y * 10, x * 10 + 10, y * 10 + 10))
+            if artwork_strokes <= 32:
+                x, y = hole
+                image.paste(bare, (x * 10, y * 10, x * 10 + 10, y * 10 + 10))
         return image
 
     painter = _impatient(Painter(controller, screen_capture=capture))
@@ -1866,7 +1867,7 @@ def test_the_touch_up_pass_uses_the_cleared_sign_to_see_holes() -> None:
     # The pass ran to its end, so its clock is on record for the estimate.
     timing = painter.touch_up_timing
     assert timing is not None
-    assert timing.passes == 1
+    assert timing.passes == 2  # initial audit, then proof the repair landed
     assert timing.seconds > 0.0
     # And the artwork's own clock does not count it.
     measured = painter.paint_phase_timing
@@ -2995,6 +2996,54 @@ def test_saved_grid_mismatch_falls_back_without_clearing(
         "find_quad_edges",
         lambda _capture, expected, _search: (expected[0] + 30, None, None, None),
     )
+
+    assert painter._reuse_saved_calibration(job) is False
+    assert painter.measured_brush_size_model is None
+
+
+def test_saved_grid_without_proven_detail_size_repeats_the_dab_probe() -> None:
+    """Profiles from before adaptive sizing must not skip the safety proof."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    profile.brush_size_box = ScreenRect(800, 100, 60, 24)
+    profile.clear_button = ScreenRect(880, 100, 24, 24)
+    profile.metadata["brush_size_model"] = fit_brush_size_model(
+        [(1, 1 / 20), (4, 4 / 20)]
+    ).to_dict()
+    profile.metadata["texel_grid"] = TexelGridModel(
+        columns=200,
+        rows=2,
+        pitch_x=2.0,
+        pitch_y=40.0,
+        origin_x=100.0,
+        origin_y=100.0,
+    ).to_dict()
+    # Deliberately no calibration_performance.detailSize: an old profile can
+    # know the grid while knowing nothing about whether Size 1 lands a dab.
+    painter = Painter(
+        controller,
+        screen_capture=lambda rect: Image.new("RGB", (rect.width, rect.height), "gray"),
+    )
+    plan = PaintPlan(
+        200,
+        2,
+        (
+            ColorGroup(
+                (220, 40, 20),
+                tuple(Stroke(x, 0, x, 0) for x in range(200)),
+                200,
+            ),
+        ),
+    )
+    painter.configure(
+        plan,
+        profile,
+        _settings(apply_brush_size=True, reuse_calibration=True, verify_passes=0),
+    )
+    job = painter._job
+    assert job is not None
 
     assert painter._reuse_saved_calibration(job) is False
     assert painter.measured_brush_size_model is None

@@ -9,6 +9,7 @@ from app.input_controller import MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
 from app.painter import Painter, PainterSettings, PainterState
 from app.profiles import CalibrationProfile
+from app.sign_export import SignExport
 from app.verification import (
     mismatched_cells,
     plan_expectations,
@@ -158,11 +159,18 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
     def capture(rect):
         if (rect.width, rect.height) != (canvas.width, canvas.height):
             return Image.new("RGB", (rect.width, rect.height), (120, 120, 120))
+        canvas_presses = sum(
+            1
+            for start, _end in _held_travel(controller)
+            if canvas.left <= start[0] < canvas.left + canvas.width
+            and canvas.top <= start[1] < canvas.top + canvas.height
+        )
+        remaining = corrupted if canvas_presses <= 55 else set()
         pixels = np.zeros((rect.height, rect.width, 3), dtype=np.uint8)
         for y in range(55):
             for x in range(70):
                 expected = red if y < 27 else blue
-                if (x, y) in corrupted:
+                if (x, y) in remaining:
                     expected = blue if expected == red else red
                 pixels[y * 20 : (y + 1) * 20, x * 20 : (x + 1) * 20] = expected
         return Image.fromarray(pixels, "RGB")
@@ -189,8 +197,7 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
         stroke_interpolation_step_pixels=4096.0,
         progress_callback_interval_seconds=0.0,
         safety_poll_interval_seconds=0.002,
-        # The capture stub never changes, so a second pass would repaint the
-        # same three cells again; one pass is what this test is counting.
+        # One repair is enough; the mandatory audit after it sees the clean sign.
         verify_passes=1,
         confirm_strokes=False,
     )
@@ -214,6 +221,57 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
     assert (center(40, 40), center(40, 40)) in spans
     # The main plan painted 55 row strokes; only two touch-up strokes follow.
     assert len(spans) == 57
+
+
+def test_final_export_refuses_success_while_a_required_texel_is_untouched() -> None:
+    """One repair includes a second audit; it is not assumed to have landed."""
+
+    plan = _two_band_plan()
+    canvas = ScreenRect(200, 150, 800, 600)
+    profile = CalibrationProfile.new(
+        "Exact final audit",
+        canvas=canvas,
+        color_box=ScreenRect(1100, 150, 200, 200),
+        hue_bar=ScreenRect(1350, 150, 20, 200),
+        download_button=ScreenRect(1400, 400, 30, 30),
+    )
+    rgb = np.empty((6, 8, 3), dtype=np.float32)
+    rgb[:3] = RED
+    rgb[3:] = BLUE
+    painted = np.ones((6, 8), dtype=bool)
+    painted[1, 2] = False
+    export = SignExport(rgb=rgb, painted=painted, source="simulated")
+
+    controller = _RealishInputController()
+    painter = Painter(
+        controller,
+        screen_capture=lambda rect: Image.new(
+            "RGB", (rect.width, rect.height), (120, 120, 120)
+        ),
+    )
+    painter.use_export_reader(lambda: export)
+    settings = PainterSettings(
+        countdown_seconds=0.0,
+        mouse_down_duration_seconds=0.0,
+        delay_after_hue_seconds=0.0,
+        delay_after_saturation_value_seconds=0.0,
+        delay_between_strokes_seconds=0.0,
+        delay_between_colors_seconds=0.0,
+        stroke_speed_pixels_per_second=1_000_000.0,
+        stroke_interpolation_step_pixels=4096.0,
+        progress_callback_interval_seconds=0.0,
+        safety_poll_interval_seconds=0.002,
+        verify_passes=1,
+        confirm_strokes=False,
+        verify_color_picks=False,
+    )
+
+    assert painter.start(plan, profile, settings)
+    assert painter.wait(30.0 * _TIMEOUT_SCALE)
+    assert painter.state is PainterState.ERROR
+    assert "1 required texel still untouched" in painter.state_reason
+    assert painter.touch_up_timing is not None
+    assert painter.touch_up_timing.passes == 2
 
 
 def test_lighting_normalization_recovers_a_globally_shifted_capture() -> None:

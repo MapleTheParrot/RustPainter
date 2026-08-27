@@ -153,11 +153,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "delay_between_colors_seconds": 0.12,
         "stroke_interpolation_step_pixels": 4.0,
         "stroke_merge_mode": "balanced",
-        # After painting, capture the canvas and repaint cells that stayed
-        # bare or took the wrong color - up to this many passes.  Two by
-        # default: the touch-up strokes are short and can be dropped by the
-        # game exactly as the originals were, and a second capture is what
-        # catches that.
+        # After painting, audit the canvas and repaint cells that stayed bare
+        # or took the wrong color up to this many times. Every repair is audited,
+        # including the final one. Two repairs by default; zero disables it.
         "verify_passes": 2,
         # Check each color as it goes down: capture the sign after its
         # strokes, repaint the cells that did not take, and capture again -

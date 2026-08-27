@@ -635,9 +635,10 @@ Two things answer it, under **Settings → Painting → Touch-up**:
   never lengthened for a color that missed: the measurements above say a
   longer hold buys nothing, and the hold stays at the frame floor.
 
-What remains is caught by the **touch-up** passes at the end. After the
+What remains is caught by the **touch-up** audit at the end. After the
 artwork is down, the sign is captured and each cell compared with the plan,
-and the cells that came out wrong are repainted. The comparison is relative,
+and only cells that came out wrong are repainted. A clean first audit therefore
+adds no painting pass. The comparison is relative,
 so the sign's lighting and material never count against it, and it measures
 each color against *what that color actually looks like on this sign*, read
 off the capture itself - two palette entries the sign renders identically can
@@ -650,9 +651,11 @@ merges runs across later colors a dropped stroke shows the first, darkest
 color rather than the wood, and the nine-hour sign above had 35,000 such
 cells that an earlier version set aside as capture noise - when it looks like
 nothing the plan painted, or when it decisively took another color. The
-default is two passes: the touch-up strokes are short and can be dropped by
-the game exactly as the originals were, and the second capture is what
-catches that; the touch-up's own colors are checked as they go down too.
+default allows two repairs. Every repair is captured again, including the last,
+because a touch-up stroke can miss exactly as an original can. When Rust's
+export is available, a job cannot report success while any required texel is
+still untouched; transparent and otherwise plan-uncovered texels are excluded.
+The touch-up's own colors are checked as they go down too.
 
 On a plan finer than the game can paint - cells narrower than Rust's smallest
 brush, or under two screen pixels across - the touch-up fills holes only. A

@@ -351,8 +351,9 @@ class PainterSettings:
     # single-cell strokes and touch-up then use.  Off, or unproven, the
     # one-cell brush stays the game's smallest.
     measure_dab_size: bool = True
-    # After painting, capture the canvas and repaint decisively wrong cells,
-    # up to this many correction passes. Zero disables verification.
+    # After painting, audit the canvas and repaint decisively wrong cells,
+    # up to this many times. Every repair is followed by another audit, so a
+    # job never assumes its last touch-up landed. Zero disables verification.
     verify_passes: int = 2
     # Check each color as it goes down: once its strokes are painted the
     # sign is captured, the cells that did not take the color are repainted,
@@ -2265,6 +2266,11 @@ class Painter:
             or model is None
             or grid is None
             or not grid.agrees_with(target.canvas)
+            or (
+                settings.measure_dab_size
+                and self._plan_needs_dab_probe(job.plan)
+                and target.cached_detail_size is None
+            )
         ):
             return False
         canvas = ScreenRect(
@@ -3313,6 +3319,17 @@ class Painter:
     _DAB_PROBE_MAX_MISSES = DAB_PROBE_MAX_MISSES
     _DAB_PROBE_MIN_DABS = DAB_PROBE_MIN_DABS
 
+    def _plan_needs_dab_probe(self, plan: PaintPlan) -> bool:
+        """Whether proving the detail brush can save more work than it costs."""
+
+        lone = sum(
+            1
+            for group in plan.color_groups
+            for stroke in group.strokes
+            if stroke.pixel_count == 1
+        )
+        return lone >= self._DAB_PROBE_MIN_DABS
+
     def _probe_dab_size(self, job: _Job) -> None:
         """Prove the one-cell brush on this sign: which Size lands a lone dab.
 
@@ -3322,7 +3339,8 @@ class Painter:
         each dot scored: a hit is a stamp on its own texel, a spill a stamp
         that also reached a neighbour's.  The first Size whose batch misses
         no more than :data:`DAB_PROBE_MAX_MISSES` dots is the job's one-cell
-        brush; a sign where none does keeps the smallest brush, as before.
+        brush. If none succeeds the job stops before artwork: continuing with
+        a brush the probe just proved can miss would make required texels bare.
         """
 
         settings = job.settings
@@ -3344,9 +3362,12 @@ class Painter:
         if not aiming.native or aiming.mapper is None:
             return
         lone = sum(
-            1 for group in plan.color_groups for stroke in group.strokes if stroke.pixel_count == 1
+            1
+            for group in plan.color_groups
+            for stroke in group.strokes
+            if stroke.pixel_count == 1
         )
-        if lone < self._DAB_PROBE_MIN_DABS:
+        if not self._plan_needs_dab_probe(plan):
             LOGGER.info(
                 "The plan's %d lone dabs are too few for the dab probe to pay "
                 "for its captures; the one-cell brush stays the smallest",
@@ -3403,12 +3424,16 @@ class Painter:
         chosen: tuple[float, bool] | None = None
         # Point before sweep at each Size: the least invasive stamp that
         # lands every dot wins.  A point touches nothing but its texel; a
-        # sweep reaches sideways, and a wider brush reaches all round.  On
-        # a native plan only the smallest brush is a one-texel stamp at all
-        # (Size 1.25 paints two to four texels, measured on the export), so
-        # the ladder stops there and a miss is answered by re-aiming.
-        sizes = (BRUSH_SIZE_MIN,) if aiming.native else self._DAB_PROBE_SIZES
-        trials = [(size, sweep) for size in sizes for sweep in (False, True)]
+        # sweep reaches sideways, and a wider brush reaches all round. A wider
+        # native-resolution stamp can touch neighbours, but a Size-1 stamp
+        # narrower than a texel can leave the requested texel completely bare.
+        # Coverage wins that trade only after the smaller trials have failed,
+        # and the final export still catches collateral wrong colors.
+        trials = [
+            (size, sweep)
+            for size in self._DAB_PROBE_SIZES
+            for sweep in (False, True)
+        ]
         try:
             epoch = self._pause_generation_value()
             before = self._capture_parked(canvas, park, epoch)
@@ -3481,18 +3506,18 @@ class Painter:
         except (_RetryAction, _AbortRequested):
             raise
         except Exception as exc:
-            LOGGER.warning(
-                "The dab probe could not run (%s); the one-cell brush stays the smallest",
-                exc,
+            raise RuntimeError(
+                "The one-cell brush could not be proved on this sign; no artwork "
+                f"was painted ({exc})"
             )
-            return
         if chosen is None:
-            LOGGER.warning(
-                "No probed stamp landed every lone dab; the one-cell brush stays "
-                "the smallest, sweeping its texel, and the touch-up pass will "
-                "have holes to fill"
+            tried = ", ".join(
+                format_brush_size(size) for size in self._DAB_PROBE_SIZES
             )
-            return
+            raise RuntimeError(
+                "No one-cell brush reliably covered its requested texels. "
+                f"Tried Size {tried}; no artwork was painted."
+            )
         size, sweep = chosen
         self._measured_detail_size = size
         self._measured_dab_sweep = sweep
@@ -4878,7 +4903,11 @@ class Painter:
         color sits decisively closer to a *different* plan color than to its
         own - so lighting and the sign's material shift, which move every
         color together, never trigger a repaint.  Each pass captures, decides,
-        and repaints; a clean capture or an implausible one ends the loop.
+        and repaints. Every repaint is audited, including the final allowed
+        one; a clean capture or an implausible one ends the loop. With a Rust
+        export, covered texels that remain untouched after the repair budget
+        are an error. Plan-uncovered (for example transparent) texels are never
+        part of that verdict.
         """
 
         import numpy as np
@@ -4963,7 +4992,8 @@ class Painter:
             int(round(target.color_box.left + target.color_box.width / 2.0)),
             int(round(target.color_box.top + target.color_box.height / 2.0)),
         )
-        pass_number = 1
+        audit_number = 1
+        repairs = 0
         touch_up_started = self._active_elapsed()
         # The cells the previous pass repainted: a cell still wrong after a
         # stationary press at its audited aim is one this stamp cannot
@@ -4974,20 +5004,22 @@ class Painter:
             with self._condition:
                 self._touch_up_timing = TouchUpTiming(
                     seconds=max(0.0, self._active_elapsed() - touch_up_started),
-                    passes=pass_number,
+                    passes=audit_number,
                 )
 
         native = self._aiming(job, plan).native
         previous_targets: Any = None
-        while pass_number <= settings.verify_passes:
+        while True:
             try:
                 epoch = self._pause_generation_value()
                 self._update_progress_state(
                     PainterState.RUNNING,
-                    f"Verifying the painted sign (pass {pass_number})",
+                    f"Verifying the painted sign (audit {audit_number})",
                     phase="verify",
                 )
-                export = self._export_sign(job, epoch, why=f"verification pass {pass_number}")
+                export = self._export_sign(
+                    job, epoch, why=f"verification audit {audit_number}"
+                )
                 if export is not None:
                     # Texel-exact: what was never painted, and what is the
                     # wrong colour, straight from the game's own texture.
@@ -5019,9 +5051,9 @@ class Painter:
                 mismatch = verdict.cells
                 wrong = verdict.count
                 LOGGER.info(
-                    "Verification pass %d read %d blank, %d unexplained and %d "
+                    "Verification audit %d read %d blank, %d unexplained and %d "
                     "wrong-color cells of %d%s",
-                    pass_number,
+                    audit_number,
                     verdict.blank,
                     verdict.unexplained,
                     verdict.wrong_color,
@@ -5030,11 +5062,11 @@ class Painter:
                 )
                 if verdict.discarded:
                     LOGGER.warning(
-                        "Verification pass %d also read %d cells as the wrong "
+                        "Verification audit %d also read %d cells as the wrong "
                         "color, scattered through colors that are otherwise "
                         "right; the capture is not resolving cells at this "
                         "size, so they are left alone and only holes are filled",
-                        pass_number,
+                        audit_number,
                         verdict.discarded,
                     )
                 if wrong == 0:
@@ -5042,11 +5074,36 @@ class Painter:
                         message = "Verified: no holes left on the sign"
                     else:
                         message = "Verified: the sign matches the plan"
-                    LOGGER.info("Verification pass %d: %s", pass_number, message)
+                    LOGGER.info("Verification audit %d: %s", audit_number, message)
                     self._update_progress_state(PainterState.RUNNING, message)
                     record_touch_up()
                     return
-                if wrong > covered * UNRELIABLE_CAPTURE_FRACTION:
+                if repairs >= settings.verify_passes:
+                    record_touch_up()
+                    if export is not None and verdict.blank:
+                        noun = "texel" if verdict.blank == 1 else "texels"
+                        raise RuntimeError(
+                            f"Final verification found {verdict.blank:,} required "
+                            f"{noun} still untouched after "
+                            f"{repairs} repair{'s' if repairs != 1 else ''}. "
+                            "Transparent and intentionally unpainted texels were ignored."
+                        )
+                    if export is not None:
+                        LOGGER.warning(
+                            "Final export has no untouched required texels, but %d "
+                            "wrong-color cells remain after %d repairs",
+                            wrong,
+                            repairs,
+                        )
+                        return
+                    LOGGER.warning(
+                        "Final verification still found %d cells wrong after %d "
+                        "repairs; no exact untouched-texel verdict was available",
+                        wrong,
+                        repairs,
+                    )
+                    return
+                if export is None and wrong > covered * UNRELIABLE_CAPTURE_FRACTION:
                     LOGGER.warning(
                         "Verification read %d of %d cells as wrong; the capture "
                         "looks unreliable (occluded sign, open menu, moved view), "
@@ -5055,24 +5112,24 @@ class Painter:
                         covered,
                     )
                     return
-                if previous_repaint is not None and not native:
+                if previous_repaint is not None and (not native or export is None):
                     # A bigger brush covers a logical cell of several texels
                     # that the smallest missed.  On a native plan a cell is
                     # one texel and Size 1.25 already paints two to four of
-                    # them (measured on the sign's export), so there the
-                    # answer to a miss is a re-aim, learned above, never a
-                    # wider stamp.
+                    # them (measured on the sign's export), so an exact export
+                    # answers a native miss by re-aiming. Without an export,
+                    # repeated screen-visible holes need the wider stamp.
                     self._escalate_touch_up_brush(
-                        job, pass_number, mismatch, previous_repaint
+                        job, audit_number, mismatch, previous_repaint
                     )
                 previous_repaint = mismatch.copy()
                 previous_targets = mismatch.copy()
                 repaint = touch_up_plan(mismatch, indices, palette)
                 predicted = self._work_schedule(repaint, target, settings).total
                 LOGGER.info(
-                    "Verification pass %d: repainting %d of %d cells in %d "
+                    "Verification audit %d: repainting %d of %d cells in %d "
                     "strokes, about %s",
-                    pass_number,
+                    audit_number,
                     wrong,
                     covered,
                     repaint.stroke_count,
@@ -5080,20 +5137,19 @@ class Painter:
                 )
                 self._update_progress_state(
                     PainterState.RUNNING,
-                    f"Touching up {wrong:,} cells (pass {pass_number}, "
+                    f"Touching up {wrong:,} cells (repair {repairs + 1}, "
                     f"about {_describe_seconds(predicted)})",
                     phase="verify",
                 )
                 # The capture the touch-up was planned from is the reading
                 # of the sign before it, so its colors are checked too.
                 self._execute_plan(job, plan=repaint, reference=sampled)
-                pass_number += 1
+                repairs += 1
+                audit_number += 1
             except _RetryAction:
                 # A pause released the mouse mid-pass; redo this pass whole,
                 # from a fresh capture, once painting resumes.
                 continue
-        pass_number -= 1
-        record_touch_up()
 
     # How many rounds of picker clicks a color gets before the panel is
     # looked for again, and how many after that before the job pauses.
