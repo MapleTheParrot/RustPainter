@@ -3648,7 +3648,7 @@ class MainWindow(QMainWindow):
         self.apply_game_settings_button.setToolTip(
             "Starts a countdown, then opens Rust's console, types the settings\n"
             "below, and closes the console again.  Switch to Rust during the\n"
-            "countdown and stand in the world with no sign open."
+            "countdown with the sign's painting screen already open."
         )
         self.game_commands_label = QLabel("")
         self.game_commands_label.setObjectName("muted")
@@ -3665,10 +3665,14 @@ class MainWindow(QMainWindow):
 
         steps = QLabel(
             "How to use it:\n"
-            "1. In Rust, stand in the world with no sign open.\n"
+            "1. In Rust, open the sign's painting screen and leave it open.\n"
             "2. Click Apply in Rust now, then switch to Rust before the countdown ends.\n"
             "3. Watch the console open, list the settings, and close on its own.\n"
-            "4. Open the sign and paint as usual.\n\n"
+            "4. Close the painting screen with Save changes and open it again.\n"
+            "5. Paint as usual.\n\n"
+            "The painting screen has to be open: these settings belong to Rust's "
+            "sign painter, and setting them with no sign open does nothing. "
+            "Step 4 is what lets a raised maximum brush size take effect.\n\n"
             "Rust remembers these until something changes them, so once is "
             "usually enough. Run it again after a game update or if a paint "
             "suddenly looks washed out or offset."
@@ -10518,7 +10522,7 @@ class MainWindow(QMainWindow):
             max(3, self.countdown_spin.value()),
             self._execute_game_setup,
             hint=(
-                "Switch to Rust with no sign open. "
+                "Switch to Rust with the painting screen open. "
                 f"{self.abort_hotkey_combo.currentText()} cancels"
             ),
         )
@@ -10651,11 +10655,14 @@ class MainWindow(QMainWindow):
                     self,
                     "Rust is set up",
                     "The paint settings were typed into Rust's console.\n\n"
+                    "Now close the sign's painting screen with Save changes and "
+                    "open it again, so a raised maximum brush size takes effect. "
+                    "Then paint as usual.\n\n"
                     "If the console did not open, or it is still open now, the "
                     "Console key is wrong for this keyboard: pick another under "
-                    "Settings > Rust and apply again.\n\n"
-                    "Rust remembers these settings, so you can open the sign "
-                    "and paint.",
+                    "Settings > Rust and apply again. If the painting screen was "
+                    "not open, the commands reached nothing - open the sign and "
+                    "apply again.",
                 )
         elif status == "cancelled":
             LOGGER.warning("Rust setup cancelled: %s", message)

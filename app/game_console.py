@@ -12,8 +12,7 @@ half-opacity brush paints every colour wrong and the export audit then
 marks the whole sign as mismatched.
 
 Rust exposes all of them as ``paint.*`` console variables, so instead of
-hoping they are right, they are typed into the console once, before the
-sign is opened::
+hoping they are right, they are typed into the console once::
 
     paint.brushopacity 1
     paint.selectedtool 0
@@ -21,6 +20,13 @@ sign is opened::
     paint.leftsided False
     paint.brushspacing 0.01
     paint.maxbrushsize 100
+
+The sign's painting screen has to be open while they are typed.  Rust's own
+console describes each one as getting or setting a value "in the sign
+painter", and with no sign open there is no sign painter for them to reach:
+the commands are accepted and change nothing (confirmed live).  Reopening
+the painting screen afterwards is what lets a raised ``paint.maxbrushsize``
+take effect.
 
 This runs from the app's own Settings page, with the same foreground guard
 as every other real-input action: nothing is typed unless the Rust window

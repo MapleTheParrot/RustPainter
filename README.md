@@ -82,8 +82,8 @@ painting unattended. Everything below is detail you only need when tuning.
 ## Detailed setup and first paint
 
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
-2. While standing in the game with no sign open, go to **Settings → Rust** in RustPainter and click **Apply in Rust now**. Switch to Rust during the countdown; the console opens, the paint settings painting depends on are typed in, and it closes again. See *Settings inside Rust* below. Once is usually enough.
-3. Open the target sign's painting interface and leave it stationary.
+2. Open the target sign's painting interface, then go to **Settings → Rust** in RustPainter and click **Apply in Rust now**. Switch to Rust during the countdown; the console opens, the paint settings painting depends on are typed in, and it closes again. Close the painting screen with **Save changes** and open it again. See *Settings inside Rust* below. Once is usually enough.
+3. Leave the sign's painting interface open and stationary.
 4. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
 5. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
 6. With the numeric **Size value box** and **Clear button** detected or set, automatic brush sizing measures the sign on its first run. Later jobs first compare the visible sign with the stored texel grid. A match reuses the saved brush and timing measurements after a short check; a moved, changed, or uncertain sign automatically performs the full probe sequence and clears it before painting. Disable **Fast startup when the saved measurement still matches** in Settings to force a full measurement every time.
@@ -370,8 +370,12 @@ exactly what it will type.
 **Apply in Rust now** runs the same way every other real-input action does: a
 countdown to switch to Rust, the foreground guard so nothing is typed unless
 Rust is the active window, and the stop hotkey to cancel between keystrokes.
-Do it standing in the game world with no sign open - `paint.maxbrushsize` only
-takes effect when the painting menu is next opened. Rust keeps the values, so
+**Do it with the sign's painting screen already open.** These are the sign
+painter's own settings: Rust's console describes each one as getting or setting
+a value "in the sign painter", and with no sign open there is no sign painter
+for them to reach - the commands are accepted and change nothing. Afterwards,
+close the painting screen with **Save changes** and open it again, which is
+what lets a raised `paint.maxbrushsize` take effect. Rust keeps the values, so
 once per install is usually enough; run it again after a game update or when a
 paint suddenly comes out washed out or offset.
 

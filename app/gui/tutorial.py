@@ -39,12 +39,14 @@ class TutorialStep:
 TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     TutorialStep(
         "Let RustPainter set up Rust",
-        "Stand in the game with no sign open. Under Settings → Rust, click "
-        "Apply in Rust now and switch to Rust during the countdown. The "
-        "console opens, RustPainter types the paint settings it relies on "
-        "(full opacity, the right brush and tool, stamp spacing), and it "
-        "closes again. Rust remembers them, so once is usually enough. If "
-        "your laptop needs Fn for F1, pick Ctrl+F1 as the console key first.",
+        "Open the sign's painting screen and leave it open. Under Settings → "
+        "Rust, click Apply in Rust now and switch to Rust during the "
+        "countdown. The console opens, RustPainter types the paint settings "
+        "it relies on (full opacity, the right brush and tool, stamp "
+        "spacing), and it closes again. Then close the painting screen with "
+        "Save changes and open it again. Rust remembers them, so once is "
+        "usually enough. If your laptop needs Fn for F1, pick Ctrl+F1 as the "
+        "console key first.",
         "tutorial-rust-console",
     ),
     TutorialStep(
