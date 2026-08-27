@@ -8674,6 +8674,19 @@ class MainWindow(QMainWindow):
             != QMessageBox.StandardButton.Yes
         ):
             return
+        if not self.dry_run_check.isChecked():
+            risk = self._hole_risk_warning(self._plan)
+            if risk and (
+                QMessageBox.warning(
+                    self,
+                    "This painting can be left with holes",
+                    risk + "\n\nStart anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
         try:
             dry_run = self.dry_run_check.isChecked()
             target_profile = self._execution_profile(dry_run, self._plan)
@@ -8709,6 +8722,56 @@ class MainWindow(QMainWindow):
         )
         if not launched:
             self._pending_paint = None
+
+    def _hole_risk_warning(self, plan: Any) -> str:
+        """Why this start would leave holes the app cannot repair, if it would.
+
+        A lone dab is the stroke the game most often drops, and single-texel
+        work is exactly what the measurement toggles below protect.  A plan
+        light on lone dabs is not worth a dialog; one heavy on them, started
+        with those protections off, gets one loud plain-language warning
+        naming what to turn back on - the app never again fails silently the
+        way the run painted at an unproven Size 1 did.
+        """
+
+        from app.paint_timing import DAB_PROBE_MIN_DABS
+
+        if plan is None:
+            return ""
+        lone = sum(
+            1
+            for group in plan.color_groups
+            for stroke in group.strokes
+            if stroke.pixel_count == 1
+        )
+        if lone < DAB_PROBE_MIN_DABS:
+            return ""
+        reasons: list[str] = []
+        if not self.apply_brush_check.isChecked():
+            reasons.append(
+                "Automatic brush sizing is off, so the one-cell brush cannot "
+                "be measured or corrected when its dabs miss.  Turn on "
+                "“Automatically set brush size”."
+            )
+        elif not self.dab_size_check.isChecked():
+            reasons.append(
+                "“Prove the one-cell brush with lone dabs” is off, so "
+                "the painting starts at the smallest brush without checking "
+                "that it lands - measured on a large sign, up to one dab in "
+                "ten misses its texel entirely.  Turn that option back on."
+            )
+        if self.verify_passes_spin.value() <= 0:
+            reasons.append(
+                "“Repairs at the end” is 0, so any texel the game "
+                "drops stays bare.  Set it to at least 1."
+            )
+        if not reasons:
+            return ""
+        return (
+            f"This plan paints {lone:,} texels as single dabs - the stroke "
+            "the game most often drops - and the following would leave those "
+            "misses on the sign:\n\n- " + "\n- ".join(reasons)
+        )
 
     def _validate_profile_on_virtual_screen(
         self,
