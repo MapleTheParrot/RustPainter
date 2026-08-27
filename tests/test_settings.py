@@ -289,3 +289,27 @@ def test_checking_each_color_is_off_by_default_and_reading_picks_back_is_on() ->
         {"painting": {"confirm_strokes": False, "confirm_max_rounds": 2}}
     )
     assert off.confirm_strokes is False and off.confirm_max_rounds == 2
+
+
+def test_game_settings_default_and_validate(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"image": {"color_count": 64}}), encoding="utf-8")
+    loaded = SettingsStore(path).load()
+    assert loaded["game"] == {
+        "console_key": "F1",
+        "selected_brush": 3,
+        "brush_spacing": 0.01,
+    }
+
+    store = SettingsStore(path)
+    assert store.set("game.console_key", "CTRL+F1")["game"]["console_key"] == "CTRL+F1"
+    assert store.set("game.brush_spacing", 0.25)["game"]["brush_spacing"] == 0.25
+    for key, bad in (
+        ("game.console_key", ""),
+        ("game.console_key", "WIN+F1"),
+        ("game.selected_brush", -1),
+        ("game.selected_brush", True),
+        ("game.brush_spacing", 2),
+    ):
+        with pytest.raises(SettingsError):
+            store.set(key, bad)
