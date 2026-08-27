@@ -976,6 +976,7 @@ class _PainterBridge(QObject):
     abort_requested = Signal()
     hotkey_error = Signal(str)
     debug_finished = Signal(str, str)
+    game_setup_finished = Signal(str, str)
 
 
 class MainWindow(QMainWindow):
@@ -1159,6 +1160,7 @@ class MainWindow(QMainWindow):
         self._painter_bridge.abort_requested.connect(self._abort_painting)
         self._painter_bridge.hotkey_error.connect(self._on_hotkey_error)
         self._painter_bridge.debug_finished.connect(self._on_debug_finished)
+        self._painter_bridge.game_setup_finished.connect(self._on_game_setup_finished)
 
         self._build_ui()
         self._connect_processing_controls()
@@ -3499,6 +3501,7 @@ class MainWindow(QMainWindow):
         self.settings_tabs = tabs
         tabs.addTab(self._wrap_scroll(self._build_image_settings(), 0), "Artwork")
         tabs.addTab(self._wrap_scroll(self._build_paint_settings(), 0), "Painting")
+        tabs.addTab(self._wrap_scroll(self._build_game_settings(), 0), "Rust")
         tabs.addTab(self._wrap_scroll(self._build_safety_settings(), 0), "Safety")
         tabs.addTab(self._wrap_scroll(self._build_color_settings(), 0), "Color")
         tabs.addTab(self._build_diagnostics_settings(), "Diagnostics")
@@ -3589,6 +3592,110 @@ class MainWindow(QMainWindow):
         layout.addWidget(afk_group)
         layout.addStretch(1)
         return content
+
+    def _build_game_settings(self) -> QWidget:
+        """Settings that live inside Rust, applied through the game's console.
+
+        The brush opacity, the selected brush and tool, the stamp spacing,
+        which side the UI is on and the Size field's ceiling are all things
+        the game remembers between sessions and the app cannot see.  Each
+        one wrong ruins a paint without a single error, so the app types
+        them into the console itself rather than asking anyone to.
+        """
+
+        from app.game_console import CONSOLE_KEY_CHOICES, MAX_SELECTED_BRUSH
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        title = QLabel("Rust game settings")
+        title.setObjectName("pageTitle")
+        note = QLabel(
+            "A few settings inside Rust decide whether paint lands the way the "
+            "preview shows it. RustPainter types them into Rust's console for "
+            "you - do this once before opening the sign."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(note)
+
+        game_group = QGroupBox("Painting settings inside Rust")
+        game_form = QFormLayout(game_group)
+        self.console_key_combo = NoWheelComboBox()
+        self.console_key_combo.setEditable(True)
+        self.console_key_combo.addItems(list(CONSOLE_KEY_CHOICES))
+        self.console_key_combo.setCurrentText(CONSOLE_KEY_CHOICES[0])
+        self.console_key_combo.setToolTip(
+            "The key that opens Rust's console.  F1 on most keyboards; a laptop\n"
+            "whose function row hides behind Fn usually needs Ctrl+F1.  Try it in\n"
+            "Rust first: the console is the dark text panel across the top."
+        )
+        self.selected_brush_spin = self._int_spin(0, MAX_SELECTED_BRUSH, 3, "")
+        self.selected_brush_spin.setToolTip(
+            "Which of Rust's brushes to paint with, counting from 0.  Keep the\n"
+            "brush your profile was measured with; RustPainter was built on 3."
+        )
+        self.brush_spacing_spin = self._double_spin(0.0, 1.0, 0.01, 0.01, "")
+        self.brush_spacing_spin.setDecimals(2)
+        self.brush_spacing_spin.setToolTip(
+            "How far apart Rust stamps the brush along a stroke, as a fraction\n"
+            "of the brush width.  Lower is denser.  The speed presets were tuned\n"
+            "at 0.01; Rust's own default is 0.25."
+        )
+        self.apply_game_settings_button = QPushButton("Apply in Rust now")
+        self.apply_game_settings_button.setToolTip(
+            "Starts a countdown, then opens Rust's console, types the settings\n"
+            "below, and closes the console again.  Switch to Rust during the\n"
+            "countdown and stand in the world with no sign open."
+        )
+        self.game_commands_label = QLabel("")
+        self.game_commands_label.setObjectName("muted")
+        self.game_commands_label.setWordWrap(True)
+        self.game_commands_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        game_form.addRow("Console key", self.console_key_combo)
+        game_form.addRow("Brush", self.selected_brush_spin)
+        game_form.addRow("Brush spacing", self.brush_spacing_spin)
+        game_form.addRow("", self.apply_game_settings_button)
+        game_form.addRow("Will type", self.game_commands_label)
+        layout.addWidget(game_group)
+
+        steps = QLabel(
+            "How to use it:\n"
+            "1. In Rust, stand in the world with no sign open.\n"
+            "2. Click Apply in Rust now, then switch to Rust before the countdown ends.\n"
+            "3. Watch the console open, list the settings, and close on its own.\n"
+            "4. Open the sign and paint as usual.\n\n"
+            "Rust remembers these until something changes them, so once is "
+            "usually enough. Run it again after a game update or if a paint "
+            "suddenly looks washed out or offset."
+        )
+        steps.setWordWrap(True)
+        steps.setObjectName("muted")
+        layout.addWidget(steps)
+        layout.addStretch(1)
+        return content
+
+    def _game_convars(self) -> Any:
+        """The console settings as the widgets show them, validated."""
+
+        from app.game_console import PaintConVars
+
+        return PaintConVars(
+            selected_brush=int(self.selected_brush_spin.value()),
+            brush_spacing=float(self.brush_spacing_spin.value()),
+        )
+
+    def _refresh_game_commands_preview(self) -> None:
+        try:
+            commands = self._game_convars().commands()
+        except ValueError as exc:
+            self.game_commands_label.setText(str(exc))
+            return
+        self.game_commands_label.setText("\n".join(commands))
 
     def _build_color_settings(self) -> QWidget:
         content = QWidget()
@@ -6186,6 +6293,16 @@ class MainWindow(QMainWindow):
         self.capture_reference_button.clicked.connect(self._capture_reference)
         for name, button in self.debug_buttons.items():
             button.clicked.connect(lambda _checked=False, action=name: self._run_debug_action(action))
+        self.apply_game_settings_button.clicked.connect(self._run_game_setup)
+        # An editable combo changes by typing as well as by picking.
+        self.console_key_combo.editTextChanged.connect(self._schedule_settings_save)
+        self.selected_brush_spin.valueChanged.connect(
+            lambda _value: self._refresh_game_commands_preview()
+        )
+        self.brush_spacing_spin.valueChanged.connect(
+            lambda _value: self._refresh_game_commands_preview()
+        )
+        self._refresh_game_commands_preview()
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
         self.show_status_check.toggled.connect(self._on_show_calibration_toggled)
@@ -6281,6 +6398,9 @@ class MainWindow(QMainWindow):
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
+            self.console_key_combo,
+            self.selected_brush_spin,
+            self.brush_spacing_spin,
         )
         for control in settings_controls:
             if isinstance(control, QComboBox):
@@ -6602,6 +6722,11 @@ class MainWindow(QMainWindow):
             self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
             self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
             self.abort_hotkey_combo.setCurrentText(str(hotkeys.get("abort", "F10")))
+            game = settings.get("game", {})
+            self.console_key_combo.setCurrentText(str(game.get("console_key", "F1")))
+            self.selected_brush_spin.setValue(int(game.get("selected_brush", 3)))
+            self.brush_spacing_spin.setValue(float(game.get("brush_spacing", 0.01)))
+            self._refresh_game_commands_preview()
         finally:
             for control in controls:
                 control.blockSignals(False)
@@ -6720,6 +6845,12 @@ class MainWindow(QMainWindow):
             "ui_guard_enabled": self.ui_guard_check.isChecked(),
             "anti_afk_enabled": self.anti_afk_check.isChecked(),
             "anti_afk_interval_minutes": self.anti_afk_interval_spin.value(),
+        }
+        current["game"] = {
+            **current.get("game", {}),
+            "console_key": self.console_key_combo.currentText().strip() or "F1",
+            "selected_brush": self.selected_brush_spin.value(),
+            "brush_spacing": round(self.brush_spacing_spin.value(), 4),
         }
         current["execution"] = {
             **current.get("execution", {}),
@@ -8504,6 +8635,10 @@ class MainWindow(QMainWindow):
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
+            self.console_key_combo,
+            self.selected_brush_spin,
+            self.brush_spacing_spin,
+            self.apply_game_settings_button,
             self.capture_reference_button,
             self.prepare_color_chart_button,
             self.measure_color_chart_button,
@@ -10342,8 +10477,203 @@ class MainWindow(QMainWindow):
             LOGGER.exception("Debug action failed")
             QMessageBox.warning(self, "Debug action stopped", str(exc))
 
+    # ------------------------------------------------------------ Rust setup
+
+    @Slot()
+    def _run_game_setup(self) -> None:
+        """Type the Rust-side paint settings into the game's console."""
+
+        if self._debug_running or self._countdown_callback_running or (
+            self._countdown is not None and self._countdown.isVisible()
+        ):
+            self.statusBar().showMessage("Another operation is already in progress.", 4000)
+            return
+        if self._painter_is_active():
+            QMessageBox.warning(self, "Painting is active", "Pause or stop the paint job first.")
+            return
+        try:
+            from app.game_console import validate_console_key
+
+            self._game_convars()
+            validate_console_key(self.console_key_combo.currentText())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Check the Rust settings", str(exc))
+            return
+        dry_run = self.dry_run_check.isChecked()
+        if not dry_run and not self._emergency_hotkey_available():
+            QMessageBox.critical(
+                self,
+                "Emergency hotkey unavailable",
+                "Typing into Rust is disabled because the global stop hotkey is "
+                "not active. Choose distinct, available hotkeys and try again.",
+            )
+            return
+        self._pending_start_cancelled = False
+        with self._debug_input_gate:
+            self._debug_abort_event.clear()
+        if dry_run:
+            self._execute_game_setup()
+            return
+        self._launch_countdown(
+            max(3, self.countdown_spin.value()),
+            self._execute_game_setup,
+            hint=(
+                "Switch to Rust with no sign open. "
+                f"{self.abort_hotkey_combo.currentText()} cancels"
+            ),
+        )
+
+    def _execute_game_setup(self) -> None:
+        if self._pending_start_cancelled or self._closing:
+            self._set_idle_ui("Rust setup cancelled")
+            return
+        try:
+            from app.game_console import apply_convars
+            from app.input_controller import (
+                DryRunInputController,
+                create_system_input_controller,
+            )
+            from app.screen import foreground_window_matches
+
+            dry_run = self.dry_run_check.isChecked()
+            if not dry_run and not self._emergency_hotkey_available():
+                raise RuntimeError(
+                    "The global stop hotkey stopped before the Rust setup began."
+                )
+            expected_title = self.expected_window_edit.text().strip()
+            expected_process = self.expected_process_edit.text().strip()
+            require_foreground = not dry_run and self.focus_guard_check.isChecked()
+            if require_foreground and not expected_title and not expected_process:
+                raise RuntimeError(
+                    "Foreground protection needs an expected window title or process name."
+                )
+            commands = self._game_convars().commands()
+            console_key = self.console_key_combo.currentText().strip() or "F1"
+
+            with self._debug_input_gate:
+                if self._pending_start_cancelled or self._debug_abort_event.is_set():
+                    raise _DebugCancelled("cancelled before input")
+                self._debug_abort_event.clear()
+                controller = (
+                    DryRunInputController()
+                    if dry_run
+                    else create_system_input_controller()
+                )
+                if self._pending_start_cancelled or self._debug_abort_event.is_set():
+                    controller.release_all()
+                    raise _DebugCancelled("cancelled before input")
+                self._debug_controller = controller
+                self._debug_running = True
+
+            self._update_start_availability()
+
+            def run_setup() -> None:
+                def checkpoint() -> None:
+                    if self._debug_abort_event.is_set() or self._closing:
+                        raise _DebugCancelled("emergency stop requested")
+                    if require_foreground and not foreground_window_matches(
+                        title_contains=expected_title or None,
+                        executable=expected_process or None,
+                    ):
+                        self._debug_abort_event.set()
+                        raise _DebugCancelled("Rust was not the active window")
+
+                def wait(seconds: float) -> None:
+                    # Waits are spent on the abort event, so Stop lands
+                    # between keystrokes instead of after the next command.
+                    if self._debug_abort_event.wait(seconds):
+                        raise _DebugCancelled("emergency stop requested")
+
+                status = "completed"
+                message = ""
+                try:
+                    typed = apply_convars(
+                        controller,
+                        commands,
+                        console_key=console_key,
+                        checkpoint=checkpoint,
+                        sleep=wait,
+                    )
+                    message = f"{len(typed)} settings typed into Rust's console"
+                except _DebugCancelled as exc:
+                    status = "cancelled"
+                    message = str(exc)
+                except Exception as exc:
+                    LOGGER.exception("Rust setup failed")
+                    status = "error"
+                    message = str(exc)
+                finally:
+                    try:
+                        with self._debug_input_gate:
+                            controller.release_all()
+                    except Exception as exc:
+                        LOGGER.exception("Could not release Rust setup input")
+                        if status == "completed":
+                            status = "error"
+                            message = f"Could not release input: {exc}"
+                    self._painter_bridge.game_setup_finished.emit(status, message)
+
+            thread = threading.Thread(
+                target=run_setup,
+                name="RustPainterConsoleWorker",
+                daemon=True,
+            )
+            self._debug_thread = thread
+            try:
+                thread.start()
+            except Exception:
+                with self._debug_input_gate:
+                    controller.release_all()
+                    self._debug_controller = None
+                self._debug_thread = None
+                self._debug_running = False
+                self._update_start_availability()
+                raise
+        except Exception as exc:
+            LOGGER.exception("Rust setup failed")
+            QMessageBox.warning(self, "Rust setup stopped", str(exc))
+
     @Slot(str, str)
-    def _on_debug_finished(self, status: str, message: str) -> None:
+    def _on_game_setup_finished(self, status: str, message: str) -> None:
+        status, message = self._finish_debug_worker(status, message)
+        if self._closing:
+            return
+        dry_run = self.dry_run_check.isChecked()
+        if status == "completed":
+            LOGGER.info(
+                "Rust setup completed: %s%s",
+                message,
+                " (dry run; no input emitted)" if dry_run else "",
+            )
+            self.statusBar().showMessage(f"Rust paint settings applied - {message}", 8000)
+            if not dry_run:
+                QMessageBox.information(
+                    self,
+                    "Rust is set up",
+                    "The paint settings were typed into Rust's console.\n\n"
+                    "If the console did not open, or it is still open now, the "
+                    "Console key is wrong for this keyboard: pick another under "
+                    "Settings > Rust and apply again.\n\n"
+                    "Rust remembers these settings, so you can open the sign "
+                    "and paint.",
+                )
+        elif status == "cancelled":
+            LOGGER.warning("Rust setup cancelled: %s", message)
+            self._set_idle_ui(f"Rust setup cancelled: {message}")
+            QMessageBox.warning(
+                self,
+                "Rust setup stopped",
+                f"{message}.\n\nNothing more was typed. Switch to Rust during the "
+                "countdown and try again.",
+            )
+        else:
+            LOGGER.error("Rust setup failed: %s", message)
+            QMessageBox.warning(self, "Rust setup stopped", message)
+        self._update_start_availability()
+
+    def _finish_debug_worker(self, status: str, message: str) -> tuple[str, str]:
+        """Release a finished real-input worker's controller and clear the gate."""
+
         with self._debug_input_gate:
             controller = self._debug_controller
             if controller is not None:
@@ -10363,6 +10693,11 @@ class MainWindow(QMainWindow):
         # potentially held mouse button.
         self._debug_running = self._debug_controller is not None
         self._debug_thread = None
+        return status, message
+
+    @Slot(str, str)
+    def _on_debug_finished(self, status: str, message: str) -> None:
+        status, message = self._finish_debug_worker(status, message)
         if self._closing:
             return
         if status == "completed":

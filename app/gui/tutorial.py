@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
 from .assets import asset_path
 
 
-TUTORIAL_VERSION = 1
+# 2: the step that types Rust's paint settings through the console.
+TUTORIAL_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,16 @@ class TutorialStep:
 
 
 TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
+    TutorialStep(
+        "Let RustPainter set up Rust",
+        "Stand in the game with no sign open. Under Settings → Rust, click "
+        "Apply in Rust now and switch to Rust during the countdown. The "
+        "console opens, RustPainter types the paint settings it relies on "
+        "(full opacity, the right brush and tool, stamp spacing), and it "
+        "closes again. Rust remembers them, so once is usually enough. If "
+        "your laptop needs Fn for F1, pick Ctrl+F1 as the console key first.",
+        "tutorial-rust-console",
+    ),
     TutorialStep(
         "Open the sign in Rust",
         "Open the sign's painting screen. Rust initially shows basic colour "

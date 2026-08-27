@@ -82,14 +82,15 @@ painting unattended. Everything below is detail you only need when tuning.
 ## Detailed setup and first paint
 
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
-2. Open the target sign's painting interface and leave it stationary.
-3. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
-4. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
-5. With the numeric **Size value box** and **Clear button** detected or set, automatic brush sizing measures the sign on its first run. Later jobs first compare the visible sign with the stored texel grid. A match reuses the saved brush and timing measurements after a short check; a moved, changed, or uncertain sign automatically performs the full probe sequence and clears it before painting. Disable **Fast startup when the saved measurement still matches** in Settings to force a full measurement every time.
-6. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
-7. Inspect the paint simulation and plan statistics.
-8. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
-9. Begin with a small, low-color test image. Keep the stop hotkey available.
+2. While standing in the game with no sign open, go to **Settings → Rust** in RustPainter and click **Apply in Rust now**. Switch to Rust during the countdown; the console opens, the paint settings painting depends on are typed in, and it closes again. See *Settings inside Rust* below. Once is usually enough.
+3. Open the target sign's painting interface and leave it stationary.
+4. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
+5. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
+6. With the numeric **Size value box** and **Clear button** detected or set, automatic brush sizing measures the sign on its first run. Later jobs first compare the visible sign with the stored texel grid. A match reuses the saved brush and timing measurements after a short check; a moved, changed, or uncertain sign automatically performs the full probe sequence and clears it before painting. Disable **Fast startup when the saved measurement still matches** in Settings to force a full measurement every time.
+7. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
+8. Inspect the paint simulation and plan statistics.
+9. Use the debug corner/center and color-picker tests, then paint one dot or short stroke.
+10. Begin with a small, low-color test image. Keep the stop hotkey available.
 
 The niche **Run without mouse input** diagnostic remains available under
 **Settings → Diagnostics** for plan timing and troubleshooting, but is off by default.
@@ -336,6 +337,51 @@ clearly show the picker leaves the calibration exactly as you drew it.
 RustPainter opts into per-monitor DPI awareness before creating the GUI and stores virtual-desktop screen coordinates plus the current display layout with each profile. This supports Windows scaling and monitors left/above the primary display (negative coordinates). A display-layout warning means that the profile should be recalibrated before painting.
 
 Exclusive fullscreen applications can prevent overlays, screenshots, focus checks, or synthetic input from behaving normally. Borderless fullscreen is recommended. If Rust or Windows is running at a different privilege level than RustPainter, Windows may reject input; run both at the same privilege level.
+
+## Settings inside Rust
+
+Rust's painting UI remembers a handful of settings between sessions that
+RustPainter cannot see and that every job silently depends on: the brush
+opacity, which brush and tool are selected, how densely a drag is stamped,
+whether the UI sits on the left or right of the screen, and how far the Size
+field goes. Each one wrong ruins a paint without a single error - a brush left
+at half opacity paints every colour wrong and the export audit then marks the
+whole sign as mismatched; a UI flipped to the left side puts every calibrated
+rectangle on the wrong half of the screen.
+
+Rust exposes all of them as `paint.*` console variables, so **Settings → Rust**
+types them into the game's console for you rather than asking you to:
+
+```
+paint.brushopacity 1
+paint.selectedtool 0
+paint.selectedbrush 3
+paint.brushspacing 0.01
+paint.leftsided False
+paint.maxbrushsize 100
+```
+
+Opacity, tool, side and the Size ceiling are pinned to what painting needs.
+The **Brush** (Rust counts from 0; keep whichever your profile was measured
+on) and **Brush spacing** (stamps per brush width, 0-1; the speed presets were
+tuned at 0.01, Rust's own default is 0.25) are settings, and the page shows
+exactly what it will type.
+
+**Apply in Rust now** runs the same way every other real-input action does: a
+countdown to switch to Rust, the foreground guard so nothing is typed unless
+Rust is the active window, and the stop hotkey to cancel between keystrokes.
+Do it standing in the game world with no sign open - `paint.maxbrushsize` only
+takes effect when the painting menu is next opened. Rust keeps the values, so
+once per install is usually enough; run it again after a game update or when a
+paint suddenly comes out washed out or offset.
+
+The **Console key** is F1 on most keyboards. Compact laptops that put the
+function row behind **Fn** never deliver a bare F1, so the page also offers
+Ctrl+F1, Shift+F1 and Alt+F1 - try the key in Rust yourself first and pick the
+one that opens the dark console panel across the top of the screen. If the
+console did not open (or is still open when the pass ends), the key is wrong
+for your keyboard; nothing else is harmed, because Rust ignores the text when
+no console is up.
 
 ## Settings that require experimentation
 
