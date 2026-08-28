@@ -32,6 +32,23 @@ from .digit_reader import read_number
 from .color_mapping import picker_click_plan
 from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
+from .cursor_map import (
+    ANCHOR_LANES,
+    DEFAULT_LANES,
+    MAX_LANES,
+    SWEEP_MARGIN_PIXELS,
+    SweepError,
+    attribute_sweep,
+    check_lattice,
+    fill_in_sweep,
+    grid_from_tables,
+    lane_line,
+    lane_offsets,
+    lattice_targets,
+    sweep_positions,
+    unread_positions,
+)
+from .native_plan import is_native, nativize_plan, stroke_index_map
 from .input_controller import InputController, MouseButton
 from .models import PaintPlan, RGBColor, ScreenRect, Stroke
 from .paint_timing import (
@@ -708,6 +725,12 @@ class _Job:
     # False until proven, so a resumed job, a sizing-off job, or a sign whose
     # probe fails all keep painting long runs as drags.
     line_tool_ok: bool = False
+    # When the plan was laid out on the sign's texels (see _adopt_native_plan):
+    # for each native stroke, the index of the plan stroke it came from, and
+    # how many strokes that plan had.  Progress, the resume record and the
+    # start offset all speak in the plan's own strokes.
+    stroke_origins: tuple[int, ...] | None = None
+    original_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,6 +747,9 @@ class _Aiming:
     # Every cell is one texel and sits exactly on it: the stroke geometry
     # needs no sideways extension, and lone dabs are pure stationary presses.
     native: bool
+    # The swept cursor map when the job has one and the plan is native on
+    # it: strokes are then looked up texel by texel (see _execute_stroke).
+    swept: "TexelGridModel | None" = None
 
 
 def _describe_seconds(seconds: float) -> str:
@@ -825,6 +851,7 @@ class Painter:
         # clicked: the desktop watcher by default, a simulated sign in tests.
         self._export_watcher = ExportWatcher()
         self._export_reader: "Callable[[], SignExport | None] | None" = None
+        self._native_plan: PaintPlan | None = None
         self._last_export: SignExport | None = None
         self._exports_taken = 0
         # Per-cell aim corrections in screen pixels, learned by the touch-up
@@ -993,6 +1020,7 @@ class Painter:
             self._measured_press_hold_seconds = None
             self._measured_detail_size = None
             self._measured_dab_sweep = False
+            self._native_plan = None
             self._measured_stroke_gap_seconds = None
             self._measured_drag_rate = None
             self._measured_bare_color = None
@@ -1137,36 +1165,8 @@ class Painter:
         the plan - a stale file, or a sign other than the one calibrated.
         """
 
-        button = job.target.download_button
-        if button is None:
-            return None
-        target = job.target
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
-        point = normalized_point(button, 0.5, 0.5)
-        self._checkpoint(epoch=epoch, check_focus=True)
-        if self._export_reader is None:
-            self._export_watcher.snapshot()
-        self._move((int(round(point[0])), int(round(point[1]))), epoch)
-        self._checkpoint(epoch=epoch, check_focus=True)
-        self._mouse_down(epoch)
-        try:
-            self._interruptible_sleep(
-                self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
-            )
-        finally:
-            self.input.mouse_up(MouseButton.LEFT)
-        self._move(park, epoch)
-        if self._export_reader is not None:
-            export = self._export_reader()
-        else:
-            export = self._export_watcher.collect(
-                sleep=lambda s: self._interruptible_sleep(s, epoch=epoch, check_focus=True)
-            )
+        export = self._export_texture(job, epoch, why=why)
         if export is None:
-            LOGGER.warning("No export could be read for %s; falling back to the screen", why)
             return None
         if (export.columns, export.rows) != (job.plan.width, job.plan.height):
             LOGGER.warning(
@@ -1189,6 +1189,74 @@ class Painter:
             export.painted.size,
         )
         return export
+
+    # A download click the game answers with no file is retried this many
+    # times: live, one click in ten produced nothing while the next did.
+    _EXPORT_ATTEMPTS = 3
+    _EXPORT_HOVER_SECONDS = 0.08
+    # The game uploads the sign to the server in the background, bottom rows
+    # last, and the download button reads - and re-syncs the client from -
+    # the server's copy: an export clicked 0.3 s after a burst of presses
+    # discarded the last half-second of them for good (measured live: 19 of
+    # 800 lost; none lost after 3 s or 5 s).  So the sign is left alone this
+    # long before any export.
+    _EXPORT_SETTLE_SECONDS = 3.0
+
+    def _export_texture(self, job: _Job, epoch: int, *, why: str) -> SignExport | None:
+        """Click Rust's download button and read the texture it writes, whole.
+
+        The sign's texture at its own size, whatever the plan's resolution;
+        :meth:`_export_sign` adds the plan-size check.  None when the button
+        is not calibrated or no file appears after a few clicks.
+        """
+
+        button = job.target.download_button
+        if button is None:
+            return None
+        target = job.target
+        park = self._park_point(target)
+        point = normalized_point(button, 0.5, 0.5)
+        self._move(park, epoch)
+        if self._CAPTURE_SETTLE_SECONDS > 0:  # a simulated sign has no server to sync
+            self._interruptible_sleep(
+                self._EXPORT_SETTLE_SECONDS, epoch=epoch, check_focus=True
+            )
+        for attempt in range(self._EXPORT_ATTEMPTS):
+            self._checkpoint(epoch=epoch, check_focus=True)
+            if self._export_reader is None:
+                self._export_watcher.snapshot()
+            self._move((int(round(point[0])), int(round(point[1]))), epoch)
+            # The button wants a frame with the cursor over it before the
+            # press: clicked the instant the cursor arrived, one download
+            # click in ten did nothing (live).
+            self._interruptible_sleep(
+                self._settle(self._EXPORT_HOVER_SECONDS), epoch=epoch, check_focus=True
+            )
+            self._checkpoint(epoch=epoch, check_focus=True)
+            self._mouse_down(epoch)
+            try:
+                self._interruptible_sleep(
+                    self._PICKER_CLICK_HOLD_SECONDS, epoch=epoch, check_focus=True
+                )
+            finally:
+                self.input.mouse_up(MouseButton.LEFT)
+            self._move(park, epoch)
+            if self._export_reader is not None:
+                export = self._export_reader()
+            else:
+                export = self._export_watcher.collect(
+                    sleep=lambda s: self._interruptible_sleep(s, epoch=epoch, check_focus=True)
+                )
+            if export is not None:
+                return export
+            LOGGER.warning(
+                "No export appeared for %s (click %d of %d)",
+                why,
+                attempt + 1,
+                self._EXPORT_ATTEMPTS,
+            )
+        LOGGER.warning("No export could be read for %s; falling back to the screen", why)
+        return None
 
     @property
     def measured_bare_color(self) -> RGBColor | None:
@@ -1782,10 +1850,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         for _attempt in range(self._CALIBRATION_ATTEMPTS):
             # A pause hands the mouse back partway through; the capture is
             # simply taken again once painting resumes.
@@ -2032,7 +2097,7 @@ class Painter:
             # Size that lands them, that Size is the one-cell brush instead.
             size = BRUSH_SIZE_MIN
             measured = self._measured_detail_size
-            if measured is not None and settings.measure_dab_size:
+            if measured is not None and settings.measure_dab_size and not grid.swept:
                 size = max(size, measured)
         else:
             size = self._brush_plan_size(
@@ -2212,9 +2277,19 @@ class Painter:
                 job.target = replace(job.target, brush_size_model=model)
                 with self._condition:
                     self._measured_brush_size_model = model
-                job.texel_grid = self._measure_texel_grid_safely(job)
+                job.texel_grid = self._sweep_cursor_map_safely(job)
+                if job.texel_grid is None:
+                    job.texel_grid = self._measure_texel_grid_safely(job)
                 with self._condition:
                     self._measured_texel_grid = job.texel_grid
+                if job.texel_grid is not None and job.texel_grid.swept:
+                    # The one exact stamp and a measured map: the plan goes
+                    # down texel by texel, and the only timing left to prove
+                    # is how fast the game takes a press.
+                    self._adopt_native_plan(job)
+                    self._probe_press_timing_by_export(job)
+                    self._clear_canvas(job)
+                    break
                 if job.texel_grid is None and job.target.texel_grid is not None:
                     # The probe is allowed to fail on a hard sign (live: the
                     # fine-pitch XXL probe succeeds most runs, not all); a
@@ -2296,10 +2371,7 @@ class Painter:
             canvas.width + 2 * margin,
             canvas.height + 2 * margin,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         epoch = self._pause_generation_value()
         try:
             self._update_progress_state(
@@ -2343,6 +2415,13 @@ class Painter:
             )
             return False
 
+        if grid.swept:
+            # A swept map is reused only after it proves itself the way a
+            # fresh one does: a lattice of dabs through it, read back from
+            # the export.  A sign that has moved by a pixel fails it.
+            if target.download_button is None or not self._check_stored_cursor_map(job, grid):
+                LOGGER.info("The stored cursor map did not prove out; measuring fully")
+                return False
         job.texel_grid = grid
         self._measured_brush_size_model = model
         self._measured_texel_grid = grid
@@ -2359,6 +2438,59 @@ class Painter:
         )
         self._clear_canvas(job)
         return True
+
+    def _check_stored_cursor_map(self, job: _Job, grid: TexelGridModel) -> bool:
+        """Dab a lattice through a stored map and read the export: all exact?"""
+
+        import numpy as np
+
+        target = job.target
+        settings = job.settings
+        box = target.brush_size_box
+        if box is None:
+            return False
+        try:
+            epoch = self._pause_generation_value()
+            self._update_progress_state(
+                PainterState.RUNNING, "Proving the stored cursor map", phase="calibrate"
+            )
+            self._write_brush_size(box, BRUSH_SIZE_MIN, settings, epoch)
+            self._clear_canvas(job, quiet=True)
+            epoch = self._pause_generation_value()
+            self._select_color(self._SWEEP_COLOR, target, settings, epoch, apply_correction=False)
+            targets = lattice_targets(grid.columns, grid.rows, *self._SWEEP_CHECK_LATTICE)
+            hold = min(self._SWEEP_HOLD_SECONDS, self._MIN_PRESS_SECONDS)
+            gap = min(self._SWEEP_GAP_SECONDS, self._STROKE_GAP_FLOOR_SECONDS)
+            for u, v in targets:
+                point = grid.aim_pixel(u, v)
+                self._screen_stroke(point, point, settings, epoch, hold_seconds=hold)
+                self._interruptible_sleep(gap, epoch=epoch, check_focus=True)
+            export = self._export_texture(job, epoch, why="the stored cursor map check")
+            if export is None or (export.columns, export.rows) != (grid.columns, grid.rows):
+                return False
+            exact, wrong = check_lattice(np.where(export.painted, 255, 0), targets)
+            if wrong:
+                epoch = self._pause_generation_value()
+                for u, v in wrong:
+                    point = grid.aim_pixel(u, v)
+                    self._screen_stroke(point, point, settings, epoch, hold_seconds=hold)
+                    self._interruptible_sleep(gap, epoch=epoch, check_focus=True)
+                export = self._export_texture(job, epoch, why="the stored cursor map re-check")
+                if export is None:
+                    return False
+                exact, wrong = check_lattice(np.where(export.painted, 255, 0), targets)
+            LOGGER.info(
+                "Stored cursor map check: %d of %d lattice dabs on their texel%s",
+                exact,
+                len(targets),
+                "" if not wrong else f"; missed {wrong[:6]}",
+            )
+            return not wrong
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.info("The stored cursor map could not be checked (%s)", exc)
+            return False
 
     def _prepare_resumed_sign(self, job: _Job) -> None:
         """Take a half-painted sign as it is: no clear, no probe.
@@ -2390,6 +2522,7 @@ class Painter:
         )
         if job.target.texel_grid is not None:
             self._adopt_stored_texel_grid(job)
+            self._adopt_native_plan(job)
         else:
             LOGGER.warning(
                 "No texel grid is stored for this profile, so the resumed "
@@ -2514,7 +2647,7 @@ class Painter:
     # it, so the sign gets a generous beat to go blank before painting starts.
     _CLEAR_SETTLE_SECONDS = 0.5
 
-    def _clear_canvas(self, job: _Job) -> None:
+    def _clear_canvas(self, job: _Job, *, quiet: bool = False) -> None:
         """Click Rust's clear control and give the sign time to go blank.
 
         The clear click is trusted.  A capture comparison used to stop the job
@@ -2538,10 +2671,7 @@ class Painter:
             job.target.canvas.width,
             job.target.canvas.height,
         )
-        park = (
-            int(round(job.target.color_box.left + job.target.color_box.width / 2.0)),
-            int(round(job.target.color_box.top + job.target.color_box.height / 2.0)),
-        )
+        park = self._park_point(job.target)
         before = self._capture_parked(canvas, park, epoch)
         self._safe_click(
             normalized_point(button, 0.5, 0.5),
@@ -2564,7 +2694,8 @@ class Painter:
                 "clear control over the button that wipes the sign."
             )
         else:
-            LOGGER.info("Cleared the sign after measuring the brush")
+            if not quiet:
+                LOGGER.info("Cleared the sign after measuring the brush")
             self._remember_bare_color(after)
         job.bare_canvas = after
 
@@ -2620,10 +2751,7 @@ class Painter:
             target.canvas.height,
         )
         # Parked over the color box, the cursor cannot shadow the capture.
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         # Drawn through the vertical middle and well short of both sides.  The
         # drag is deliberately short: the band extends past each end by half
         # the brush's horizontal footprint, and a size-100 probe on a close-up
@@ -2802,6 +2930,374 @@ class Painter:
     _EDGE_MARGIN_FRACTION = 0.02
     _EDGE_MARGIN_MIN_PIXELS = 8
 
+    # The sweep's own press timing, before this sign's timing has been probed:
+    # a fraction of the frame floor, well above the shortest press the game
+    # was measured to take (100 of 100 at 6 ms, gap 0).
+    _SWEEP_HOLD_SECONDS = 0.02
+    _SWEEP_GAP_SECONDS = 0.005
+    # The probe colour for the sweeps: saturated, far from any bare sign.
+    _SWEEP_COLOR: RGBColor = (220, 40, 40)
+    # A measured map is proved before it is trusted: this lattice of dabs
+    # through it must all land on their texels.
+    _SWEEP_CHECK_LATTICE = (24, 12)
+
+    def _sweep_cursor_map_safely(self, job: _Job) -> TexelGridModel | None:
+        """Measure the cursor map from the export, or None to fall back.
+
+        Needs the download button and the Size field; a sweep that cannot
+        be read (no export, lanes that collided, a moved sign) is logged and
+        leaves the staircase probe to try.  A pause or abort passes through.
+        """
+
+        settings = job.settings
+        target = job.target
+        if (
+            not settings.measure_texel_grid
+            or not settings.apply_brush_size
+            or not self.input.emits_real_input
+            or target.brush_size_box is None
+            or target.download_button is None
+            or target.clear_button is None
+        ):
+            return None
+        try:
+            return self._sweep_cursor_map(job)
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "The cursor map could not be swept from the export (%s); "
+                "falling back to the staircase probe",
+                exc,
+            )
+            return None
+
+    def _sweep_cursor_map(self, job: _Job) -> TexelGridModel:
+        """Press at every pixel across the sign and read the texels it stamped.
+
+        One press per screen pixel along x on a few rows, an export, a wipe,
+        then the same along y; :func:`app.cursor_map.attribute_sweep` turns
+        each export into a table of which texel every pixel stamps.  The map
+        is then proved with a lattice of dabs before anything trusts it.
+        """
+
+        import numpy as np
+
+        target = job.target
+        settings = job.settings
+        canvas = ScreenRect(
+            target.canvas.left,
+            target.canvas.top,
+            target.canvas.width,
+            target.canvas.height,
+        )
+        box = target.brush_size_box
+        assert box is not None
+        epoch = self._pause_generation_value()
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Measuring where the cursor stamps every texel (export sweep)",
+            phase="calibrate",
+        )
+        self._write_brush_size(box, BRUSH_SIZE_MIN, settings, epoch)
+        margin = SWEEP_MARGIN_PIXELS
+        # Never slower than the job's own floors (a simulated sign runs them
+        # at zero), never faster than the sweep's proven timing.
+        hold = min(self._SWEEP_HOLD_SECONDS, self._MIN_PRESS_SECONDS)
+        gap = min(self._SWEEP_GAP_SECONDS, self._STROKE_GAP_FLOOR_SECONDS)
+
+        def press(x: int, y: int, batch_epoch: int) -> None:
+            self._screen_stroke((x, y), (x, y), settings, batch_epoch, hold_seconds=hold)
+            self._interruptible_sleep(gap, epoch=batch_epoch, check_focus=True)
+
+        def sweep(along_x: bool, lanes: int):
+            self._clear_canvas(job, quiet=True)
+            batch_epoch = self._pause_generation_value()
+            self._select_color(self._SWEEP_COLOR, target, settings, batch_epoch, apply_correction=False)
+            # A few lanes more than the sweep uses each carry one anchor
+            # press at the middle of the rectangle, which pins the lattice
+            # the lanes only fix up to a stride (see attribute_sweep).  Three
+            # of them, because the game now and then drops a press.
+            anchors = ANCHOR_LANES
+            if along_x:
+                positions = sweep_positions(canvas.left, canvas.width, margin)
+                offsets = lane_offsets(canvas.height, lanes + anchors)
+                across = [canvas.top + offset for offset in offsets[:lanes]]
+                anchor_lanes = [canvas.top + offset for offset in offsets[lanes:]]
+                anchor = canvas.left + canvas.width // 2
+                interior = (canvas.left + 40, canvas.left + canvas.width - 41)
+            else:
+                positions = sweep_positions(canvas.top, canvas.height, margin)
+                offsets = lane_offsets(canvas.width, lanes + anchors)
+                across = [canvas.left + offset for offset in offsets[:lanes]]
+                anchor_lanes = [canvas.left + offset for offset in offsets[lanes:]]
+                anchor = canvas.top + canvas.height // 2
+                interior = (canvas.top + 40, canvas.top + canvas.height - 41)
+            self._update_progress_state(
+                PainterState.RUNNING,
+                f"Sweeping the cursor along {'x' if along_x else 'y'}: "
+                f"{len(positions)} presses in {lanes} lanes",
+                phase="calibrate",
+            )
+            for i, position in enumerate(positions):
+                lane = across[i % lanes]
+                if along_x:
+                    press(position, lane, batch_epoch)
+                else:
+                    press(lane, position, batch_epoch)
+            for anchor_lane in anchor_lanes:
+                if along_x:
+                    press(anchor, anchor_lane, batch_epoch)
+                else:
+                    press(anchor_lane, anchor, batch_epoch)
+            export = self._export_texture(
+                job, batch_epoch, why=f"the {'x' if along_x else 'y'} cursor sweep"
+            )
+            if export is None:
+                raise SweepError("no export could be read after the sweep")
+            alpha = np.where(export.painted, 255, 0)
+            table = attribute_sweep(
+                alpha, positions, lanes, along_x=along_x, interior=interior, anchor=anchor
+            )
+            # A press the game dropped leaves its pixel unread.  Press those
+            # pixels again - on the first lane, whose row is known - and
+            # read the export once more; a pixel still unread after that is
+            # one the sign really does not answer to.
+            for _pass in range(2):
+                gaps = unread_positions(table)
+                if not gaps:
+                    break
+                LOGGER.info(
+                    "%s sweep: %d pixel(s) went unread; pressing them again",
+                    "x" if along_x else "y",
+                    len(gaps),
+                )
+                batch_epoch = self._pause_generation_value()
+                for position in gaps:
+                    if along_x:
+                        press(position, across[0], batch_epoch)
+                    else:
+                        press(across[0], position, batch_epoch)
+                export = self._export_texture(job, batch_epoch, why="the sweep's fill-in")
+                if export is None:
+                    break
+                table = fill_in_sweep(table, np.where(export.painted, 255, 0), lane_line(alpha, along_x, 0), along_x=along_x)
+            return table
+
+        tables = []
+        for along_x in (True, False):
+            lanes = DEFAULT_LANES
+            while True:
+                try:
+                    tables.append(sweep(along_x, lanes))
+                    break
+                except SweepError as exc:
+                    if "share a texel" in str(exc) and lanes * 2 <= MAX_LANES:
+                        LOGGER.info("%s; sweeping again with %d lanes", exc, lanes * 2)
+                        lanes *= 2
+                        continue
+                    raise
+        x_table, y_table = tables
+        for name, table in (("column", x_table), ("row", y_table)):
+            if table.unreachable:
+                # A structural limit of the screen geometry: some texels
+                # have no whole pixel that stamps them.  Refusing beats
+                # painting a sign with holes nothing can fill.
+                raise RuntimeError(
+                    f"{len(table.unreachable)} texel {name}(s) of this sign cannot be "
+                    f"reached by the cursor at this screen size ({table.pitch:.2f} px per "
+                    f"texel): {list(table.unreachable[:10])}. Make the sign larger on "
+                    "screen (stand closer, raise the resolution or the UI scale) and "
+                    "calibrate again."
+                )
+        grid = grid_from_tables(x_table, y_table)
+        LOGGER.info(
+            "Cursor map swept from the export: %dx%d texels; columns answer to x %d-%d "
+            "(%.4f px each from %.2f), rows to y %d-%d (%.4f px each from %.2f)",
+            grid.columns,
+            grid.rows,
+            grid.aim_columns[0][0],
+            grid.aim_columns[-1][1],
+            grid.pitch_x,
+            grid.origin_x,
+            grid.aim_rows[0][0],
+            grid.aim_rows[-1][1],
+            grid.pitch_y,
+            grid.origin_y,
+        )
+        # Prove it: a lattice of dabs aimed through the map, read back exactly.
+        self._clear_canvas(job, quiet=True)
+        batch_epoch = self._pause_generation_value()
+        self._select_color(self._SWEEP_COLOR, target, settings, batch_epoch, apply_correction=False)
+        targets = lattice_targets(grid.columns, grid.rows, *self._SWEEP_CHECK_LATTICE)
+        self._update_progress_state(
+            PainterState.RUNNING,
+            f"Proving the cursor map with {len(targets)} dabs",
+            phase="calibrate",
+        )
+        for u, v in targets:
+            press(*grid.aim_pixel(u, v), batch_epoch)
+        export = self._export_texture(job, batch_epoch, why="the cursor map check")
+        if export is None:
+            raise SweepError("no export could be read after the cursor map check")
+        exact, wrong = check_lattice(np.where(export.painted, 255, 0), targets)
+        if wrong:
+            # The game drops the odd press; a miss is a miss only if the
+            # same aim misses twice.
+            LOGGER.info(
+                "Cursor map check: %d of %d dabs missed on the first try; pressing them again",
+                len(wrong),
+                len(targets),
+            )
+            batch_epoch = self._pause_generation_value()
+            for u, v in wrong:
+                press(*grid.aim_pixel(u, v), batch_epoch)
+            export = self._export_texture(job, batch_epoch, why="the cursor map re-check")
+            if export is None:
+                raise SweepError("no export could be read after the cursor map re-check")
+            exact, wrong = check_lattice(np.where(export.painted, 255, 0), targets)
+        if wrong:
+            raise SweepError(
+                f"the cursor map check landed {exact} of {len(targets)} dabs; "
+                f"missed {wrong[:8]}"
+            )
+        LOGGER.info(
+            "Cursor map proved: %d of %d lattice dabs landed on their texel",
+            exact,
+            len(targets),
+        )
+        return grid
+
+    def _adopt_native_plan(self, job: _Job) -> None:
+        """Execute the job's plan as one Size-1 stroke per texel row.
+
+        A fresh job only: a resumed job's place is counted in its own
+        plan's strokes, so its plan is left as it was.
+        """
+
+        grid = job.texel_grid
+        if grid is None or not grid.swept:
+            return
+        if is_native(job.plan, grid.columns, grid.rows):
+            return
+        before = job.plan
+        job.plan = nativize_plan(before, grid.columns, grid.rows)
+        origins = stroke_index_map(before, job.plan)
+        job.stroke_origins = tuple(origins)
+        job.original_total = before.stroke_count
+        if job.start_stroke > 0:
+            # A resumed job's place is counted in the plan's own strokes.
+            job.start_stroke = next(
+                (i for i, origin in enumerate(origins) if origin >= job.start_stroke),
+                len(origins),
+            )
+        with self._condition:
+            self._native_plan = job.plan
+        LOGGER.info(
+            "Plan of %dx%d cells in %d strokes laid out on the sign's %dx%d texels "
+            "as %d single-row strokes with the one-texel brush",
+            before.width,
+            before.height,
+            before.stroke_count,
+            grid.columns,
+            grid.rows,
+            job.plan.stroke_count,
+        )
+
+    @property
+    def executed_plan(self) -> PaintPlan | None:
+        """The plan the job really paints, when it differs from the one given."""
+
+        with self._condition:
+            return self._native_plan
+
+    # Press timing candidates, fastest first, as (hold, gap) in seconds.  The
+    # probe adopts the pair one step slower than the fastest clean one.
+    _EXPORT_TIMING_CANDIDATES = ((0.006, 0.0), (0.012, 0.005), (0.024, 0.01), (0.04, 0.02))
+    _EXPORT_TIMING_DOTS = 100
+
+    def _probe_press_timing_by_export(self, job: _Job) -> None:
+        """Prove the press hold and stroke gap on this sign, texel-exactly.
+
+        Batches of dabs through the swept map at each candidate timing, one
+        export per batch: a dab that left its texel bare was a press the
+        game never saw.  The hold and gap adopted are one candidate slower
+        than the fastest clean pair, so the timing in use always has a
+        proven step of margin.  Never slower than the floors.
+        """
+
+        import numpy as np
+
+        settings = job.settings
+        grid = job.texel_grid
+        if not settings.measure_press_hold or grid is None or not grid.swept:
+            return
+        target = job.target
+        self._measured_press_hold_seconds = None
+        self._measured_stroke_gap_seconds = None
+        dots = self._EXPORT_TIMING_DOTS
+        if grid.columns < dots // 2 or grid.rows < 16:
+            return
+        self._update_progress_state(
+            PainterState.RUNNING,
+            "Proving the press timing this sign takes (export)",
+            phase="calibrate",
+        )
+        clean: list[tuple[float, float]] = []
+        try:
+            for batch, (hold, gap) in enumerate(self._EXPORT_TIMING_CANDIDATES):
+                epoch = self._pause_generation_value()
+                self._clear_canvas(job, quiet=True)
+                epoch = self._pause_generation_value()
+                self._select_color(self._SWEEP_COLOR, target, settings, epoch, apply_correction=False)
+                texels = [
+                    (
+                        4 + (k * (grid.columns - 8)) // dots,
+                        4 + ((k * 37 + batch * 17) % max(1, grid.rows - 8)),
+                    )
+                    for k in range(dots)
+                ]
+                for u, v in texels:
+                    point = grid.aim_pixel(u, v)
+                    self._screen_stroke(point, point, settings, epoch, hold_seconds=hold)
+                    self._interruptible_sleep(gap, epoch=epoch, check_focus=True)
+                export = self._export_texture(job, epoch, why=f"press timing batch {batch + 1}")
+                if export is None:
+                    LOGGER.info("Press timing probe: no export; keeping the floors")
+                    return
+                landed = sum(1 for u, v in texels if export.painted[v, u])
+                LOGGER.info(
+                    "Press timing probe: %d of %d dabs landed at a %d ms hold, %d ms gap",
+                    landed,
+                    dots,
+                    int(round(hold * 1000)),
+                    int(round(gap * 1000)),
+                )
+                if landed == dots:
+                    clean.append((hold, gap))
+                    break
+        except (_RetryAction, _AbortRequested):
+            raise
+        except Exception as exc:
+            LOGGER.warning("The press timing probe could not run (%s); keeping the floors", exc)
+            return
+        if not clean:
+            LOGGER.info("Press timing probe: no candidate landed every dab; keeping the floors")
+            return
+        fastest = clean[-1]
+        index = self._EXPORT_TIMING_CANDIDATES.index(fastest)
+        adopted = self._EXPORT_TIMING_CANDIDATES[min(index + 1, len(self._EXPORT_TIMING_CANDIDATES) - 1)]
+        self._measured_press_hold_seconds = float(adopted[0])
+        self._measured_stroke_gap_seconds = float(adopted[1])
+        LOGGER.info(
+            "Adopting a %d ms press hold and %d ms stroke gap for this sign "
+            "(%d ms / %d ms proved clean below them)",
+            int(round(adopted[0] * 1000)),
+            int(round(adopted[1] * 1000)),
+            int(round(fastest[0] * 1000)),
+            int(round(fastest[1] * 1000)),
+        )
+
     def _measure_texel_grid(self, job: _Job) -> TexelGridModel:
         """Stamp the smallest brush around the sign and read its texel grid.
 
@@ -2824,10 +3320,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         epoch = self._pause_generation_value()
         self._update_progress_state(
             PainterState.RUNNING, "Measuring the sign's texel grid", phase="calibrate"
@@ -2990,10 +3483,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         return grid, canvas, park, dots
 
     def _stamp_dot_batch(
@@ -3257,10 +3747,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         self._update_progress_state(
             PainterState.RUNNING,
             "Measuring how fast this sign takes a long drag",
@@ -3428,10 +3915,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         self._measured_detail_size = None
         self._update_progress_state(
             PainterState.RUNNING,
@@ -3616,10 +4100,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         epoch = self._pause_generation_value()
         self._update_progress_state(
             PainterState.RUNNING,
@@ -3738,6 +4219,20 @@ class Painter:
     # taken the instant the cursor moves away can still hold the frame that had
     # it in shot.  Five frames is comfortably past that.
     _CAPTURE_SETTLE_SECONDS = 0.35
+
+    # Where the cursor waits between strokes and while the sign is read.
+    # Not over the colour picker: hovering it between bursts of presses made
+    # the game discard most of every third burst (measured live, 7 of 20
+    # bursts lost from their fourth press on; none lost when parked on the
+    # dark panel beside the sign).  Nothing but the sign lives to its left.
+    _PARK_MARGIN_PIXELS = 40
+
+    @classmethod
+    def _park_point(cls, target: PaintingTarget) -> tuple[int, int]:
+        canvas = target.canvas
+        x = int(round(canvas.left - cls._PARK_MARGIN_PIXELS))
+        y = int(round(canvas.top + canvas.height / 2.0))
+        return x, y
 
     def _capture_parked(
         self, canvas: ScreenRect, park: tuple[int, int], epoch: int
@@ -4036,6 +4531,7 @@ class Painter:
                 return x, y
         texel_pitch = self._texel_pitch_pixels(plan, paint_canvas, model, grid)
         native = mapper is not None and scale_u == 1.0 and scale_v == 1.0
+        swept = grid if (native and grid is not None and grid.swept) else None
         return _Aiming(
             sizing=sizing_enabled,
             model=model,
@@ -4045,6 +4541,7 @@ class Painter:
             mapper=mapper,
             texel_pitch=texel_pitch,
             native=native,
+            swept=swept,
         )
 
     def _execute_plan(
@@ -4072,6 +4569,15 @@ class Painter:
         painted = 0
         total = sum(len(group.strokes) for group in plan.color_groups)
         total_colors = len(plan.color_groups)
+        # Progress is shown in the strokes of the plan the job was given,
+        # which a native layout expands into more.
+        origins = job.stroke_origins if main_plan else None
+        shown_total = job.original_total if (main_plan and origins) else total
+
+        def shown(completed_native: int) -> int:
+            if not origins or completed_native <= 0:
+                return completed_native
+            return origins[min(completed_native, len(origins)) - 1] + 1
         # Progress advances in predicted seconds, priced from the same timing
         # rules the strokes below execute with, so percent and time left move
         # at the pace of the clock instead of racing through the big,
@@ -4255,6 +4761,7 @@ class Painter:
                             texel_pitch=texel_pitch,
                             line_tool=job.line_tool_ok and current.use_line_tool,
                             drag_rate=self._drag_rate_cap(),
+                            swept=aiming.swept,
                         )
                         return
                     except _RetryAction:
@@ -4277,8 +4784,8 @@ class Painter:
                     total_colors=total_colors,
                     stroke_index_in_color=index_in_group,
                     strokes_in_color=len(group.strokes),
-                    completed_strokes=completed,
-                    total_strokes=total,
+                    completed_strokes=shown(completed),
+                    total_strokes=shown_total,
                     completed_work=completed_work,
                     total_work=total_work,
                     skipped_work=skipped_work,
@@ -4420,10 +4927,7 @@ class Painter:
             target.canvas.width,
             target.canvas.height,
         )
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         indices, _underpaint, palette = plan_layers(plan)
         centers, blend = self._cell_sampling(job, plan, canvas)
 
@@ -5135,7 +5639,10 @@ class Painter:
         # the neighbours it was read from.
         cell_pixels = min(canvas.width / plan.width, canvas.height / plan.height)
         overshoot = self._detail_brush_overshoot(job)
-        recolor = (
+        exact = job.texel_grid is not None and job.texel_grid.swept and is_native(
+            plan, job.texel_grid.columns, job.texel_grid.rows
+        )
+        recolor = exact or (
             cell_pixels >= RECOLOR_MIN_CELL_PIXELS
             and overshoot <= self._DETAIL_OVERSHOOT_LIMIT
         )
@@ -5175,10 +5682,7 @@ class Painter:
             except Exception:
                 LOGGER.exception("The bare-sign capture could not be sampled")
         # Parked over the color box, the cursor cannot shadow the capture.
-        park = (
-            int(round(target.color_box.left + target.color_box.width / 2.0)),
-            int(round(target.color_box.top + target.color_box.height / 2.0)),
-        )
+        park = self._park_point(target)
         audit_number = 1
         repairs = 0
         touch_up_started = self._active_elapsed()
@@ -5196,6 +5700,7 @@ class Painter:
 
         native = self._aiming(job, plan).native
         previous_targets: Any = None
+        previous_wrong: int | None = None
 
         def read_sign(why: str) -> tuple[Any, Any, SignExport | None]:
             """One reading of the sign: the exact export, or the screen."""
@@ -5247,7 +5752,12 @@ class Painter:
                 )
                 if export is not None and previous_targets is not None:
                     self._learn_cell_nudges(
-                        export, indices, palette, previous_targets, verdict.cells
+                        export,
+                        indices,
+                        palette,
+                        previous_targets,
+                        verdict.cells,
+                        only_displaced=exact,
                     )
                 mismatch = verdict.cells
                 wrong = verdict.count
@@ -5279,7 +5789,20 @@ class Painter:
                     self._update_progress_state(PainterState.RUNNING, message)
                     record_touch_up()
                     return
-                if repairs >= settings.verify_passes:
+                allowed_passes = settings.verify_passes
+                if exact:
+                    # A refill of exact one-texel presses can only leave a
+                    # hole when the game dropped a press; give it the room
+                    # to refill those too, as long as each pass gains.
+                    allowed_passes = max(settings.verify_passes, self._EXACT_REPAIR_PASSES)
+                    if (
+                        repairs >= settings.verify_passes
+                        and previous_wrong is not None
+                        and wrong >= previous_wrong
+                    ):
+                        allowed_passes = repairs  # the extra passes must gain
+                previous_wrong = wrong
+                if repairs >= allowed_passes:
                     record_touch_up()
                     if export is not None and verdict.blank:
                         noun = "texel" if verdict.blank == 1 else "texels"
@@ -5313,7 +5836,7 @@ class Painter:
                         covered,
                     )
                     return
-                if previous_repaint is not None and (
+                if previous_repaint is not None and not exact and (
                     not native or export is None or audit_number >= 3
                 ):
                     # A bigger brush covers a logical cell of several texels
@@ -5333,17 +5856,21 @@ class Painter:
                     )
                 previous_repaint = mismatch.copy()
                 previous_targets = mismatch.copy()
-                mismatch, sampled = self._touch_up_probe_batches(
-                    job,
-                    mismatch,
-                    indices,
-                    palette,
-                    sampled,
-                    covered=covered,
-                    native=native,
-                    audit_number=audit_number,
-                    read_sign=read_sign,
-                )
+                if not exact:
+                    # The batches, re-aims and Size ladder exist for stamps
+                    # that cannot be trusted to land; a swept map with the
+                    # one-texel brush lands them, so the pass paints whole.
+                    mismatch, sampled = self._touch_up_probe_batches(
+                        job,
+                        mismatch,
+                        indices,
+                        palette,
+                        sampled,
+                        covered=covered,
+                        native=native,
+                        audit_number=audit_number,
+                        read_sign=read_sign,
+                    )
                 wrong = int(mismatch.sum())
                 if wrong == 0:
                     # The batches alone repaired everything they saw; the
@@ -5385,6 +5912,8 @@ class Painter:
     # repainted last pass still wrong raises the one-cell brush a step.
     _TOUCH_UP_STUBBORN_MIN = 10
     _TOUCH_UP_STUBBORN_FRACTION = 0.25
+    # Repair passes a texel-exact job may take while each pass still gains.
+    _EXACT_REPAIR_PASSES = 8
 
     # A big touch-up is tested before it is trusted: batches of this many of
     # its lone dabs go down first, each read back, so a stamp that cannot
@@ -5593,7 +6122,14 @@ class Painter:
     _CELL_NUDGE_SEARCH = ((0, -1), (0, 1), (-1, 0), (1, 0))
 
     def _learn_cell_nudges(
-        self, export: SignExport, indices: Any, palette: Any, targets: Any, still_wrong: Any
+        self,
+        export: SignExport,
+        indices: Any,
+        palette: Any,
+        targets: Any,
+        still_wrong: Any,
+        *,
+        only_displaced: bool = False,
     ) -> None:
         """Re-aim the cells the last pass repainted and the export says it missed.
 
@@ -5630,6 +6166,11 @@ class Painter:
                     break
             key = (int(u), int(v))
             current = self._cell_nudges.get(key, (0, 0))
+            if found is None and only_displaced:
+                # On a swept map a bare cell with no displaced neighbour is
+                # a press the game dropped, not an aim to correct: the same
+                # pixel is pressed again.
+                continue
             if found is not None:
                 # Landed one texel over: aim a step the other way, growing
                 # by a pixel each time the same miss repeats.
@@ -6019,12 +6560,43 @@ class Painter:
         texel_pitch: float | None = None,
         line_tool: bool = False,
         drag_rate: float | None = None,
+        swept: TexelGridModel | None = None,
     ) -> None:
         # The line tool draws straight between its endpoints, so only a run
         # the plan itself laid straight may use it; a diagonal keeps gliding.
         line_tool = line_tool and (
             stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y  # type: ignore[attr-defined]
         )
+        if swept is not None and (
+            stroke.start_y == stroke.end_y or stroke.start_x == stroke.end_x  # type: ignore[attr-defined]
+        ):
+            # Texel-exact: the press goes to the pixel measured to stamp the
+            # first texel, and a run ends at the pixel measured to paint the
+            # last texel and no further.  No rounding, clamp or extension:
+            # every pixel here was seen accepted in the sweep.
+            u0, v0 = int(stroke.start_x), int(stroke.start_y)  # type: ignore[attr-defined]
+            u1, v1 = int(stroke.end_x), int(stroke.end_y)  # type: ignore[attr-defined]
+            start_int = swept.aim_pixel(u0, v0)
+            if (u0, v0) == (u1, v1):
+                # A cell whose dab the export saw land on a neighbour is
+                # aimed the measured pixel the other way.
+                nudge = self._cell_nudges.get((u0, v0))
+                if nudge is not None:
+                    start_int = (start_int[0] + nudge[0], start_int[1] + nudge[1])
+                end_int = start_int
+            elif v0 == v1:
+                end_int = (swept.drag_end_x(u1, 1 if u1 > u0 else -1), start_int[1])
+            else:
+                end_int = (start_int[0], swept.drag_end_y(v1, 1 if v1 > v0 else -1))
+            self._screen_stroke(
+                start_int,
+                end_int,
+                settings,
+                epoch,
+                texel_pitch=texel_pitch,
+                jump=True,
+            )
+            return
         if mapper is not None:
             # A measured cursor map places each cell itself; the rectangle
             # only bounds the mouse.
@@ -6165,8 +6737,15 @@ class Painter:
         line_tool: bool = False,
         hold_seconds: float | None = None,
         drag_rate: float | None = None,
+        jump: bool = False,
     ) -> None:
         """Drag between two physical points, or dab when they are the same.
+
+        With ``jump`` the drag is one cursor move from start to end: the
+        game fills every texel centre the segment crosses however far it
+        is (measured 1016 of 1016 at 5,000 texels a second), so pacing
+        buys nothing.  The dwell before the release stays: a release under
+        30 ms after the press lost a third of such drags live.
 
         ``texel_pitch`` paces the drag: a run of a few texels goes at the
         set speed and is caught by the frame hold below, a longer drag is
@@ -6207,6 +6786,13 @@ class Painter:
                     else self._press_hold_seconds(settings),
                     epoch=epoch,
                     check_focus=True,
+                )
+                return
+            if jump:
+                self._checkpoint(epoch=epoch, check_focus=True)
+                self._move(end_int, epoch)
+                self._interruptible_sleep(
+                    self._drag_dwell_seconds(settings), epoch=epoch, check_focus=True
                 )
                 return
             pace = stroke_pace(

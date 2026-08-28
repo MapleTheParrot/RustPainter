@@ -78,11 +78,15 @@ class ReplayingTexelSign(SimulatedSign):
         faithful_colors: bool = False,
         min_gap_seconds: float = 0.0,
         max_drag_texels_per_second: float = float("inf"),
+        crossing_drags: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.controller = controller
         self.profile = profile
+        # Drags paint the texel centres their segment crosses (the game's
+        # measured behaviour), whatever the jump; the release is excluded.
+        self.crossing_drags = crossing_drags
         self.canvas = profile.canvas
         self.base = self.texture.copy()
         self.shift_lines = shift_lines
@@ -146,6 +150,38 @@ class ReplayingTexelSign(SimulatedSign):
         column, row = self._texel_at(x, y)
         self._stamp_texel(column, row, size, color)
 
+    def _stamp_crossed(self, start, end, size: float, color) -> None:
+        """Paint the texels whose centres the open segment [start, end) crosses."""
+
+        ox, oy = self.origin
+        px, py = self.pitch
+        u0 = (start[0] - ox - self.cursor_shift[0]) / px
+        u1 = (end[0] - ox - self.cursor_shift[0]) / px
+        v0 = (start[1] - oy - self.cursor_shift[1]) / py
+        v1 = (end[1] - oy - self.cursor_shift[1]) / py
+        steps = max(1, int(math.ceil(max(abs(u1 - u0), abs(v1 - v0)) * 8)))
+        seen: set[tuple[int, int]] = set()
+        for step in range(steps):
+            t = step / steps  # never t == 1: the release point is not crossed
+            u = u0 + (u1 - u0) * t
+            v = v0 + (v1 - v0) * t
+            u_next = u0 + (u1 - u0) * (step + 1) / steps
+            v_next = v0 + (v1 - v0) * (step + 1) / steps
+            for k in range(int(math.floor(min(u, u_next))), int(math.floor(max(u, u_next))) + 1):
+                centre = k + 0.5
+                if min(u, u_next) < centre <= max(u, u_next) and abs(v - (math.floor(v) + 0.5)) <= 0.5:
+                    texel = (k + self.stamp_offset[0], int(math.floor(v)) + self.stamp_offset[1])
+                    if texel not in seen and self._on_texture(ox + (k + 0.5) * px, start[1]):
+                        seen.add(texel)
+                        self._stamp_texel(texel[0], texel[1], size, color)
+            for m in range(int(math.floor(min(v, v_next))), int(math.floor(max(v, v_next))) + 1):
+                centre = m + 0.5
+                if min(v, v_next) < centre <= max(v, v_next) and abs(u1 - u0) < 1e-9:
+                    texel = (int(math.floor(u)) + self.stamp_offset[0], m + self.stamp_offset[1])
+                    if texel not in seen and self._on_texture(start[0], oy + (m + 0.5) * py):
+                        seen.add(texel)
+                        self._stamp_texel(texel[0], texel[1], size, color)
+
     def _replay(self) -> None:
         self.texture = self.base.copy()
         self.painted = {}
@@ -194,6 +230,13 @@ class ReplayingTexelSign(SimulatedSign):
                                 unsampled_travel = 0.0
                                 if self._on_texture(*new_position):
                                     self._stamp(new_position[0], new_position[1], size, color)
+                        elif self.crossing_drags:
+                            # What the game was measured to do with a drag,
+                            # however far it jumps: paint every texel whose
+                            # centre the segment crosses, the release point
+                            # itself excluded (so a drag released on the
+                            # first pixel of its last texel leaves it bare).
+                            self._stamp_crossed(position, new_position, size, color)
                         elif travel > self.max_drag_step_px:
                             # Too far for one frame: the game never saw the
                             # positions between, only where the cursor arrived.
@@ -1365,6 +1408,7 @@ def test_the_touch_up_reads_the_export_and_re_aims_the_dabs_that_missed() -> Non
         controller,
         profile,
         faithful_colors=True,
+        crossing_drags=True,  # the export path drags with one jump, as the game takes it
         columns=128,
         rows=64,
         origin=(99.4, 100.8),
@@ -1410,3 +1454,65 @@ def test_the_touch_up_reads_the_export_and_re_aims_the_dabs_that_missed() -> Non
         assert final.painted[30, x], f"row 30 texel {x} still bare"
     # and the re-aim was learned, not guessed with a bigger brush
     assert any(dy < 0 for (dx, dy) in touch_up._cell_nudges.values())
+
+
+def _dot_and_run_plan() -> PaintPlan:
+    """Lone dabs, short runs, a full-width row, and a coarse fill brush."""
+
+    red, blue = (200, 30, 160), (40, 90, 230)
+    return PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup(red, (Stroke(0, 0, 127, 0), Stroke(3, 12, 3, 12), Stroke(20, 12, 27, 12), Stroke(127, 63, 127, 63)), 138),
+            ColorGroup(blue, (Stroke(10, 30, 60, 30),), 153, brush_diameter=3),
+        ),
+    )
+
+
+def test_with_an_export_the_job_sweeps_the_cursor_map_and_paints_every_texel_exactly() -> None:
+    """The export path: the map is read pixel by pixel off the sign's own
+    export, the plan goes down as one-texel rows with jump drags, and the
+    export audit finds nothing to touch up - on a sign whose cursor map is
+    shifted, stretched and jittered against the rectangle."""
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile_with_download()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        faithful_colors=True,
+        crossing_drags=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+        cursor_pitch=(5.03, 5.0),
+    )
+    plan = _dot_and_run_plan()
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
+    painter.use_export_reader(sign.export)
+    _record_color_picks(painter, controller)
+    assert painter.start(plan, profile, _settings(verify_passes=2))
+    assert painter.wait(120.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    grid = painter.measured_texel_grid
+    assert grid is not None and grid.swept, "the map should come from the export sweep"
+    assert (grid.columns, grid.rows) == (128, 64)
+    executed = painter.executed_plan
+    assert executed is not None and all(g.brush_diameter == 1 for g in executed.color_groups)
+    from app.verification import plan_layers
+
+    indices, _under, palette = plan_layers(executed)
+    final = sign.export()
+    import numpy as np
+
+    covered = indices >= 0
+    assert final.painted[covered].all(), "every planned texel is painted"
+    assert not final.painted[~covered].any(), "no texel outside the plan is painted"
+    for index, color in enumerate(palette):
+        cells = indices == index
+        assert (final.rgb[cells] == np.asarray(color, dtype=np.float32)).all()
