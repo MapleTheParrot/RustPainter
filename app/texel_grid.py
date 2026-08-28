@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Mapping, Sequence
 
 import logging
+import math
 
 import numpy as np
 
@@ -929,6 +930,16 @@ class TexelGridModel:
     # the wrong step, every dab lands one texel over.  Empty means unaudited.
     aim_nudge_x: tuple[float, ...] = ()
     aim_nudge_y: tuple[float, ...] = ()
+    # Measured cursor tables (:mod:`app.cursor_map`): for every texel column
+    # the first and last whole screen x, inclusive, at which a press stamps
+    # it, and likewise for rows.  Read off the sign's own exported texture
+    # after a press at every pixel, so nothing here is fitted or rounded:
+    # the pixel that stamps texel k IS one of these.  Empty for a grid the
+    # staircase probe fitted instead.  With tables present the lattice
+    # fields above are a least-squares summary kept for logs and for
+    # readers of screen captures; aiming never touches them.
+    aim_columns: tuple[tuple[int, int], ...] = ()
+    aim_rows: tuple[tuple[int, int], ...] = ()
     # How far outside the calibrated rectangle the cursor may go to reach a
     # texel the aim lattice places there.  A few pixels: enough for the
     # lattice's offset from the texture and the hand that dragged the
@@ -956,6 +967,94 @@ class TexelGridModel:
             object.__setattr__(self, "aim_pitch_y", self.pitch_y)
         if not self.captured_at:
             object.__setattr__(self, "captured_at", _utc_now())
+        for name, count in (("aim_columns", self.columns), ("aim_rows", self.rows)):
+            table = getattr(self, name)
+            if table and len(table) != count:
+                raise ValueError(f"{name} must hold one pixel run per texel")
+            if any(int(last) < int(first) for first, last in table):
+                raise ValueError(f"{name} runs must be first <= last")
+
+    @property
+    def swept(self) -> bool:
+        """Whether the cursor tables were measured pixel by pixel."""
+
+        return bool(self.aim_columns and self.aim_rows)
+
+    @staticmethod
+    def _table_position(table: tuple[tuple[int, int], ...], t: float) -> float:
+        """Where along an axis the cursor stamps continuous texel coordinate t.
+
+        Whole-plus-a-half coordinates (texel centres) return the middle
+        pixel of that texel's run; anything else is interpolated between
+        the neighbouring texels' middles, so a boundary (an integer t)
+        lands between two runs.
+        """
+
+        count = len(table)
+        k = min(max(int(math.floor(t)), 0), count - 1)
+        fraction = t - k
+        first, last = table[k]
+        middle = (first + last) / 2.0
+        if abs(fraction - 0.5) < 1e-9:
+            return middle
+        if fraction > 0.5:
+            if k + 1 <= count - 1:
+                other = table[k + 1]
+                other_middle = (other[0] + other[1]) / 2.0
+            else:
+                other_middle = middle + (last - first + 1)
+            return middle + (fraction - 0.5) * (other_middle - middle)
+        if k - 1 >= 0:
+            other = table[k - 1]
+            other_middle = (other[0] + other[1]) / 2.0
+        else:
+            other_middle = middle - (last - first + 1)
+        return middle - (0.5 - fraction) * (middle - other_middle)
+
+    def aim_pixel(self, u: int, v: int) -> tuple[int, int]:
+        """The whole pixel that stamps texel (u, v): the middle of each run."""
+
+        if not self.swept:
+            x, y = self.cursor_point(u + 0.5, v + 0.5)
+            return int(math.floor(x + 0.5)), int(math.floor(y + 0.5))
+        cf, cl = self.aim_columns[min(max(u, 0), self.columns - 1)]
+        rf, rl = self.aim_rows[min(max(v, 0), self.rows - 1)]
+        return (cf + cl) // 2, (rf + rl) // 2
+
+    def drag_end_x(self, u: int, direction: int) -> int:
+        """The x a Size-1 drag must end at to paint texel column u and stop there.
+
+        The game paints a drag as the texel centres its path crosses, and
+        the release position itself is never crossed - so a drag released
+        on the first pixel of its last texel leaves that texel bare
+        (measured 0/8 live), while one released a pixel further paints it
+        and never the next (8/8 and 0/8, both directions).  "First" is the
+        first pixel met travelling in ``direction``.
+        """
+
+        first, last = self.aim_columns[min(max(u, 0), self.columns - 1)]
+        step = self._drag_end_step(self.aim_pitch_x)
+        return first + step if direction >= 0 else last - step
+
+    def drag_end_y(self, v: int, direction: int) -> int:
+        first, last = self.aim_rows[min(max(v, 0), self.rows - 1)]
+        step = self._drag_end_step(self.aim_pitch_y)
+        return first + step if direction >= 0 else last - step
+
+    @staticmethod
+    def _drag_end_step(pitch: float) -> int:
+        """Pixels past a run's first pixel that are past the texel's centre.
+
+        The run's first pixel lies within a pixel after the texel's leading
+        boundary, and the centre half a pitch after that boundary, so
+        ``floor(pitch / 2) + 1`` pixels on is past the centre for any
+        pitch, and short of the next texel's centre by more than
+        ``pitch - 2`` (or by more than half a pixel when texels are under
+        two pixels wide).  One pixel on the largest sign measured (1.77 px
+        texels), which is what the 8/8 live measurements used.
+        """
+
+        return int(math.floor(max(pitch, 1.0) / 2.0)) + 1
 
     @property
     def width(self) -> float:
@@ -996,6 +1095,11 @@ class TexelGridModel:
         axis, so the two are solved together.
         """
 
+        if self.swept:
+            return (
+                self._table_position(self.aim_columns, u),
+                self._table_position(self.aim_rows, v),
+            )
         # x = ox + u * px + sx * y;  y = oy + v * py + sy * x  (screen-absolute)
         ox, oy = self.aim_origin_x, self.aim_origin_y
         px, py = self.aim_pitch_x, self.aim_pitch_y
@@ -1052,6 +1156,22 @@ class TexelGridModel:
         slack rather than by the texture alone.
         """
 
+        if self.swept:
+            # Every pixel in the tables was seen to stamp a texel, so the
+            # tables' extent is exactly where the game takes a click - the
+            # hand-dragged rectangle has nothing to add.  A drag's end pixel
+            # can sit one past the last texel's run (see drag_end_x), which
+            # the game accepted in every live measurement.
+            left = min(first for first, _ in self.aim_columns) - 1
+            right = max(last for _, last in self.aim_columns) + 1
+            top = min(first for first, _ in self.aim_rows) - 1
+            bottom = max(last for _, last in self.aim_rows) + 1
+            return SimpleNamespace(
+                left=float(left),
+                top=float(top),
+                width=float(right - left + 1),
+                height=float(bottom - top + 1),
+            )
         aim_left = self.aim_origin_x
         aim_right = self.aim_origin_x + self.columns * self.aim_pitch_x
         aim_top = self.aim_origin_y
@@ -1120,6 +1240,10 @@ class TexelGridModel:
             value["aimNudgeX"] = list(self.aim_nudge_x)
         if self.aim_nudge_y:
             value["aimNudgeY"] = list(self.aim_nudge_y)
+        if self.aim_columns:
+            value["aimColumns"] = [[int(a), int(b)] for a, b in self.aim_columns]
+        if self.aim_rows:
+            value["aimRows"] = [[int(a), int(b)] for a, b in self.aim_rows]
         return value
 
     @classmethod
@@ -1141,6 +1265,12 @@ class TexelGridModel:
             aim_map_y=tuple(float(v) for v in value.get("aimMapY", (0.0, 0.0, 0.0, 0.0))),
             aim_nudge_x=tuple(float(v) for v in value.get("aimNudgeX", ())),
             aim_nudge_y=tuple(float(v) for v in value.get("aimNudgeY", ())),
+            aim_columns=tuple(
+                (int(run[0]), int(run[1])) for run in value.get("aimColumns", ())
+            ),
+            aim_rows=tuple(
+                (int(run[0]), int(run[1])) for run in value.get("aimRows", ())
+            ),
             residual=float(value.get("residual", 0.0)),
             from_edges=bool(value.get("fromEdges", False)),
             captured_at=str(value.get("capturedAt") or ""),
