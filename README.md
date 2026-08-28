@@ -511,6 +511,56 @@ fractions interpolates between the recorded probes rather than reading the
 fitted line: the line can miss a nearby probe by a few pixels, and a few
 pixels is the entire seam budget of a one-cell brush.
 
+### Painting texel-exactly from the sign's export
+
+With the **Download** button calibrated, a job measures the sign through
+Rust's own export of its texture instead of through screen captures, and
+the strokes it paints are the texels themselves:
+
+- **The cursor map is swept, not fitted.** With the smallest brush - which
+  stamps exactly the one texel under the cursor - the job presses once at
+  every screen pixel across the sign along each axis (in lanes, so no two
+  consecutive presses share a texel), exports the texture, and reads which
+  texel every pixel stamped. The result is a table: for every texel column
+  the first and last x that stamp it, and likewise for rows. Aiming is a
+  lookup. It is proved before it is trusted with a lattice of dabs read
+  back from the export, and a texel no pixel can reach is reported rather
+  than silently skipped. About 2,700 presses on the largest sign, well
+  under two minutes.
+- **The plan is laid out on the texels.** Whatever resolution or brush the
+  plan was drawn with, it is executed as one Size-1 stroke per texel row of
+  every cell it covers, colour order unchanged. The smallest brush is the
+  only stamp the game was measured to make exactly; every wider one has a
+  soft rim whose partial coverage depends on where inside a texel the
+  cursor sits - the one-texel strip of half-transparent canvas that used
+  to run along every fill band.
+- **Runs are one cursor jump.** The game paints every texel centre a drag's
+  path crosses however far the jump (1016 of 1016 at 5,000 texels a
+  second), and never the release point itself, so a run is released one
+  measured pixel past its last texel's centre.
+- **Timing is proved per sign** from the export: batches of dabs at each
+  candidate hold and gap, adopting the pair one step slower than the
+  fastest clean one (12 ms / 5 ms on the largest sign, where 6 ms / 0 ms
+  still landed 100 of 100).
+- **Every gap is refilled from the export.** The interim audits and the
+  final verification read the texture texel by texel; anything the plan
+  covers that is not at full alpha is pressed again, exactly, until nothing
+  is bare.
+
+Two things about the game shape the timing around exports: the sign is
+uploaded to the server in the background and the download re-syncs the
+client from the server's copy, so an export requested within a fraction of
+a second of painting discards the last half-second of presses - every
+export waits a few seconds first. And hovering the colour picker between
+bursts of presses made the game drop most of every third burst, so the
+cursor parks on the dark panel beside the sign, never over a widget.
+Sporadic losses still happen around colour changes (measured between half
+a percent and a few percent of presses on a sign with thousands of
+colours); the audits catch them.
+
+Without the Download button the job falls back to the staircase probe
+described next.
+
 ### Finding the sign's texel grid
 
 Strokes are laid out on the sign texture's own grid, not on the hand-dragged
