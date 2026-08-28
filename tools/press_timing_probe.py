@@ -96,6 +96,13 @@ BAND_COLORS = (
 # driving the mouse itself has to, or every capture is scored against a
 # rectangle with a red border burnt across it.
 _OVERLAY_TITLE = "RustPainter Calibration Preview"
+# The GUI also keeps one small top-level window per calibrated rectangle -
+# "Resize Canvas calibration - RustPainter" and so on - carrying the drag
+# handles around its border.  Those are NOT click-through: a press on one
+# grabs the handle, and a probe that dabs along a sign's edge with them up
+# resizes the profile's rectangles instead of painting (measured live: a
+# sweep dragged the canvas rectangle to three pixels wide).
+_HANDLE_TITLE_SUFFIX = " calibration - RustPainter"
 _SW_HIDE, _SW_SHOWNA = 0, 8
 
 
@@ -110,7 +117,9 @@ def _overlay_windows() -> list:
         if length:
             buffer = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(hwnd, buffer, length + 1)
-            if _OVERLAY_TITLE in buffer.value:
+            if _OVERLAY_TITLE in buffer.value or buffer.value.endswith(
+                _HANDLE_TITLE_SUFFIX
+            ):
                 found.append(hwnd)
         return True
 
