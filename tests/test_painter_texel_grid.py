@@ -11,7 +11,7 @@ from PIL import Image
 
 from app.input_controller import InputEvent, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
-from app.painter import Painter, PainterSettings, PainterState
+from app.painter import Painter, PainterSettings, PainterState, _only_isolated_corner_misses
 from app.profiles import CalibrationProfile
 from test_texel_grid import SimulatedSign
 
@@ -712,6 +712,35 @@ def test_long_straight_runs_go_down_as_shift_lines_when_the_probe_proves_them() 
     assert sign.shift_lines_drawn == 3
     assert not controller.held_buttons
     assert not controller.held_keys
+
+
+def test_cursor_map_validation_accepts_only_isolated_corner_misses() -> None:
+    """A hand-dragged canvas edge can exclude a corner without invalidating
+    the export-measured interior map; an edge or interior miss still fails."""
+
+    assert _only_isolated_corner_misses([(0, 0)], 512, 512)
+    assert _only_isolated_corner_misses([(0, 0), (511, 511)], 512, 512)
+    assert not _only_isolated_corner_misses([(0, 120)], 512, 512)
+    assert not _only_isolated_corner_misses([(120, 120)], 512, 512)
+
+
+def test_a_32_texel_shift_line_meets_the_documented_threshold() -> None:
+    controller = MockInputController()
+    controller.emits_real_input = False  # type: ignore[misc]
+    painter = Painter(controller)
+
+    painter._screen_stroke(
+        (100, 100),
+        (255, 100),  # 31 five-pixel intervals = 32 texels, inclusive
+        _settings(),
+        0,
+        texel_pitch=5.0,
+        line_tool=True,
+    )
+
+    assert any(
+        event.kind == "key_down" and event.value == "SHIFT" for event in controller.events
+    )
 
 
 def test_a_sign_without_the_line_mechanic_keeps_painting_drags() -> None:

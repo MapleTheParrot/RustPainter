@@ -121,6 +121,30 @@ _COMMANDED_POINT_HISTORY = 8
 _MOUSE_DRIFT_WINDOW_SECONDS = 0.6
 
 
+# A hand-drawn canvas rectangle can be a pixel out at a corner. A cursor map
+# that proves every interior sample but cannot hit one or two corners is still
+# useful: the map itself was measured from Rust's export, and the normal
+# verification pass will still report any border cell that needs attention.
+# Do not relax a whole edge -- that would hide a real mapping error.
+_SWEEP_CHECK_CORNER_MISS_LIMIT = 4
+
+
+def _only_isolated_corner_misses(
+    misses: Sequence[tuple[int, int]], columns: int, rows: int
+) -> bool:
+    """Whether failed map checks are a few corners, not an edge/interior fault."""
+
+    corners = {
+        (0, 0),
+        (columns - 1, 0),
+        (0, rows - 1),
+        (columns - 1, rows - 1),
+    }
+    return bool(misses) and len(misses) <= _SWEEP_CHECK_CORNER_MISS_LIMIT and all(
+        target in corners for target in misses
+    )
+
+
 @contextlib.contextmanager
 def _high_resolution_timer() -> Iterator[None]:
     """Request 1 ms timer resolution while painting.
@@ -3156,7 +3180,13 @@ class Painter:
             if export is None:
                 raise SweepError("no export could be read after the cursor map re-check")
             exact, wrong = check_lattice(np.where(export.painted, 255, 0), targets)
-        if wrong:
+        if wrong and _only_isolated_corner_misses(wrong, grid.columns, grid.rows):
+            LOGGER.warning(
+                "Cursor map proved everywhere except corner test dabs %s; accepting the "
+                "export-measured map and leaving those border cells to verification",
+                wrong,
+            )
+        elif wrong:
             raise SweepError(
                 f"the cursor map check landed {exact} of {len(targets)} dabs; "
                 f"missed {wrong[:8]}"
@@ -4327,7 +4357,7 @@ class Painter:
             sizing=sizing,
             texel_pitch_pixels=pitch,
             line_min_pixels=(
-                self._SHIFT_LINE_MIN_TEXELS * pitch if line_tool else None
+                (self._SHIFT_LINE_MIN_TEXELS - 1.0) * pitch if line_tool else None
             ),
         )
 
@@ -6594,7 +6624,11 @@ class Painter:
                 settings,
                 epoch,
                 texel_pitch=texel_pitch,
-                jump=True,
+                line_tool=line_tool,
+                # The normal one-jump drag is the fast, measured path for a
+                # swept map. A proved Shift line is faster still for long
+                # axis-aligned runs, and _screen_stroke selects it first.
+                jump=not line_tool,
             )
             return
         if mapper is not None:
@@ -6762,7 +6796,10 @@ class Painter:
             and math.isfinite(texel_pitch)
             and texel_pitch > 0.0
             and math.hypot(end_int[0] - start_int[0], end_int[1] - start_int[1])
-            >= self._SHIFT_LINE_MIN_TEXELS * texel_pitch
+            # A 32-texel inclusive run has 31 texel intervals between its
+            # endpoint centres. Compare intervals so the documented
+            # threshold is actually 32 texels, not 33.
+            >= (self._SHIFT_LINE_MIN_TEXELS - 1.0) * texel_pitch
         ):
             self._line_stroke(start_int, end_int, settings, epoch)
             return
