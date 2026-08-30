@@ -6380,6 +6380,11 @@ class Painter:
         )
         if reading is None or self._swatch is None:
             return
+        reading = self._rescue_nearby_picker_hue(
+            picker_color, target, settings, epoch
+        )
+        if reading is None or self._swatch is None:
+            return
         with self._condition:
             self._color_pick_summary = replace(
                 self._color_pick_summary, failed=self._color_pick_summary.failed + 1
@@ -6479,6 +6484,65 @@ class Painter:
                 *expected,
                 attempt,
             )
+        return reading
+
+    @classmethod
+    def _nearby_hue_points(
+        cls, hue_point: tuple[int, int], target: PaintingTarget
+    ) -> tuple[tuple[int, int], ...]:
+        """Whole-pixel hue neighbours, ordered closest-first and in-bounds.
+
+        Rust's picker can be one or two physical pixels away from the
+        calibrated gradient after a UI-scale change.  Changing a fractional
+        inset does not help in that situation: it rounds straight back to the
+        same pixel.  Keep this deliberately narrow; the swatch read-back is
+        still the authority and no stroke is painted while searching.
+        """
+
+        points: list[tuple[int, int]] = []
+        for offset in cls._PICKER_HUE_RESCUE_OFFSETS:
+            point = (hue_point[0], hue_point[1] + offset)
+            if target.hue_bar.contains(*point) and point not in points:
+                points.append(point)
+        return tuple(points)
+
+    def _rescue_nearby_picker_hue(
+        self,
+        picker_color: RGBColor,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        epoch: int,
+    ) -> SwatchReading | None:
+        """Search adjacent hue pixels when normal verified picks disagree.
+
+        This is a last, safe recovery for picker geometry that is slightly
+        stale or rounded differently by Rust.  It deliberately does not
+        accept a merely-near colour: the selected swatch must match the
+        intended picker command before the caller may paint with it.
+        """
+
+        hue_point, sv_point, _expected = self._picker_plan(picker_color, target, 0.0)
+        reading: SwatchReading | None = None
+        for hue_candidate in self._nearby_hue_points(hue_point, target):
+            self._click_picker(hue_candidate, sv_point, settings, epoch, retry=True)
+            if self._swatch is None:
+                return None
+            reading = self._read_selected_color(picker_color, epoch)
+            if reading is None:
+                return None
+            if reading.matches(picker_color):
+                with self._condition:
+                    summary = self._color_pick_summary
+                    self._color_pick_summary = replace(
+                        summary,
+                        picks=summary.picks + 1,
+                        retried=summary.retried + 1,
+                    )
+                LOGGER.info(
+                    "Color #%02X%02X%02X took after searching a nearby hue pixel",
+                    *picker_color,
+                )
+                return None
         return reading
 
     def _click_picker(
@@ -6974,6 +7038,27 @@ class Painter:
     # Now the first attempts click the exact computed point and the panel
     # read-back decides: a swallowed click is retried progressively deeper.
     _PICK_MARGIN_SCHEDULE_PIXELS: tuple[float, ...] = (0.0, 0.0, 2.0, 2.0, 4.0)
+    # The picker is normally exact.  If its live raster has shifted by a
+    # handful of pixels, scan only this small hue neighbourhood and require
+    # swatch read-back before allowing the next stroke.
+    _PICKER_HUE_RESCUE_OFFSETS: tuple[int, ...] = (
+        -1,
+        1,
+        -2,
+        2,
+        -3,
+        3,
+        -4,
+        4,
+        -5,
+        5,
+        -6,
+        6,
+        -7,
+        7,
+        -8,
+        8,
+    )
     # Without a readable panel there is no way to see a swallowed click, so
     # blind picks stay this far inside the widgets - past every dead edge
     # pixel seen live, at a color cost of ~2 degrees of hue at the ends.

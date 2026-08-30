@@ -2765,6 +2765,7 @@ def _picky_sign(
     plan: PaintPlan,
     *,
     swallow_sv,
+    hue_raster_offset: int = 0,
 ):
     """A fake sign and color panel whose picker can swallow clicks.
 
@@ -2791,6 +2792,9 @@ def _picky_sign(
     )
 
     def selected_color(hue_point, sv_point):
+        # Model a live Rust picker whose rendered hue gradient is a few
+        # physical pixels away from its saved calibration rectangle.
+        hue_point = (hue_point[0], hue_point[1] + hue_raster_offset)
         return picker_points_to_rgb(
             hue_point,
             sv_point,
@@ -2874,12 +2878,18 @@ def _three_color_plan() -> PaintPlan:
     )
 
 
-def _run_picky_sign(*, swallow_sv):
+def _run_picky_sign(*, swallow_sv, hue_raster_offset: int = 0):
     controller = MockInputController()
     controller.emits_real_input = True  # type: ignore[misc]
     profile = _profile(canvas_width=400)
     plan = _three_color_plan()
-    capture, painted = _picky_sign(controller, profile, plan, swallow_sv=swallow_sv)
+    capture, painted = _picky_sign(
+        controller,
+        profile,
+        plan,
+        swallow_sv=swallow_sv,
+        hue_raster_offset=hue_raster_offset,
+    )
     painter = _impatient(Painter(controller, screen_capture=capture))
     painter._MIN_PRESS_SECONDS = 0.0  # type: ignore[misc]
     painter._SWATCH_RECHECK_SECONDS = 0.0  # type: ignore[misc]
@@ -3074,6 +3084,24 @@ def test_a_swallowed_picker_click_is_clicked_again_until_the_panel_agrees() -> N
     assert summary.picks == 3
     assert summary.retried == 1
     assert summary.failed == 0
+
+
+def test_a_small_live_hue_raster_shift_is_found_before_painting() -> None:
+    """A UI-scale rounding shift needs a different whole-pixel hue click."""
+
+    painter, painted, plan = _run_picky_sign(
+        swallow_sv=lambda n: False, hue_raster_offset=3
+    )
+    assert painter.wait(_t(60.0))
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+    # The test deliberately offsets the live gradient, so its exact RGB can
+    # be inside the panel's read-back tolerance rather than the normal
+    # eight-level synthetic-picker tolerance.  Completion proves the nearby
+    # whole-pixel search, rather than a pause or a wrong-color stroke.
+    assert len(painted()) == 60
+    summary = painter.color_pick_summary
+    assert summary.failed == 0
+    assert summary.retried >= 1
 
 
 def test_a_color_the_panel_never_shows_pauses_the_job_for_the_user() -> None:
