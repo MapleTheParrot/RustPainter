@@ -714,6 +714,57 @@ def test_long_straight_runs_go_down_as_shift_lines_when_the_probe_proves_them() 
     assert not controller.held_keys
 
 
+def test_multi_cell_bands_stay_dense_drags_when_shift_lines_are_proven() -> None:
+    """A Size-1 Shift probe must not authorize broad optimized bands.
+
+    Some Rust sign painters draw a Shift line at the detail width even after
+    accepting a wider Size.  Painting three-row bands that way leaves the
+    horizontal pinstripes the plan already considers covered.
+    """
+
+    controller = MockInputController()
+    controller.emits_real_input = True  # type: ignore[misc]
+    profile = _profile()
+    sign = ReplayingTexelSign(
+        controller,
+        profile,
+        shift_lines=True,
+        columns=128,
+        rows=64,
+        origin=(99.4, 100.8),
+        pitch=(5.02, 5.01),
+        cursor_shift=(1.3, -0.7),
+    )
+    painter = _impatient(Painter(controller, screen_capture=sign.capture))
+    plan = PaintPlan(
+        128,
+        64,
+        (
+            ColorGroup(
+                (40, 80, 160),
+                (Stroke(4, 30, 123, 30),),
+                360,
+                brush_diameter=3,
+            ),
+        ),
+    )
+
+    assert painter.start(plan, profile, _settings())
+    assert painter.wait(30.0)
+    assert painter.state is PainterState.COMPLETED, painter.state_reason
+
+    sign.capture(profile.canvas)
+    # With no one-cell run to prove, neither the calibration probe nor the
+    # artwork uses Shift. The broad run is an ordinary held drag.
+    assert sign.shift_lines_drawn == 0
+    assert not any(
+        event.kind == "key_down" and event.value == "SHIFT"
+        for event in controller.events
+    )
+    assert not controller.held_buttons
+    assert not controller.held_keys
+
+
 def test_cursor_map_validation_accepts_only_isolated_corner_misses() -> None:
     """A hand-dragged canvas edge can exclude a corner without invalidating
     the export-measured interior map; an edge or interior miss still fails."""

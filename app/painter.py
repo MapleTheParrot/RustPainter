@@ -4109,6 +4109,13 @@ class Painter:
             return False
         longest = 0
         for group in job.plan.color_groups:
+            # A Shift line is only proved at the one-cell detail size below.
+            # Rust has been observed drawing the same thin line when a wider
+            # Size was selected, leaving a bare scanline between the
+            # optimizer's multi-row bands.  Broad groups therefore stay on
+            # the dense-drag path whose full brush footprint was measured.
+            if max(1, int(group.brush_diameter)) != 1:
+                continue
             for stroke in group.strokes:
                 if stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y:
                     longest = max(longest, stroke.pixel_count)
@@ -4789,7 +4796,17 @@ class Painter:
                             clamp_rect=clamp_canvas,
                             mapper=mapper,
                             texel_pitch=texel_pitch,
-                            line_tool=job.line_tool_ok and current.use_line_tool,
+                            # The startup probe proves a Shift line only at
+                            # the one-cell detail size.  On the XXL sign Rust
+                            # accepted a wider Size value but rendered broad
+                            # Shift lines as thin scanlines, so three-row
+                            # groups left regular horizontal gaps.  Dense
+                            # drags honor the measured footprint and spacing.
+                            line_tool=(
+                                job.line_tool_ok
+                                and current.use_line_tool
+                                and diameter == 1
+                            ),
                             drag_rate=self._drag_rate_cap(),
                             swept=aiming.swept,
                         )

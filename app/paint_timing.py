@@ -587,6 +587,7 @@ class PlanWorkSchedule:
                     pitch,
                     line_tool=(
                         line_min_pixels is not None
+                        and max(1, int(group.brush_diameter)) == 1
                         and (stroke.start_x == stroke.end_x or stroke.start_y == stroke.end_y)
                         and (max(1, int(stroke.pixel_count)) - 1) * cell_width_pixels
                         >= line_min_pixels

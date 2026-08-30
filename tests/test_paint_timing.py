@@ -463,6 +463,45 @@ def test_work_schedule_prices_long_straight_runs_as_lines_only_when_proven() -> 
     assert as_lines.total < as_drags.total
 
 
+def test_work_schedule_never_prices_a_multi_cell_band_as_a_shift_line() -> None:
+    """The line probe only proves the one-cell footprint.
+
+    A wide optimizer band must keep the dense-drag price even when its run is
+    long enough for Shift: Rust can render that shortcut at the detail width,
+    producing the regular scanline gaps seen on the XXL sign.
+    """
+
+    plan = PaintPlan(
+        1000,
+        10,
+        (
+            ColorGroup(
+                (10, 20, 30),
+                (Stroke(0, 2, 999, 2),),
+                3000,
+                brush_diameter=3,
+            ),
+        ),
+    )
+    timing = StrokeTiming.from_settings(PainterSettings())
+    pitch = 2.0
+    as_drags = PlanWorkSchedule(
+        plan, timing, 2.0, sizing=True, texel_pitch_pixels=pitch
+    )
+    with_line_tool = PlanWorkSchedule(
+        plan,
+        timing,
+        2.0,
+        sizing=True,
+        texel_pitch_pixels=pitch,
+        line_min_pixels=SHIFT_LINE_MIN_TEXELS * pitch,
+    )
+
+    assert with_line_tool.stroke_cost(0, 0) == pytest.approx(
+        as_drags.stroke_cost(0, 0)
+    )
+
+
 def test_a_measured_dab_press_prices_dabs_and_lines_but_never_drags() -> None:
     """The probe's hold replaces the frame floor for stationary presses only."""
 
