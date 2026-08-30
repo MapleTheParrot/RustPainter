@@ -2583,6 +2583,18 @@ def test_plan_recalculation_shows_pending_feedback(
     assert window.analysis_time.value_label.text() != "…"
 
 
+def test_ready_preview_is_shown_while_its_plan_is_still_building(window: MainWindow) -> None:
+    preview = Image.new("RGB", (12, 6), (30, 140, 90))
+    window._process_serial = 17
+
+    window._on_processing_preview_ready(
+        main_window_module._ProcessPreview(17, preview)
+    )
+
+    assert "preview ready" in window.processing_label.text().lower()
+    assert not window.paint_preview._source.isNull()
+
+
 def test_the_estimate_is_one_figure_that_learns_the_checks_and_touch_up(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:

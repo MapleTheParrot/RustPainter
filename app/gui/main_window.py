@@ -420,6 +420,14 @@ class _ProcessResult:
 
 
 @dataclass(slots=True)
+class _ProcessPreview:
+    """The visual target available before its stroke plan is finished."""
+
+    serial: int
+    simulation: Image.Image
+
+
+@dataclass(slots=True)
 class _LoadResult:
     serial: int
     path: Path
@@ -472,6 +480,7 @@ class _TextOverlayOptions:
 
 class _WorkerSignals(QObject):
     completed = Signal(object)
+    preview_ready = Signal(object)
     failed = Signal(int, str)
 
 
@@ -771,6 +780,17 @@ class _ImageWorker(QRunnable):
                 # the plan asks for - and the preview promises - only colors
                 # the sign can actually receive.
                 processed = _snap_processed_to_picker(processed, self.picker)
+            # The pixels are ready before the potentially much longer work of
+            # grouping them into strokes. Let the GUI show this honest draft
+            # while the worker continues building the plan; Exact mode uses it
+            # unchanged as its final Rust preview.
+            draft_simulation = _build_simulation_image(
+                processed, self.color_correction
+            )
+            self.signals.preview_ready.emit(
+                _ProcessPreview(self.serial, draft_simulation)
+            )
+            draft_processed = processed
             mode = PaintMode(self.paint_mode)
             optimization = None
             if mode is PaintMode.EXACT:
@@ -805,8 +825,10 @@ class _ImageWorker(QRunnable):
             # palette-limited, so the Rust preview promises exactly what the
             # painter will put on the sign.  Text stays editable as vector
             # items over the source image instead.
-            simulation = _build_simulation_image(
-                simulation_processed, self.color_correction
+            simulation = (
+                draft_simulation
+                if simulation_processed is draft_processed
+                else _build_simulation_image(simulation_processed, self.color_correction)
             )
             self.signals.completed.emit(
                 _ProcessResult(
@@ -5827,6 +5849,7 @@ class MainWindow(QMainWindow):
             self._brush_capabilities(),
             self._picker_geometry(),
         )
+        worker.signals.preview_ready.connect(self._on_processing_preview_ready)
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
         # Recorded rather than recomputed on arrival, so the result is always
@@ -5838,6 +5861,15 @@ class MainWindow(QMainWindow):
         for stale in sorted(self._plan_keys)[:-2]:
             del self._plan_keys[stale]
         self._thread_pool.start(worker)
+
+    @Slot(object)
+    def _on_processing_preview_ready(self, preview: _ProcessPreview) -> None:
+        """Show the ready image while its stroke list still builds off-thread."""
+
+        if preview.serial != self._process_serial or self._closing:
+            return
+        self.paint_preview.set_source(self._pil_to_pixmap(preview.simulation))
+        self.processing_label.setText("Rust preview ready — building the paint plan…")
 
     @Slot(object)
     def _on_processing_complete(self, result: _ProcessResult) -> None:
