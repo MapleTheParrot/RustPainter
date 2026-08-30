@@ -2595,6 +2595,14 @@ def test_ready_preview_is_shown_while_its_plan_is_still_building(window: MainWin
     assert not window.paint_preview._source.isNull()
 
 
+def test_plan_builder_reports_its_current_background_stage(window: MainWindow) -> None:
+    window._process_serial = 18
+
+    window._on_processing_stage(18, "Building paint strokes…")
+
+    assert window.processing_label.text() == "Building paint strokes…"
+
+
 def test_the_estimate_is_one_figure_that_learns_the_checks_and_touch_up(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:

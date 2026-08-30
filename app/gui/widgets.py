@@ -405,6 +405,15 @@ class BusyOverlay(QWidget):
         self._spinner.stop()
         self.hide()
 
+    def set_detail(self, detail: str) -> None:
+        """Refresh the description without resetting the elapsed timer."""
+
+        self._base_detail = detail
+        self._detail.setVisible(bool(detail))
+        self._refresh_elapsed()
+        if self.isVisible():
+            self._layout_card()
+
     @property
     def is_pending(self) -> bool:
         """Whether the overlay is showing or still waiting out its delay."""

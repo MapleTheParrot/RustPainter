@@ -482,6 +482,7 @@ class _TextOverlayOptions:
 class _WorkerSignals(QObject):
     completed = Signal(object)
     preview_ready = Signal(object)
+    stage = Signal(int, str)
     failed = Signal(int, str)
 
 
@@ -774,13 +775,16 @@ class _ImageWorker(QRunnable):
     @Slot()
     def run(self) -> None:
         try:
+            self.signals.stage.emit(self.serial, "Preparing the source image…")
             base_processed = process_image(self.image, self.options)
+            self.signals.stage.emit(self.serial, "Applying text and palette settings…")
             processed = _apply_text_overlays(base_processed, self.text_overlays)
             if self.picker is not None:
                 # Quantize the palette to colors the picker can select, so
                 # the plan asks for - and the preview promises - only colors
                 # the sign can actually receive.
                 processed = _snap_processed_to_picker(processed, self.picker)
+            self.signals.stage.emit(self.serial, "Rendering the Rust preview…")
             # The pixels are ready before the potentially much longer work of
             # grouping them into strokes. Let the GUI show this honest draft
             # while the worker continues building the plan; Exact mode uses it
@@ -794,6 +798,7 @@ class _ImageWorker(QRunnable):
             draft_processed = processed
             mode = PaintMode(self.paint_mode)
             optimization = None
+            self.signals.stage.emit(self.serial, "Building paint strokes…")
             if mode is PaintMode.EXACT:
                 plan = generate_paint_plan(processed, overpaint_gap=self.overpaint_gap)
                 unmerged_stroke_count = (
@@ -822,6 +827,7 @@ class _ImageWorker(QRunnable):
                 )
                 simulation_processed = optimized_processed
                 processed = optimized_processed
+            self.signals.stage.emit(self.serial, "Finalizing the paint plan…")
             # The simulation is the plan's own target, text baked in and
             # palette-limited, so the Rust preview promises exactly what the
             # painter will put on the sign.  Text stays editable as vector
@@ -5957,6 +5963,7 @@ class MainWindow(QMainWindow):
             self._picker_geometry(),
         )
         worker.signals.preview_ready.connect(self._on_processing_preview_ready)
+        worker.signals.stage.connect(self._on_processing_stage)
         worker.signals.completed.connect(self._on_processing_complete)
         worker.signals.failed.connect(self._on_processing_failed)
         # Recorded rather than recomputed on arrival, so the result is always
@@ -5977,6 +5984,16 @@ class MainWindow(QMainWindow):
             return
         self.paint_preview.set_source(self._pil_to_pixmap(preview.simulation))
         self.processing_label.setText("Rust preview ready — building the paint plan…")
+        self.plan_busy.set_detail("Rust preview ready — building the paint plan…")
+
+    @Slot(int, str)
+    def _on_processing_stage(self, serial: int, detail: str) -> None:
+        """Keep the long-running plan builder visibly moving between stages."""
+
+        if serial != self._process_serial or self._closing:
+            return
+        self.processing_label.setText(detail)
+        self.plan_busy.set_detail(detail)
 
     @Slot(object)
     def _on_processing_complete(self, result: _ProcessResult) -> None:
