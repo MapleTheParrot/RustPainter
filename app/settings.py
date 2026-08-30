@@ -211,6 +211,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "pause_on_mouse_move": True,
         "mouse_move_pause_threshold_pixels": 24,
         "require_rust_foreground": True,
+        "auto_resume_on_focus_return": True,
+        "auto_resume_focus_retry_seconds": 10,
         "expected_process_name": DEFAULT_EXPECTED_PROCESS_NAME,
         "expected_window_title_contains": "Rust",
         "verify_calibrated_ui": False,
@@ -604,6 +606,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
     for key in (
         "pause_on_mouse_move",
         "require_rust_foreground",
+        "auto_resume_on_focus_return",
         "verify_calibrated_ui",
         "anti_afk_enabled",
         "ui_guard_enabled",
@@ -619,6 +622,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
     may_be_zero = {"mouse_move_tolerance_pixels"}
     for key in (
         "focus_check_interval_seconds",
+        "auto_resume_focus_retry_seconds",
         "safety_poll_interval_seconds",
         "mouse_move_pause_threshold_pixels",
         "mouse_move_tolerance_pixels",

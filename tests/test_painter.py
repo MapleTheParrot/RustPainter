@@ -668,6 +668,7 @@ def test_focus_guard_pauses_before_any_input_and_rechecks_on_resume() -> None:
     painter = Painter(
         input_controller,
         foreground_checker=lambda _requirement: foreground["matches"],
+        screen_capture=_panel_capture,
     )
     painter.start(
         _dot_plan(1),
@@ -691,6 +692,64 @@ def test_focus_guard_pauses_before_any_input_and_rechecks_on_resume() -> None:
     assert painter.wait(_t(2.0))
     assert painter.state is PainterState.COMPLETED
     assert input_controller.events
+
+
+def test_focus_loss_recovers_when_rust_returns_without_mouse_movement() -> None:
+    input_controller = MockInputController()
+    input_controller.emits_real_input = True
+    foreground = {"matches": False}
+    painter = Painter(
+        input_controller,
+        foreground_checker=lambda _requirement: foreground["matches"],
+        screen_capture=_panel_capture,
+    )
+    painter.start(
+        _dot_plan(1),
+        _profile(),
+        _settings(
+            require_foreground=True,
+            focus_check_interval_seconds=0.001,
+            auto_resume_on_focus_return=True,
+            auto_resume_focus_retry_seconds=0.01,
+        ),
+    )
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    assert input_controller.events == []
+
+    foreground["matches"] = True
+    assert painter.wait(_t(2.0))
+    assert painter.state is PainterState.COMPLETED
+    assert input_controller.events
+
+
+def test_focus_recovery_stays_paused_when_the_user_moves_the_mouse() -> None:
+    input_controller = MockInputController()
+    input_controller.emits_real_input = True
+    foreground = {"matches": False}
+    painter = Painter(
+        input_controller,
+        foreground_checker=lambda _requirement: foreground["matches"],
+        screen_capture=_panel_capture,
+    )
+    painter.start(
+        _dot_plan(1),
+        _profile(),
+        _settings(
+            require_foreground=True,
+            focus_check_interval_seconds=0.001,
+            auto_resume_on_focus_return=True,
+            auto_resume_focus_retry_seconds=0.01,
+        ),
+    )
+    assert _wait_until(lambda: painter.state is PainterState.PAUSED)
+    input_controller.move_mouse(100, 100)  # User movement while it waits.
+    assert _wait_until(lambda: "automatic retry cancelled" in painter.state_reason)
+
+    foreground["matches"] = True
+    time.sleep(_t(0.05))
+    assert painter.state is PainterState.PAUSED
+    painter.abort("test cleanup")
+    assert painter.wait(_t(2.0))
 
 
 def test_a_cursor_flung_to_a_screen_corner_only_pauses() -> None:

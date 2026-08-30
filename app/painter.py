@@ -421,6 +421,11 @@ class PainterSettings:
     expected_window_title_contains: str | None = "Rust"
     expected_process_name: str | None = "RustClient.exe"
     focus_check_interval_seconds: float = 0.05
+    # A temporary focus loss is common during a long unattended paint.  Keep
+    # the job safe while Rust is elsewhere, then retry when it returns unless
+    # the user has taken the mouse back.
+    auto_resume_on_focus_return: bool = True
+    auto_resume_focus_retry_seconds: float = 10.0
     pause_on_mouse_move: bool = True
     mouse_move_pause_threshold_pixels: float = 24.0
     mouse_move_tolerance_pixels: float = 3.0
@@ -460,6 +465,8 @@ class PainterSettings:
         "expected_window_title_contains",
         "expected_process_name",
         "focus_check_interval_seconds",
+        "auto_resume_on_focus_return",
+        "auto_resume_focus_retry_seconds",
         "pause_on_mouse_move",
         "mouse_move_pause_threshold_pixels",
         "mouse_move_tolerance_pixels",
@@ -483,6 +490,7 @@ class PainterSettings:
             "stroke_interpolation_step_pixels": self.stroke_interpolation_step_pixels,
             "logical_pixel_spacing": self.logical_pixel_spacing,
             "focus_check_interval_seconds": self.focus_check_interval_seconds,
+            "auto_resume_focus_retry_seconds": self.auto_resume_focus_retry_seconds,
             "safety_poll_interval_seconds": self.safety_poll_interval_seconds,
             "mouse_move_pause_threshold_pixels": self.mouse_move_pause_threshold_pixels,
             "anti_afk_interval_seconds": self.anti_afk_interval_seconds,
@@ -586,6 +594,12 @@ class PainterSettings:
             expected_process_name=pick(safety, "expected_process_name", "RustClient.exe"),
             focus_check_interval_seconds=float(
                 pick(safety, "focus_check_interval_seconds", 0.05)
+            ),
+            auto_resume_on_focus_return=bool(
+                pick(safety, "auto_resume_on_focus_return", True)
+            ),
+            auto_resume_focus_retry_seconds=float(
+                pick(safety, "auto_resume_focus_retry_seconds", 10.0)
             ),
             pause_on_mouse_move=bool(pick(safety, "pause_on_mouse_move", True)),
             mouse_move_pause_threshold_pixels=float(
@@ -847,6 +861,9 @@ class Painter:
         self._paused_at: float | None = None
         self._paused_seconds = 0.0
         self._last_focus_check = 0.0
+        self._auto_resume_focus_wait = False
+        self._auto_resume_cursor_anchor: tuple[int, int] | None = None
+        self._next_auto_focus_retry_at = 0.0
         self._last_cursor_check = 0.0
         self._last_commanded_point: tuple[int, int] | None = None
         self._commanded_history: deque[tuple[int, int]] = deque(
@@ -1450,6 +1467,10 @@ class Painter:
         with self._condition:
             if self._state != PainterState.PAUSED or self._abort_requested:
                 return False
+            # A successful manual or automatic recovery consumes this
+            # one-shot permission. Any later pause must arm itself explicitly.
+            self._auto_resume_focus_wait = False
+            self._auto_resume_cursor_anchor = None
             now = time.monotonic()
             if self._paused_at is not None:
                 paused_for = now - self._paused_at
@@ -7148,9 +7169,11 @@ class Painter:
                 paused = (
                     self._pause_event.is_set() or self._state == PainterState.PAUSED
                 )
-                if paused:
-                    self._condition.wait(timeout=0.05)
             if paused:
+                self._try_auto_resume_after_focus_loss()
+                with self._condition:
+                    if self._pause_event.is_set() or self._state == PainterState.PAUSED:
+                        self._condition.wait(timeout=0.05)
                 continue
             if self._check_safety(check_focus=check_focus):
                 continue
@@ -7179,12 +7202,86 @@ class Painter:
                 executable=settings.expected_process_name or None,
             )
             if not self._foreground_checker(requirement):
-                self.pause("foreground window lost")
+                self._pause_for_foreground_loss(settings)
                 return True
         if check_focus and self._check_painting_ui(settings, now):
             return True
 
         return self._check_cursor(settings, now)
+
+    def _pause_for_foreground_loss(self, settings: PainterSettings) -> None:
+        """Pause for focus loss and arm hands-off recovery when configured."""
+
+        anchor: tuple[int, int] | None = None
+        if settings.auto_resume_on_focus_return:
+            try:
+                anchor = self.input.get_cursor_position()
+            except Exception:
+                LOGGER.warning("Could not read the cursor for focus recovery", exc_info=True)
+        self.pause("foreground window lost")
+        with self._condition:
+            # The pause may have lost a race to Stop; never revive such a job.
+            if self._state is not PainterState.PAUSED or self._abort_requested:
+                return
+            self._auto_resume_focus_wait = settings.auto_resume_on_focus_return
+            self._auto_resume_cursor_anchor = anchor
+            self._next_auto_focus_retry_at = (
+                time.monotonic() + settings.auto_resume_focus_retry_seconds
+            )
+        if settings.auto_resume_on_focus_return:
+            LOGGER.info(
+                "Rust focus lost; retrying in %.0f seconds unless the mouse moves",
+                settings.auto_resume_focus_retry_seconds,
+            )
+
+    def _try_auto_resume_after_focus_loss(self) -> None:
+        """Resume a focus-loss pause only after Rust returns and the mouse rests."""
+
+        with self._condition:
+            job = self._job
+            if (
+                job is None
+                or self._state is not PainterState.PAUSED
+                or not self._auto_resume_focus_wait
+                or self._abort_requested
+            ):
+                return
+            now = time.monotonic()
+            if now < self._next_auto_focus_retry_at:
+                return
+            settings = job.settings
+            self._next_auto_focus_retry_at = now + settings.auto_resume_focus_retry_seconds
+            anchor = self._auto_resume_cursor_anchor
+
+        if anchor is not None:
+            try:
+                cursor = self.input.get_cursor_position()
+            except Exception:
+                LOGGER.warning("Could not read the cursor for focus recovery", exc_info=True)
+                return
+            moved = math.hypot(cursor[0] - anchor[0], cursor[1] - anchor[1])
+            if moved >= settings.mouse_move_pause_threshold_pixels:
+                reason = "foreground window lost; automatic retry cancelled because mouse moved"
+                with self._condition:
+                    if self._state is not PainterState.PAUSED:
+                        return
+                    self._auto_resume_focus_wait = False
+                    self._auto_resume_cursor_anchor = None
+                    self._state_reason = reason
+                LOGGER.info(reason)
+                self._emit_state(PainterState.PAUSED, reason)
+                self._update_progress_state(PainterState.PAUSED, f"Paused: {reason}")
+                return
+
+        requirement = ForegroundRequirement(
+            title_contains=settings.expected_window_title_contains or None,
+            executable=settings.expected_process_name or None,
+        )
+        if not self._foreground_checker(requirement):
+            LOGGER.info("Rust is still not foreground; retrying focus recovery later")
+            return
+        LOGGER.info("Rust focus returned; automatically resuming painting")
+        self.resume()
 
     def _check_cursor(self, settings: PainterSettings, now: float) -> bool:
         """Sample the real cursor for user movement.

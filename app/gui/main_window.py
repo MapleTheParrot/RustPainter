@@ -3526,6 +3526,15 @@ class MainWindow(QMainWindow):
         self.countdown_spin.setToolTip("Time to switch focus to Rust after pressing Start.")
         self.focus_guard_check = QCheckBox("Pause unless expected window is foreground")
         self.focus_guard_check.setChecked(True)
+        self.auto_focus_resume_check = QCheckBox(
+            "Retry automatically when Rust focus returns (hands off)"
+        )
+        self.auto_focus_resume_check.setChecked(True)
+        self.auto_focus_resume_check.setToolTip(
+            "After a focus-loss pause, checks every 10 seconds and resumes from the "
+            "same stroke when Rust is foreground again. Moving the mouse while it "
+            "waits cancels automatic retry."
+        )
         self.expected_window_edit = QLineEdit("Rust")
         self.expected_window_edit.setPlaceholderText("Window title contains, e.g. Rust")
         self.expected_process_edit = QLineEdit("RustClient.exe")
@@ -3552,6 +3561,7 @@ class MainWindow(QMainWindow):
         self.abort_hotkey_combo = self._hotkey_combo("F10")
         safety_form.addRow("Countdown", self.countdown_spin)
         safety_form.addRow("Focus guard", self.focus_guard_check)
+        safety_form.addRow("Focus recovery", self.auto_focus_resume_check)
         safety_form.addRow("Expected window", self.expected_window_edit)
         safety_form.addRow("Expected process", self.expected_process_edit)
         safety_form.addRow("Mouse guard", self.mouse_pause_check)
@@ -6393,6 +6403,7 @@ class MainWindow(QMainWindow):
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
+            self.auto_focus_resume_check,
             self.expected_window_edit,
             self.expected_process_edit,
             self.mouse_pause_check,
@@ -6711,6 +6722,9 @@ class MainWindow(QMainWindow):
             self.focus_guard_check.setChecked(
                 bool(safety.get("require_rust_foreground", True))
             )
+            self.auto_focus_resume_check.setChecked(
+                bool(safety.get("auto_resume_on_focus_return", True))
+            )
             self.expected_window_edit.setText(
                 str(safety.get("expected_window_title_contains", "Rust") or "")
             )
@@ -6843,6 +6857,7 @@ class MainWindow(QMainWindow):
             "countdown_seconds": self.countdown_spin.value(),
             "pause_on_mouse_move": self.mouse_pause_check.isChecked(),
             "require_rust_foreground": self.focus_guard_check.isChecked(),
+            "auto_resume_on_focus_return": self.auto_focus_resume_check.isChecked(),
             "expected_window_title_contains": self.expected_window_edit.text().strip(),
             "expected_process_name": self.expected_process_edit.text().strip(),
             "verify_calibrated_ui": self.verify_ui_check.isChecked(),
@@ -8558,6 +8573,7 @@ class MainWindow(QMainWindow):
             self.confirm_strokes_check,
             self.confirm_rounds_spin,
             self.focus_guard_check,
+            self.auto_focus_resume_check,
             self.expected_window_edit,
             self.expected_process_edit,
             self.mouse_pause_check,
@@ -8630,6 +8646,7 @@ class MainWindow(QMainWindow):
             self.countdown_spin,
             self.dry_run_check,
             self.focus_guard_check,
+            self.auto_focus_resume_check,
             self.expected_window_edit,
             self.expected_process_edit,
             self.mouse_pause_check,

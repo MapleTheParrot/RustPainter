@@ -281,7 +281,10 @@ def test_checking_each_color_is_off_by_default_and_reading_picks_back_is_on() ->
     settings = PainterSettings.from_mapping(defaults)
     assert settings.confirm_strokes is False and settings.confirm_max_rounds == 4
     assert settings.verify_color_picks is True
+    assert settings.auto_resume_on_focus_return is True
+    assert settings.auto_resume_focus_retry_seconds == 10.0
     assert "verify_color_picks" in PainterSettings.RETUNABLE_FIELDS
+    assert "auto_resume_on_focus_return" in PainterSettings.RETUNABLE_FIELDS
     # Both can be changed from a paused job.
     assert "confirm_strokes" in PainterSettings.RETUNABLE_FIELDS
     assert "confirm_max_rounds" in PainterSettings.RETUNABLE_FIELDS
