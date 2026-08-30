@@ -85,6 +85,7 @@ from app.image_processing import (
     process_image,
     quantize_image,
 )
+from app.image_readiness import assess_image_readiness
 from app.calibration import (
     CalibrationPreviewOverlay,
     capture_display_metadata,
@@ -2349,6 +2350,29 @@ class MainWindow(QMainWindow):
         self.resolution_cap_panel.setVisible(False)
         quick_grid.addWidget(self.resolution_cap_panel, 7, 0, 1, 2)
 
+        # A source can always be enlarged, but that cannot reveal pixels a
+        # screenshot never captured.  Keep this beside Quality, where a user
+        # can make a safe, reversible choice before committing to a long run.
+        self.image_readiness_panel = QFrame()
+        self.image_readiness_panel.setObjectName("inlinePanel")
+        readiness_layout = QHBoxLayout(self.image_readiness_panel)
+        readiness_layout.setContentsMargins(10, 7, 10, 7)
+        readiness_layout.setSpacing(8)
+        readiness_layout.addWidget(_glyph_label("resolution", 16), 0, Qt.AlignmentFlag.AlignTop)
+        self.image_readiness_label = QLabel()
+        self.image_readiness_label.setObjectName("muted")
+        self.image_readiness_label.setWordWrap(True)
+        readiness_layout.addWidget(self.image_readiness_label, 1)
+        self.image_readiness_button = QPushButton()
+        self.image_readiness_button.setVisible(False)
+        self.image_readiness_button.setToolTip(
+            "Lower the paint grid to the detail actually present in this image. "
+            "The original file is never changed."
+        )
+        readiness_layout.addWidget(self.image_readiness_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.image_readiness_panel.setVisible(False)
+        quick_grid.addWidget(self.image_readiness_panel, 8, 0, 1, 2)
+
         self.custom_resolution_panel = QFrame()
         self.custom_resolution_panel.setObjectName("inlinePanel")
         custom_layout = QHBoxLayout(self.custom_resolution_panel)
@@ -2377,7 +2401,7 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(self.logical_width_spin)
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
-        quick_grid.addWidget(self.custom_resolution_panel, 8, 0, 1, 2)
+        quick_grid.addWidget(self.custom_resolution_panel, 9, 0, 1, 2)
 
         self.background_removal_panel = QFrame()
         self.background_removal_panel.setObjectName("inlinePanel")
@@ -3925,6 +3949,9 @@ class MainWindow(QMainWindow):
         self.removal_scope_combo.currentIndexChanged.connect(self._schedule_processing)
         self.transparency_combo.currentIndexChanged.connect(self._on_transparency_changed)
         self.quality_combo.currentIndexChanged.connect(self._update_quality_dimensions)
+        self.image_readiness_button.clicked.connect(
+            self._apply_recommended_image_resolution
+        )
         self.logical_width_spin.valueChanged.connect(
             lambda _value: self._on_logical_dimension_changed("width")
         )
@@ -4978,6 +5005,7 @@ class MainWindow(QMainWindow):
             result.image.width,
             result.image.height,
         )
+        self._refresh_image_readiness()
         self._schedule_processing()
 
     @Slot(int, str)
@@ -5019,6 +5047,7 @@ class MainWindow(QMainWindow):
             self._last_named_crop = value or self._last_named_crop
             self._crop_focus = None
         self._refresh_text_editor_layers()
+        self._refresh_image_readiness()
         self._schedule_processing()
 
     @Slot(float, float)
@@ -5036,6 +5065,7 @@ class MainWindow(QMainWindow):
         # The dashed frame and every text layer anchored to it follow the drag
         # immediately; the plan itself catches up on the usual debounce.
         self._refresh_text_editor_layers()
+        self._refresh_image_readiness()
         self._schedule_processing()
 
     @Slot()
@@ -5054,6 +5084,7 @@ class MainWindow(QMainWindow):
         # Stretch reshapes the backdrop text is placed over, so the editor is
         # brought up to date now rather than when the reprocess lands.
         self._refresh_text_editor_layers()
+        self._refresh_image_readiness()
         self._schedule_processing()
 
     @Slot()
@@ -5099,6 +5130,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.blockSignals(False)
         self._sync_custom_resolution(axis)
         self._refresh_resolution_cap_notice()
+        self._refresh_image_readiness()
         self._rescale_text_layers()
         # A canvas of a new shape restretches the backdrop under it, which
         # _rescale_text_layers only redraws when a layer's size moved too.
@@ -5434,6 +5466,80 @@ class MainWindow(QMainWindow):
         )
         self.resolution_cap_panel.setVisible(True)
 
+    def _refresh_image_readiness(self) -> None:
+        """Explain when the selected grid would enlarge the useful source.
+
+        The processing pipeline still accepts the image: nearest-neighbour
+        upscale is intentional because it is honest about missing detail.  The
+        notice merely makes that trade-off visible and gives people a one-click
+        way to avoid a slower, no-more-detailed plan.
+        """
+
+        source = self._original_image
+        if source is None:
+            self.image_readiness_panel.setVisible(False)
+            return
+        target = (self.logical_width_spin.value(), self._logical_height())
+        readiness = assess_image_readiness(
+            source.size, target, ScaleMode(self.scale_mode_combo.currentData())
+        )
+        self._image_readiness_recommendation = readiness.recommended_size
+        used_width, used_height = readiness.used_source_size
+        painted_width, painted_height = readiness.painted_size
+        if readiness.needs_warning:
+            recommended_width, recommended_height = readiness.recommended_size
+            self.image_readiness_label.setText(
+                f"This image contributes {used_width:,}×{used_height:,} useful pixels, "
+                f"but {target[0]:,}×{target[1]:,} quality enlarges it "
+                f"{readiness.enlargement:.1f}×. Enlarging keeps the image crisp, "
+                "but cannot add detail."
+            )
+            self.image_readiness_button.setText(
+                f"Use {recommended_width}×{recommended_height}"
+            )
+            self.image_readiness_button.setVisible(True)
+            self.image_readiness_panel.setToolTip(
+                "The source image is smaller than the paint grid after its crop. "
+                "Use the suggested grid for the same visible detail with fewer strokes."
+            )
+        else:
+            self.image_readiness_label.setText(
+                f"Source detail: {used_width:,}×{used_height:,}  •  painted area: "
+                f"{painted_width:,}×{painted_height:,}. No detail is being enlarged."
+            )
+            self.image_readiness_button.setVisible(False)
+            self.image_readiness_panel.setToolTip(
+                "The source has enough pixels for this paint grid."
+            )
+        self.image_readiness_panel.setVisible(True)
+
+    @Slot()
+    def _apply_recommended_image_resolution(self) -> None:
+        """Adopt the advisory grid without changing the imported image itself."""
+
+        recommended = getattr(self, "_image_readiness_recommendation", None)
+        if recommended is None:
+            return
+        width, height = recommended
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.setCurrentText("Custom")
+        self.quality_combo.blockSignals(False)
+        self.custom_resolution_panel.setVisible(True)
+        self.logical_width_spin.setEnabled(True)
+        self.logical_height_spin.setEnabled(True)
+        self.logical_width_spin.blockSignals(True)
+        self.logical_height_spin.blockSignals(True)
+        self.logical_width_spin.setValue(width)
+        self.logical_height_spin.setValue(height)
+        self.logical_width_spin.blockSignals(False)
+        self.logical_height_spin.blockSignals(False)
+        self._refresh_resolution_cap_notice()
+        self._refresh_image_readiness()
+        self._rescale_text_layers()
+        self._refresh_text_editor_layers()
+        self._schedule_processing()
+        self._schedule_settings_save()
+
     def _cap_to_sign_resolution(self, width: int, height: int) -> tuple[int, int]:
         """Hold a requested logical size at what the sign can actually show.
 
@@ -5509,6 +5615,7 @@ class MainWindow(QMainWindow):
         else:
             self._sync_custom_resolution("width")
         self._refresh_resolution_cap_notice()
+        self._refresh_image_readiness()
         self._rescale_text_layers()
         self._schedule_processing()
 
