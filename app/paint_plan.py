@@ -264,6 +264,13 @@ def _runs_for_color(
 # never crossing other colors.  Unlimited-palette plans land here.
 GAP_MERGE_MAX_COLORS = 2048
 
+# The original, color-at-a-time gap merger is pleasantly small and is fastest
+# for modest palettes.  On a photo-sized Max plan, however, it reads the whole
+# canvas once for every color.  738 colors on a 2048 x 1023 sign meant about
+# 1.5 billion cell visits before a single stroke could be painted.  Above this
+# budget use the equivalent run-at-a-time merger below instead.
+GAP_MERGE_MAX_SCAN_CELLS = 64 * 1024 * 1024
+
 
 def _maximal_runs_grouped(
     rgb: np.ndarray,
@@ -318,6 +325,88 @@ def _maximal_runs_grouped(
     return tuple(groups)
 
 
+def _bounded_gap_runs_grouped(
+    index_map: np.ndarray,
+    colors: list[RGBColor],
+    pixel_counts: np.ndarray,
+    max_gap: int,
+) -> tuple[ColorGroup, ...]:
+    """Merge bounded overpaint gaps in one pass over the image's row runs.
+
+    This is deliberately the same rule as :func:`_runs_for_color`: two runs
+    of color ``c`` join only when their gap is short and every intervening
+    cell belongs to a color painted after ``c``.  Vectorized endpoint tests
+    evaluate that rule once per permitted gap length, rather than re-reading
+    every pixel once per palette entry.
+    """
+
+    height, width = index_map.shape
+    run_starts = np.empty((height, width), dtype=np.bool_)
+    run_starts[:, 0] = True
+    run_starts[:, 1:] = index_map[:, 1:] != index_map[:, :-1]
+    run_ends = np.empty_like(run_starts)
+    run_ends[:, :-1] = run_starts[:, 1:]
+    run_ends[:, -1] = True
+
+    # Mark only the run endpoints that a legal short overpaint gap connects.
+    # Each gap length costs a few whole-array vector operations, independent
+    # of palette size; the previous code performed a whole-array scan for
+    # every color.
+    joined_out = np.zeros_like(run_starts)
+    joined_in = np.zeros_like(run_starts)
+    for gap in range(1, min(max_gap, width - 2) + 1):
+        span = width - gap - 1
+        left = index_map[:, :span]
+        right = index_map[:, gap + 1 :]
+        gap_min = index_map[:, 1 : span + 1].copy()
+        for offset in range(2, gap + 1):
+            np.minimum(gap_min, index_map[:, offset : offset + span], out=gap_min)
+        joins = (
+            run_ends[:, :span]
+            & run_starts[:, gap + 1 :]
+            & (left >= 0)
+            & (left == right)
+            & (gap_min > left)
+        )
+        joined_out[:, :span] |= joins
+        joined_in[:, gap + 1 :] |= joins
+
+    starts_y, starts_x = np.nonzero(run_starts & ~joined_in & (index_map >= 0))
+    ends_y, ends_x = np.nonzero(run_ends & ~joined_out & (index_map >= 0))
+    run_color = index_map[starts_y, starts_x]
+    end_color = index_map[ends_y, ends_x]
+    # Starts and ends are both in row scan order.  Sorting them with the same
+    # stable color key keeps the k-th start paired with the k-th end.
+    order = np.argsort(run_color, kind="stable")
+    end_order = np.argsort(end_color, kind="stable")
+    starts_y, starts_x, ends_x = (
+        starts_y[order],
+        starts_x[order],
+        ends_x[end_order],
+    )
+    boundaries = np.searchsorted(
+        run_color[order], np.arange(len(colors) + 1, dtype=np.int64)
+    )
+    return tuple(
+        ColorGroup(
+            color=color,
+            strokes=tuple(
+                Stroke(
+                    int(starts_x[i]),
+                    int(starts_y[i]),
+                    int(ends_x[i]),
+                    int(starts_y[i]),
+                )
+                for i in range(
+                    int(boundaries[index]), int(boundaries[index + 1])
+                )
+            ),
+            pixel_count=int(pixel_counts[index]),
+        )
+        for index, color in enumerate(colors)
+    )
+
+
 def count_unmerged_strokes(
     source: PlanImage,
     paint_mask: np.ndarray | None = None,
@@ -355,6 +444,14 @@ def generate_merged_color_groups(
     if len(colors) > GAP_MERGE_MAX_COLORS:
         return _maximal_runs_grouped(rgb, mask, index_map, colors, pixel_counts)
     max_gap = int(mask.shape[1]) if overpaint_gap is None else max(0, int(overpaint_gap))
+    if (
+        max_gap > 0
+        and max_gap < mask.shape[1]
+        and len(colors) * mask.size > GAP_MERGE_MAX_SCAN_CELLS
+    ):
+        return _bounded_gap_runs_grouped(index_map, colors, pixel_counts, max_gap)
+    if max_gap == 0:
+        return _maximal_runs_grouped(rgb, mask, index_map, colors, pixel_counts)
     groups = []
     for color_index, color in enumerate(colors):
         strokes = _runs_for_color(index_map, color_index, max_gap)

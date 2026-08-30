@@ -33,6 +33,7 @@ from .paint_plan import (
     PaintPlanTiming,
     PlanImage,
     _as_rgb_and_mask,
+    _bounded_gap_runs_grouped,
     _ordered_color_index_map,
     analyze_paint_plan,
     merge_runs_across_gaps,
@@ -680,52 +681,62 @@ def optimize_paint_plan(
         and _brush_is_achievable(diameter, capabilities)
     )
 
-    groups: list[ColorGroup] = []
-    last_diameter = 1
-    # Mirrors the painter's brush changes: each switch to a new diameter costs
-    # a click and a typed number, so the planner only pays for one when the
-    # wider brush saves more travel than the switch costs.
-    searched_diameters: set[int] = set()
-    for color_index, color in enumerate(colors):
-        allowed = index_map >= color_index
-        uncovered = index_map == color_index
-        for diameter in diameters:
-            remaining_cells = int(uncovered.sum())
-            if remaining_cells < 32:
-                break
-            if diameter == last_diameter:
-                switch_cost = 0.0
-            elif diameter in searched_diameters:
-                switch_cost = float(options.revisit_cost_cells)
-            else:
-                switch_cost = float(options.resize_cost_cells)
-            trial, strokes, covered, benefit = _evaluate_pass(
-                allowed, uncovered, diameter
+    if not diameters:
+        # A native Max-quality plan cannot safely use a wider brush.  Its
+        # entire plan is therefore detail runs, which can be built for every
+        # color in one pass rather than one full-canvas scan per color.
+        groups = list(
+            _bounded_gap_runs_grouped(
+                index_map, colors, _counts, options.overpaint_gap
             )
-            if not strokes or benefit <= switch_cost:
-                continue
-            uncovered = trial
-            groups.append(
-                ColorGroup(
-                    color=color,
-                    strokes=tuple(_serpentine(strokes)),
-                    pixel_count=covered,
-                    brush_diameter=diameter,
+        )
+    else:
+        groups = []
+        last_diameter = 1
+        # Mirrors the painter's brush changes: each switch to a new diameter costs
+        # a click and a typed number, so the planner only pays for one when the
+        # wider brush saves more travel than the switch costs.
+        searched_diameters: set[int] = set()
+        for color_index, color in enumerate(colors):
+            allowed = index_map >= color_index
+            uncovered = index_map == color_index
+            for diameter in diameters:
+                remaining_cells = int(uncovered.sum())
+                if remaining_cells < 32:
+                    break
+                if diameter == last_diameter:
+                    switch_cost = 0.0
+                elif diameter in searched_diameters:
+                    switch_cost = float(options.revisit_cost_cells)
+                else:
+                    switch_cost = float(options.resize_cost_cells)
+                trial, strokes, covered, benefit = _evaluate_pass(
+                    allowed, uncovered, diameter
                 )
-            )
-            last_diameter = diameter
-            searched_diameters.add(diameter)
-        if uncovered.any():
-            detail = _plan_detail_runs(uncovered, allowed, options.overpaint_gap)
-            groups.append(
-                ColorGroup(
-                    color=color,
-                    strokes=tuple(_serpentine(detail)),
-                    pixel_count=int(uncovered.sum()),
-                    brush_diameter=1,
+                if not strokes or benefit <= switch_cost:
+                    continue
+                uncovered = trial
+                groups.append(
+                    ColorGroup(
+                        color=color,
+                        strokes=tuple(_serpentine(strokes)),
+                        pixel_count=covered,
+                        brush_diameter=diameter,
+                    )
                 )
-            )
-            last_diameter = 1
+                last_diameter = diameter
+                searched_diameters.add(diameter)
+            if uncovered.any():
+                detail = _plan_detail_runs(uncovered, allowed, options.overpaint_gap)
+                groups.append(
+                    ColorGroup(
+                        color=color,
+                        strokes=tuple(_serpentine(detail)),
+                        pixel_count=int(uncovered.sum()),
+                        brush_diameter=1,
+                    )
+                )
+                last_diameter = 1
 
     plan = PaintPlan(
         width=width,
