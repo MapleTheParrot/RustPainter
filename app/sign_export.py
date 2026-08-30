@@ -1,8 +1,9 @@
 """Rust's own export of the painting, read back as texel-exact ground truth.
 
-The paint UI's download button writes the sign's texture to the desktop as
-``artists_canvas_<size>_<w>x<h>_<unixtime>.png`` - every texel exactly as the
-game holds it, alpha 0 where nothing was ever painted.  Measured against it,
+The paint UI's download button writes the sign's texture to the desktop as a
+PNG (historically ``artists_canvas_<size>_<w>x<h>_<unixtime>.png``) - every
+texel exactly as the game holds it, alpha 0 where nothing was ever painted.
+Measured against it,
 a screenshot of the sign at 1.77 px per texel is nearly blind: on one
 finished 1024x512 sign the screenshot-based check found 1,006 wrong texels
 where the export showed 80,000.  So whenever the download button is
@@ -29,7 +30,13 @@ from PIL import Image
 
 LOGGER = logging.getLogger("rust_painter.export")
 
-EXPORT_PATTERN = "artists_canvas_*.png"
+# Rust historically named these ``artists_canvas_*.png``.  Current builds can
+# use a different basename, but the contract we can rely on is stronger than
+# the name: the painter snapshots the directory immediately before its click
+# and consumes only a PNG that appears afterwards.  Watching every PNG keeps
+# working across game filename changes while leaving all pre-existing files
+# alone.
+EXPORT_PATTERN = "*.png"
 # How long the game gets to write the file after the button is clicked, and
 # how long the file gets to stop growing once it appears.
 EXPORT_WAIT_SECONDS = 12.0

@@ -19,6 +19,14 @@ def _write_export(directory: Path, stamp: int, painted: bool = True) -> Path:
     return path
 
 
+def _write_renamed_export(directory: Path, name: str) -> Path:
+    image = Image.new("RGBA", (8, 4), (0, 0, 0, 0))
+    image.putpixel((2, 1), (30, 60, 220, 255))
+    path = directory / name
+    image.save(path)
+    return path
+
+
 def test_load_export_reads_texels_and_whether_they_were_painted(tmp_path: Path) -> None:
     path = _write_export(tmp_path, 1)
     export = load_export(path)
@@ -39,6 +47,23 @@ def test_the_watcher_takes_only_the_file_that_appeared_after_its_click(tmp_path:
     assert export is not None and export.painted[1, 2]
     assert not produced.exists(), "the painter's own export is cleaned off the desktop"
     assert old.exists(), "a file that was there before the click is left alone"
+
+
+def test_the_watcher_accepts_a_new_png_when_rust_changes_the_export_name(
+    tmp_path: Path,
+) -> None:
+    """Filename changes must not leave every audit download on the Desktop."""
+
+    user_picture = _write_renamed_export(tmp_path, "my-painting.png")
+    watcher = ExportWatcher(tmp_path)
+    watcher.snapshot()
+    produced = _write_renamed_export(tmp_path, "sign-export-new-format.png")
+
+    export = watcher.collect(wait_seconds=2.0, sleep=lambda s: None)
+
+    assert export is not None and export.painted[1, 2]
+    assert not produced.exists(), "the PNG created by the painter's click is removed"
+    assert user_picture.exists(), "a pre-existing PNG is never consumed or removed"
 
 
 def test_the_watcher_gives_up_quietly_when_nothing_appears(tmp_path: Path) -> None:
