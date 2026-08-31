@@ -44,6 +44,8 @@ SHARED_CALIBRATION_FIELDS: tuple[str, ...] = (
     "color_box",
     "hue_bar",
     "brush_size_box",
+    "circle_brush_button",
+    "square_brush_button",
     "clear_button",
     "hunger",
     "thirst",
@@ -315,6 +317,10 @@ class CalibrationProfile:
     color_box: Rect | None = None
     hue_bar: Rect | None = None
     brush_size_box: Rect | None = None
+    # The two solid brush buttons in Rust's painting UI.  RustPainter clicks
+    # these instead of relying on fragile console variables.
+    circle_brush_button: Rect | None = None
+    square_brush_button: Rect | None = None
     # Rust's "clear the sign" control.  Painting wipes the sign with it after
     # measuring the brush, so the probe strokes never end up under the artwork.
     clear_button: Rect | None = None
@@ -368,7 +374,13 @@ class CalibrationProfile:
 
     @property
     def is_ready(self) -> bool:
-        return self.canvas is not None and self.color_box is not None and self.hue_bar is not None
+        return (
+            self.canvas is not None
+            and self.color_box is not None
+            and self.hue_bar is not None
+            and self.circle_brush_button is not None
+            and self.square_brush_button is not None
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -381,6 +393,8 @@ class CalibrationProfile:
             "color_box": self.color_box is not None,
             "hue_bar": self.hue_bar is not None,
             "brush_size_box": self.brush_size_box is not None,
+            "circle_brush_button": self.circle_brush_button is not None,
+            "square_brush_button": self.square_brush_button is not None,
             "clear_button": self.clear_button is not None,
             "save_button": self.save_button is not None,
             "hunger": self.hunger is not None,
@@ -415,6 +429,8 @@ class CalibrationProfile:
             "colorBox": _rect_dict(self.color_box),
             "hueBar": _rect_dict(self.hue_bar),
             "brushSizeBox": _rect_dict(self.brush_size_box),
+            "circleBrushButton": _rect_dict(self.circle_brush_button),
+            "squareBrushButton": _rect_dict(self.square_brush_button),
             "clearButton": _rect_dict(self.clear_button),
             "saveButton": _rect_dict(self.save_button),
             "hunger": _rect_dict(self.hunger),
@@ -449,6 +465,16 @@ class CalibrationProfile:
             brush_size_box=_rect_from(
                 _first(value, "brushSizeBox", "brush_size_box"),
                 "brush size box",
+                optional=True,
+            ),
+            circle_brush_button=_rect_from(
+                _first(value, "circleBrushButton", "circle_brush_button"),
+                "circle brush button",
+                optional=True,
+            ),
+            square_brush_button=_rect_from(
+                _first(value, "squareBrushButton", "square_brush_button"),
+                "square brush button",
                 optional=True,
             ),
             clear_button=_rect_from(

@@ -2671,6 +2671,7 @@ class MainWindow(QMainWindow):
             self.customize_image_button,
             self.customize_image_panel,
             "Customize artwork and quality",
+            expanded=True,
         )
         layout.addWidget(image_group)
 
@@ -2752,6 +2753,8 @@ class MainWindow(QMainWindow):
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
         self.brush_size_box_status = CalibrationStatus("Size value box", optional=True)
+        self.circle_brush_button_status = CalibrationStatus("Circle brush", optional=True)
+        self.square_brush_button_status = CalibrationStatus("Square brush", optional=True)
         self.clear_button_status = CalibrationStatus("Clear button", optional=True)
         self.save_button_status = CalibrationStatus("Save button", optional=True)
         self.hunger_status = CalibrationStatus("Hunger number", optional=True)
@@ -2761,6 +2764,8 @@ class MainWindow(QMainWindow):
         self.calibrate_color_box_button = QPushButton("Set area")
         self.calibrate_hue_bar_button = QPushButton("Set area")
         self.calibrate_brush_button = QPushButton("Set area")
+        self.calibrate_circle_brush_button = QPushButton("Set area")
+        self.calibrate_square_brush_button = QPushButton("Set area")
         self.calibrate_clear_button = QPushButton("Set area")
         self.calibrate_save_button = QPushButton("Set area")
         self.calibrate_hunger_button = QPushButton("Set area")
@@ -2774,6 +2779,16 @@ class MainWindow(QMainWindow):
                 self.brush_size_box_status,
                 self.calibrate_brush_button,
                 "Calibrate the numeric Size field beside Rust's size slider",
+            ),
+            (
+                self.circle_brush_button_status,
+                self.calibrate_circle_brush_button,
+                "Calibrate the solid circle brush button. RustPainter clicks it for smooth artwork.",
+            ),
+            (
+                self.square_brush_button_status,
+                self.calibrate_square_brush_button,
+                "Calibrate the solid square brush button. RustPainter clicks it for pixel art.",
             ),
             (
                 self.clear_button_status,
@@ -2841,6 +2856,7 @@ class MainWindow(QMainWindow):
             self.required_setup_button,
             self.required_setup_panel,
             "Required setup",
+            expanded=True,
         )
 
         self.optional_setup_button = QPushButton()
@@ -2914,6 +2930,7 @@ class MainWindow(QMainWindow):
             self.optional_setup_button,
             self.optional_setup_panel,
             "Optional automation and overlays",
+            expanded=True,
         )
         self.display_warning_label = QLabel("")
         self.display_warning_label.setWordWrap(True)
@@ -2955,6 +2972,7 @@ class MainWindow(QMainWindow):
             self.resume_disclosure_button,
             resume_panel,
             "Resume a previous painting",
+            expanded=True,
         )
         self.sessions_button = QPushButton()
         self.sessions_button.setObjectName("compactButton")
@@ -3656,112 +3674,37 @@ class MainWindow(QMainWindow):
         return content
 
     def _build_game_settings(self) -> QWidget:
-        """Settings that live inside Rust, applied through the game's console.
-
-        The brush opacity, the selected brush and tool, the stamp spacing,
-        which side the UI is on and the Size field's ceiling are all things
-        the game remembers between sessions and the app cannot see.  Each
-        one wrong ruins a paint without a single error, so the app types
-        them into the console itself rather than asking anyone to.
-        """
-
-        from app.game_console import CONSOLE_KEY_CHOICES, MAX_SELECTED_BRUSH
+        """Brush-selection preferences; Rust itself is controlled by clicks."""
 
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
-        title = QLabel("Rust game settings")
+        title = QLabel("Brush selection")
         title.setObjectName("pageTitle")
         note = QLabel(
-            "A few settings inside Rust decide whether paint lands the way the "
-            "preview shows it. RustPainter types them into Rust's console for "
-            "you - do this once before opening the sign."
+            "Calibrate Rust's circle and square brush buttons in Prepare Rust. "
+            "Before painting, RustPainter clicks the chosen button; it never opens "
+            "Rust's console or changes console variables."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(note)
-
-        game_group = QGroupBox("Painting settings inside Rust")
-        game_form = QFormLayout(game_group)
-        self.console_key_combo = NoWheelComboBox()
-        self.console_key_combo.setEditable(True)
-        self.console_key_combo.addItems(list(CONSOLE_KEY_CHOICES))
-        self.console_key_combo.setCurrentText(CONSOLE_KEY_CHOICES[0])
-        self.console_key_combo.setToolTip(
-            "The key that opens Rust's console.  F1 on most keyboards; a laptop\n"
-            "whose function row hides behind Fn usually needs Ctrl+F1.  Try it in\n"
-            "Rust first: the console is the dark text panel across the top."
+        group = QGroupBox("Choose brush shape")
+        form = QFormLayout(group)
+        self.brush_shape_combo = NoWheelComboBox()
+        self.brush_shape_combo.addItem("Automatic", "auto")
+        self.brush_shape_combo.addItem("Always circle", "circle")
+        self.brush_shape_combo.addItem("Always square", "square")
+        self.brush_shape_combo.setToolTip(
+            "Automatic uses square for small pixel-art grids (64 logical pixels or less "
+            "on either side) and circle for larger artwork."
         )
-        self.selected_brush_spin = self._int_spin(0, MAX_SELECTED_BRUSH, 3, "")
-        self.selected_brush_spin.setToolTip(
-            "Which of Rust's brushes to paint with, counting from 0.  Keep the\n"
-            "brush your profile was measured with; RustPainter was built on 3."
-        )
-        self.brush_spacing_spin = self._double_spin(0.0, 1.0, 0.01, 0.01, "")
-        self.brush_spacing_spin.setDecimals(2)
-        self.brush_spacing_spin.setToolTip(
-            "How far apart Rust stamps the brush along a stroke, as a fraction\n"
-            "of the brush width.  Lower is denser.  The speed presets were tuned\n"
-            "at 0.01; Rust's own default is 0.25."
-        )
-        self.apply_game_settings_button = QPushButton("Apply in Rust now")
-        self.apply_game_settings_button.setToolTip(
-            "Starts a countdown, then opens Rust's console, types the settings\n"
-            "below, and closes the console again.  Switch to Rust during the\n"
-            "countdown with the sign's painting screen already open."
-        )
-        self.game_commands_label = QLabel("")
-        self.game_commands_label.setObjectName("muted")
-        self.game_commands_label.setWordWrap(True)
-        self.game_commands_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        game_form.addRow("Console key", self.console_key_combo)
-        game_form.addRow("Brush", self.selected_brush_spin)
-        game_form.addRow("Brush spacing", self.brush_spacing_spin)
-        game_form.addRow("", self.apply_game_settings_button)
-        game_form.addRow("Will type", self.game_commands_label)
-        layout.addWidget(game_group)
-
-        steps = QLabel(
-            "How to use it:\n"
-            "1. In Rust, open the sign's painting screen and leave it open.\n"
-            "2. Click Apply in Rust now, then switch to Rust before the countdown ends.\n"
-            "3. Watch the console open, list the settings, and close on its own.\n"
-            "4. Close the painting screen with Save changes and open it again.\n"
-            "5. Paint as usual.\n\n"
-            "The painting screen has to be open: these settings belong to Rust's "
-            "sign painter, and setting them with no sign open does nothing. "
-            "Step 4 is what lets a raised maximum brush size take effect.\n\n"
-            "Rust remembers these until something changes them, so once is "
-            "usually enough. Run it again after a game update or if a paint "
-            "suddenly looks washed out or offset."
-        )
-        steps.setWordWrap(True)
-        steps.setObjectName("muted")
-        layout.addWidget(steps)
+        form.addRow("Brush shape", self.brush_shape_combo)
+        layout.addWidget(group)
         layout.addStretch(1)
         return content
-
-    def _game_convars(self) -> Any:
-        """The console settings as the widgets show them, validated."""
-
-        from app.game_console import PaintConVars
-
-        return PaintConVars(
-            selected_brush=int(self.selected_brush_spin.value()),
-            brush_spacing=float(self.brush_spacing_spin.value()),
-        )
-
-    def _refresh_game_commands_preview(self) -> None:
-        try:
-            commands = self._game_convars().commands()
-        except ValueError as exc:
-            self.game_commands_label.setText(str(exc))
-            return
-        self.game_commands_label.setText("\n".join(commands))
 
     def _build_color_settings(self) -> QWidget:
         content = QWidget()
@@ -6430,6 +6373,12 @@ class MainWindow(QMainWindow):
                 "brush_size_box", "numeric Size field beside the size slider"
             )
         )
+        self.calibrate_circle_brush_button.clicked.connect(
+            lambda: self._begin_calibration("circle_brush_button", "solid circle brush button")
+        )
+        self.calibrate_square_brush_button.clicked.connect(
+            lambda: self._begin_calibration("square_brush_button", "solid square brush button")
+        )
         self.calibrate_clear_button.clicked.connect(
             lambda: self._begin_calibration(
                 "clear_button", "trash / clear icon that wipes the sign"
@@ -6463,16 +6412,7 @@ class MainWindow(QMainWindow):
         self.capture_reference_button.clicked.connect(self._capture_reference)
         for name, button in self.debug_buttons.items():
             button.clicked.connect(lambda _checked=False, action=name: self._run_debug_action(action))
-        self.apply_game_settings_button.clicked.connect(self._run_game_setup)
-        # An editable combo changes by typing as well as by picking.
-        self.console_key_combo.editTextChanged.connect(self._schedule_settings_save)
-        self.selected_brush_spin.valueChanged.connect(
-            lambda _value: self._refresh_game_commands_preview()
-        )
-        self.brush_spacing_spin.valueChanged.connect(
-            lambda _value: self._refresh_game_commands_preview()
-        )
-        self._refresh_game_commands_preview()
+        self.brush_shape_combo.currentIndexChanged.connect(self._schedule_settings_save)
 
         self.show_calibration_check.toggled.connect(self._on_show_calibration_toggled)
         self.show_status_check.toggled.connect(self._on_show_calibration_toggled)
@@ -6569,9 +6509,7 @@ class MainWindow(QMainWindow):
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
-            self.console_key_combo,
-            self.selected_brush_spin,
-            self.brush_spacing_spin,
+            self.brush_shape_combo,
         )
         for control in settings_controls:
             if isinstance(control, QComboBox):
@@ -6896,11 +6834,9 @@ class MainWindow(QMainWindow):
             self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
             self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
             self.abort_hotkey_combo.setCurrentText(str(hotkeys.get("abort", "F10")))
-            game = settings.get("game", {})
-            self.console_key_combo.setCurrentText(str(game.get("console_key", "F1")))
-            self.selected_brush_spin.setValue(int(game.get("selected_brush", 3)))
-            self.brush_spacing_spin.setValue(float(game.get("brush_spacing", 0.01)))
-            self._refresh_game_commands_preview()
+            brush_shape = str(settings.get("painting", {}).get("brush_shape", "auto"))
+            index = self.brush_shape_combo.findData(brush_shape)
+            self.brush_shape_combo.setCurrentIndex(max(0, index))
         finally:
             for control in controls:
                 control.blockSignals(False)
@@ -7021,12 +6957,9 @@ class MainWindow(QMainWindow):
             "anti_afk_enabled": self.anti_afk_check.isChecked(),
             "anti_afk_interval_minutes": self.anti_afk_interval_spin.value(),
         }
-        current["game"] = {
-            **current.get("game", {}),
-            "console_key": self.console_key_combo.currentText().strip() or "F1",
-            "selected_brush": self.selected_brush_spin.value(),
-            "brush_spacing": round(self.brush_spacing_spin.value(), 4),
-        }
+        current["painting"]["brush_shape"] = str(
+            self.brush_shape_combo.currentData() or "auto"
+        )
         current["execution"] = {
             **current.get("execution", {}),
             "dry_run": self.dry_run_check.isChecked(),
@@ -7150,6 +7083,12 @@ class MainWindow(QMainWindow):
         )
         self.clear_button_status.set_calibrated(
             bool(status.get("clear_button")), brush_optional
+        )
+        self.circle_brush_button_status.set_calibrated(
+            bool(status.get("circle_brush_button")), False
+        )
+        self.square_brush_button_status.set_calibrated(
+            bool(status.get("square_brush_button")), False
         )
         # The anti-AFK break leaves the painting UI through Save; with the
         # break off, the button is never clicked.
@@ -7746,6 +7685,8 @@ class MainWindow(QMainWindow):
         "Color box": "color_box",
         "Hue bar": "hue_bar",
         "Size value box": "brush_size_box",
+        "Circle brush": "circle_brush_button",
+        "Square brush": "square_brush_button",
         "Clear button": "clear_button",
         "Save button": "save_button",
         "Hunger number": "hunger",
@@ -7818,6 +7759,8 @@ class MainWindow(QMainWindow):
                     ("Color box", getattr(profile, "color_box", None)),
                     ("Hue bar", getattr(profile, "hue_bar", None)),
                     ("Size value box", getattr(profile, "brush_size_box", None)),
+                    ("Circle brush", getattr(profile, "circle_brush_button", None)),
+                    ("Square brush", getattr(profile, "square_brush_button", None)),
                     ("Clear button", getattr(profile, "clear_button", None)),
                     ("Save button", getattr(profile, "save_button", None)),
                     ("Hunger number", getattr(profile, "hunger", None)),
@@ -8676,6 +8619,8 @@ class MainWindow(QMainWindow):
                     ("canvas", self._current_profile.canvas is not None),
                     ("color box", self._current_profile.color_box is not None),
                     ("hue bar", self._current_profile.hue_bar is not None),
+                    ("circle brush", self._current_profile.circle_brush_button is not None),
+                    ("square brush", self._current_profile.square_brush_button is not None),
                 )
                 if self._current_profile is not None and not done
             ]
@@ -8812,10 +8757,7 @@ class MainWindow(QMainWindow):
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
-            self.console_key_combo,
-            self.selected_brush_spin,
-            self.brush_spacing_spin,
-            self.apply_game_settings_button,
+            self.brush_shape_combo,
             self.capture_reference_button,
             self.prepare_color_chart_button,
             self.measure_color_chart_button,
@@ -9476,6 +9418,8 @@ class MainWindow(QMainWindow):
             # The touch-up pass restarts the bar for its own, smaller plan;
             # titled anything less specific, it reads as the job starting over.
             self.active_progress_title.setText("TOUCHING UP")
+        elif phase == "paint":
+            self.active_progress_title.setText("PAINTING")
         if (
             getattr(progress, "phase", "paint") == "paint"
             and getattr(progress.state, "value", "") == "running"

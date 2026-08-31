@@ -6,7 +6,7 @@ python -m PyInstaller `
     --onefile `
     --windowed `
     --name RustPainter `
-    --icon RustPainterIcon.ico `
+    --icon RustPainterIcon.png `
     --add-data "RustPainterIcon.png;." `
     --add-data "assets/ui;assets/ui" `
     main.py

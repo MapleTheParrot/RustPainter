@@ -241,6 +241,8 @@ class PaintingTarget:
     color_box: RectangleLike
     hue_bar: RectangleLike
     brush_size_box: RectangleLike | None = None
+    circle_brush_button: RectangleLike | None = None
+    square_brush_button: RectangleLike | None = None
     clear_button: RectangleLike | None = None
     save_button: RectangleLike | None = None
     hunger: RectangleLike | None = None
@@ -331,6 +333,8 @@ class PaintingTarget:
             color_box=color_box,
             hue_bar=hue_bar,
             brush_size_box=getattr(profile, "brush_size_box", None),
+            circle_brush_button=getattr(profile, "circle_brush_button", None),
+            square_brush_button=getattr(profile, "square_brush_button", None),
             clear_button=getattr(profile, "clear_button", None),
             save_button=getattr(profile, "save_button", None),
             hunger=getattr(profile, "hunger", None),
@@ -415,6 +419,7 @@ class PainterSettings:
     # pick again when the clicks did not take.
     verify_color_picks: bool = True
     brush_direction: str = "low_to_high"
+    brush_shape: str = "auto"
     delay_after_brush_seconds: float = 0.07
     countdown_seconds: float = 3.0
     require_foreground: bool = False
@@ -522,6 +527,8 @@ class PainterSettings:
             raise ValueError("confirm_max_rounds must be an integer between 1 and 8")
         if self.brush_direction not in {"low_to_high", "high_to_low"}:
             raise ValueError("brush_direction must be low_to_high or high_to_low")
+        if self.brush_shape not in {"auto", "circle", "square"}:
+            raise ValueError("brush_shape must be auto, circle, or square")
         if not math.isfinite(self.brush_size) or not 0.0 <= self.brush_size <= 1.0:
             raise ValueError("brush_size must be a finite value between 0 and 1")
         if self.require_foreground and not (
@@ -583,6 +590,7 @@ class PainterSettings:
             interim_audit_seconds=float(pick(painting, "interim_audit_seconds", 600.0)),
             verify_color_picks=bool(pick(painting, "verify_color_picks", True)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
+            brush_shape=str(pick(painting, "brush_shape", "auto")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
             require_foreground=bool(
@@ -1735,6 +1743,7 @@ class Painter:
             self._checkpoint(check_focus=True)
             self._confirm_painting_ui(job)
             job.target = self._measured_picker_target(job.target)
+            self._select_brush(job)
             self._locate_color_swatch(job)
             if job.mode == "measure_brush":
                 measured = self._measure_brush_size_model(job)
@@ -2103,6 +2112,29 @@ class Painter:
         return SimpleNamespace(
             left=canvas.left, top=canvas.top, width=width, height=height
         )
+
+    def _select_brush(self, job: _Job) -> None:
+        """Click the profile's calibrated solid brush before any probes or paint."""
+
+        shape = job.settings.brush_shape
+        if shape == "auto":
+            # A small logical grid is intentional pixel art; its square cells
+            # need the square stamp.  Larger grids benefit from the smoother
+            # circular edge.  The GUI normally resolves auto before start.
+            shape = "square" if min(job.plan.width, job.plan.height) <= 64 else "circle"
+        button = (
+            job.target.square_brush_button
+            if shape == "square"
+            else job.target.circle_brush_button
+        )
+        if button is None:
+            raise ValueError(
+                f"Calibrate Rust's {shape} brush button before painting."
+            )
+        epoch = self._pause_generation
+        self._safe_click(button.center, epoch)
+        self._settle(job.settings.delay_after_brush_seconds, epoch=epoch)
+        LOGGER.info("Selected the calibrated %s brush", shape)
 
     def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:
         """Type the Size number that paints ``diameter_cells`` logical cells.

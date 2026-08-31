@@ -14,7 +14,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .game_console import MAX_SELECTED_BRUSH, validate_console_key
 from .hotkeys import (
     SUPPORTED_HOTKEY_CHOICES,
     is_supported_hotkey,
@@ -146,6 +145,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # cannot read already falls back to the brush-derived grid on its own.
         "measure_texel_grid": True,
         "brush_direction": "low_to_high",
+        # Choose a calibrated brush button automatically from the logical
+        # artwork size, or explicitly when the artwork calls for it.
+        "brush_shape": "auto",
         "logical_pixel_spacing": 1.0,
         "stroke_speed_pixels_per_second": 700.0,
         # The Standard preset.  Holds and settles sit on the game's frame
@@ -191,20 +193,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "hotkeys": {
         "start_resume": "F8",
         "abort": "F10",
-    },
-    # Settings that live inside Rust and that painting silently depends on.
-    # They are typed into the game's console from Settings > Rust; see
-    # app/game_console.py for what each one protects against.
-    "game": {
-        # The key that opens Rust's console: F1, or a modifier chord on a
-        # laptop whose function row hides behind Fn.
-        "console_key": "F1",
-        # Rust's brush index (0 is the first).  Whatever brush the profile
-        # was measured on; the app was developed on brush 3.
-        "selected_brush": 3,
-        # Stamp spacing as a fraction of the brush diameter (0..1).  The
-        # drag speeds were tuned at 0.01; Rust's own default is 0.25.
-        "brush_spacing": 0.01,
     },
     "safety": {
         "countdown_seconds": 3,
@@ -290,7 +278,6 @@ def _validate(settings: Mapping[str, Any]) -> None:
     painting = settings.get("painting")
     timelapse = settings.get("timelapse")
     hotkeys = settings.get("hotkeys")
-    game = settings.get("game")
     safety = settings.get("safety")
     execution = settings.get("execution")
     ui = settings.get("ui")
@@ -299,7 +286,6 @@ def _validate(settings: Mapping[str, Any]) -> None:
         ("painting", painting),
         ("timelapse", timelapse),
         ("hotkeys", hotkeys),
-        ("game", game),
         ("safety", safety),
         ("execution", execution),
         ("ui", ui),
@@ -514,6 +500,8 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError("painting.reuse_calibration must be true or false")
     if not isinstance(painting.get("measure_texel_grid"), bool):
         raise SettingsError("painting.measure_texel_grid must be true or false")
+    if painting.get("brush_shape", "auto") not in {"auto", "circle", "square"}:
+        raise SettingsError("painting.brush_shape must be auto, circle, or square")
     if not isinstance(painting.get("brush_direction"), str) or painting.get(
         "brush_direction"
     ) not in {"low_to_high", "high_to_low"}:
@@ -639,30 +627,6 @@ def _validate(settings: Mapping[str, Any]) -> None:
             raise SettingsError(f"safety.{key} must be a finite non-negative number")
         if key not in may_be_zero and value == 0:
             raise SettingsError(f"safety.{key} must be positive")
-
-    assert isinstance(game, Mapping)
-    console_key = game.get("console_key")
-    if not isinstance(console_key, str) or not console_key.strip():
-        raise SettingsError("game.console_key must be a non-empty string")
-    try:
-        validate_console_key(console_key)
-    except ValueError as exc:
-        raise SettingsError(f"game.console_key is not a key the app can press: {exc}") from exc
-    selected_brush = game.get("selected_brush")
-    if (
-        isinstance(selected_brush, bool)
-        or not isinstance(selected_brush, int)
-        or not 0 <= selected_brush <= MAX_SELECTED_BRUSH
-    ):
-        raise SettingsError(f"game.selected_brush must be an integer from 0 to {MAX_SELECTED_BRUSH}")
-    spacing = game.get("brush_spacing")
-    if (
-        isinstance(spacing, bool)
-        or not isinstance(spacing, (int, float))
-        or not math.isfinite(float(spacing))
-        or not 0.0 <= float(spacing) <= 1.0
-    ):
-        raise SettingsError("game.brush_spacing must be a number from 0 to 1")
 
     assert isinstance(execution, Mapping)
     for key in ("dry_run", "debug_mouse_logging"):

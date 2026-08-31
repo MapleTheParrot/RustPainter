@@ -39,7 +39,21 @@ if (-not (Test-Path -LiteralPath $entryScript)) {
     throw "No main.py next to this script"
 }
 
-$icon = Join-Path $PSScriptRoot "RustPainterIcon.ico"
+$iconSource = Join-Path $PSScriptRoot "RustPainterIcon.png"
+$iconDirectory = Join-Path $env:LOCALAPPDATA "RustPainter"
+$icon = Join-Path $iconDirectory "RustPainterIcon.ico"
+if (Test-Path -LiteralPath $iconSource) {
+    New-Item -ItemType Directory -Path $iconDirectory -Force | Out-Null
+    $iconScript = "from PIL import Image; import sys; Image.open(sys.argv[1]).save(sys.argv[2], format='ICO', sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])"
+    $iconInterpreter = Join-Path (Split-Path -Parent $interpreter) "python.exe"
+    if (-not (Test-Path -LiteralPath $iconInterpreter)) {
+        $iconInterpreter = $interpreter
+    }
+    & $iconInterpreter -c $iconScript $iconSource $icon
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create the shortcut icon from $iconSource"
+    }
+}
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcutPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "RustPainter (Dev).lnk"
