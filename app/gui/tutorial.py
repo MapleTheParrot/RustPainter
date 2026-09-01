@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
 from .assets import asset_path
 
 
-# 2: the step that types Rust's paint settings through the console.
-TUTORIAL_VERSION = 2
+# 3: the optional temporary Rust UI-scale workflow.
+TUTORIAL_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,15 +38,13 @@ class TutorialStep:
 
 TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     TutorialStep(
-        "Let RustPainter set up Rust",
-        "Open the sign's painting screen and leave it open. Under Settings → "
-        "Rust, click Apply in Rust now and switch to Rust during the "
-        "countdown. The console opens, RustPainter types the paint settings "
-        "it relies on (full opacity, the right brush and tool, stamp "
-        "spacing), and it closes again. Then close the painting screen with "
-        "Save changes and open it again. Rust remembers them, so once is "
-        "usually enough. If your laptop needs Fn for F1, pick Ctrl+F1 as the "
-        "console key first.",
+        "Choose the painting UI scale",
+        "For more placement room, optionally enable temporary UI scaling "
+        "under Settings > Rust. Click Apply painting scale now, switch to "
+        "Rust during the countdown, then calibrate every region at that "
+        "scale. RustPainter applies it for each real paint session and "
+        "restores your configured normal scale afterward. Verify the console "
+        "key first; compact keyboards may need Ctrl+F1.",
         "tutorial-rust-console",
     ),
     TutorialStep(

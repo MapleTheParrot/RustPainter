@@ -176,6 +176,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # groups on one 1024x512 sign - and this is what stops it.
         "verify_color_picks": True,
     },
+    "game": {
+        # Opt-in for existing installs because every saved rectangle must have
+        # been calibrated at the managed painting scale.
+        "manage_ui_scale": False,
+        "painting_ui_scale": 0.5,
+        "normal_ui_scale": 1.0,
+        "console_key": "F1",
+    },
     "timelapse": {
         # Capture the calibrated canvas region while painting, one PNG frame
         # per interval, into a per-job session folder under data/timelapse.
@@ -276,6 +284,7 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[st
 def _validate(settings: Mapping[str, Any]) -> None:
     image = settings.get("image")
     painting = settings.get("painting")
+    game = settings.get("game")
     timelapse = settings.get("timelapse")
     hotkeys = settings.get("hotkeys")
     safety = settings.get("safety")
@@ -284,6 +293,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
     for label, section in (
         ("image", image),
         ("painting", painting),
+        ("game", game),
         ("timelapse", timelapse),
         ("hotkeys", hotkeys),
         ("safety", safety),
@@ -535,6 +545,24 @@ def _validate(settings: Mapping[str, Any]) -> None:
         raise SettingsError("painting.confirm_max_rounds must be an integer from 1 to 8")
     if not isinstance(painting.get("verify_color_picks", True), bool):
         raise SettingsError("painting.verify_color_picks must be true or false")
+
+    assert isinstance(game, Mapping)
+    if not isinstance(game.get("manage_ui_scale"), bool):
+        raise SettingsError("game.manage_ui_scale must be true or false")
+    from .game_console import validate_console_key, validate_ui_scale
+
+    try:
+        validate_ui_scale(game.get("painting_ui_scale"))
+    except ValueError as exc:
+        raise SettingsError(f"game.painting_ui_scale: {exc}") from exc
+    try:
+        validate_ui_scale(game.get("normal_ui_scale"))
+    except ValueError as exc:
+        raise SettingsError(f"game.normal_ui_scale: {exc}") from exc
+    try:
+        validate_console_key(game.get("console_key"))
+    except ValueError as exc:
+        raise SettingsError(f"game.console_key: {exc}") from exc
 
     assert isinstance(timelapse, Mapping)
     for key in ("enabled", "capture_final_frame"):

@@ -3674,25 +3674,63 @@ class MainWindow(QMainWindow):
         return content
 
     def _build_game_settings(self) -> QWidget:
-        """Brush-selection preferences; Rust itself is controlled by clicks."""
+        """Rust-side settings used during a paint session."""
+
+        from app.game_console import CONSOLE_KEY_CHOICES
 
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
-        title = QLabel("Brush selection")
+        title = QLabel("Rust session settings")
         title.setObjectName("pageTitle")
         note = QLabel(
-            "Calibrate Rust's circle and square brush buttons in Prepare Rust. "
-            "Before painting, RustPainter clicks the chosen button; it never opens "
-            "Rust's console or changes console variables."
+            "RustPainter can temporarily shrink Rust's UI while it paints, giving "
+            "the enlarged sign canvas more physical pixels for accurate placement."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(note)
-        group = QGroupBox("Choose brush shape")
-        form = QFormLayout(group)
+        scale_group = QGroupBox("Painting UI scale")
+        scale_form = QFormLayout(scale_group)
+        self.manage_ui_scale_check = QCheckBox(
+            "Set a temporary UI scale for every real paint session"
+        )
+        self.manage_ui_scale_check.setToolTip(
+            "Opens Rust's console after the Start countdown, applies the painting "
+            "scale, and restores the normal scale when the job completes or stops."
+        )
+        self.painting_ui_scale_spin = self._double_spin(0.5, 1.0, 0.5, 0.05, "")
+        self.painting_ui_scale_spin.setDecimals(2)
+        self.normal_ui_scale_spin = self._double_spin(0.5, 1.0, 1.0, 0.05, "")
+        self.normal_ui_scale_spin.setDecimals(2)
+        self.console_key_combo = NoWheelComboBox()
+        self.console_key_combo.setEditable(True)
+        self.console_key_combo.addItems(list(CONSOLE_KEY_CHOICES))
+        self.console_key_combo.setCurrentText("F1")
+        self.apply_game_settings_button = QPushButton("Apply painting scale now")
+        self.apply_game_settings_button.setToolTip(
+            "Use this before calibrating: switch to Rust during the countdown, "
+            "then draw every calibration rectangle at the painting scale."
+        )
+        scale_form.addRow("Automatic", self.manage_ui_scale_check)
+        scale_form.addRow("While painting", self.painting_ui_scale_spin)
+        scale_form.addRow("Restore afterward", self.normal_ui_scale_spin)
+        scale_form.addRow("Console key", self.console_key_combo)
+        scale_form.addRow("", self.apply_game_settings_button)
+        scale_note = QLabel(
+            "Calibrate the canvas and controls at the painting scale. Existing "
+            "profiles made at another scale must be recalibrated before enabling this. "
+            "Keep Rust foreground when stopping so the normal scale can be restored."
+        )
+        scale_note.setWordWrap(True)
+        scale_note.setObjectName("muted")
+        scale_form.addRow("", scale_note)
+        layout.addWidget(scale_group)
+
+        brush_group = QGroupBox("Choose brush shape")
+        form = QFormLayout(brush_group)
         self.brush_shape_combo = NoWheelComboBox()
         self.brush_shape_combo.addItem("Automatic", "auto")
         self.brush_shape_combo.addItem("Always circle", "circle")
@@ -3702,9 +3740,24 @@ class MainWindow(QMainWindow):
             "on either side) and circle for larger artwork."
         )
         form.addRow("Brush shape", self.brush_shape_combo)
-        layout.addWidget(group)
+        layout.addWidget(brush_group)
         layout.addStretch(1)
         return content
+
+    def _sync_ui_scale_controls(self, *_args: Any) -> None:
+        enabled = self.manage_ui_scale_check.isChecked()
+        for control in (
+            self.painting_ui_scale_spin,
+            self.normal_ui_scale_spin,
+            self.console_key_combo,
+        ):
+            control.setEnabled(enabled)
+
+    def _game_commands(self) -> tuple[str, ...]:
+        from app.game_console import ui_scale_command, validate_console_key
+
+        validate_console_key(self.console_key_combo.currentText())
+        return (ui_scale_command(self.painting_ui_scale_spin.value()),)
 
     def _build_color_settings(self) -> QWidget:
         content = QWidget()
@@ -6510,6 +6563,10 @@ class MainWindow(QMainWindow):
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
             self.brush_shape_combo,
+            self.manage_ui_scale_check,
+            self.painting_ui_scale_spin,
+            self.normal_ui_scale_spin,
+            self.console_key_combo,
         )
         for control in settings_controls:
             if isinstance(control, QComboBox):
@@ -6526,6 +6583,11 @@ class MainWindow(QMainWindow):
         self.start_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
         self.abort_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
         self.dry_run_check.toggled.connect(self._update_start_availability)
+        self.manage_ui_scale_check.toggled.connect(self._sync_ui_scale_controls)
+        self.manage_ui_scale_check.toggled.connect(self._update_start_availability)
+        self.focus_guard_check.toggled.connect(self._update_start_availability)
+        self.apply_game_settings_button.clicked.connect(self._run_game_setup)
+        self._sync_ui_scale_controls()
 
     @staticmethod
     def _set_combo_data(combo: QComboBox, value: Any) -> None:
@@ -6588,6 +6650,7 @@ class MainWindow(QMainWindow):
     def _apply_settings(self, settings: dict[str, Any]) -> None:
         image = settings.get("image", {})
         painting = settings.get("painting", {})
+        game = settings.get("game", {})
         hotkeys = settings.get("hotkeys", {})
         safety = settings.get("safety", {})
         execution = settings.get("execution", {})
@@ -6837,6 +6900,10 @@ class MainWindow(QMainWindow):
             brush_shape = str(settings.get("painting", {}).get("brush_shape", "auto"))
             index = self.brush_shape_combo.findData(brush_shape)
             self.brush_shape_combo.setCurrentIndex(max(0, index))
+            self.manage_ui_scale_check.setChecked(bool(game.get("manage_ui_scale", False)))
+            self.painting_ui_scale_spin.setValue(float(game.get("painting_ui_scale", 0.5)))
+            self.normal_ui_scale_spin.setValue(float(game.get("normal_ui_scale", 1.0)))
+            self.console_key_combo.setCurrentText(str(game.get("console_key", "F1")))
         finally:
             for control in controls:
                 control.blockSignals(False)
@@ -6851,6 +6918,7 @@ class MainWindow(QMainWindow):
         self._sync_paint_mode_dependent_controls()
         self._refresh_timelapse_speed_label()
         self._refresh_text_editor_layers()
+        self._sync_ui_scale_controls()
 
     def _settings_document(self) -> dict[str, Any]:
         current = self._settings.copy()
@@ -6960,6 +7028,13 @@ class MainWindow(QMainWindow):
         current["painting"]["brush_shape"] = str(
             self.brush_shape_combo.currentData() or "auto"
         )
+        current["game"] = {
+            **current.get("game", {}),
+            "manage_ui_scale": self.manage_ui_scale_check.isChecked(),
+            "painting_ui_scale": round(self.painting_ui_scale_spin.value(), 2),
+            "normal_ui_scale": round(self.normal_ui_scale_spin.value(), 2),
+            "console_key": self.console_key_combo.currentText().strip() or "F1",
+        }
         current["execution"] = {
             **current.get("execution", {}),
             "dry_run": self.dry_run_check.isChecked(),
@@ -7250,6 +7325,7 @@ class MainWindow(QMainWindow):
                         "brush_size_model",
                         "texel_grid",
                         "calibration_performance",
+                        "rust_ui_scale",
                     ):
                         if key in source.metadata:
                             candidate.metadata[key] = deepcopy(source.metadata[key])
@@ -7431,6 +7507,10 @@ class MainWindow(QMainWindow):
                 name: round(float(region.confidence), 3)
                 for name, region in detection.regions.items()
             }
+            if self.manage_ui_scale_check.isChecked():
+                candidate.metadata["rust_ui_scale"] = round(
+                    self.painting_ui_scale_spin.value(), 2
+                )
             candidate.display = capture_display_metadata()
             self._current_profile = self._profile_store.save(candidate)
         except Exception as exc:
@@ -7492,6 +7572,10 @@ class MainWindow(QMainWindow):
                     setattr(candidate, other, None)
             candidate.metadata.pop("ui_reference", None)
         setattr(candidate, field, rectangle)
+        if self.manage_ui_scale_check.isChecked():
+            candidate.metadata["rust_ui_scale"] = round(
+                self.painting_ui_scale_spin.value(), 2
+            )
         removed_reference: Any = None
         if field in {"color_box", "hue_bar"}:
             removed_reference = candidate.metadata.pop("ui_reference", None)
@@ -8641,6 +8725,15 @@ class MainWindow(QMainWindow):
                     "Anti-AFK off under Preferences to paint without it."
                 )
             return "Finish calibrating this profile before painting."
+        if (
+            not self.dry_run_check.isChecked()
+            and self.manage_ui_scale_check.isChecked()
+            and not self.focus_guard_check.isChecked()
+        ):
+            return (
+                "Temporary Rust UI scaling types a console command, so the "
+                "foreground guard must be enabled under Safety."
+            )
         if not self.dry_run_check.isChecked() and not self._emergency_hotkey_available():
             return (
                 "The global stop hotkey is not active, so real painting is blocked. "
@@ -8758,6 +8851,11 @@ class MainWindow(QMainWindow):
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
             self.brush_shape_combo,
+            self.manage_ui_scale_check,
+            self.painting_ui_scale_spin,
+            self.normal_ui_scale_spin,
+            self.console_key_combo,
+            self.apply_game_settings_button,
             self.capture_reference_button,
             self.prepare_color_chart_button,
             self.measure_color_chart_button,
@@ -8813,6 +8911,7 @@ class MainWindow(QMainWindow):
                     and "color_correction" in self._current_profile.metadata
                 )
             )
+            self._sync_ui_scale_controls()
 
     def _launch_countdown(
         self,
@@ -8911,6 +9010,12 @@ class MainWindow(QMainWindow):
             )
             return
         if not self.dry_run_check.isChecked():
+            if not self._confirm_profile_ui_scale():
+                self.statusBar().showMessage(
+                    "Start cancelled: confirm or recalibrate the profile at the painting UI scale",
+                    8000,
+                )
+                return
             self._refresh_display_warning()
             try:
                 self._validate_profile_on_virtual_screen(
@@ -8918,7 +9023,7 @@ class MainWindow(QMainWindow):
                     anti_afk=self.anti_afk_check.isChecked(),
                 )
             except ValueError as exc:
-                QMessageBox.critical(self, "Calibration is outside the desktop", str(exc))
+                QMessageBox.critical(self, "Calibration mismatch", str(exc))
                 return
         if (
             not self.dry_run_check.isChecked()
@@ -9043,6 +9148,17 @@ class MainWindow(QMainWindow):
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No sign profile is selected")
+        game = self._settings_document().get("game", {})
+        if bool(game.get("manage_ui_scale", False)):
+            wanted = round(float(game.get("painting_ui_scale", 0.5)), 2)
+            metadata = getattr(profile, "metadata", {})
+            calibrated = metadata.get("rust_ui_scale") if isinstance(metadata, Mapping) else None
+            if calibrated is not None and round(float(calibrated), 2) != wanted:
+                raise ValueError(
+                    f"This profile was calibrated at Rust UI scale {float(calibrated):g}, "
+                    f"but paint sessions are configured for {wanted:g}. Apply the "
+                    "painting scale under Settings > Rust and recalibrate the profile."
+                )
         from app.screen import get_virtual_screen
 
         desktop = get_virtual_screen()
@@ -9083,6 +9199,43 @@ class MainWindow(QMainWindow):
                     f"({rectangle.left}, {rectangle.top}, {rectangle.width}, {rectangle.height}) "
                     "is not wholly inside the current virtual desktop. Recalibrate it."
                 )
+
+    def _confirm_profile_ui_scale(self) -> bool:
+        """Bind a legacy profile to the managed scale only with confirmation."""
+
+        if self.dry_run_check.isChecked() or not self.manage_ui_scale_check.isChecked():
+            return True
+        profile = self._current_profile
+        if profile is None:
+            return False
+        metadata = profile.metadata if isinstance(profile.metadata, dict) else {}
+        if metadata.get("rust_ui_scale") is not None:
+            return True
+        scale = round(self.painting_ui_scale_spin.value(), 2)
+        if (
+            QMessageBox.question(
+                self,
+                "Confirm this profile's Rust UI scale",
+                f"This profile predates automatic UI-scale tracking. Was every "
+                f"canvas and control rectangle calibrated while Rust's UI scale "
+                f"was {scale:g}?\n\nChoose No, apply the painting scale under "
+                "Settings > Rust, and recalibrate if you are not certain.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return False
+        try:
+            candidate = Profile.from_dict(profile.to_dict())
+            candidate.metadata["rust_ui_scale"] = scale
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not bind the profile to its Rust UI scale")
+            QMessageBox.warning(self, "Could not update profile", str(exc))
+            return False
+        LOGGER.info("Profile %s confirmed at Rust UI scale %.2f", profile.name, scale)
+        return True
 
     def _begin_paint_after_countdown(self) -> None:
         pending = self._pending_paint
@@ -9612,10 +9765,37 @@ class MainWindow(QMainWindow):
             # resolution the brush cannot paint.  Losing it because the
             # user stopped the job is how the same mistake gets repeated.
             self._store_measured_brush_model()
+            target_painter = self._painter
+            QTimer.singleShot(
+                100,
+                lambda target=target_painter: self._check_ui_scale_restoration(target),
+            )
         if reason:
             self.statusBar().showMessage(f"{value.title()}: {reason}", 5000)
         LOGGER.info("Painter state: %s (%s)", value, reason)
         self._update_start_availability()
+
+    def _check_ui_scale_restoration(self, painter: Any) -> None:
+        """Report a terminal job that could not safely restore Rust's UI."""
+
+        if painter is None or self._closing:
+            return
+        if painter.is_alive:
+            QTimer.singleShot(
+                100, lambda target=painter: self._check_ui_scale_restoration(target)
+            )
+            return
+        message = painter.ui_scale_restore_error
+        if not message:
+            return
+        warning = (
+            "RustPainter could not restore your normal Rust UI scale because "
+            f"{message}. Bring Rust to the foreground and set "
+            f"graphics.uiscale {self.normal_ui_scale_spin.value():g} in F1."
+        )
+        LOGGER.warning(warning)
+        self.statusBar().showMessage(warning, 15000)
+        QMessageBox.warning(self, "Restore Rust UI scale", warning)
 
     @Slot(int)
     def _on_paint_complete(self, generation: int) -> None:
@@ -10602,7 +10782,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _run_game_setup(self) -> None:
-        """Type the Rust-side paint settings into the game's console."""
+        """Apply the configured painting UI scale through Rust's console."""
 
         if self._debug_running or self._countdown_callback_running or (
             self._countdown is not None and self._countdown.isVisible()
@@ -10615,7 +10795,7 @@ class MainWindow(QMainWindow):
         try:
             from app.game_console import validate_console_key
 
-            self._game_convars()
+            self._game_commands()
             validate_console_key(self.console_key_combo.currentText())
         except ValueError as exc:
             QMessageBox.warning(self, "Check the Rust settings", str(exc))
@@ -10639,7 +10819,7 @@ class MainWindow(QMainWindow):
             max(3, self.countdown_spin.value()),
             self._execute_game_setup,
             hint=(
-                "Switch to Rust with the painting screen open. "
+                "Switch to Rust. "
                 f"{self.abort_hotkey_combo.currentText()} cancels"
             ),
         )
@@ -10649,7 +10829,7 @@ class MainWindow(QMainWindow):
             self._set_idle_ui("Rust setup cancelled")
             return
         try:
-            from app.game_console import apply_convars
+            from app.game_console import apply_console_commands
             from app.input_controller import (
                 DryRunInputController,
                 create_system_input_controller,
@@ -10663,12 +10843,14 @@ class MainWindow(QMainWindow):
                 )
             expected_title = self.expected_window_edit.text().strip()
             expected_process = self.expected_process_edit.text().strip()
-            require_foreground = not dry_run and self.focus_guard_check.isChecked()
+            # Console text is never safe to emit into an arbitrary foreground
+            # application, even when the user has disabled the paint-stroke guard.
+            require_foreground = not dry_run
             if require_foreground and not expected_title and not expected_process:
                 raise RuntimeError(
                     "Foreground protection needs an expected window title or process name."
                 )
-            commands = self._game_convars().commands()
+            commands = self._game_commands()
             console_key = self.console_key_combo.currentText().strip() or "F1"
 
             with self._debug_input_gate:
@@ -10689,15 +10871,21 @@ class MainWindow(QMainWindow):
             self._update_start_availability()
 
             def run_setup() -> None:
-                def checkpoint() -> None:
-                    if self._debug_abort_event.is_set() or self._closing:
-                        raise _DebugCancelled("emergency stop requested")
+                def foreground_checkpoint() -> None:
                     if require_foreground and not foreground_window_matches(
                         title_contains=expected_title or None,
                         executable=expected_process or None,
                     ):
-                        self._debug_abort_event.set()
                         raise _DebugCancelled("Rust was not the active window")
+
+                def checkpoint() -> None:
+                    if self._debug_abort_event.is_set() or self._closing:
+                        raise _DebugCancelled("emergency stop requested")
+                    try:
+                        foreground_checkpoint()
+                    except _DebugCancelled:
+                        self._debug_abort_event.set()
+                        raise
 
                 def wait(seconds: float) -> None:
                     # Waits are spent on the abort event, so Stop lands
@@ -10708,14 +10896,15 @@ class MainWindow(QMainWindow):
                 status = "completed"
                 message = ""
                 try:
-                    typed = apply_convars(
+                    typed = apply_console_commands(
                         controller,
                         commands,
                         console_key=console_key,
                         checkpoint=checkpoint,
+                        close_checkpoint=foreground_checkpoint,
                         sleep=wait,
                     )
-                    message = f"{len(typed)} settings typed into Rust's console"
+                    message = "painting UI scale applied in Rust"
                 except _DebugCancelled as exc:
                     status = "cancelled"
                     message = str(exc)
@@ -10766,20 +10955,16 @@ class MainWindow(QMainWindow):
                 message,
                 " (dry run; no input emitted)" if dry_run else "",
             )
-            self.statusBar().showMessage(f"Rust paint settings applied - {message}", 8000)
+            self.statusBar().showMessage(message, 8000)
             if not dry_run:
                 QMessageBox.information(
                     self,
-                    "Rust is set up",
-                    "The paint settings were typed into Rust's console.\n\n"
-                    "Now close the sign's painting screen with Save changes and "
-                    "open it again, so a raised maximum brush size takes effect. "
-                    "Then paint as usual.\n\n"
+                    "Painting scale applied",
+                    "Rust's UI is now at the configured painting scale. Calibrate "
+                    "the canvas and every control at this scale before painting.\n\n"
                     "If the console did not open, or it is still open now, the "
                     "Console key is wrong for this keyboard: pick another under "
-                    "Settings > Rust and apply again. If the painting screen was "
-                    "not open, the commands reached nothing - open the sign and "
-                    "apply again.",
+                    "Settings > Rust and apply again.",
                 )
         elif status == "cancelled":
             LOGGER.warning("Rust setup cancelled: %s", message)

@@ -420,6 +420,10 @@ class PainterSettings:
     verify_color_picks: bool = True
     brush_direction: str = "low_to_high"
     brush_shape: str = "auto"
+    manage_ui_scale: bool = False
+    painting_ui_scale: float = 0.5
+    normal_ui_scale: float = 1.0
+    console_key: str = "F1"
     delay_after_brush_seconds: float = 0.07
     countdown_seconds: float = 3.0
     require_foreground: bool = False
@@ -529,6 +533,15 @@ class PainterSettings:
             raise ValueError("brush_direction must be low_to_high or high_to_low")
         if self.brush_shape not in {"auto", "circle", "square"}:
             raise ValueError("brush_shape must be auto, circle, or square")
+        from .game_console import validate_console_key, validate_ui_scale
+
+        validate_ui_scale(self.painting_ui_scale)
+        validate_ui_scale(self.normal_ui_scale)
+        validate_console_key(self.console_key)
+        if self.manage_ui_scale and not self.require_foreground:
+            raise ValueError(
+                "Temporary Rust UI scaling requires the foreground guard"
+            )
         if not math.isfinite(self.brush_size) or not 0.0 <= self.brush_size <= 1.0:
             raise ValueError("brush_size must be a finite value between 0 and 1")
         if self.require_foreground and not (
@@ -544,8 +557,9 @@ class PainterSettings:
         """Read either a flat mapping or the application's nested settings."""
 
         painting = values.get("painting", values)
+        game = values.get("game", values)
         safety = values.get("safety", values)
-        if not isinstance(painting, Mapping) or not isinstance(safety, Mapping):
+        if not isinstance(painting, Mapping) or not isinstance(game, Mapping) or not isinstance(safety, Mapping):
             raise TypeError("Painter settings sections must be mappings")
 
         def pick(section: Mapping[str, Any], name: str, default: Any, *aliases: str) -> Any:
@@ -591,6 +605,10 @@ class PainterSettings:
             verify_color_picks=bool(pick(painting, "verify_color_picks", True)),
             brush_direction=str(pick(painting, "brush_direction", "low_to_high")),
             brush_shape=str(pick(painting, "brush_shape", "auto")),
+            manage_ui_scale=bool(pick(game, "manage_ui_scale", False)),
+            painting_ui_scale=float(pick(game, "painting_ui_scale", 0.5)),
+            normal_ui_scale=float(pick(game, "normal_ui_scale", 1.0)),
+            console_key=str(pick(game, "console_key", "F1")),
             delay_after_brush_seconds=float(pick(painting, "delay_after_brush_seconds", 0.07)),
             countdown_seconds=float(pick(safety, "countdown_seconds", 3.0)),
             require_foreground=bool(
@@ -932,6 +950,8 @@ class Painter:
         self._ui_guard_suspended = False
         self._last_ui_check = 0.0
         self._ui_missing_checks = 0
+        self._session_ui_scale_applied = False
+        self._ui_scale_restore_error: str | None = None
         # Where the panel shows the selected color, found beside the hue bar
         # as the job starts; None while picks are not read back.
         self._swatch: ScreenRect | None = None
@@ -952,6 +972,13 @@ class Painter:
     def state_reason(self) -> str:
         with self._condition:
             return self._state_reason
+
+    @property
+    def ui_scale_restore_error(self) -> str | None:
+        """Why an emergency cleanup could not restore Rust's normal scale."""
+
+        with self._condition:
+            return self._ui_scale_restore_error
 
     @property
     def progress(self) -> PaintProgress:
@@ -1075,6 +1102,8 @@ class Painter:
             self._measured_bare_color = None
             self._cell_nudges = {}
             self._abort_requested = False
+            self._session_ui_scale_applied = False
+            self._ui_scale_restore_error = None
             self._abort_event.clear()
             self._pause_event.clear()
             self._pause_generation = 0
@@ -1741,6 +1770,7 @@ class Painter:
             # RUNNING is set before the first guard so a zero-second countdown
             # can still enter the ordinary PAUSED state when focus is wrong.
             self._checkpoint(check_focus=True)
+            self._apply_session_ui_scale(job)
             self._confirm_painting_ui(job)
             job.target = self._measured_picker_target(job.target)
             self._select_brush(job)
@@ -1763,7 +1793,8 @@ class Painter:
                 )
                 self._execute_plan(job)
                 self._verify_and_touch_up(job)
-            self._checkpoint(check_focus=False)
+            self._checkpoint(check_focus=True)
+            self._restore_session_ui_scale(job)
             self._finish_completed()
             self._update_progress_state(PainterState.COMPLETED, "Completed")
             final_progress = self.progress
@@ -1785,10 +1816,97 @@ class Painter:
                 self._update_progress_state(PainterState.ERROR, f"Error: {exc}")
                 self._safe_callback(self._on_error, exc, label="error")
         finally:
+            job = self._job
+            if job is not None and self._session_ui_scale_applied:
+                self._restore_session_ui_scale(job, best_effort=True)
             self._safe_release_all()
             with self._condition:
                 self._paused_at = None
                 self._condition.notify_all()
+
+    def _apply_session_ui_scale(self, job: _Job) -> None:
+        settings = job.settings
+        if not settings.manage_ui_scale or not getattr(self.input, "emits_real_input", True):
+            return
+        from .game_console import set_ui_scale
+
+        self._update_progress_state(PainterState.RUNNING, "Setting Rust UI scale")
+        # Mark restoration necessary before the first console keystroke. If
+        # Stop lands after Rust applies the command but before this method
+        # returns, the finally block must still put the user's scale back.
+        with self._condition:
+            self._session_ui_scale_applied = True
+            self._ui_scale_restore_error = None
+        requirement = ForegroundRequirement(
+            title_contains=settings.expected_window_title_contains or None,
+            executable=settings.expected_process_name or None,
+        )
+
+        def foreground_checkpoint() -> None:
+            if not self._foreground_checker(requirement):
+                raise RuntimeError("Rust stopped being the foreground window")
+
+        self._ui_guard_suspended = True
+        try:
+            set_ui_scale(
+                self.input,
+                settings.painting_ui_scale,
+                console_key=settings.console_key,
+                checkpoint=lambda: self._checkpoint(check_focus=True),
+                close_checkpoint=foreground_checkpoint,
+                sleep=lambda seconds: self._interruptible_sleep(seconds, check_focus=True),
+            )
+        finally:
+            self._ui_guard_suspended = False
+        LOGGER.info("Rust UI scale set to %.2f for this paint session", settings.painting_ui_scale)
+
+    def _restore_session_ui_scale(self, job: _Job, *, best_effort: bool = False) -> None:
+        if not self._session_ui_scale_applied:
+            return
+        settings = job.settings
+        from .game_console import set_ui_scale
+
+        requirement = ForegroundRequirement(
+            title_contains=settings.expected_window_title_contains or None,
+            executable=settings.expected_process_name or None,
+        )
+
+        def foreground_checkpoint() -> None:
+            if not self._foreground_checker(requirement):
+                raise RuntimeError("Rust was not foreground when the session stopped")
+
+        try:
+            if best_effort:
+                foreground_checkpoint()
+                checkpoint = foreground_checkpoint
+                sleeper = time.sleep
+            else:
+                checkpoint = lambda: self._checkpoint(check_focus=True)
+                sleeper = lambda seconds: self._interruptible_sleep(seconds, check_focus=True)
+            self._ui_guard_suspended = True
+            try:
+                set_ui_scale(
+                    self.input,
+                    settings.normal_ui_scale,
+                    console_key=settings.console_key,
+                    checkpoint=checkpoint,
+                    close_checkpoint=foreground_checkpoint,
+                    sleep=sleeper,
+                )
+            finally:
+                self._ui_guard_suspended = False
+        except BaseException as exc:
+            if not best_effort:
+                raise
+            message = str(exc) or type(exc).__name__
+            with self._condition:
+                self._ui_scale_restore_error = message
+            LOGGER.error("Could not restore Rust UI scale: %s", message)
+            return
+        with self._condition:
+            self._session_ui_scale_applied = False
+            self._ui_scale_restore_error = None
+        LOGGER.info("Rust UI scale restored to %.2f", settings.normal_ui_scale)
 
     def _run_countdown(self, seconds: float) -> None:
         remaining = seconds
@@ -2133,7 +2251,11 @@ class Painter:
             )
         epoch = self._pause_generation
         self._safe_click(button.center, epoch)
-        self._settle(job.settings.delay_after_brush_seconds, epoch=epoch)
+        self._interruptible_sleep(
+            self._settle(job.settings.delay_after_brush_seconds),
+            epoch=epoch,
+            check_focus=True,
+        )
         LOGGER.info("Selected the calibrated %s brush", shape)
 
     def _apply_brush_size(self, job: _Job, diameter_cells: int, epoch: int) -> None:

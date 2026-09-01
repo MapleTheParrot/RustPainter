@@ -118,6 +118,114 @@ def test_painter_completes_and_releases_mouse() -> None:
     assert states[-1] is PainterState.COMPLETED
 
 
+class _RealConsoleInput(MockInputController):
+    emits_real_input = True
+    is_dry_run = False
+
+
+def test_managed_ui_scale_requires_foreground_protection() -> None:
+    with pytest.raises(ValueError, match="foreground guard"):
+        _settings(manage_ui_scale=True, require_foreground=False)
+
+
+def _console_profile(*, canvas_width: int = 400) -> CalibrationProfile:
+    profile = _profile(canvas_width=canvas_width)
+    profile.circle_brush_button = ScreenRect(760, 100, 20, 20)
+    profile.square_brush_button = ScreenRect(790, 100, 20, 20)
+    return profile
+
+
+def test_real_session_sets_and_restores_rust_ui_scale(monkeypatch) -> None:
+    controller = _RealConsoleInput()
+    scales: list[float] = []
+    monkeypatch.setattr(
+        "app.game_console.set_ui_scale",
+        lambda _controller, value, **_kwargs: scales.append(float(value)) or "ok",
+    )
+    painter = Painter(
+        controller,
+        foreground_checker=lambda _requirement: True,
+        screen_capture=_panel_capture,
+    )
+
+    assert painter.start(
+        _dot_plan(1),
+        _console_profile(),
+        _settings(
+            manage_ui_scale=True,
+            painting_ui_scale=0.5,
+            normal_ui_scale=0.85,
+            require_foreground=True,
+        ),
+    )
+    assert painter.wait(_t(2.0))
+
+    assert painter.state is PainterState.COMPLETED
+    assert scales == [0.5, 0.85]
+    assert painter.ui_scale_restore_error is None
+
+
+def test_abort_restores_session_ui_scale(monkeypatch) -> None:
+    controller = _RealConsoleInput(operation_delay=0.01)
+    scales: list[float] = []
+    scale_applied = threading.Event()
+
+    def set_scale(_controller, value, **_kwargs):
+        scales.append(float(value))
+        scale_applied.set()
+        return "ok"
+
+    monkeypatch.setattr("app.game_console.set_ui_scale", set_scale)
+    painter = Painter(
+        controller,
+        foreground_checker=lambda _requirement: True,
+        screen_capture=_panel_capture,
+    )
+    assert painter.start(
+        _dot_plan(100),
+        _console_profile(canvas_width=1000),
+        _settings(manage_ui_scale=True, require_foreground=True),
+    )
+    assert scale_applied.wait(_t(1.0))
+    assert painter.abort("test stop")
+    assert painter.wait(_t(3.0))
+
+    assert painter.state is PainterState.ABORTED
+    assert scales == [0.5, 1.0]
+    assert painter.ui_scale_restore_error is None
+
+
+def test_abort_never_types_restoration_into_the_wrong_window(monkeypatch) -> None:
+    controller = _RealConsoleInput(operation_delay=0.01)
+    scales: list[float] = []
+    scale_applied = threading.Event()
+    foreground = True
+
+    def set_scale(_controller, value, **_kwargs):
+        scales.append(float(value))
+        scale_applied.set()
+        return "ok"
+
+    monkeypatch.setattr("app.game_console.set_ui_scale", set_scale)
+    painter = Painter(
+        controller,
+        foreground_checker=lambda _requirement: foreground,
+        screen_capture=_panel_capture,
+    )
+    assert painter.start(
+        _dot_plan(100),
+        _console_profile(canvas_width=1000),
+        _settings(manage_ui_scale=True, require_foreground=True),
+    )
+    assert scale_applied.wait(_t(1.0))
+    foreground = False
+    assert painter.abort("test stop")
+    assert painter.wait(_t(3.0))
+
+    assert scales == [0.5]
+    assert "not foreground" in str(painter.ui_scale_restore_error)
+
+
 def _sized_profile(name: str, *, sign_rows: int = 320) -> CalibrationProfile:
     """A calibrated profile whose brush model describes a known sign.
 

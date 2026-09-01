@@ -82,7 +82,7 @@ painting unattended. Everything below is detail you only need when tuning.
 ## Detailed setup and first paint
 
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
-2. Open the target sign's painting interface, then go to **Settings → Rust** in RustPainter and click **Apply in Rust now**. Switch to Rust during the countdown; the console opens, the paint settings painting depends on are typed in, and it closes again. Close the painting screen with **Save changes** and open it again. See *Settings inside Rust* below. Once is usually enough.
+2. Optionally enable temporary painting UI scale under **Settings → Rust**. The default paints at `0.5` and restores `1.0`; enter your actual normal scale before enabling it. Click **Apply painting scale now**, switch to Rust during the countdown, and calibrate at that scale. See *Settings inside Rust* below.
 3. Leave the sign's painting interface open and stationary.
 4. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
 5. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
@@ -340,52 +340,40 @@ Exclusive fullscreen applications can prevent overlays, screenshots, focus check
 
 ## Settings inside Rust
 
-Rust's painting UI remembers a handful of settings between sessions that
-RustPainter cannot see and that every job silently depends on: the brush
-opacity, which brush and tool are selected, how densely a drag is stamped,
-whether the UI sits on the left or right of the screen, and how far the Size
-field goes. Each one wrong ruins a paint without a single error - a brush left
-at half opacity paints every colour wrong and the export audit then marks the
-whole sign as mismatched; a UI flipped to the left side puts every calibrated
-rectangle on the wrong half of the screen.
-
-Rust exposes all of them as `paint.*` console variables, so **Settings → Rust**
-types them into the game's console for you rather than asking you to:
+Rust's UI scale changes how much physical screen space the sign painter can
+use. At `0.5`, a sign can be enlarged farther, giving each texture cell more
+screen pixels and leaving less placement to cursor rounding. RustPainter can
+therefore wrap every real paint session with:
 
 ```
-paint.brushopacity 1
-paint.selectedtool 0
-paint.selectedbrush 3
-paint.brushspacing 0.01
-paint.leftsided False
-paint.maxbrushsize 100
+graphics.uiscale 0.5
+# painting happens
+graphics.uiscale 1
 ```
 
-Opacity, tool, side and the Size ceiling are pinned to what painting needs.
-The **Brush** (Rust counts from 0; keep whichever your profile was measured
-on) and **Brush spacing** (stamps per brush width, 0-1; the speed presets were
-tuned at 0.01, Rust's own default is 0.25) are settings, and the page shows
-exactly what it will type.
+This is opt-in so an existing profile calibrated at another scale is not moved
+without warning. Set **While painting** and **Restore afterward** under
+**Settings → Rust**, then use **Apply painting scale now** before calibrating.
+Every rectangle in a profile must be captured at the painting scale. Profiles
+calibrated by this version remember their scale and a later mismatch blocks
+Start instead of painting at shifted coordinates.
 
-**Apply in Rust now** runs the same way every other real-input action does: a
-countdown to switch to Rust, the foreground guard so nothing is typed unless
-Rust is the active window, and the stop hotkey to cancel between keystrokes.
-**Do it with the sign's painting screen already open.** These are the sign
-painter's own settings: Rust's console describes each one as getting or setting
-a value "in the sign painter", and with no sign open there is no sign painter
-for them to reach - the commands are accepted and change nothing. Afterwards,
-close the painting screen with **Save changes** and open it again, which is
-what lets a raised `paint.maxbrushsize` take effect. Rust keeps the values, so
-once per install is usually enough; run it again after a game update or when a
-paint suddenly comes out washed out or offset.
+The job applies the painting scale after the ordinary Start countdown, before
+checking the painting UI or sending a brush click. It stays applied through a
+pause. Normal completion waits for Rust to be foreground and restores the
+configured normal scale before reporting success. Stop and error paths also
+attempt restoration; if Rust is not foreground, RustPainter refuses to type
+into another application and displays the exact `graphics.uiscale` command to
+run manually. A crash or forced process termination cannot run cleanup, so the
+normal scale may also need to be restored manually after one.
 
 The **Console key** is F1 on most keyboards. Compact laptops that put the
 function row behind **Fn** never deliver a bare F1, so the page also offers
 Ctrl+F1, Shift+F1 and Alt+F1 - try the key in Rust yourself first and pick the
 one that opens the dark console panel across the top of the screen. If the
 console did not open (or is still open when the pass ends), the key is wrong
-for your keyboard; nothing else is harmed, because Rust ignores the text when
-no console is up.
+for your keyboard. Leave temporary scaling disabled until the chosen key has
+been verified with **Apply painting scale now**.
 
 ## Settings that require experimentation
 

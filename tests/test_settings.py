@@ -194,6 +194,32 @@ def test_expected_process_defaults_to_the_rust_client() -> None:
     assert safety["anti_afk_enabled"] is True
 
 
+def test_session_ui_scale_defaults_are_safe_for_existing_profiles() -> None:
+    from app.settings import DEFAULT_SETTINGS
+
+    game = DEFAULT_SETTINGS["game"]
+    assert game == {
+        "manage_ui_scale": False,
+        "painting_ui_scale": 0.5,
+        "normal_ui_scale": 1.0,
+        "console_key": "F1",
+    }
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"game": {"manage_ui_scale": "yes"}},
+        {"game": {"painting_ui_scale": 0.49}},
+        {"game": {"normal_ui_scale": 1.01}},
+        {"game": {"console_key": "WIN+F1"}},
+    ],
+)
+def test_settings_reject_invalid_session_ui_scale_values(tmp_path, patch) -> None:
+    with pytest.raises(SettingsError, match="game"):
+        SettingsStore(tmp_path / "settings.json").save(patch)
+
+
 def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(
     tmp_path,
 ) -> None:

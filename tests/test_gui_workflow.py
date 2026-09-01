@@ -22,7 +22,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QShortcut,
 )
-from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent
+from PySide6.QtWidgets import QColorDialog, QGraphicsSceneMouseEvent, QMessageBox
 
 import app.gui.main_window as main_window_module
 from app.gui.main_window import (
@@ -110,6 +110,66 @@ def test_history_is_an_icon_button_beside_start(window: MainWindow) -> None:
     assert not window.sessions_button.icon().isNull()
     assert window.sessions_button.accessibleName() == "Painting history"
     assert window.sessions_button.height() == window.start_button.minimumHeight()
+
+
+def test_rust_session_ui_scale_controls_round_trip(window: MainWindow) -> None:
+    assert not window.manage_ui_scale_check.isChecked()
+    assert window.painting_ui_scale_spin.value() == pytest.approx(0.5)
+    assert window.normal_ui_scale_spin.value() == pytest.approx(1.0)
+    assert not window.painting_ui_scale_spin.isEnabled()
+
+    window.manage_ui_scale_check.setChecked(True)
+    window.painting_ui_scale_spin.setValue(0.6)
+    window.normal_ui_scale_spin.setValue(0.9)
+    window.console_key_combo.setCurrentText("CTRL+F1")
+    document = window._settings_document()
+
+    assert document["game"] == {
+        "manage_ui_scale": True,
+        "painting_ui_scale": 0.6,
+        "normal_ui_scale": 0.9,
+        "console_key": "CTRL+F1",
+    }
+    assert window.painting_ui_scale_spin.isEnabled()
+
+
+def test_managed_ui_scale_rejects_a_profile_calibrated_at_another_scale(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = Profile.new(
+        "Different scale",
+        canvas=ScreenRect(10, 10, 400, 200),
+        color_box=ScreenRect(500, 100, 100, 100),
+        hue_bar=ScreenRect(610, 100, 12, 100),
+        circle_brush_button=ScreenRect(650, 100, 20, 20),
+        square_brush_button=ScreenRect(680, 100, 20, 20),
+        metadata={"rust_ui_scale": 0.75},
+    )
+    monkeypatch.setattr(
+        "app.screen.get_virtual_screen", lambda: VirtualScreen(0, 0, 1920, 1080)
+    )
+    window.manage_ui_scale_check.setChecked(True)
+    window.painting_ui_scale_spin.setValue(0.5)
+
+    with pytest.raises(ValueError, match="calibrated at Rust UI scale 0.75"):
+        window._validate_profile_on_virtual_screen(profile)
+
+
+def test_legacy_profile_scale_is_bound_only_after_confirmation(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert window._current_profile is not None
+    assert "rust_ui_scale" not in window._current_profile.metadata
+    window.manage_ui_scale_check.setChecked(True)
+    window.painting_ui_scale_spin.setValue(0.5)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    assert window._confirm_profile_ui_scale() is True
+    assert window._current_profile.metadata["rust_ui_scale"] == pytest.approx(0.5)
 
 
 def test_optimization_mode_merges_colors_and_gates_controls(
