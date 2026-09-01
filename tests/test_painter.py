@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 import app.painter as painter_module
 from app.color_calibration import ColorCorrectionModel
 from app.color_mapping import map_rgb_to_picker
+from app.color_swatch import SwatchReading
 from app.input_controller import DryRunInputController, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
 from app.paint_timing import (
@@ -3251,6 +3252,42 @@ def test_a_swallowed_picker_click_is_clicked_again_until_the_panel_agrees() -> N
     assert summary.picks == 3
     assert summary.retried == 1
     assert summary.failed == 0
+
+
+def test_a_delayed_picker_retry_recovers_before_pausing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale small-scale picker frame should not require a manual resume."""
+
+    painter = Painter(MockInputController())
+    painter._swatch = ScreenRect(740, 100, 12, 12)
+    target = PaintingTarget.from_profile(_profile())
+    stale = SwatchReading((232, 129, 44), 0.0)
+    waits: list[float] = []
+    attempts: list[int] = []
+
+    monkeypatch.setattr(
+        painter,
+        "_interruptible_sleep",
+        lambda seconds, **_kwargs: waits.append(seconds),
+    )
+    monkeypatch.setattr(
+        painter,
+        "_pick_until_shown",
+        lambda *_args, **_kwargs: attempts.append(1) or stale,
+    )
+    # The retried clicks land; this is the same swatch confirmation the real
+    # picker uses before a stroke is allowed.
+    monkeypatch.setattr(painter, "_rescue_nearby_picker_hue", lambda *_args: None)
+
+    assert (
+        painter._recover_delayed_color_pick(
+            (226, 162, 42), target, _settings(), 0, stale
+        )
+        is None
+    )
+    assert attempts == [1]
+    assert waits == [painter._PICK_RECOVERY_DELAY_SECONDS]
 
 
 def test_a_small_live_hue_raster_shift_is_found_before_painting() -> None:

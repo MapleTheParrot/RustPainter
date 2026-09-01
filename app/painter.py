@@ -6486,6 +6486,13 @@ class Painter:
 
     _PICK_ATTEMPTS = 3
     _PICK_ATTEMPTS_AFTER_RELOCATE = 2
+    # At a small Rust UI scale a click can occasionally arrive while the
+    # picker is still redrawing.  The normal rounds below are intentionally
+    # quick, but do not make a user resume a job just to repeat the exact
+    # same safe operation.  These are full, delayed retries before the
+    # fail-safe pause; no paint stroke can happen until the swatch agrees.
+    _PICK_RECOVERY_ROUNDS = 2
+    _PICK_RECOVERY_DELAY_SECONDS = 0.75
     # When the panel does not yet show the color, it is read once more after
     # this long: the frame carrying the click may not have been presented.
     _SWATCH_RECHECK_SECONDS = 0.15
@@ -6560,6 +6567,11 @@ class Painter:
         )
         if reading is None or self._swatch is None:
             return
+        reading = self._recover_delayed_color_pick(
+            picker_color, target, settings, epoch, reading
+        )
+        if reading is None or self._swatch is None:
+            return
         with self._condition:
             self._color_pick_summary = replace(
                 self._color_pick_summary, failed=self._color_pick_summary.failed + 1
@@ -6578,6 +6590,47 @@ class Painter:
         # Waits out the pause; resuming starts a new epoch, and the caller
         # picks the color again under it.
         self._checkpoint(epoch=epoch, check_focus=True)
+
+    def _recover_delayed_color_pick(
+        self,
+        picker_color: RGBColor,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        epoch: int,
+        reading: SwatchReading,
+    ) -> SwatchReading | None:
+        """Retry a verified pick after Rust has had a full redraw interval.
+
+        This covers the intermittent small-scale case where every immediate
+        click is processed against an old picker frame.  Keep the existing
+        swatch rather than locating it again: a failed locator pick would
+        itself be another transient UI failure and must not disable the
+        safety check.
+        """
+
+        for round_number in range(1, self._PICK_RECOVERY_ROUNDS + 1):
+            LOGGER.warning(
+                "The panel still shows %s after selecting #%02X%02X%02X; "
+                "waiting for the picker and retrying (%d of %d)",
+                reading.hex,
+                *picker_color,
+                round_number,
+                self._PICK_RECOVERY_ROUNDS,
+            )
+            self._interruptible_sleep(
+                self._PICK_RECOVERY_DELAY_SECONDS, epoch=epoch, check_focus=True
+            )
+            reading = self._pick_until_shown(
+                picker_color, target, settings, epoch, self._PICK_ATTEMPTS
+            )
+            if reading is None or self._swatch is None:
+                return None
+            reading = self._rescue_nearby_picker_hue(
+                picker_color, target, settings, epoch
+            )
+            if reading is None or self._swatch is None:
+                return None
+        return reading
 
     def _picker_plan(
         self, picker_color: RGBColor, target: PaintingTarget, margin_pixels: float
