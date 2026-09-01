@@ -53,4 +53,3 @@ original RustPainter maintainers expressly state otherwise for a particular
 release, they do not provide warranties, guarantees, support, maintenance, or
 approval for third-party modified distributions. The GPLv3 warranty disclaimer
 and limitation of liability in [LICENSE](LICENSE) remain applicable.
-

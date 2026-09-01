@@ -27,4 +27,3 @@ This policy does not prohibit truthful attribution or lawful nominative use.
 The GPL license covers copyright permissions; it does not grant trademark
 rights. Nothing in this policy asserts trademark rights beyond those available
 under applicable law.
-
