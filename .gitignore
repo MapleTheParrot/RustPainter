@@ -13,6 +13,20 @@ env/
 data/
 *.log
 
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+
+# Local diagnostic inputs
+murica.png
+
 # PyInstaller output
 build/
 build-*/
