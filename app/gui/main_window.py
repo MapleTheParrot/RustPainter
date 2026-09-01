@@ -7565,15 +7565,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Setup detection failed", str(exc))
             return
 
-        if "hue_bar" not in detection.regions:
-            QMessageBox.information(
-                self,
-                "Adaptive Palette not found",
-                "RustPainter could not find the rainbow hue bar. In Rust, toggle "
-                "Adaptive Palette so the large gradient colour box and vertical "
-                "rainbow bar are visible, then try again.",
-            )
-            return
         review = SetupReviewDialog(capture, screen, detection, self)
         if review.exec() != QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("Detected setup was not saved", 4000)
@@ -11167,39 +11158,30 @@ class MainWindow(QMainWindow):
                 result = payload
                 captured = result.capture
                 detection = captured.detection
-                if "hue_bar" not in detection.regions:
-                    QMessageBox.information(
-                        self,
-                        "Painting view needs manual setup",
-                        "RustPainter restored your normal UI scale but could not find "
-                        "Adaptive Palette, so it did not zoom. Toggle Adaptive Palette "
-                        "in Rust and retry, or use the individual Set area buttons.",
-                    )
-                else:
-                    review = SetupReviewDialog(
-                        captured.image, captured.screen, detection, self
-                    )
-                    if review.exec() == QDialog.DialogCode.Accepted:
-                        self._save_detected_setup(detection)
-                        missing = detection.missing_required
-                        if missing:
-                            QMessageBox.information(
-                                self,
-                                "Finish manual calibration",
-                                "The detected areas were saved and your normal UI scale "
-                                "was restored. Use the Set area buttons for: "
-                                + ", ".join(missing)
-                                + ".",
-                            )
-                        else:
-                            self.statusBar().showMessage(
-                                "Painting view saved; normal Rust UI scale restored", 8000
-                            )
+                review = SetupReviewDialog(
+                    captured.image, captured.screen, detection, self
+                )
+                if review.exec() == QDialog.DialogCode.Accepted:
+                    self._save_detected_setup(detection)
+                    missing = detection.missing_required
+                    if missing:
+                        QMessageBox.information(
+                            self,
+                            "Finish manual calibration",
+                            "The detected areas were saved and your normal UI scale "
+                            "was restored. Use the Set area buttons for: "
+                            + ", ".join(missing)
+                            + ".",
+                        )
                     else:
                         self.statusBar().showMessage(
-                            "Painting view was not saved; normal Rust UI scale restored",
-                            6000,
+                            "Painting view saved; normal Rust UI scale restored", 8000
                         )
+                else:
+                    self.statusBar().showMessage(
+                        "Painting view was not saved; normal Rust UI scale restored",
+                        6000,
+                    )
         elif status == "cancelled":
             LOGGER.warning("Rust setup cancelled: %s", message)
             self._set_idle_ui(f"Rust setup cancelled: {message}")

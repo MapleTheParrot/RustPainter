@@ -139,13 +139,16 @@ def signature_similarity(reference: np.ndarray, current: np.ndarray) -> float:
     return float(min(1.0, max(0.0, correlation)))
 
 
-def looks_like_hue_bar(image: "Image") -> bool:
+def looks_like_hue_bar(image: "Image", *, reduced: bool = False) -> bool:
     """Whether ``image`` is a strip of saturated colour sweeping the spectrum.
 
     Most of it must be saturated, the hues in it must cover most of the
     colour wheel, and they must run in order along the strip: three things
     a photograph or a menu screen in the same place very rarely manage at
-    once, and the real bar manages with room to spare.
+    once, and the real bar manages with room to spare. ``reduced`` permits
+    the small amount of bilinear colour blending introduced when a full
+    monitor capture is downsampled only for setup detection; the live safety
+    guard deliberately keeps the stricter default.
     """
 
     from PIL import Image as PillowImage
@@ -156,25 +159,29 @@ def looks_like_hue_bar(image: "Image") -> bool:
     hsv = np.asarray(working.convert("HSV"), dtype=np.float32) / 255.0
     hue, saturation, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     saturated = (saturation > 0.5) & (value > 0.3)
-    if float(saturated.mean()) < _HUE_BAR_SATURATED_FRACTION:
+    saturated_fraction = 0.35 if reduced else _HUE_BAR_SATURATED_FRACTION
+    bins = 8 if reduced else _HUE_BAR_BINS
+    bins_covered = 5 if reduced else _HUE_BAR_BINS_COVERED
+    monotonic_fraction = 0.65 if reduced else _HUE_BAR_MONOTONIC_FRACTION
+    if float(saturated.mean()) < saturated_fraction:
         return False
-    histogram = np.histogram(hue[saturated], bins=_HUE_BAR_BINS, range=(0.0, 1.0))[0]
+    histogram = np.histogram(hue[saturated], bins=bins, range=(0.0, 1.0))[0]
     covered = int((histogram / max(1, int(saturated.sum())) >= 0.01).sum())
-    if covered < _HUE_BAR_BINS_COVERED:
+    if covered < bins_covered:
         return False
     angle = hue * 2.0 * np.pi
     row_x = (np.cos(angle) * saturated).sum(axis=1)
     row_y = (np.sin(angle) * saturated).sum(axis=1)
     populated = saturated.sum(axis=1) > 0
     row_hue = (np.arctan2(row_y[populated], row_x[populated]) / (2.0 * np.pi)) % 1.0
-    if row_hue.size < 4:
+    if row_hue.size < (3 if reduced else 4):
         return False
     steps = (np.diff(row_hue) + 0.5) % 1.0 - 0.5
     steps = steps[np.abs(steps) > 1e-3]
     if steps.size == 0:
         return False
     ordered = max(float((steps > 0).mean()), float((steps < 0).mean()))
-    return ordered >= _HUE_BAR_MONOTONIC_FRACTION
+    return ordered >= monotonic_fraction
 
 
 class PaintingUiGuard:

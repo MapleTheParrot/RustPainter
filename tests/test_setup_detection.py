@@ -68,6 +68,34 @@ def test_basic_palette_does_not_produce_confident_setup() -> None:
     assert result.missing_required == ("canvas", "color_box", "hue_bar")
 
 
+def test_canvas_is_still_proposed_when_the_palette_cannot_be_found() -> None:
+    pixels = np.full((720, 1280, 3), 34, dtype=np.uint8)
+    pixels[90:640, 150:800] = (188, 160, 122)
+
+    result = detect_painting_setup(
+        Image.fromarray(pixels, "RGB"), ScreenRect(0, 0, 1280, 720)
+    )
+
+    assert set(result.regions) == {"canvas"}
+    assert result.missing_required == ("color_box", "hue_bar")
+
+
+def test_detects_a_small_palette_after_a_high_resolution_capture_is_reduced() -> None:
+    width, height = 2557, 1316
+    pixels = np.full((height, width, 3), 34, dtype=np.uint8)
+    pixels[80:1200, 70:2180] = (188, 160, 122)
+    # This matches the short hue strip visible at 0.5 UI scale. It becomes
+    # roughly 45 pixels tall when setup detection reduces the monitor image.
+    _add_adaptive_picker(pixels, box_left=2220, box_top=600, box_size=128)
+
+    result = detect_painting_setup(
+        Image.fromarray(pixels, "RGB"), ScreenRect(0, 0, width, height)
+    )
+
+    assert result.missing_required == ()
+    assert result.regions["hue_bar"].rect.height >= 120
+
+
 def test_detects_adaptive_picker_when_low_scale_places_it_near_screen_center() -> None:
     pixels = np.full((720, 1280, 3), 34, dtype=np.uint8)
     pixels[100:620, 100:450] = 188

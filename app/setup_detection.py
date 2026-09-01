@@ -94,6 +94,30 @@ def _local_rect(rect: ScreenRect, origin: ScreenRect) -> ScreenRect:
     )
 
 
+def _narrow_hue_strip(crop: Image.Image) -> tuple[int, int] | None:
+    """Return the longest run of columns that independently sweep the spectrum.
+
+    At small UI scales, resizing a monitor capture can blend the thin hue strip
+    into the saturated edge of the adjacent S/V square. Each hue-strip column
+    still contains a complete ordered spectrum; the S/V square's columns do
+    not. This separates the two without relying on an exact pixel gap.
+    """
+
+    candidates = np.array(
+        [
+            looks_like_hue_bar(
+                crop.crop((column, 0, column + 1, crop.height)), reduced=True
+            )
+            for column in range(crop.width)
+        ],
+        dtype=bool,
+    )
+    run = _longest_run(candidates)
+    if run is None or run[1] - run[0] < 2:
+        return None
+    return run
+
+
 def _close_short_gaps(values: np.ndarray, maximum: int) -> np.ndarray:
     """Fill short false runs without joining genuinely separate edges."""
 
@@ -211,28 +235,30 @@ def _rectangular_material_core(
 
 
 def _detect_hue_bar(
-    original: Image.Image, working: Image.Image, scale: float, screen: ScreenRect
+    working: Image.Image, scale: float, screen: ScreenRect
 ) -> DetectedRegion | None:
     hsv = np.asarray(working.convert("HSV"), dtype=np.uint8)
     saturated = (hsv[:, :, 1] > 140) & (hsv[:, :, 2] > 80)
     minimum = max(12, int(working.width * working.height * 0.00005))
     candidates = []
     for left, top, width, height, area in _components(saturated, minimum):
-        if height < 25 or height < width * 2.5:
+        # A 0.5 Rust UI scale on a high-resolution monitor can leave fewer
+        # than 25 pixels after the monitor capture is reduced for analysis.
+        if height < 12:
             continue
         density = area / max(1, width * height)
         if density < 0.35:
             continue
-        margin = max(1, round(width * 0.12))
-        box = (
-            max(0, left - margin),
-            max(0, top - margin),
-            min(working.width, left + width + margin),
-            min(working.height, top + height + margin),
-        )
-        crop = working.crop(box)
-        if not looks_like_hue_bar(crop):
+        crop = working.crop((left, top, left + width, top + height))
+        # A normal hue strip is already narrow. Only split unusually broad
+        # components, where downsampling has joined it to the colour square.
+        strip = _narrow_hue_strip(crop) if width > height * 0.4 else None
+        if not looks_like_hue_bar(crop, reduced=True) and strip is None:
             continue
+        if strip is not None:
+            strip_left, strip_right = strip
+            left += strip_left
+            width = strip_right - strip_left
         # The ordered-spectrum test is the position-independent discriminator.
         # At a low Rust UI scale the picker can sit near the screen centre, so
         # rejecting candidates outside an assumed right-side panel is unsafe.
@@ -242,8 +268,10 @@ def _detect_hue_bar(
         return None
     _, box = max(candidates, key=lambda item: item[0])
     rect = _screen_rect(box, scale, screen)
-    # Include the thin widget border that the saturated component omits, then
-    # let the existing conservative trimmer settle on the actual gradient.
+    # Include the thin widget border that the saturated component omits. Do
+    # not run the generic gradient trimmer here: it treats dark rainbow hues
+    # as background and can shorten this vertical widget, which in turn makes
+    # the derived square picker too small.
     border = 1
     expanded = ScreenRect(
         rect.left - border,
@@ -251,12 +279,6 @@ def _detect_hue_bar(
         rect.width + 2 * border,
         rect.height + 2 * border,
     )
-    local = _local_rect(expanded, screen)
-    bounds = (local.left, local.top, local.right, local.bottom)
-    if all(
-        (bounds[0] >= 0, bounds[1] >= 0, bounds[2] <= original.width, bounds[3] <= original.height)
-    ):
-        expanded = trim_to_widget(original.crop(bounds), expanded)
     return DetectedRegion(expanded, 0.97, "ordered adaptive hue spectrum")
 
 
@@ -348,17 +370,22 @@ def detect_painting_setup(image: Image.Image, screen: ScreenRect) -> SetupDetect
     if image.size != (screen.width, screen.height):
         raise ValueError("Setup capture size does not match its screen rectangle")
     working, scale = _working_copy(image)
-    hue = _detect_hue_bar(image, working, scale, screen)
-    if hue is None:
-        return SetupDetection({})
-    color_box = _picker_box(image, hue.rect, screen)
-    regions: dict[str, DetectedRegion] = {
-        "hue_bar": hue,
-        "color_box": color_box,
-    }
-    canvas = _detect_canvas(working, scale, screen, color_box.rect.left)
+    hue = _detect_hue_bar(working, scale, screen)
+    regions: dict[str, DetectedRegion] = {}
+    picker_left = screen.right
+    if hue is not None:
+        color_box = _picker_box(image, hue.rect, screen)
+        regions.update({"hue_bar": hue, "color_box": color_box})
+        picker_left = color_box.rect.left
+    canvas = _detect_canvas(working, scale, screen, picker_left)
     if canvas is not None:
         regions["canvas"] = canvas
+
+    # The canvas can still be useful when the picker is obscured, rendered
+    # too small, or simply changed by a Rust update. Show that partial result
+    # for review instead of making the user start from nothing.
+    if hue is None:
+        return SetupDetection(regions)
 
     # Fixed UI controls are useful for automatic brush sizing and safety. They
     # are lower-confidence inferred proposals and are always shown for review.

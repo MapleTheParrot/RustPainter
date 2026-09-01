@@ -56,7 +56,7 @@ class SetupReviewDialog(QDialog):
             if not missing
             else "RustPainter found part of the painting UI. The missing "
             + ", ".join(_LABELS.get(name, name) for name in missing)
-            + " can still be set manually."
+            + " can still be set manually with their Set area buttons."
         )
         note = QLabel(detail)
         note.setObjectName("muted")
@@ -86,7 +86,14 @@ class SetupReviewDialog(QDialog):
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         save = buttons.button(QDialogButtonBox.StandardButton.Save)
-        save.setText("Use detected areas")
+        if missing:
+            save.setText(
+                "Continue to manual setup"
+                if not detection.regions
+                else "Use detected areas and finish manually"
+            )
+        else:
+            save.setText("Use detected areas")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
