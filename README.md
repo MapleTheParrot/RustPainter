@@ -8,6 +8,12 @@
 
 this takes an image and paints it onto a Rust sign for you. It uses normal mouse input, so you set up the parts of Rust's paint UI it needs to click first.
 
+## Early build
+
+this is the first public version of a tool I made for myself, and it works well for how I use it. The setup might still be confusing on a new PC or a different Rust UI layout though, so start with a small test image first.
+
+if you try it, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know what was confusing or what went wrong. That is basically what this release is for.
+
 ## Download and run
 
 You need Windows 10 or 11, plus Rust running in borderless or windowed mode.
