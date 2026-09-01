@@ -1007,6 +1007,20 @@ python -m pytest
 The GUI tests use `pytest-qt`. If you are running headless, set
 `QT_QPA_PLATFORM=offscreen`.
 
+## Open source, forks, and official releases
+
+RustPainter is open source under [GPL-3.0-only](LICENSE), and forks and
+modifications are welcome. This repository,
+<https://github.com/YeheyaMohammad01/RustPainter>, is the official RustPainter
+repository. Only releases published through this repository should be treated
+as official RustPainter releases; third-party forks and modified binaries are
+unofficial and independently maintained.
+
+Public modified distributions must follow the attribution and
+modified-version notices in [ADDITIONAL_TERMS.md](ADDITIONAL_TERMS.md).
+[BRANDING.md](BRANDING.md) explains how to use the RustPainter name, icon,
+logo, and related branding without implying that a fork is official.
+
 ## Disclaimer
 
 RustPainter is an independent, unofficial project. It is not affiliated with,
@@ -1023,5 +1037,7 @@ risk. See the warranty disclaimer in [LICENSE](LICENSE).
 
 ## License
 
-Released under the [MIT License](LICENSE). Third-party runtime dependencies
+RustPainter is licensed under the GNU General Public License, version 3 only
+([GPL-3.0-only](LICENSE)), with the GPLv3 section 7 terms in
+[ADDITIONAL_TERMS.md](ADDITIONAL_TERMS.md). Third-party runtime dependencies
 ship under their own terms; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
