@@ -26,6 +26,12 @@ Write-Host "Built dist\RustPainter.exe"
 $releaseDirectory = Join-Path $PSScriptRoot "release"
 New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
 $archive = Join-Path $releaseDirectory "RustPainter-Windows-x64.zip"
-Compress-Archive -LiteralPath $executable -DestinationPath $archive -Force
+$releaseFiles = @(
+    $executable,
+    (Join-Path $PSScriptRoot "LICENSE"),
+    (Join-Path $PSScriptRoot "ADDITIONAL_TERMS.md"),
+    (Join-Path $PSScriptRoot "THIRD_PARTY_LICENSES.md")
+)
+Compress-Archive -LiteralPath $releaseFiles -DestinationPath $archive -Force
 
 Write-Host "Packaged release\RustPainter-Windows-x64.zip"
