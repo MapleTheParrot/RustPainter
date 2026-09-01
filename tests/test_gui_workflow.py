@@ -877,7 +877,7 @@ def test_baked_text_has_no_antialiased_fringe() -> None:
         np.zeros((80, 160), dtype=bool),
         64,
     )
-    plain = _TextOverlayOptions("RUST", "", 44, (255, 255, 255))
+    plain = _TextOverlayOptions("RUST", "", 44, (255, 255, 255), smooth=False)
     baked = main_window_module._apply_text_overlays(backdrop, (plain,))
     painted = np.asarray(baked.image.convert("RGB"), dtype=np.uint8)[
         np.asarray(baked.paint_mask, dtype=bool)
