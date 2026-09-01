@@ -39,6 +39,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QImage,
+    QIcon,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -133,6 +134,12 @@ from app.resume_record import (
     record_for_job,
 )
 from app.settings import DEFAULT_COLOR_COUNT, SettingsStore, default_settings
+from app.sign_catalog import (
+    SignCatalogEntry,
+    catalog_entry,
+    catalog_icon_path,
+    search_catalog,
+)
 from app.timelapse_export import (
     DEFAULT_FRAME_RATE,
     MAX_FRAME_RATE,
@@ -933,6 +940,90 @@ class _TimelapseExportWorker(QRunnable):
 
 class _DebugCancelled(RuntimeError):
     """Internal control-flow marker for a safely interrupted debug action."""
+
+
+class _SignCatalogDialog(QDialog):
+    """Searchable picker for the paintable surfaces declared by Rust."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose a Rust canvas")
+        self.resize(590, 570)
+        self.selected_entry: SignCatalogEntry | None = None
+
+        layout = QVBoxLayout(self)
+        heading = QLabel("Premade Rust profiles")
+        heading.setObjectName("pageTitle")
+        note = QLabel(
+            "Texture sizes come directly from Rust's paintable prefabs. Choose "
+            "the item you are facing, then set or adjust its canvas box for your zoom."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search canvases, frames, signs…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(68, 68))
+        self.list.setSpacing(3)
+        self.list.setAlternatingRowColors(True)
+        self.list.itemDoubleClicked.connect(lambda _item: self._accept_selection())
+        self.search_edit.textChanged.connect(self._refresh_results)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("Create profile")
+        self.ok_button.setEnabled(False)
+        buttons.accepted.connect(self._accept_selection)
+        buttons.rejected.connect(self.reject)
+        self.list.currentItemChanged.connect(
+            lambda current, _previous: self.ok_button.setEnabled(current is not None)
+        )
+
+        layout.addWidget(heading)
+        layout.addWidget(note)
+        layout.addWidget(self.search_edit)
+        layout.addWidget(self.list, 1)
+        layout.addWidget(buttons)
+        self._refresh_results("")
+        self.search_edit.setFocus()
+
+    @Slot(str)
+    def _refresh_results(self, query: str) -> None:
+        selected_id = (
+            self.list.currentItem().data(Qt.ItemDataRole.UserRole)
+            if self.list.currentItem() is not None
+            else None
+        )
+        self.list.clear()
+        for entry in search_catalog(query):
+            item = QListWidgetItem(
+                f"{entry.name}\n{entry.category}  •  {entry.width}×{entry.height} texels"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, entry.id)
+            item.setToolTip(
+                f"Rust item: {entry.item_shortname}\n"
+                f"Paint texture: {entry.width}×{entry.height} texels"
+            )
+            icon_path = catalog_icon_path(entry)
+            if icon_path.exists():
+                item.setIcon(QIcon(str(icon_path)))
+            self.list.addItem(item)
+            if entry.id == selected_id:
+                self.list.setCurrentItem(item)
+        if self.list.currentItem() is None and self.list.count():
+            self.list.setCurrentRow(0)
+        self.ok_button.setEnabled(self.list.currentItem() is not None)
+
+    def _accept_selection(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            return
+        self.selected_entry = catalog_entry(str(item.data(Qt.ItemDataRole.UserRole)))
+        if self.selected_entry is not None:
+            self.accept()
 
 
 class _NameDialog(QDialog):
@@ -2689,10 +2780,17 @@ class MainWindow(QMainWindow):
         profile_label.setObjectName("sectionTitle")
         profile_layout.addWidget(profile_label)
         self.profile_combo = NoWheelComboBox()
+        self.profile_combo.setIconSize(QSize(30, 30))
         self.profile_combo.setToolTip(
             "Each profile stores one sign's canvas and setup. Fixed Rust UI/HUD "
             "calibrations carry across every profile."
         )
+        self.browse_profiles_button = QPushButton("Browse Rust canvases")
+        self.browse_profiles_button.setToolTip(
+            "Search Rust's built-in canvases, frames and signs. Premade profiles "
+            "know the exact texture resolution before the first paint."
+        )
+        self.browse_profiles_button.setObjectName("secondaryButton")
         profile_row = QHBoxLayout()
         profile_row.addWidget(self.profile_combo, 1)
         self.new_profile_button = QPushButton("")
@@ -2716,6 +2814,7 @@ class MainWindow(QMainWindow):
         self.rename_profile_button.setAccessibleName("Rename profile")
         self.delete_profile_button.setAccessibleName("Delete profile")
         profile_layout.addLayout(profile_row)
+        profile_layout.addWidget(self.browse_profiles_button)
 
         self.setup_summary = QFrame()
         self.setup_summary.setObjectName("readinessCard")
@@ -5292,10 +5391,12 @@ class MainWindow(QMainWindow):
         return (typed, nearest) if source_axis == "width" else (nearest, typed)
 
     def _sign_resolution_cap_source(self) -> str:
-        """Where the cap comes from: "grid", "table", "brush" or "" for none."""
+        """Where the cap comes from: grid, catalog, table, brush, or nothing."""
 
         if self._texel_grid() is not None:
             return "grid"
+        if self._catalog_texture_size() is not None:
+            return "catalog"
         model = self._brush_size_model()
         if model is None:
             return ""
@@ -5305,14 +5406,33 @@ class MainWindow(QMainWindow):
             return "table"
         return "brush"
 
+    def _catalog_texture_size(self) -> tuple[int, int] | None:
+        """The selected Rust prefab's declared paint texture, if known."""
+
+        profile = self._current_profile
+        value = (
+            profile.metadata.get("sign_texture_size")
+            if profile is not None and isinstance(profile.metadata, dict)
+            else None
+        )
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return None
+        try:
+            width, height = int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return None
+        if not (8 <= width <= 2048 and 8 <= height <= 2048):
+            return None
+        return width, height
+
     def _sign_resolution_cap(self) -> tuple[int, int] | None:
         """The largest logical size this sign's texture actually resolves.
 
         The brush measurement pins down how many texture rows the sign holds.
         Planning more rows than that cannot add detail - Rust's smallest brush
         already covers a full texel, so finer cells only make neighbouring
-        strokes overpaint each other.  ``None`` until a job has measured this
-        sign.
+        strokes overpaint each other. A premade profile supplies the value
+        directly from Rust's prefab; a custom profile learns it from a job.
         """
 
         grid = self._texel_grid()
@@ -5334,6 +5454,12 @@ class MainWindow(QMainWindow):
                 max(8, min(2048, columns)),
                 max(8, min(2048, rows)),
             )
+        catalog_size = self._catalog_texture_size()
+        if catalog_size is not None:
+            # MeshPaintableSource declares this size in the game's prefab. It
+            # is a stronger preview ceiling than a brush inference and does
+            # not depend on camera distance or the hand-dragged canvas box.
+            return catalog_size
         model = self._brush_size_model()
         if model is None:
             return None
@@ -5499,6 +5625,12 @@ class MainWindow(QMainWindow):
                 "with more cells than that cannot add detail: neighbouring "
                 "cells would land on the same texel and overpaint each other."
             )
+        elif source == "catalog":
+            self.resolution_cap_panel.setToolTip(
+                f"{cap_width}×{cap_height} is declared by this paintable's "
+                "MeshPaintableSource in Rust's game assets. It is independent "
+                "of camera zoom; calibration only places those texels on screen."
+            )
         elif source == "table":
             self.resolution_cap_panel.setToolTip(
                 f"{cap_width}×{cap_height} is the texture size Rust's own sign "
@@ -5523,6 +5655,7 @@ class MainWindow(QMainWindow):
                 return
             basis = {
                 "grid": "",
+                "catalog": " (Rust game assets)",
                 "table": " (Rust's own sign data)",
                 "brush": " (estimated from the brush)",
             }[source]
@@ -6431,7 +6564,12 @@ class MainWindow(QMainWindow):
 
     def _canvas_aspect_ratio(self) -> float:
         rect = self._profile_rect("canvas")
-        return rect.aspect_ratio if rect else 2.0
+        if rect is not None:
+            return rect.aspect_ratio
+        catalog_size = self._catalog_texture_size()
+        if catalog_size is not None:
+            return catalog_size[0] / catalog_size[1]
+        return 2.0
 
     # Service integration methods are kept below the visual/image code so that
     # the platform-specific pieces remain easy to audit.
@@ -6503,6 +6641,7 @@ class MainWindow(QMainWindow):
     def _connect_service_controls(self) -> None:
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
         self.new_profile_button.clicked.connect(self._new_profile)
+        self.browse_profiles_button.clicked.connect(self._browse_catalog_profiles)
         self.detect_setup_button.clicked.connect(self._begin_setup_detection)
         self.rename_profile_button.clicked.connect(self._rename_profile)
         self.delete_profile_button.clicked.connect(self._delete_profile)
@@ -7209,7 +7348,18 @@ class MainWindow(QMainWindow):
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
         for profile in profiles:
-            self.profile_combo.addItem(profile.name, profile.id)
+            entry = catalog_entry(str(profile.metadata.get("sign_catalog_id", "")))
+            icon_path = catalog_icon_path(entry) if entry is not None else None
+            if icon_path is not None and icon_path.exists():
+                self.profile_combo.addItem(QIcon(str(icon_path)), profile.name, profile.id)
+            else:
+                self.profile_combo.addItem(profile.name, profile.id)
+            if entry is not None:
+                self.profile_combo.setItemData(
+                    self.profile_combo.count() - 1,
+                    f"{entry.category} — {entry.width}×{entry.height} texels",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         index = self.profile_combo.findData(preferred_id)
         if index < 0:
             default = self._profile_store.get_default()
@@ -7449,6 +7599,81 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could not create profile", str(exc))
             return
         self._reload_profiles(profile.id)
+
+    @Slot()
+    def _browse_catalog_profiles(self) -> None:
+        dialog = _SignCatalogDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.selected_entry is None:
+            return
+        self._create_catalog_profile(dialog.selected_entry)
+
+    def _create_catalog_profile(self, entry: SignCatalogEntry) -> Profile | None:
+        """Create or select a profile tied to one game-declared paintable."""
+
+        try:
+            profiles = self._profile_store.list_profiles()
+            existing = next(
+                (
+                    profile
+                    for profile in profiles
+                    if profile.metadata.get("sign_catalog_id") == entry.id
+                ),
+                None,
+            )
+            if existing is not None:
+                self._reload_profiles(existing.id)
+                self.statusBar().showMessage(
+                    f"Selected {existing.name} — {entry.width}×{entry.height} texels",
+                    6000,
+                )
+                return existing
+
+            used_names = {profile.name.casefold() for profile in profiles}
+            name = entry.name
+            if name.casefold() in used_names:
+                suffix = 2
+                while f"{entry.name} ({suffix})".casefold() in used_names:
+                    suffix += 1
+                name = f"{entry.name} ({suffix})"
+
+            # Fixed picker/HUD rectangles are inherited by ProfileStore. The
+            # canvas is sign-specific, but keeping a similarly-shaped current
+            # box gives automatic detection or an edge drag a useful start.
+            canvas = None
+            source = self._current_profile
+            if source is not None and source.canvas is not None:
+                wanted_aspect = entry.width / entry.height
+                if abs(source.canvas.aspect_ratio / wanted_aspect - 1.0) <= 0.12:
+                    canvas = source.canvas
+            profile = Profile.new(
+                name,
+                canvas=canvas,
+                metadata={
+                    "sign_catalog_id": entry.id,
+                    "sign_item_shortname": entry.item_shortname,
+                    "sign_texture_size": [entry.width, entry.height],
+                },
+            )
+            profile = self._profile_store.save(profile, make_default=True)
+        except Exception as exc:
+            LOGGER.exception("Could not create the premade profile")
+            QMessageBox.warning(self, "Could not create profile", str(exc))
+            return None
+
+        self._reload_profiles(profile.id)
+        if canvas is None:
+            self.statusBar().showMessage(
+                f"Created {entry.name} at {entry.width}×{entry.height} texels. "
+                "Set its canvas area for the current view.",
+                9000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Created {entry.name} at {entry.width}×{entry.height} texels. "
+                "Check the canvas outline against the frame.",
+                9000,
+            )
+        return profile
 
     @Slot()
     def _rename_profile(self) -> None:
@@ -8427,8 +8652,16 @@ class MainWindow(QMainWindow):
             texture = (
                 f"a {grid.columns}×{grid.rows}-texel texture, counted on the sign"
             )
-        elif (cap := self._sign_resolution_cap()) and self._sign_resolution_cap_source() == "table":
-            texture = f"a {cap[0]}×{cap[1]}-texel texture, by Rust's sign data"
+        elif (cap := self._sign_resolution_cap()) and self._sign_resolution_cap_source() in {
+            "catalog",
+            "table",
+        }:
+            basis = (
+                "the selected Rust prefab"
+                if self._sign_resolution_cap_source() == "catalog"
+                else "Rust's sign data"
+            )
+            texture = f"a {cap[0]}×{cap[1]}-texel texture, by {basis}"
         else:
             texture = f"about a {rows}-row texture, inferred from the brush"
         next_run = (

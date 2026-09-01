@@ -9,6 +9,7 @@ python -m PyInstaller `
     --icon RustPainterIcon.png `
     --add-data "RustPainterIcon.png;." `
     --add-data "assets/ui;assets/ui" `
+    --add-data "assets/signs;assets/signs" `
     main.py
 
 if ($LASTEXITCODE -ne 0) {
