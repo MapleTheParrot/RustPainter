@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 import app.painter as painter_module
 from app.color_calibration import ColorCorrectionModel
-from app.color_mapping import map_rgb_to_picker
+from app.color_mapping import map_rgb_to_picker, picker_points_to_rgb
 from app.color_swatch import SwatchReading
 from app.input_controller import DryRunInputController, MockInputController
 from app.models import ColorGroup, PaintPlan, ScreenRect, Stroke
@@ -3288,6 +3288,48 @@ def test_a_delayed_picker_retry_recovers_before_pausing(
     )
     assert attempts == [1]
     assert waits == [painter._PICK_RECOVERY_DELAY_SECONDS]
+
+
+def test_picker_swatch_corrects_a_small_scale_raster_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The swatch identifies offsets in the hue strip and the S/V box."""
+
+    painter = Painter(MockInputController())
+    painter._swatch = ScreenRect(740, 100, 12, 12)
+    target = PaintingTarget.from_profile(_profile())
+    color = (226, 162, 42)
+    hue, sv, expected = painter._picker_plan(color, target, 0.0)
+    shown = picker_points_to_rgb(
+        (hue[0], hue[1] + 3),
+        (sv[0] + 2, sv[1] + 2),
+        target.hue_bar,
+        target.color_box,
+        hue_direction=target.picker_directions.hue,
+        saturation_direction=target.picker_directions.saturation,
+        value_direction=target.picker_directions.value,
+    )
+    clicked: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    monkeypatch.setattr(
+        painter,
+        "_click_picker",
+        lambda hue_point, sv_point, *_args, **_kwargs: clicked.append((hue_point, sv_point)),
+    )
+    monkeypatch.setattr(
+        painter,
+        "_read_selected_color",
+        lambda *_args: SwatchReading(expected, 0.0),
+    )
+
+    assert (
+        painter._correct_picker_geometry_from_swatch(
+            color, target, _settings(), 0, SwatchReading(shown, 0.0)
+        )
+        is None
+    )
+    # The live raster behaved as if each click were three/two pixels farther
+    # into its widgets, so compensate in the opposite direction.
+    assert clicked == [((hue[0], hue[1] - 3), (sv[0] - 2, sv[1] - 2))]
 
 
 def test_a_small_live_hue_raster_shift_is_found_before_painting() -> None:

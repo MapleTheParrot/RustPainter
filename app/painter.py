@@ -29,7 +29,7 @@ from .brush_calibration import (
 )
 from .color_calibration import ColorCorrectionModel
 from .digit_reader import read_number
-from .color_mapping import picker_click_plan
+from .color_mapping import picker_click_plan, rgb_to_hsv
 from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
 from .cursor_map import (
@@ -6567,6 +6567,11 @@ class Painter:
         )
         if reading is None or self._swatch is None:
             return
+        reading = self._correct_picker_geometry_from_swatch(
+            picker_color, target, settings, epoch, reading
+        )
+        if reading is None or self._swatch is None:
+            return
         reading = self._recover_delayed_color_pick(
             picker_color, target, settings, epoch, reading
         )
@@ -6590,6 +6595,72 @@ class Painter:
         # Waits out the pause; resuming starts a new epoch, and the caller
         # picks the color again under it.
         self._checkpoint(epoch=epoch, check_focus=True)
+
+    def _correct_picker_geometry_from_swatch(
+        self,
+        picker_color: RGBColor,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        epoch: int,
+        reading: SwatchReading,
+    ) -> SwatchReading | None:
+        """Correct small picker-rectangle offsets from its displayed colour.
+
+        At 0.5 UI scale, a calibrated widget can be a few physical pixels
+        away from Rust's live raster.  The displayed swatch gives the actual
+        hue, saturation, and value, so it is enough to move each click by the
+        corresponding pixel error instead of asking the player to type an
+        exact colour into Rust's unreliable text field.
+        """
+
+        hue_point, sv_point, _expected = self._picker_plan(picker_color, target, 0.0)
+        wanted = rgb_to_hsv(picker_color)
+        shown = rgb_to_hsv(reading.color)
+        hue_delta = (wanted.hue - shown.hue + 180.0) % 360.0 - 180.0
+        hue_sign = -1.0 if target.picker_directions.hue == "bottom_to_top" else 1.0
+        saturation_sign = (
+            -1.0 if target.picker_directions.saturation == "left_high" else 1.0
+        )
+        value_sign = -1.0 if target.picker_directions.value == "top_bright" else 1.0
+        corrected_hue = clamp_to_rect(
+            hue_point[0],
+            hue_point[1] + hue_sign * hue_delta * (target.hue_bar.height - 1) / 360.0,
+            target.hue_bar,
+        )
+        corrected_sv = clamp_to_rect(
+            sv_point[0]
+            + saturation_sign
+            * (wanted.saturation - shown.saturation)
+            * (target.color_box.width - 1),
+            sv_point[1]
+            + value_sign * (wanted.value - shown.value) * (target.color_box.height - 1),
+            target.color_box,
+        )
+        corrected_hue = int(round(corrected_hue[0])), int(round(corrected_hue[1]))
+        corrected_sv = int(round(corrected_sv[0])), int(round(corrected_sv[1]))
+        if corrected_hue == hue_point and corrected_sv == sv_point:
+            return reading
+        LOGGER.warning(
+            "The picker raster appears offset; correcting its hue and S/V clicks "
+            "from %s toward #%02X%02X%02X",
+            reading.hex,
+            *picker_color,
+        )
+        self._click_picker(corrected_hue, corrected_sv, settings, epoch, retry=True)
+        if self._swatch is None:
+            return None
+        corrected_reading = self._read_selected_color(picker_color, epoch)
+        if corrected_reading is None:
+            return None
+        if corrected_reading.matches(picker_color):
+            with self._condition:
+                summary = self._color_pick_summary
+                self._color_pick_summary = replace(
+                    summary, picks=summary.picks + 1, retried=summary.retried + 1
+                )
+            LOGGER.info("Color #%02X%02X%02X took after picker-raster correction", *picker_color)
+            return None
+        return corrected_reading
 
     def _recover_delayed_color_pick(
         self,
