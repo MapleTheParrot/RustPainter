@@ -1309,8 +1309,16 @@ def test_required_setup_summary_names_progress_in_plain_language(
     profile.color_box = ScreenRect(600, 100, 120, 120)
     profile.hue_bar = ScreenRect(730, 100, 20, 120)
     window._refresh_profile_ui()
-    assert window.setup_state_label.text() == "Rust setup complete"
+    assert window.setup_state_label.text() == "Basic Rust setup complete"
+    assert "Size value box" in window.setup_hint_label.text()
+    assert "Download button" in window.setup_hint_label.text()
     assert window.setup_summary.property("state") == "ready"
+
+    profile.brush_size_box = ScreenRect(760, 100, 60, 24)
+    profile.download_button = ScreenRect(830, 100, 24, 24)
+    window._refresh_profile_ui()
+    assert window.setup_state_label.text() == "Rust setup complete"
+    assert "exact texel verification" in window.setup_hint_label.text()
 
 
 def test_detected_setup_populates_required_and_common_optional_regions(
