@@ -30,11 +30,11 @@ if you try it, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know 
 
 ## Public test build
 
-I use this myself, but I am not posting a public `.exe` yet because the first-time setup still needs some work.
+want to try it? [download the latest Windows test build](https://github.com/YeheyaMohammad01/RustPainter/releases/latest), unzip it somewhere, then run `RustPainter.exe`. you dont need Python or anything else installed.
 
-If you would actually want to try it, [join the Discord](https://discord.gg/VMNQtgD3v). I mainly want to see whether anyone else would use this before I spend more time making the setup easier.
+this is still early, so start with a small image first. if something is confusing or it paints wrong, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know what happened.
 
-When a test build is available, you will need Windows 10 or 11 and Rust running in borderless or windowed mode.
+you will need Windows 10 or 11 and Rust running in borderless or windowed mode.
 
 ## Use it
 
