@@ -2,6 +2,5 @@
 
 ## Git conventions
 
-- **Never add a `Co-Authored-By` trailer to commits.** Commits must show only
-  the repository owner as the author on GitHub. This applies to every commit,
-  including ones authored entirely by an assistant.
+* Never add `Co-Authored-By` or other AI/assistant attribution trailers to commits.
+* Preserve the repository's existing Git author configuration. Do not modify `user.name`, `user.email`, signing configuration, or other Git identity settings.
