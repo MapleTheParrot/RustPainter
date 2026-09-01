@@ -8,6 +8,20 @@
 
 this takes an image and paints it onto a Rust sign for you. It uses normal mouse input, so you set up the parts of Rust's paint UI it needs to click first.
 
+## Made with RustPainter
+
+<p align="center">
+  <a href="PaintExamples/Ex1.png"><img src="PaintExamples/Ex1.png" alt="RustPainter example 1" width="31%"></a>
+  <a href="PaintExamples/Ex2.png"><img src="PaintExamples/Ex2.png" alt="RustPainter example 2" width="31%"></a>
+  <a href="PaintExamples/Ex3.png"><img src="PaintExamples/Ex3.png" alt="RustPainter example 3" width="31%"></a><br>
+  <a href="PaintExamples/Ex4.png"><img src="PaintExamples/Ex4.png" alt="RustPainter example 4" width="31%"></a>
+  <a href="PaintExamples/Ex5.png"><img src="PaintExamples/Ex5.png" alt="RustPainter example 5" width="31%"></a>
+  <a href="PaintExamples/Ex6.png"><img src="PaintExamples/Ex6.png" alt="RustPainter example 6" width="31%"></a><br>
+  <a href="PaintExamples/Ex7.png"><img src="PaintExamples/Ex7.png" alt="RustPainter example 7" width="31%"></a>
+  <a href="PaintExamples/Ex8.png"><img src="PaintExamples/Ex8.png" alt="RustPainter example 8" width="31%"></a>
+  <a href="PaintExamples/Ex9.png"><img src="PaintExamples/Ex9.png" alt="RustPainter example 9" width="31%"></a>
+</p>
+
 ## Early build
 
 this is the first public version of a tool I made for myself, and it works well for how I use it. The setup might still be confusing on a new PC or a different Rust UI layout though, so start with a small test image first.
