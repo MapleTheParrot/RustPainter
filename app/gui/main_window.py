@@ -2157,6 +2157,14 @@ class MainWindow(QMainWindow):
         self.browse_button.setMinimumHeight(36)
         self._set_icon(self.browse_button, "choose-image", ON_ACCENT, size=20)
         self.browse_button.clicked.connect(self._browse_image)
+        self.transparent_canvas_button = QPushButton("Start with transparent canvas")
+        self.transparent_canvas_button.setObjectName("compactButton")
+        self.transparent_canvas_button.setToolTip(
+            "Create a blank, transparent source so you can paint text or other "
+            "layers without importing an image. Transparent pixels stay unpainted "
+            "unless you choose a background in Artwork settings."
+        )
+        self.transparent_canvas_button.clicked.connect(self._start_transparent_canvas)
         image_info = QHBoxLayout()
         self.image_name_label = QLabel("No image selected")
         self.image_name_label.setWordWrap(True)
@@ -2165,6 +2173,7 @@ class MainWindow(QMainWindow):
         image_info.addWidget(self.image_name_label, 1)
         image_info.addWidget(self.image_dimensions_label)
         image_layout.addWidget(self.browse_button)
+        image_layout.addWidget(self.transparent_canvas_button)
         image_layout.addLayout(image_info)
 
         result_row = QHBoxLayout()
@@ -5009,24 +5018,7 @@ class MainWindow(QMainWindow):
 
     def load_image(self, path: Path) -> None:
         path = Path(path)
-        self._load_serial += 1
-        serial = self._load_serial
-        self._process_serial += 1
-        self._process_timer.stop()
-        self._plan_pending = False
-        self._plan_deferred = False
-        self._thread_pool.clear()
-        # Every cached plan belongs to the image it was made from.
-        self._plan_cache.clear()
-        self._plan_keys.clear()
-        self._original_image = None
-        self._image_path = None
-        self._processed = None
-        self._plan = None
-        self._plan_metric_source = None
-        self._plan_timing_profile = None
-        self._source_pixmap = QPixmap()
-        self._source_preview_size = None
+        serial = self._clear_source_for_replacement()
         self._show_preview_after_processing = True
         self.original_preview.clear_source("Decoding image…")
         self.paint_preview.clear_source("Waiting for the new image")
@@ -5044,6 +5036,56 @@ class MainWindow(QMainWindow):
         worker.signals.completed.connect(self._on_image_loaded)
         worker.signals.failed.connect(self._on_image_load_failed)
         self._load_pool.start(worker)
+
+    def _clear_source_for_replacement(self) -> int:
+        """Discard source-dependent state and invalidate queued image decodes."""
+
+        self._load_serial += 1
+        self._process_serial += 1
+        self._process_timer.stop()
+        self._plan_pending = False
+        self._plan_deferred = False
+        self._thread_pool.clear()
+        # Every cached plan belongs to the image it was made from.
+        self._plan_cache.clear()
+        self._plan_keys.clear()
+        self._original_image = None
+        self._image_path = None
+        self._processed = None
+        self._plan = None
+        self._plan_metric_source = None
+        self._plan_timing_profile = None
+        self._source_pixmap = QPixmap()
+        self._source_preview_size = None
+        self._load_pool.clear()
+        return self._load_serial
+
+    @Slot()
+    def _start_transparent_canvas(self) -> None:
+        """Create an image-free source whose untouched cells are transparent."""
+
+        self._clear_source_for_replacement()
+        width, height = self.logical_width_spin.value(), self._logical_height()
+        image = Image.new("RGBA", (width, height))
+        self._original_image = image
+        self._source_pixmap = self._pil_to_pixmap(image)
+        self._source_preview_size = None
+        self._show_preview_after_processing = True
+        self.original_preview.clear_source("Preparing transparent canvas...")
+        self.paint_preview.clear_source("Preparing transparent canvas")
+        self.image_name_label.setText("Transparent canvas")
+        self.image_dimensions_label.setText(
+            f"{width:,} x {height:,} px - transparent"
+        )
+        self.processing_label.setText("Transparent canvas ready")
+        self._refresh_text_editor_layers()
+        self._refresh_image_readiness()
+        self._refresh_statistics()
+        self._update_start_availability()
+        self._schedule_processing()
+        self._schedule_settings_save()
+        self._show_source_tab()
+        self.text_edit.setFocus()
 
     @Slot(object)
     def _on_image_loaded(self, result: _LoadResult) -> None:
