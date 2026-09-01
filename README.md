@@ -82,10 +82,10 @@ painting unattended. Everything below is detail you only need when tuning.
 ## Detailed setup and first paint
 
 1. Run Rust in borderless or windowed mode for the easiest calibration and focus switching.
-2. Optionally enable temporary painting UI scale under **Settings → Rust**. The default paints at `0.5` and restores `1.0`; enter your actual normal scale before enabling it. Click **Apply painting scale now**, switch to Rust during the countdown, and calibrate at that scale. See *Settings inside Rust* below.
+2. Optionally enable temporary painting UI scale under **Settings → Rust**. The default paints at `0.5` and restores `1.0`; enter your actual normal scale before enabling it. See *Settings inside Rust* below.
 3. Leave the sign's painting interface open and stationary.
 4. In RustPainter, create a profile for that sign/UI layout. A new profile starts with a copy of the current profile's calibration, so an unchanged setup needs no recalibration.
-5. Toggle Rust's **Adaptive Palette**, then click **Detect Rust setup** under Prepare Rust. Switch back during the countdown and review the proposed outlines. The detector fills the **canvas**, **color box**, **hue bar**, and the common fixed controls it can see. If an outline is off, drag its edge while idle or use its **Set area** button. The manual path remains available when Rust's layout cannot be recognised.
+5. Toggle Rust's **Adaptive Palette**, then click **Set up painting view** under Prepare Rust. Switch back during the countdown. With temporary scaling enabled, RustPainter applies the painting scale, detects the complete layout, tries both wheel directions, and enlarges the canvas only while it remains clear of the UI and screen edges. It captures the last safe view and restores the normal scale before showing the review. Save the proposed outlines, then use an individual **Set area** button for anything that needs fine-tuning. If the first full layout cannot be recognised, no zoom input is sent and the manual path remains available.
 6. With the numeric **Size value box** and **Clear button** detected or set, automatic brush sizing measures the sign on its first run. Later jobs first compare the visible sign with the stored texel grid. A match reuses the saved brush and timing measurements after a short check; a moved, changed, or uncertain sign automatically performs the full probe sequence and clears it before painting. Disable **Fast startup when the saved measurement still matches** in Settings to force a full measurement every time.
 7. Load an image. The balanced defaults are ready to use; composition, quality, palette, background, and transparency controls are under **Settings → Artwork** when needed.
 8. Inspect the paint simulation and plan statistics.
@@ -353,7 +353,14 @@ graphics.uiscale 1
 
 This is opt-in so an existing profile calibrated at another scale is not moved
 without warning. Set **While painting** and **Restore afterward** under
-**Settings → Rust**, then use **Apply painting scale now** before calibrating.
+**Settings → Rust**, then use **Set up painting view** after opening the sign
+and enabling Adaptive Palette. The setup pass temporarily applies the painting
+scale, captures and reviews every visible painting region, and restores the
+normal scale before returning control to the app. Its optional automatic zoom
+is confidence-gated: the cursor is placed inside the detected canvas, both
+wheel directions are probed, and the first clipped or overlapping step is
+undone. Incomplete detection never emits wheel input.
+
 Every rectangle in a profile must be captured at the painting scale. Profiles
 calibrated by this version remember their scale and a later mismatch blocks
 Start instead of painting at shifted coordinates.
@@ -373,7 +380,7 @@ Ctrl+F1, Shift+F1 and Alt+F1 - try the key in Rust yourself first and pick the
 one that opens the dark console panel across the top of the screen. If the
 console did not open (or is still open when the pass ends), the key is wrong
 for your keyboard. Leave temporary scaling disabled until the chosen key has
-been verified with **Apply painting scale now**.
+been verified with **Set up painting view**.
 
 ## Settings that require experimentation
 

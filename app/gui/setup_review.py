@@ -51,8 +51,8 @@ class SetupReviewDialog(QDialog):
         title.setObjectName("pageTitle")
         missing = detection.missing_required
         detail = (
-            "RustPainter found the painting UI. Use these areas, then drag any "
-            "outline edge on the Rust screen to fine-tune it."
+            "RustPainter found the painting UI. Save these areas, then use any "
+            "individual Set area button if an outline needs fine-tuning."
             if not missing
             else "RustPainter found part of the painting UI. The missing "
             + ", ".join(_LABELS.get(name, name) for name in missing)

@@ -137,6 +137,30 @@ def test_mock_controller_records_held_keys_and_releases_them() -> None:
     ]
 
 
+def test_mock_controller_records_signed_wheel_delta() -> None:
+    controller = MockInputController()
+    controller.scroll_wheel(120)
+    controller.scroll_wheel(-240)
+    controller.scroll_wheel(0)
+    assert [(event.kind, event.value) for event in controller.events] == [
+        ("wheel", 120),
+        ("wheel", -240),
+    ]
+
+
+def test_send_input_controller_emits_native_wheel_event() -> None:
+    controller = object.__new__(SendInputController)
+    controller._lock = threading.RLock()
+    sent: list[tuple[int, int]] = []
+    controller._send = lambda native: sent.append(
+        (native.mi.dwFlags, native.mi.mouseData)
+    )
+
+    controller.scroll_wheel(-120)
+
+    assert sent == [(0x0800, 0xFFFFFF88)]
+
+
 def test_type_text_sends_characters_as_unicode_regardless_of_layout() -> None:
     """Console commands need ``.``, ``#`` and ``"``, whose keys move between
     keyboard layouts; Unicode events deliver the character itself."""

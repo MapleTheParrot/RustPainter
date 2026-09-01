@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
 from .assets import asset_path
 
 
-# 3: the optional temporary Rust UI-scale workflow.
-TUTORIAL_VERSION = 3
+# 4: guided painting-scale setup and confidence-gated canvas fitting.
+TUTORIAL_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,11 +40,10 @@ TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     TutorialStep(
         "Choose the painting UI scale",
         "For more placement room, optionally enable temporary UI scaling "
-        "under Settings > Rust. Click Apply painting scale now, switch to "
-        "Rust during the countdown, then calibrate every region at that "
-        "scale. RustPainter applies it for each real paint session and "
-        "restores your configured normal scale afterward. Verify the console "
-        "key first; compact keyboards may need Ctrl+F1.",
+        "under Settings > Rust and enter your actual normal scale. The guided "
+        "setup and each real paint session apply the smaller scale only while "
+        "needed, then restore your normal scale. Verify the console key first; "
+        "compact keyboards may need Ctrl+F1.",
         "tutorial-rust-console",
     ),
     TutorialStep(
@@ -56,9 +55,10 @@ TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     ),
     TutorialStep(
         "Prepare RustPainter",
-        "Under Prepare Rust, click Detect Rust setup, switch back during the "
-        "countdown, then review the outlines. If one is off, drag its edge or "
-        "use Set area. RustPainter remembers them for the sign profile.",
+        "Under Prepare Rust, click Set up painting view and switch back during "
+        "the countdown. RustPainter detects the complete layout and enlarges "
+        "the canvas only while it stays clear of the UI. Review the captured "
+        "outlines, save them, then use Set area for any fine-tuning.",
         "tutorial-prepare-rust",
     ),
     TutorialStep(

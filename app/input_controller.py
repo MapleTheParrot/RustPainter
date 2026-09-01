@@ -52,6 +52,8 @@ class InputController(Protocol):
 
     def mouse_up(self, button: MouseButton | str = MouseButton.LEFT) -> None: ...
 
+    def scroll_wheel(self, delta: int) -> None: ...
+
     def click(
         self,
         x: float,
@@ -267,6 +269,7 @@ class SendInputController(BaseInputController):
     _MOUSEEVENTF_RIGHTUP = 0x0010
     _MOUSEEVENTF_MIDDLEDOWN = 0x0020
     _MOUSEEVENTF_MIDDLEUP = 0x0040
+    _MOUSEEVENTF_WHEEL = 0x0800
     _MOUSEEVENTF_VIRTUALDESK = 0x4000
     _MOUSEEVENTF_ABSOLUTE = 0x8000
 
@@ -308,12 +311,14 @@ class SendInputController(BaseInputController):
             error = ctypes.get_last_error()
             raise ctypes.WinError(error or 1)
 
-    def _mouse_event(self, flags: int, *, x: int = 0, y: int = 0) -> None:
+    def _mouse_event(
+        self, flags: int, *, x: int = 0, y: int = 0, mouse_data: int = 0
+    ) -> None:
         native_input = _INPUT(type=self._INPUT_MOUSE)
         native_input.mi = _MOUSEINPUT(
             dx=x,
             dy=y,
-            mouseData=0,
+            mouseData=mouse_data & 0xFFFFFFFF,
             dwFlags=flags,
             time=0,
             dwExtraInfo=0,
@@ -371,6 +376,15 @@ class SendInputController(BaseInputController):
             # the only record of a potentially held button is not.
             self._mouse_event(self._BUTTON_FLAGS[resolved][1])
             self._held_buttons.discard(resolved)
+
+    def scroll_wheel(self, delta: int) -> None:
+        """Turn the vertical wheel by a signed Win32 wheel delta."""
+
+        value = int(delta)
+        if value == 0:
+            return
+        with self._lock:
+            self._mouse_event(self._MOUSEEVENTF_WHEEL, mouse_data=value)
 
     def _key_input(self, vk: int, *, up: bool) -> "_INPUT":
         """Build a key event that a game will see as a real key.
@@ -584,6 +598,15 @@ class MockInputController(BaseInputController):
             self._held_buttons.discard(resolved)
             if self._record_events:
                 self.events.append(InputEvent("mouse_up", value=resolved.value))
+        self._delay()
+
+    def scroll_wheel(self, delta: int) -> None:
+        value = int(delta)
+        if value == 0:
+            return
+        with self._lock:
+            if self._record_events:
+                self.events.append(InputEvent("wheel", value=value))
         self._delay()
 
     def press_key(self, key: int | str, *, hold_seconds: float = 0.01) -> None:
