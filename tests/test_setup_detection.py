@@ -68,6 +68,19 @@ def test_basic_palette_does_not_produce_confident_setup() -> None:
     assert result.missing_required == ("canvas", "color_box", "hue_bar")
 
 
+def test_detects_adaptive_picker_when_low_scale_places_it_near_screen_center() -> None:
+    pixels = np.full((720, 1280, 3), 34, dtype=np.uint8)
+    pixels[100:620, 100:450] = 188
+    _add_adaptive_picker(pixels, box_left=480)
+
+    result = detect_painting_setup(
+        Image.fromarray(pixels, "RGB"), ScreenRect(0, 0, 1280, 720)
+    )
+
+    assert result.missing_required == ()
+    assert result.regions["hue_bar"].rect.left < 1280 * 0.55
+
+
 def test_canvas_detection_uses_inner_material_instead_of_metal_frame() -> None:
     pixels = np.full((720, 1280, 3), 34, dtype=np.uint8)
     # A connected, bright-enough metal surround would enlarge the old

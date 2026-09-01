@@ -220,8 +220,6 @@ def _detect_hue_bar(
     for left, top, width, height, area in _components(saturated, minimum):
         if height < 25 or height < width * 2.5:
             continue
-        if left + width / 2.0 < working.width * 0.55:
-            continue
         density = area / max(1, width * height)
         if density < 0.35:
             continue
@@ -235,6 +233,9 @@ def _detect_hue_bar(
         crop = working.crop(box)
         if not looks_like_hue_bar(crop):
             continue
+        # The ordered-spectrum test is the position-independent discriminator.
+        # At a low Rust UI scale the picker can sit near the screen centre, so
+        # rejecting candidates outside an assumed right-side panel is unsafe.
         score = density + min(1.0, height / max(1.0, width * 8.0))
         candidates.append((score, (left, top, width, height)))
     if not candidates:
