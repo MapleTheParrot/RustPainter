@@ -18,7 +18,7 @@ basically, it handles the clicking and color picking part so you can turn an ima
   <a href="PaintExamples/Ex3.png"><img src="PaintExamples/Ex3.png" alt="RustPainter example 3" width="31%"></a><br>
   <a href="PaintExamples/Ex4.png"><img src="PaintExamples/Ex4.png" alt="RustPainter example 4" width="31%"></a>
   <a href="PaintExamples/Ex5.png"><img src="PaintExamples/Ex5.png" alt="RustPainter example 5" width="31%"></a>
-  <a href="PaintExamples/Ex6.png"><img src="PaintExamples/Ex6.png" alt="RustPainter example 6" width="31%"></a><br>
+  <a href="https://raw.githubusercontent.com/MapleTheParrot/RustPainter/main/PaintExamples/Ex6.png"><img src="https://raw.githubusercontent.com/MapleTheParrot/RustPainter/main/PaintExamples/Ex6.png" alt="RustPainter example 6" width="31%"></a><br>
   <a href="PaintExamples/Ex7.png"><img src="PaintExamples/Ex7.png" alt="RustPainter example 7" width="31%"></a>
   <a href="PaintExamples/Ex8.png"><img src="PaintExamples/Ex8.png" alt="RustPainter example 8" width="31%"></a>
   <a href="PaintExamples/Ex9.png"><img src="PaintExamples/Ex9.png" alt="RustPainter example 9" width="31%"></a>
