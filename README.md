@@ -30,7 +30,7 @@ if you try it, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know 
 
 ## Public test build
 
-want to try it? [download the latest Windows test build](https://github.com/MapleTheParrot/RustPainter/releases/latest), unzip it somewhere, then run `RustPainter.exe`. you dont need Python or anything else installed.
+want to try it? [download the Windows test build](https://github.com/MapleTheParrot/RustPainter/releases/tag/v0.1.0-test), unzip it somewhere, then run `RustPainter.exe`. you dont need Python or anything else installed.
 
 this is still early, so start with a small image first. if something is confusing or it paints wrong, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know what happened.
 
