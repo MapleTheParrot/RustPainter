@@ -18,14 +18,14 @@ that:
 
 - identifies it as a modified or unofficial version of RustPainter;
 - identifies RustPainter as the original project and links to the official
-  repository: <https://github.com/YeheyaMohammad01/RustPainter>;
+  repository: <https://github.com/MapleTheParrot/RustPainter>;
 - states that the version is maintained independently; and
 - states that it is not an official RustPainter release and is not maintained,
   endorsed, supported, approved, or released by the original RustPainter
   maintainers.
 
 For example: “Unofficial modified version of RustPainter, independently
-maintained. Based on RustPainter: https://github.com/YeheyaMohammad01/RustPainter.
+maintained. Based on RustPainter: https://github.com/MapleTheParrot/RustPainter.
 Not an official RustPainter release and not endorsed or supported by the
 original RustPainter maintainers.”
 

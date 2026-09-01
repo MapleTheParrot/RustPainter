@@ -2,7 +2,7 @@
 
 The RustPainter name, logo, application icon (`RustPainterIcon.png`), and
 related visual branding identify the original RustPainter project published at
-<https://github.com/YeheyaMohammad01/RustPainter>.
+<https://github.com/MapleTheParrot/RustPainter>.
 
 Forks and modifications are welcome under GPL-3.0-only. You may truthfully
 describe your project as “Based on RustPainter,” “Fork of RustPainter,” or
