@@ -287,25 +287,20 @@ def test_text_overlay_is_editable_and_included_in_paint_plan(
 def test_transparent_canvas_allows_text_without_an_import(
     window: MainWindow, qtbot
 ) -> None:
-    window.quality_combo.setCurrentText("Custom")
-    window.logical_width_spin.setValue(64)
-    window.logical_height_spin.setValue(32)
-
-    window.transparent_canvas_button.click()
-
     assert window._image_path is None
     assert window._original_image is not None
-    assert window._original_image.size == (64, 32)
     assert window._original_image.getbbox() is None
     assert window.image_name_label.text() == "Transparent canvas"
     assert window.transparency_combo.currentData() == "leave_unpainted"
+    assert window.original_preview._show_upload_prompt
 
     window.text_edit.setText("RUST")
     qtbot.waitUntil(lambda: window._plan is not None, timeout=5000)
 
     assert window._processed is not None
     assert window._processed.paint_mask.sum() > 0
-    assert window._processed.paint_mask.sum() < 64 * 32
+    assert window._processed.paint_mask.sum() < window._plan.width * window._plan.height
+    assert not window.original_preview._show_upload_prompt
 
 
 def test_text_size_survives_a_change_of_quality_preset(window: MainWindow) -> None:

@@ -1197,6 +1197,7 @@ class MainWindow(QMainWindow):
         self._install_logging_handler()
         self._initialize_services()
         self._update_quality_dimensions()
+        self._start_transparent_canvas(show_upload_prompt=True)
         self._update_start_availability()
         self._reset_text_history()
 
@@ -2157,14 +2158,6 @@ class MainWindow(QMainWindow):
         self.browse_button.setMinimumHeight(36)
         self._set_icon(self.browse_button, "choose-image", ON_ACCENT, size=20)
         self.browse_button.clicked.connect(self._browse_image)
-        self.transparent_canvas_button = QPushButton("Start with transparent canvas")
-        self.transparent_canvas_button.setObjectName("compactButton")
-        self.transparent_canvas_button.setToolTip(
-            "Create a blank, transparent source so you can paint text or other "
-            "layers without importing an image. Transparent pixels stay unpainted "
-            "unless you choose a background in Artwork settings."
-        )
-        self.transparent_canvas_button.clicked.connect(self._start_transparent_canvas)
         image_info = QHBoxLayout()
         self.image_name_label = QLabel("No image selected")
         self.image_name_label.setWordWrap(True)
@@ -2173,7 +2166,6 @@ class MainWindow(QMainWindow):
         image_info.addWidget(self.image_name_label, 1)
         image_info.addWidget(self.image_dimensions_label)
         image_layout.addWidget(self.browse_button)
-        image_layout.addWidget(self.transparent_canvas_button)
         image_layout.addLayout(image_info)
 
         result_row = QHBoxLayout()
@@ -4511,6 +4503,8 @@ class MainWindow(QMainWindow):
         if self._text_layers[index].text == text:
             return
         self._text_layers[index] = replace(self._text_layers[index], text=text)
+        if self._image_path is None:
+            self.original_preview.set_upload_prompt(not bool(text.strip()))
         self._rebuild_text_layer_combo()
         self._refresh_text_editor_layers()
         self._record_text_history("text")
@@ -5061,7 +5055,7 @@ class MainWindow(QMainWindow):
         return self._load_serial
 
     @Slot()
-    def _start_transparent_canvas(self) -> None:
+    def _start_transparent_canvas(self, *, show_upload_prompt: bool = False) -> None:
         """Create an image-free source whose untouched cells are transparent."""
 
         self._clear_source_for_replacement()
@@ -5071,7 +5065,6 @@ class MainWindow(QMainWindow):
         self._source_pixmap = self._pil_to_pixmap(image)
         self._source_preview_size = None
         self._show_preview_after_processing = True
-        self.original_preview.clear_source("Preparing transparent canvas...")
         self.paint_preview.clear_source("Preparing transparent canvas")
         self.image_name_label.setText("Transparent canvas")
         self.image_dimensions_label.setText(
@@ -5079,11 +5072,13 @@ class MainWindow(QMainWindow):
         )
         self.processing_label.setText("Transparent canvas ready")
         self._refresh_text_editor_layers()
+        self.original_preview.set_upload_prompt(show_upload_prompt)
         self._refresh_image_readiness()
         self._refresh_statistics()
         self._update_start_availability()
         self._schedule_processing()
-        self._schedule_settings_save()
+        if not show_upload_prompt:
+            self._schedule_settings_save()
         self._show_source_tab()
         self.text_edit.setFocus()
 

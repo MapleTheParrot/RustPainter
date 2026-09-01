@@ -644,7 +644,7 @@ class PreviewLabel(_ImageDropTarget, QLabel):
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().paintEvent(event)
-        if self._source.isNull():
+        if self._is_empty:
             _paint_placeholder(
                 self,
                 self.contentsRect(),
@@ -1151,6 +1151,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._scene.addItem(self._background)
         self._scene.selectionChanged.connect(self._on_selection_changed)
         self._source = QPixmap()
+        self._show_upload_prompt = False
         self._items: list[_MovableTextItem] = []
         self._canvas_rect: QRectF | None = None
         self._font_scale = 1.0
@@ -1174,6 +1175,19 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
     @property
     def is_interacting(self) -> bool:
         return any(item.is_interacting for item in self._items)
+
+    @property
+    def _is_empty(self) -> bool:
+        return self._show_upload_prompt or self._source.isNull()
+
+    def set_upload_prompt(self, visible: bool) -> None:
+        """Overlay the normal upload affordance on an unused blank canvas."""
+
+        visible = bool(visible)
+        if visible == self._show_upload_prompt:
+            return
+        self._show_upload_prompt = visible
+        self._refresh_empty_state()
 
     @property
     def is_editing_text(self) -> bool:
@@ -1263,6 +1277,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
 
     def clear_source(self, placeholder: str = "No image loaded") -> None:
         self._placeholder = placeholder
+        self._show_upload_prompt = False
         self._canvas_rect = None
         self._font_scale = 1.0
         self._crop_origin = None
@@ -1304,7 +1319,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
         self._guides = []
         if primary is not None:
             self._primary = primary
-        if self._source.isNull():
+        if self._is_empty:
             return
         canvas = self.canvas_rect()
         for index, layer in enumerate(layers):
@@ -1538,7 +1553,7 @@ class TextEditorPreview(_ImageDropTarget, QGraphicsView):
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().paintEvent(event)
-        if self._source.isNull():
+        if self._is_empty:
             _paint_placeholder(
                 self.viewport(),
                 self.viewport().rect(),
