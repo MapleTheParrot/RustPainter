@@ -14,15 +14,13 @@ this is the first public version of a tool I made for myself, and it works well 
 
 if you try it, [join the Discord](https://discord.gg/VMNQtgD3v) and let me know what was confusing or what went wrong. That is basically what this release is for.
 
-## Download and run
+## Public test build
 
-You need Windows 10 or 11, plus Rust running in borderless or windowed mode.
+I use this myself, but I am not posting a public `.exe` yet because the first-time setup still needs some work.
 
-1. Download `RustPainter.exe` from the [latest release](https://github.com/YeheyaMohammad01/RustPainter/releases/latest).
-2. Open the downloaded file. There is no installer or Python setup needed.
-3. Open Rust, then open the sign's paint screen and leave it there while you set RustPainter up.
+If you would actually want to try it, [join the Discord](https://discord.gg/VMNQtgD3v). I mainly want to see whether anyone else would use this before I spend more time making the setup easier.
 
-If Windows shows a warning for the downloaded `.exe`, open its Properties and check **Unblock** if that option is there. The app is unsigned, so Windows may be a little weird about it.
+When a test build is available, you will need Windows 10 or 11 and Rust running in borderless or windowed mode.
 
 ## Use it
 
