@@ -1,4 +1,4 @@
-# RustPainter
+# RustPainter - Rust Sign Painter
 
 <p align="center">
   <img src="RustPainterIcon.png" alt="RustPainter icon" width="128">
@@ -6,7 +6,9 @@
   <a href="https://discord.gg/VMNQtgD3v"><img src="assets/discord.svg" alt="Join the RustPainter Discord" width="128"></a>
 </p>
 
-this takes an image and paints it onto a Rust sign for you. It uses normal mouse input, so you set up the parts of Rust's paint UI it needs to click first.
+RustPainter is a Windows app that takes an image and paints it onto a sign in Rust for you. It uses normal mouse input, so you set up the parts of Rust's paint UI it needs to click first.
+
+basically, it handles the clicking and color picking part so you can turn an image into Rust sign art without manually painting every part of it.
 
 ## Made with RustPainter
 
@@ -20,6 +22,8 @@ this takes an image and paints it onto a Rust sign for you. It uses normal mouse
   <a href="PaintExamples/Ex7.png"><img src="PaintExamples/Ex7.png" alt="RustPainter example 7" width="31%"></a>
   <a href="PaintExamples/Ex8.png"><img src="PaintExamples/Ex8.png" alt="RustPainter example 8" width="31%"></a>
   <a href="PaintExamples/Ex9.png"><img src="PaintExamples/Ex9.png" alt="RustPainter example 9" width="31%"></a>
+  <br>
+  <a href="PaintExamples/Ex10.png"><img src="PaintExamples/Ex10.png" alt="RustPainter example 10" width="31%"></a>
 </p>
 
 ## Early build
