@@ -2771,49 +2771,72 @@ class MainWindow(QMainWindow):
         self.calibrate_thirst_button = QPushButton("Set area")
         self.calibrate_download_button = QPushButton("Set area")
         entries = (
-            (self.canvas_status, self.calibrate_canvas_button, "Calibrate canvas"),
-            (self.color_box_status, self.calibrate_color_box_button, "Calibrate color box"),
-            (self.hue_bar_status, self.calibrate_hue_bar_button, "Calibrate hue bar"),
             (
+                "canvas",
+                self.canvas_status,
+                self.calibrate_canvas_button,
+                "Calibrate canvas",
+            ),
+            (
+                "color_box",
+                self.color_box_status,
+                self.calibrate_color_box_button,
+                "Calibrate color box",
+            ),
+            (
+                "hue_bar",
+                self.hue_bar_status,
+                self.calibrate_hue_bar_button,
+                "Calibrate hue bar",
+            ),
+            (
+                "brush_size_box",
                 self.brush_size_box_status,
                 self.calibrate_brush_button,
                 "Calibrate the numeric Size field beside Rust's size slider",
             ),
             (
+                "circle_brush_button",
                 self.circle_brush_button_status,
                 self.calibrate_circle_brush_button,
                 "Calibrate the solid circle brush button. RustPainter clicks it for smooth artwork.",
             ),
             (
+                "square_brush_button",
                 self.square_brush_button_status,
                 self.calibrate_square_brush_button,
                 "Calibrate the solid square brush button. RustPainter clicks it for pixel art.",
             ),
             (
+                "clear_button",
                 self.clear_button_status,
                 self.calibrate_clear_button,
                 "Calibrate Rust's trash/clear icon, which wipes the sign between "
                 "the brush measurement and the painting",
             ),
             (
+                "save_button",
                 self.save_button_status,
                 self.calibrate_save_button,
                 "Calibrate Rust's Save changes button, which the anti-AFK break "
                 "clicks to leave the painting UI before it jumps",
             ),
             (
+                "hunger",
                 self.hunger_status,
                 self.calibrate_hunger_button,
                 "Calibrate only the hunger digits shown on Rust's HUD. During "
                 "each anti-AFK break, values at or below 50 show STARVING.",
             ),
             (
+                "thirst",
                 self.thirst_status,
                 self.calibrate_thirst_button,
                 "Calibrate only the thirst digits shown on Rust's HUD. During "
                 "each anti-AFK break, values at or below 50 show THIRSTY.",
             ),
             (
+                "download_button",
                 self.download_button_status,
                 self.calibrate_download_button,
                 "Calibrate Rust's download icon (second in the toolbar), which "
@@ -2822,7 +2845,7 @@ class MainWindow(QMainWindow):
                 "of guessing from a screenshot; each file is removed again.",
             ),
         )
-        for status, button, tooltip in entries:
+        for _field, _status, button, tooltip in entries:
             button.setObjectName("compactButton")
             button.setToolTip(tooltip)
             button.setFixedWidth(88)
@@ -2845,7 +2868,7 @@ class MainWindow(QMainWindow):
         required_grid.setVerticalSpacing(6)
         required_grid.setHorizontalSpacing(8)
         required_grid.setColumnStretch(0, 1)
-        for row, (status, button, _tooltip) in enumerate(entries[:3]):
+        for row, (_field, status, button, _tooltip) in enumerate(entries[:3]):
             required_grid.addWidget(status, row, 0)
             required_grid.addWidget(button, row, 1)
         required_layout.addLayout(required_grid)
@@ -2875,9 +2898,34 @@ class MainWindow(QMainWindow):
         optional_grid.setVerticalSpacing(6)
         optional_grid.setHorizontalSpacing(8)
         optional_grid.setColumnStretch(0, 1)
-        for row, (status, button, _tooltip) in enumerate(entries[3:]):
+        optional_labels = {
+            "brush_size_box": "Size value box",
+            "circle_brush_button": "Circle brush",
+            "square_brush_button": "Square brush",
+            "clear_button": "Clear button",
+            "save_button": "Save button",
+            "hunger": "Hunger number",
+            "thirst": "Thirst number",
+            "download_button": "Download button",
+        }
+        self._optional_calibration_clear_buttons: dict[str, QPushButton] = {}
+        for row, (field, status, button, _tooltip) in enumerate(entries[3:]):
+            clear_button = QPushButton("×")
+            clear_button.setObjectName("flat")
+            clear_button.setFixedWidth(28)
+            label = optional_labels[field]
+            clear_button.setAccessibleName(f"Remove {label} calibration")
+            clear_button.setToolTip(f"Remove {label} calibration")
+            clear_button.clicked.connect(
+                lambda _checked=False, target=field: self._remove_optional_calibration(
+                    target
+                )
+            )
+            self._optional_calibration_clear_buttons[field] = clear_button
+            setattr(self, f"clear_{field}_calibration_button", clear_button)
             optional_grid.addWidget(status, row, 0)
             optional_grid.addWidget(button, row, 1)
+            optional_grid.addWidget(clear_button, row, 2)
         optional_layout.addLayout(optional_grid)
 
         self.apply_brush_check = QCheckBox("Automatic brush sizing")
@@ -7173,6 +7221,8 @@ class MainWindow(QMainWindow):
         self.hunger_status.set_calibrated(bool(status.get("hunger")), True)
         self.thirst_status.set_calibrated(bool(status.get("thirst")), True)
         self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
+        for field, button in self._optional_calibration_clear_buttons.items():
+            button.setEnabled(bool(status.get(field)))
         self._refresh_setup_summary()
         self._refresh_brush_model_status()
         quality_preset_moved = self._refresh_quality_preset_availability()
@@ -7407,6 +7457,40 @@ class MainWindow(QMainWindow):
             self._update_calibration_overlay()
             return
         self._finish_manual_calibration(field, rectangle)
+
+    def _remove_optional_calibration(self, field: str) -> None:
+        """Clear one saved optional target without affecting the core setup."""
+
+        if self._current_profile is None:
+            return
+        operation_active = (
+            self._painter_is_active()
+            or self._debug_running
+            or self._countdown_callback_running
+            or bool(self._countdown and self._countdown.isVisible())
+        )
+        if operation_active:
+            QMessageBox.warning(
+                self,
+                "Operation is active",
+                "Stop or wait for the current operation before changing calibration.",
+            )
+            return
+        if not getattr(self._current_profile, field, None):
+            return
+        candidate = Profile.from_dict(self._current_profile.to_dict())
+        setattr(candidate, field, None)
+        try:
+            self._current_profile = self._profile_store.save(candidate)
+        except Exception as exc:
+            LOGGER.exception("Could not remove optional calibration")
+            QMessageBox.critical(self, "Could not remove calibration", str(exc))
+            return
+        LOGGER.info("Removed optional calibration: %s", field)
+        self._refresh_profile_ui()
+        self._update_calibration_overlay()
+        if field == "brush_size_box":
+            self._schedule_processing()
 
     @Slot()
     def _begin_setup_detection(self) -> None:

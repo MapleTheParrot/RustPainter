@@ -112,6 +112,29 @@ def test_history_is_an_icon_button_beside_start(window: MainWindow) -> None:
     assert window.sessions_button.height() == window.start_button.minimumHeight()
 
 
+def test_optional_calibration_remove_button_clears_only_its_target(window: MainWindow) -> None:
+    profile = window._profile_store.save(
+        Profile.new(
+            "Optional controls",
+            hunger=ScreenRect(800, 100, 40, 20),
+            thirst=ScreenRect(850, 100, 40, 20),
+        )
+    )
+    window._current_profile = profile
+    window._refresh_profile_ui()
+
+    assert window.clear_hunger_calibration_button.isEnabled()
+    assert window.clear_thirst_calibration_button.isEnabled()
+    window.clear_hunger_calibration_button.click()
+
+    assert window._current_profile is not None
+    assert window._current_profile.hunger is None
+    assert window._current_profile.thirst == ScreenRect(850, 100, 40, 20)
+    assert not window.clear_hunger_calibration_button.isEnabled()
+    assert window.clear_thirst_calibration_button.isEnabled()
+    assert window._profile_store.require(profile.id).hunger is None
+
+
 def test_rust_session_ui_scale_controls_round_trip(window: MainWindow) -> None:
     assert not window.manage_ui_scale_check.isChecked()
     assert window.painting_ui_scale_spin.value() == pytest.approx(0.5)
