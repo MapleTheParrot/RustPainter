@@ -42,7 +42,7 @@ keep a hand near F10 on your first few runs and dont leave it painting unattende
 If you want to run the project yourself, install 64-bit Python 3.11 through 3.14, then run:
 
 ```powershell
-git clone https://github.com/YeheyaMohammad01/RustPainter.git
+git clone https://github.com/MapleTheParrot/RustPainter.git
 cd RustPainter
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
