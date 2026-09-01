@@ -1,9 +1,10 @@
 """Detect Rust's painting controls from one monitor capture.
 
 The adaptive hue bar is the anchor: its ordered rainbow is unusually distinct,
-and the colour box and fixed controls have stable positions around it.  Canvas
-detection is deliberately conservative; a dark or already-painted sign is left
-for the existing manual selector instead of returning a confident-looking guess.
+and the colour box and fixed controls have stable positions around it. Canvas
+detection refines a loose bright component to its dense rectangular material
+core, excluding sparse frames and hanging decoration. A dark or already-painted
+sign is still left for the manual selector instead of returning a confident guess.
 """
 
 from __future__ import annotations
@@ -90,6 +91,122 @@ def _screen_rect(
 def _local_rect(rect: ScreenRect, origin: ScreenRect) -> ScreenRect:
     return ScreenRect(
         rect.left - origin.left, rect.top - origin.top, rect.width, rect.height
+    )
+
+
+def _close_short_gaps(values: np.ndarray, maximum: int) -> np.ndarray:
+    """Fill short false runs without joining genuinely separate edges."""
+
+    closed = np.asarray(values, dtype=bool).copy()
+    start = 0
+    while start < len(closed):
+        if closed[start]:
+            start += 1
+            continue
+        end = start + 1
+        while end < len(closed) and not closed[end]:
+            end += 1
+        if start > 0 and end < len(closed) and end - start <= maximum:
+            closed[start:end] = True
+        start = end
+    return closed
+
+
+def _longest_run(values: np.ndarray) -> tuple[int, int] | None:
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    for index, value in enumerate(np.append(np.asarray(values, dtype=bool), False)):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if best is None or index - start > best[1] - best[0]:
+                best = (start, index)
+            start = None
+    return best
+
+
+def _coverage_core(mask: np.ndarray) -> tuple[int, int, int, int, float] | None:
+    """Find the dense rectangular core of a component-like material mask."""
+
+    if mask.size == 0:
+        return None
+    left, top, right, bottom = 0, 0, mask.shape[1], mask.shape[0]
+    for _ in range(2):
+        current = mask[top:bottom, left:right]
+        if current.size == 0:
+            return None
+        row_reference = float(np.percentile(current.mean(axis=1), 80))
+        row_cutoff = max(0.62, row_reference * 0.76)
+        rows = _close_short_gaps(
+            current.mean(axis=1) >= row_cutoff,
+            max(1, min(3, current.shape[0] // 100)),
+        )
+        row_run = _longest_run(rows)
+        if row_run is None:
+            return None
+        top += row_run[0]
+        bottom = top + row_run[1] - row_run[0]
+
+        current = mask[top:bottom, left:right]
+        column_reference = float(np.percentile(current.mean(axis=0), 80))
+        column_cutoff = max(0.62, column_reference * 0.76)
+        columns = _close_short_gaps(
+            current.mean(axis=0) >= column_cutoff,
+            max(1, min(3, current.shape[1] // 100)),
+        )
+        column_run = _longest_run(columns)
+        if column_run is None:
+            return None
+        left += column_run[0]
+        right = left + column_run[1] - column_run[0]
+
+    core = mask[top:bottom, left:right]
+    if core.size == 0:
+        return None
+    return left, top, right, bottom, float(core.mean())
+
+
+def _rectangular_material_core(
+    pixels: np.ndarray,
+    brightness_mask: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int, int], float] | None:
+    """Refine a loose bright component to its consistent rectangular material."""
+
+    left, top, width, height = box
+    crop = pixels[top : top + height, left : left + width]
+    bright = brightness_mask[top : top + height, left : left + width]
+    if crop.size == 0:
+        return None
+
+    # The broad middle is overwhelmingly paintable material on an unpainted
+    # sign. Its robust colour spread tolerates cloth/wood grain but rejects a
+    # metal frame, hooks, shadows, and other differently shaded decoration.
+    center = crop[
+        height // 4 : max(height // 4 + 1, height - height // 4),
+        width // 4 : max(width // 4 + 1, width - width // 4),
+    ]
+    samples = center.reshape(-1, 3)
+    median = np.median(samples, axis=0)
+    center_distance = np.linalg.norm(samples - median, axis=1)
+    distance_limit = max(
+        0.10,
+        min(0.30, float(np.percentile(center_distance, 90)) * 1.8),
+    )
+    material = np.linalg.norm(crop - median, axis=2) <= distance_limit
+    material &= bright
+
+    refined = _coverage_core(material)
+    if refined is None:
+        return None
+    core_left, core_top, core_right, core_bottom, density = refined
+    core_width = core_right - core_left
+    core_height = core_bottom - core_top
+    if core_width < width * 0.55 or core_height < height * 0.55 or density < 0.68:
+        return None
+    return (
+        (left + core_left, top + core_top, core_width, core_height),
+        density,
     )
 
 
@@ -181,20 +298,47 @@ def _detect_canvas(
         mask = expanded
     minimum = max(30, int(working.width * working.height * 0.004))
     choices = []
-    for left, top, width, height, area in _components(mask, minimum):
+    for left, top, width, height, _area in _components(mask, minimum):
         if width < working.width * 0.12 or height < working.height * 0.12:
             continue
         if top < working.height * 0.02 and height < working.height * 0.25:
             continue
-        density = area / max(1, width * height)
-        screen_share = width * height / max(1, working.width * working.height)
-        score = screen_share * (0.5 + min(1.0, density))
-        choices.append((score, (left + 2, top + 2, max(1, width - 4), max(1, height - 4)), density))
+        refined = _rectangular_material_core(
+            pixels, mask, (left, top, width, height)
+        )
+        if refined is None:
+            continue
+        core, density = refined
+        core_left, core_top, core_width, core_height = core
+        screen_share = core_width * core_height / max(
+            1, working.width * working.height
+        )
+        rectangularity = core_width * core_height / max(1, width * height)
+        score = screen_share * (0.6 + density) * (0.7 + 0.3 * rectangularity)
+        # The brightness bridge grows every edge by two working pixels. An
+        # equal inset returns the proposal to the detected material and adds a
+        # small safety margin against unpaintable borders.
+        box = (
+            core_left + 2,
+            core_top + 2,
+            max(1, core_width - 4),
+            max(1, core_height - 4),
+        )
+        choices.append((score, box, density, rectangularity))
     if not choices:
         return None
-    _, box, density = max(choices, key=lambda item: item[0])
-    confidence = min(0.88, 0.62 + max(0.0, density - 0.45) * 0.45)
-    return DetectedRegion(_screen_rect(box, scale, screen), confidence, "large sign surface")
+    _, box, density, rectangularity = max(choices, key=lambda item: item[0])
+    confidence = min(
+        0.91,
+        0.58
+        + max(0.0, density - 0.65) * 0.55
+        + max(0.0, rectangularity - 0.60) * 0.25,
+    )
+    return DetectedRegion(
+        _screen_rect(box, scale, screen),
+        confidence,
+        "consistent rectangular sign surface",
+    )
 
 
 def detect_painting_setup(image: Image.Image, screen: ScreenRect) -> SetupDetection:
