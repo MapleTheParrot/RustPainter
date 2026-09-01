@@ -1290,16 +1290,16 @@ def test_existing_install_does_not_interrupt_with_tutorial(
     reopened.close()
 
 
-def test_new_user_path_starts_simple_and_presets_drive_expert_controls(
+def test_new_user_presets_drive_expert_controls(
     window: MainWindow,
 ) -> None:
-    """The first screen is outcome-led, while every detailed control remains."""
+    """Presets drive the detailed controls without hiding them."""
 
     assert window.experience_combo.currentText() == "Best quality"
-    assert window.customize_image_panel.isHidden()
-    assert window.optional_setup_panel.isHidden()
-    assert window.required_setup_panel.isHidden()
-    assert window.resume_panel.isHidden()
+    assert not window.customize_image_panel.isHidden()
+    assert not window.optional_setup_panel.isHidden()
+    assert not window.required_setup_panel.isHidden()
+    assert not window.resume_panel.isHidden()
 
     window.experience_combo.setCurrentText("Faster")
     assert window.quality_combo.currentText() == "Fast"
@@ -1313,8 +1313,8 @@ def test_new_user_path_starts_simple_and_presets_drive_expert_controls(
     assert window.experience_combo.currentText() == "Custom"
 
     window.customize_image_button.click()
-    assert not window.customize_image_panel.isHidden()
-    assert window.quality_combo.isVisibleTo(window)
+    assert window.customize_image_panel.isHidden()
+    assert not window.quality_combo.isVisibleTo(window)
 
 
 def test_required_setup_summary_names_progress_in_plain_language(
