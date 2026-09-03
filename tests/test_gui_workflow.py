@@ -156,6 +156,35 @@ def test_rust_session_ui_scale_controls_round_trip(window: MainWindow) -> None:
     assert window.painting_ui_scale_spin.isEnabled()
 
 
+def test_hotkey_recorder_waits_for_enter_before_committing(
+    window: MainWindow,
+) -> None:
+    edit = window.start_hotkey_combo
+    assert edit.currentText() == "CTRL+ALT+S"
+
+    edit.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Q,
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier,
+        )
+    )
+
+    assert edit.currentText() == "CTRL+ALT+S"
+    assert "CTRL+ALT+Q" in edit.text()
+
+    edit.keyPressEvent(
+        QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Return,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    )
+
+    assert edit.currentText() == "CTRL+ALT+Q"
+    assert window._settings_document()["hotkeys"]["start_resume"] == "CTRL+ALT+Q"
+
+
 def test_managed_ui_scale_rejects_a_profile_calibrated_at_another_scale(
     window: MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:

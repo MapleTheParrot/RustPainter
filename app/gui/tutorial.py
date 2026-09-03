@@ -70,7 +70,8 @@ TUTORIAL_STEPS: tuple[TutorialStep, ...] = (
     TutorialStep(
         "Start with a quick test",
         "Try a small image first. Click Paint, switch back to Rust during the "
-        "countdown, and use F8 again to pause or resume. F10 stops the job.",
+        "countdown, and use Ctrl+Alt+S again to pause or resume. Ctrl+Alt+X "
+        "stops the job. You can record different shortcuts in Safety settings.",
         "tutorial-start-painting",
     ),
 )

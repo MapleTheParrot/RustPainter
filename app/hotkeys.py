@@ -23,6 +23,10 @@ _MODIFIER_VALUES = {
     "WIN": 0x0008,
     "WINDOWS": 0x0008,
 }
+_CANONICAL_MODIFIERS = {
+    "CONTROL": "CTRL",
+    "WINDOWS": "WIN",
+}
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
@@ -59,10 +63,24 @@ class HotkeySpec:
             return value
         if isinstance(value, int):
             return cls(value)
-        parts = [part.strip() for part in str(value).split("+") if part.strip()]
+        parts = [part.strip().upper() for part in str(value).split("+") if part.strip()]
         if not parts:
             raise ValueError("Hotkey cannot be empty")
-        return cls(parts[-1], tuple(part.upper() for part in parts[:-1]))
+        modifiers = tuple(_CANONICAL_MODIFIERS.get(part, part) for part in parts[:-1])
+        if len(set(modifiers)) != len(modifiers):
+            raise ValueError("A hotkey cannot repeat a modifier")
+        if any(modifier not in _MODIFIER_VALUES for modifier in modifiers):
+            unsupported = next(
+                modifier for modifier in modifiers if modifier not in _MODIFIER_VALUES
+            )
+            raise ValueError(f"Unsupported hotkey modifier: {unsupported!r}")
+        key = _CANONICAL_MODIFIERS.get(parts[-1], parts[-1])
+        if key in _MODIFIER_VALUES:
+            raise ValueError("A hotkey must include a non-modifier key")
+        spec = cls(key, modifiers)
+        # Validate the key name before a bad value reaches the hotkey thread.
+        spec.virtual_key
+        return spec
 
     @property
     def virtual_key(self) -> int:
@@ -83,31 +101,26 @@ class HotkeySpec:
         return "+".join(pieces)
 
 
-# Compact laptop keyboards put F5-F12 behind an Fn key that the keyboard
-# firmware consumes, so those presses never reach RegisterHotKey and the app
-# looks unusable.  Offer modifier combos that every keyboard can produce.
-# Ctrl+Alt+letter avoids both Rust's bindings and the common Windows shortcuts.
-FUNCTION_KEY_CHOICES: tuple[str, ...] = tuple(f"F{number}" for number in range(5, 13))
-MODIFIER_KEY_CHOICES: tuple[str, ...] = tuple(
-    f"CTRL+ALT+{letter}" for letter in ("S", "P", "X", "B", "N", "M")
-)
-SUPPORTED_HOTKEY_CHOICES: tuple[str, ...] = FUNCTION_KEY_CHOICES + MODIFIER_KEY_CHOICES
-
-
 def normalize_hotkey(value: object) -> str:
-    """Return the canonical spelling used by settings and the chooser."""
+    """Return the canonical spelling used by settings and the recorder."""
 
-    return "+".join(part.strip() for part in str(value).strip().upper().split("+"))
+    return str(HotkeySpec.parse(str(value).strip()))
 
 
 def is_supported_hotkey(value: object) -> bool:
-    return normalize_hotkey(value) in SUPPORTED_HOTKEY_CHOICES
+    """Return whether a hotkey can be represented by ``RegisterHotKey``."""
+
+    try:
+        spec = HotkeySpec.parse(str(value).strip())
+        return 0 < spec.virtual_key < 0xFF
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True, slots=True)
 class HotkeyBindings:
-    start_resume: HotkeySpec | int | str = "F8"
-    abort: HotkeySpec | int | str = "F10"
+    start_resume: HotkeySpec | int | str = "CTRL+ALT+S"
+    abort: HotkeySpec | int | str = "CTRL+ALT+X"
 
     def normalized(self) -> "HotkeyBindings":
         return HotkeyBindings(
@@ -118,8 +131,8 @@ class HotkeyBindings:
     @classmethod
     def from_mapping(cls, values: Mapping[str, int | str | HotkeySpec]) -> "HotkeyBindings":
         return cls(
-            start_resume=values.get("start_resume", "F8"),
-            abort=values.get("abort", "F10"),
+            start_resume=values.get("start_resume", "CTRL+ALT+S"),
+            abort=values.get("abort", "CTRL+ALT+X"),
         )
 
 

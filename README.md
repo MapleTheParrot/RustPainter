@@ -47,9 +47,9 @@ you will need Windows 10 or 11 and Rust running in borderless or windowed mode.
 3. Check the preview and start with a small, low-color image so you can make sure your calibration is right.
 4. Focus Rust during the countdown, then start painting.
 
-`F8` starts, pauses, or resumes a paint job. `F10` stops it immediately and releases the mouse button.
+`Ctrl+Alt+S` starts, pauses, or resumes a paint job. `Ctrl+Alt+X` stops it immediately and releases the mouse button. You can record any other available keyboard shortcut in Safety settings by pressing the shortcut and then Enter.
 
-keep a hand near F10 on your first few runs and dont leave it painting unattended.
+keep a hand near your stop shortcut on your first few runs and dont leave it painting unattended.
 
 ## Need help?
 

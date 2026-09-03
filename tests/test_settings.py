@@ -185,7 +185,7 @@ def test_painting_delay_and_unknown_keys_survive_round_trip(tmp_path) -> None:
             {"painting": {"stroke_speed_pixels_per_second": float("nan")}},
             "stroke_speed",
         ),
-        ({"hotkeys": {"start_resume": "Ctrl+F8"}}, "start_resume"),
+        ({"hotkeys": {"start_resume": "Ctrl+Mouse1"}}, "start_resume"),
         ({"painting": {"confirm_strokes": "yes"}}, "confirm_strokes"),
         ({"painting": {"confirm_max_rounds": 0}}, "confirm_max_rounds"),
         ({"painting": {"confirm_max_rounds": True}}, "confirm_max_rounds"),
@@ -206,6 +206,15 @@ def test_expected_process_defaults_to_the_rust_client() -> None:
     assert safety["expected_window_title_contains"] == "Rust"
     assert safety["expected_process_name"] == "RustClient.exe"
     assert safety["anti_afk_enabled"] is True
+
+
+def test_hotkey_defaults_work_without_a_function_key_row() -> None:
+    from app.settings import DEFAULT_SETTINGS
+
+    assert DEFAULT_SETTINGS["hotkeys"] == {
+        "start_resume": "CTRL+ALT+S",
+        "abort": "CTRL+ALT+X",
+    }
 
 
 def test_session_ui_scale_defaults_are_safe_for_existing_profiles() -> None:
@@ -234,17 +243,15 @@ def test_settings_reject_invalid_session_ui_scale_values(tmp_path, patch) -> Non
         SettingsStore(tmp_path / "settings.json").save(patch)
 
 
-def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(
+def test_settings_accept_user_recorded_hotkeys(
     tmp_path,
 ) -> None:
-    # Compact laptop keyboards swallow F5-F12 behind Fn, so the app was
-    # unusable there while only function keys were allowed.
     store = SettingsStore(tmp_path / "settings.json")
 
     saved = store.save(
         {
             "hotkeys": {
-                "start_resume": "CTRL+ALT+S",
+                "start_resume": "CTRL+ALT+Q",
                 "pause": "CTRL+ALT+P",
                 "abort": "CTRL+ALT+X",
             }
@@ -252,15 +259,15 @@ def test_settings_accept_modifier_hotkeys_for_keyboards_without_a_usable_fn_key(
     )
 
     assert saved["hotkeys"]["abort"] == "CTRL+ALT+X"
-    assert store.load()["hotkeys"]["start_resume"] == "CTRL+ALT+S"
+    assert store.load()["hotkeys"]["start_resume"] == "CTRL+ALT+Q"
 
 
-def test_settings_still_reject_a_modifier_hotkey_the_chooser_cannot_offer(
+def test_settings_reject_an_unrecordable_key_name(
     tmp_path,
 ) -> None:
     with pytest.raises(SettingsError, match="start_resume"):
         SettingsStore(tmp_path / "settings.json").save(
-            {"hotkeys": {"start_resume": "CTRL+ALT+Q"}}
+            {"hotkeys": {"start_resume": "CTRL+ALT+MOUSE1"}}
         )
 
 

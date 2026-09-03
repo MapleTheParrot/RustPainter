@@ -1736,7 +1736,7 @@ class CountdownDialog(QDialog):
         on_finished: Callable[[], None],
         parent: QWidget | None = None,
         *,
-        hint: str = "F10 cancels",
+        hint: str = "CTRL+ALT+X cancels",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("RustPainter")

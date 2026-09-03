@@ -1041,7 +1041,7 @@ class Painter:
         picker_directions: PickerDirections | None = None,
         start_stroke: int = 0,
     ) -> None:
-        """Prepare a job without starting it, suitable for an F8 callback.
+        """Prepare a job without starting it, suitable for a hotkey callback.
 
         ``start_stroke`` resumes a plan partway: that many strokes, in plan
         order, are taken as already on the sign.  The sign is neither

@@ -6,6 +6,7 @@ from typing import Any, Callable
 import pytest
 
 from app.hotkeys import (
+    DEFAULT_HOTKEYS,
     MOD_NOREPEAT,
     GlobalHotkeyManager,
     HotkeyRegistrationError,
@@ -128,19 +129,36 @@ def test_stop_timeout_marks_emergency_hotkeys_unhealthy() -> None:
     assert errors == [manager.startup_error]
 
 
-def test_every_offered_hotkey_choice_resolves() -> None:
-    # The chooser, the settings validator, and the key-code table must agree,
-    # or a selectable entry would fail to register at runtime.
-    from app.hotkeys import SUPPORTED_HOTKEY_CHOICES, is_supported_hotkey
+def test_default_hotkeys_do_not_require_function_keys() -> None:
+    assert DEFAULT_HOTKEYS.start_resume == "CTRL+ALT+S"
+    assert DEFAULT_HOTKEYS.abort == "CTRL+ALT+X"
 
-    assert len(set(SUPPORTED_HOTKEY_CHOICES)) == len(SUPPORTED_HOTKEY_CHOICES)
-    assert any("+" in choice for choice in SUPPORTED_HOTKEY_CHOICES)
-    for choice in SUPPORTED_HOTKEY_CHOICES:
-        assert is_supported_hotkey(choice.lower())
-        spec = HotkeySpec.parse(choice)
-        assert str(spec) == choice
-        assert spec.virtual_key > 0
-        assert spec.modifier_mask >= MOD_NOREPEAT
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("ctrl+alt+q", "CTRL+ALT+Q"),
+        ("shift+home", "SHIFT+HOME"),
+        ("F24", "F24"),
+        ("ctrl+semicolon", "CTRL+SEMICOLON"),
+        ("alt+vk_ab", "ALT+VK_AB"),
+    ],
+)
+def test_recordable_hotkeys_resolve(value: str, expected: str) -> None:
+    from app.hotkeys import is_supported_hotkey, normalize_hotkey
+
+    assert is_supported_hotkey(value)
+    assert normalize_hotkey(value) == expected
+    spec = HotkeySpec.parse(value)
+    assert spec.virtual_key > 0
+    assert spec.modifier_mask >= MOD_NOREPEAT
+
+
+@pytest.mark.parametrize("value", ["", "CTRL", "CTRL+CTRL+S", "CTRL+MOUSE1", "VK_00"])
+def test_invalid_hotkeys_are_rejected(value: str) -> None:
+    from app.hotkeys import is_supported_hotkey
+
+    assert not is_supported_hotkey(value)
 
 
 def test_registration_failure_explains_an_already_owned_hotkey() -> None:

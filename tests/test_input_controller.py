@@ -10,8 +10,19 @@ from app.input_controller import (
     MouseButton,
     SendInputController,
     create_system_input_controller,
+    virtual_key_code,
+    virtual_key_name,
 )
 from app.screen import VirtualScreen
+
+
+@pytest.mark.parametrize(
+    ("name", "code"),
+    [("A", 0x41), ("F24", 0x87), ("SEMICOLON", 0xBA), ("VK_AB", 0xAB)],
+)
+def test_recorded_virtual_keys_round_trip(name: str, code: int) -> None:
+    assert virtual_key_code(name) == code
+    assert virtual_key_code(virtual_key_name(code)) == code
 
 
 def test_failed_mouse_up_remains_tracked_for_retry() -> None:

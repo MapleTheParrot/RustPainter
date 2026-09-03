@@ -176,12 +176,43 @@ _NAMED_VIRTUAL_KEYS: dict[str, int] = {
     "ESC": 0x1B,
     "ESCAPE": 0x1B,
     "SPACE": 0x20,
+    "PAGEUP": 0x21,
+    "PAGEDOWN": 0x22,
+    "END": 0x23,
+    "HOME": 0x24,
     "LEFT": 0x25,
     "UP": 0x26,
     "RIGHT": 0x27,
     "DOWN": 0x28,
+    "PRINTSCREEN": 0x2C,
+    "INSERT": 0x2D,
     "DELETE": 0x2E,
+    "NUMLOCK": 0x90,
+    "SCROLLLOCK": 0x91,
+    "SEMICOLON": 0xBA,
+    "EQUALS": 0xBB,
+    "COMMA": 0xBC,
+    "MINUS": 0xBD,
+    "PERIOD": 0xBE,
+    "SLASH": 0xBF,
+    "BACKTICK": 0xC0,
+    "LEFTBRACKET": 0xDB,
+    "BACKSLASH": 0xDC,
+    "RIGHTBRACKET": 0xDD,
+    "APOSTROPHE": 0xDE,
 }
+for _number in range(10):
+    _NAMED_VIRTUAL_KEYS[f"NUMPAD{_number}"] = 0x60 + _number
+_NAMED_VIRTUAL_KEYS.update(
+    {
+        "MULTIPLY": 0x6A,
+        "ADD": 0x6B,
+        "SEPARATOR": 0x6C,
+        "SUBTRACT": 0x6D,
+        "DECIMAL": 0x6E,
+        "DIVIDE": 0x6F,
+    }
+)
 
 
 def virtual_key_code(key: int | str) -> int:
@@ -198,10 +229,30 @@ def virtual_key_code(key: int | str) -> int:
         number = int(name[1:])
         if 1 <= number <= 24:
             return 0x70 + number - 1
+    if name.startswith("VK_") and len(name) == 5:
+        try:
+            return int(name[3:], 16)
+        except ValueError:
+            pass
     try:
         return _NAMED_VIRTUAL_KEYS[name]
     except KeyError as exc:
         raise ValueError(f"Unsupported key name: {key!r}") from exc
+
+
+def virtual_key_name(virtual_key: int) -> str:
+    """Return a stable, readable name for a Windows virtual-key code."""
+
+    if not 0 <= virtual_key <= 0xFF:
+        raise ValueError("A virtual-key code must be in the range 0..255")
+    if 0x30 <= virtual_key <= 0x39 or 0x41 <= virtual_key <= 0x5A:
+        return chr(virtual_key)
+    if 0x70 <= virtual_key <= 0x87:
+        return f"F{virtual_key - 0x70 + 1}"
+    for name, code in _NAMED_VIRTUAL_KEYS.items():
+        if code == virtual_key:
+            return name
+    return f"VK_{virtual_key:02X}"
 
 
 if os.name == "nt":
@@ -718,4 +769,5 @@ __all__ = [
     "create_system_input_controller",
     "WindowsInputController",
     "virtual_key_code",
+    "virtual_key_name",
 ]

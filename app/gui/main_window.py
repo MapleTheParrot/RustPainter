@@ -122,7 +122,8 @@ from app.paint_optimizer import (
     mode_options,
     optimize_paint_plan,
 )
-from app.hotkeys import SUPPORTED_HOTKEY_CHOICES
+from app.hotkeys import normalize_hotkey
+from app.input_controller import virtual_key_name
 from app.profiles import Profile, ProfileStore
 from app.resume_record import (
     ResumeRecord,
@@ -1050,6 +1051,132 @@ class _NameDialog(QDialog):
     @property
     def name(self) -> str:
         return self.edit.text().strip()
+
+
+class _HotkeyEdit(QLineEdit):
+    """Record one global shortcut and apply it only when Enter is pressed."""
+
+    captureStarted = Signal()
+    captureCancelled = Signal()
+    bindingCommitted = Signal(str)
+
+    _MODIFIER_KEYS = frozenset(
+        {
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Meta,
+            Qt.Key.Key_AltGr,
+        }
+    )
+    _QT_KEY_NAMES = {
+        Qt.Key.Key_Backspace: "BACKSPACE",
+        Qt.Key.Key_Tab: "TAB",
+        Qt.Key.Key_Space: "SPACE",
+        Qt.Key.Key_PageUp: "PAGEUP",
+        Qt.Key.Key_PageDown: "PAGEDOWN",
+        Qt.Key.Key_End: "END",
+        Qt.Key.Key_Home: "HOME",
+        Qt.Key.Key_Left: "LEFT",
+        Qt.Key.Key_Up: "UP",
+        Qt.Key.Key_Right: "RIGHT",
+        Qt.Key.Key_Down: "DOWN",
+        Qt.Key.Key_Print: "PRINTSCREEN",
+        Qt.Key.Key_Insert: "INSERT",
+        Qt.Key.Key_Delete: "DELETE",
+    }
+
+    def __init__(self, default: str) -> None:
+        super().__init__()
+        self._committed = normalize_hotkey(default)
+        self._pending: str | None = None
+        self._capturing = False
+        self.setReadOnly(True)
+        self.setText(self._committed)
+        self.setPlaceholderText("Press a shortcut, then Enter")
+        self.setToolTip(
+            "Click here, press the shortcut you want, then press Enter to apply it. "
+            "Escape cancels. The Fn key itself cannot be detected by Windows."
+        )
+        self.setAccessibleName("Hotkey recorder")
+
+    def currentText(self) -> str:  # noqa: N802 - compatibility with former combo
+        return self._committed
+
+    def setCurrentText(self, value: str) -> None:  # noqa: N802 - Qt-style API
+        self._committed = normalize_hotkey(value)
+        self._pending = None
+        self.setText(self._committed)
+
+    def focusInEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        self._capturing = True
+        self._pending = None
+        self.selectAll()
+        self.captureStarted.emit()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        if self._capturing:
+            self._capturing = False
+            self._pending = None
+            self.setText(self._committed)
+            self.captureCancelled.emit()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._pending is not None:
+                self._committed = self._pending
+                self._pending = None
+                self.setText(self._committed)
+                self._capturing = False
+                self.bindingCommitted.emit(self._committed)
+                self.clearFocus()
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape:
+            self._pending = None
+            self.setText(self._committed)
+            self._capturing = False
+            self.captureCancelled.emit()
+            self.clearFocus()
+            event.accept()
+            return
+        if key in self._MODIFIER_KEYS or event.isAutoRepeat():
+            event.accept()
+            return
+
+        key_name = self._key_name(event)
+        if key_name is None:
+            event.accept()
+            return
+        modifiers = event.modifiers()
+        pieces: list[str] = []
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            pieces.append("CTRL")
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            pieces.append("ALT")
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            pieces.append("SHIFT")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            pieces.append("WIN")
+        pieces.append(key_name)
+        self._pending = "+".join(pieces)
+        self.setText(f"{self._pending}  (press Enter)")
+        event.accept()
+
+    @classmethod
+    def _key_name(cls, event: Any) -> str | None:
+        native_key = int(event.nativeVirtualKey())
+        if native_key:
+            return virtual_key_name(native_key)
+        key = event.key()
+        if Qt.Key.Key_0 <= key <= Qt.Key.Key_9 or Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            return chr(int(key))
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+            return f"F{int(key) - int(Qt.Key.Key_F1) + 1}"
+        return cls._QT_KEY_NAMES.get(key)
 
 
 class _MetricCard(QFrame):
@@ -3124,7 +3251,7 @@ class MainWindow(QMainWindow):
             "done with."
         )
         self.sessions_button.clicked.connect(self._show_sessions_dialog)
-        self.start_button = QPushButton("START PAINTING  •  F8")
+        self.start_button = QPushButton("START PAINTING  •  CTRL+ALT+S")
         self.start_button.setObjectName("accent")
         self.start_button.setMinimumHeight(44)
         self._set_icon(self.start_button, "play", ON_ACCENT, size=22)
@@ -3133,7 +3260,7 @@ class MainWindow(QMainWindow):
         start_row.addWidget(self.start_button, 1)
         start_row.addWidget(self.sessions_button)
         run_buttons = QHBoxLayout()
-        self.abort_button = QPushButton("Stop  •  F10")
+        self.abort_button = QPushButton("Stop  •  CTRL+ALT+X")
         self.abort_button.setObjectName("danger")
         self._set_icon(self.abort_button, "abort", ON_ACCENT, size=16)
         run_buttons.addWidget(self.abort_button)
@@ -3764,8 +3891,8 @@ class MainWindow(QMainWindow):
             "on from the same stroke once you open the sign and resume.\n"
             "The anti-AFK break closes the sign on purpose and is exempt."
         )
-        self.start_hotkey_combo = self._hotkey_combo("F8")
-        self.abort_hotkey_combo = self._hotkey_combo("F10")
+        self.start_hotkey_combo = self._hotkey_edit("CTRL+ALT+S")
+        self.abort_hotkey_combo = self._hotkey_edit("CTRL+ALT+X")
         safety_form.addRow("Countdown", self.countdown_spin)
         safety_form.addRow("Focus guard", self.focus_guard_check)
         safety_form.addRow("Focus recovery", self.auto_focus_resume_check)
@@ -4048,15 +4175,8 @@ class MainWindow(QMainWindow):
         return spin
 
     @staticmethod
-    def _hotkey_combo(default: str) -> QComboBox:
-        combo = NoWheelComboBox()
-        combo.addItems(list(SUPPORTED_HOTKEY_CHOICES))
-        combo.setToolTip(
-            "Laptop keyboards that need Fn for F5-F12 never deliver those presses "
-            "to the app. Pick a Ctrl+Alt combo instead."
-        )
-        combo.setCurrentText(default)
-        return combo
+    def _hotkey_edit(default: str) -> _HotkeyEdit:
+        return _HotkeyEdit(default)
 
     @staticmethod
     def _set_form_rows_visible(layout: QFormLayout, visible: bool) -> None:
@@ -6784,13 +6904,17 @@ class MainWindow(QMainWindow):
                 control.valueChanged.connect(self._schedule_settings_save)
             elif isinstance(control, QCheckBox):
                 control.toggled.connect(self._schedule_settings_save)
+            elif isinstance(control, _HotkeyEdit):
+                control.bindingCommitted.connect(self._schedule_settings_save)
             elif isinstance(control, QLineEdit):
                 control.textChanged.connect(self._schedule_settings_save)
             elif isinstance(control, ColorButton):
                 control.colorChanged.connect(self._schedule_settings_save)
 
-        self.start_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
-        self.abort_hotkey_combo.currentIndexChanged.connect(self._register_hotkeys)
+        for hotkey_edit in (self.start_hotkey_combo, self.abort_hotkey_combo):
+            hotkey_edit.captureStarted.connect(self._suspend_hotkeys_for_capture)
+            hotkey_edit.captureCancelled.connect(self._register_hotkeys)
+            hotkey_edit.bindingCommitted.connect(self._register_hotkeys)
         self.dry_run_check.toggled.connect(self._update_start_availability)
         self.manage_ui_scale_check.toggled.connect(self._sync_ui_scale_controls)
         self.manage_ui_scale_check.toggled.connect(self._update_start_availability)
@@ -7104,8 +7228,12 @@ class MainWindow(QMainWindow):
                 int(safety.get("anti_afk_interval_minutes", 30))
             )
             self.dry_run_check.setChecked(bool(execution.get("dry_run", False)))
-            self.start_hotkey_combo.setCurrentText(str(hotkeys.get("start_resume", "F8")))
-            self.abort_hotkey_combo.setCurrentText(str(hotkeys.get("abort", "F10")))
+            self.start_hotkey_combo.setCurrentText(
+                str(hotkeys.get("start_resume", "CTRL+ALT+S"))
+            )
+            self.abort_hotkey_combo.setCurrentText(
+                str(hotkeys.get("abort", "CTRL+ALT+X"))
+            )
             brush_shape = str(settings.get("painting", {}).get("brush_shape", "auto"))
             index = self.brush_shape_combo.findData(brush_shape)
             self.brush_shape_combo.setCurrentIndex(max(0, index))
@@ -7770,7 +7898,10 @@ class MainWindow(QMainWindow):
         self._launch_countdown(
             3,
             self._capture_detected_setup,
-            hint="Open the sign and switch to Adaptive Palette • F10 cancels",
+            hint=(
+                "Open the sign and switch to Adaptive Palette • "
+                f"{self.abort_hotkey_combo.currentText()} cancels"
+            ),
         )
 
     def _capture_detected_setup(self) -> None:
@@ -8725,6 +8856,15 @@ class MainWindow(QMainWindow):
         # capped dimensions feed text scaling, so the logical size is
         # re-derived rather than only reprocessed.
         self._update_quality_dimensions()
+
+    @Slot()
+    def _suspend_hotkeys_for_capture(self) -> None:
+        """Prevent an existing binding from firing while its replacement is typed."""
+
+        if self._hotkeys is not None:
+            self._hotkeys.stop()
+        self._hotkeys_ready = False
+        self._update_start_availability()
 
     @Slot()
     def _register_hotkeys(self, *_args: Any) -> None:

@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 from .hotkeys import (
-    SUPPORTED_HOTKEY_CHOICES,
     is_supported_hotkey,
     normalize_hotkey,
 )
@@ -199,8 +198,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "sort_order": "recent",
     },
     "hotkeys": {
-        "start_resume": "F8",
-        "abort": "F10",
+        "start_resume": "CTRL+ALT+S",
+        "abort": "CTRL+ALT+X",
     },
     "safety": {
         "countdown_seconds": 3,
@@ -606,9 +605,7 @@ def _validate(settings: Mapping[str, Any]) -> None:
         if not isinstance(hotkeys.get(key), str) or not str(hotkeys[key]).strip():
             raise SettingsError(f"hotkeys.{key} must be a non-empty string")
         if not is_supported_hotkey(hotkeys[key]):
-            raise SettingsError(
-                f"hotkeys.{key} must be one of: " + ", ".join(SUPPORTED_HOTKEY_CHOICES)
-            )
+            raise SettingsError(f"hotkeys.{key} is not a supported keyboard shortcut")
     normalized_hotkeys = {
         normalize_hotkey(hotkeys[key]) for key in ("start_resume", "abort")
     }
