@@ -116,23 +116,23 @@ def test_optional_calibration_remove_button_clears_only_its_target(window: MainW
     profile = window._profile_store.save(
         Profile.new(
             "Optional controls",
-            hunger=ScreenRect(800, 100, 40, 20),
-            thirst=ScreenRect(850, 100, 40, 20),
+            download_button=ScreenRect(800, 100, 40, 20),
+            save_button=ScreenRect(850, 100, 40, 20),
         )
     )
     window._current_profile = profile
     window._refresh_profile_ui()
 
-    assert window.clear_hunger_calibration_button.isEnabled()
-    assert window.clear_thirst_calibration_button.isEnabled()
-    window.clear_hunger_calibration_button.click()
+    assert window.clear_download_button_calibration_button.isEnabled()
+    assert window.clear_save_button_calibration_button.isEnabled()
+    window.clear_download_button_calibration_button.click()
 
     assert window._current_profile is not None
-    assert window._current_profile.hunger is None
-    assert window._current_profile.thirst == ScreenRect(850, 100, 40, 20)
-    assert not window.clear_hunger_calibration_button.isEnabled()
-    assert window.clear_thirst_calibration_button.isEnabled()
-    assert window._profile_store.require(profile.id).hunger is None
+    assert window._current_profile.download_button is None
+    assert window._current_profile.save_button == ScreenRect(850, 100, 40, 20)
+    assert not window.clear_download_button_calibration_button.isEnabled()
+    assert window.clear_save_button_calibration_button.isEnabled()
+    assert window._profile_store.require(profile.id).download_button is None
 
 
 def test_rust_session_ui_scale_controls_round_trip(window: MainWindow) -> None:
@@ -1217,10 +1217,12 @@ def test_primary_workspace_separates_daily_flow_from_advanced_settings(
     assert belongs_to(window.quality_combo, workspace)
     assert belongs_to(window.crop_alignment_combo, workspace)
     assert belongs_to(window.dither_check, workspace)
+    assert belongs_to(window.smooth_preview_check, workspace)
     assert belongs_to(window.logical_width_spin, workspace)
     assert belongs_to(window.logical_height_spin, workspace)
     assert window.custom_resolution_panel.isHidden()
     assert belongs_to(window.stroke_speed_spin, settings)
+    assert belongs_to(window.apply_brush_check, settings)
     assert belongs_to(window.dry_run_check, settings)
     assert not belongs_to(window.dry_run_check, workspace)
     assert not window.dry_run_check.isChecked()
@@ -1320,18 +1322,18 @@ def test_required_setup_summary_names_progress_in_plain_language(
     profile.canvas = None
     profile.color_box = None
     profile.hue_bar = None
+    profile.brush_size_box = None
     window._refresh_profile_ui()
-    assert window.setup_state_label.text() == "3 required areas remaining"
+    assert window.setup_state_label.text() == "4 required areas remaining"
     assert "canvas" in window.setup_hint_label.text()
 
     profile.canvas = ScreenRect(10, 10, 400, 200)
     profile.color_box = ScreenRect(600, 100, 120, 120)
     profile.hue_bar = ScreenRect(730, 100, 20, 120)
     window._refresh_profile_ui()
-    assert window.setup_state_label.text() == "Basic Rust setup complete"
-    assert "Size value box" in window.setup_hint_label.text()
-    assert "Download button" in window.setup_hint_label.text()
-    assert window.setup_summary.property("state") == "ready"
+    assert window.setup_state_label.text() == "1 required area remaining"
+    assert "size value box" in window.setup_hint_label.text()
+    assert window.setup_summary.property("state") == "attention"
 
     profile.brush_size_box = ScreenRect(760, 100, 60, 24)
     profile.download_button = ScreenRect(830, 100, 24, 24)
@@ -1367,14 +1369,14 @@ def test_detected_setup_populates_required_and_common_optional_regions(
     assert window.setup_state_label.text() == "Rust setup complete"
 
 
-def test_automatic_brush_sizing_marks_its_calibration_as_required(
+def test_size_box_is_always_required_and_sizing_also_requires_clear(
     window: MainWindow,
 ) -> None:
     window._current_profile.brush_size_box = None
     window._current_profile.clear_button = None
     window.apply_brush_check.setChecked(False)
     window._refresh_profile_ui()
-    assert window.brush_size_box_status._value.text() == "Optional"
+    assert window.brush_size_box_status._value.text() == "Needed"
     assert window.clear_button_status._value.text() == "Optional"
 
     # Sizing measures the brush on the sign every run, so the control that
@@ -1386,6 +1388,8 @@ def test_automatic_brush_sizing_marks_its_calibration_as_required(
 
 def test_brush_model_status_says_what_is_still_missing(window: MainWindow) -> None:
     window.apply_brush_check.setChecked(True)
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.brush_size_box = None
     window._current_profile.clear_button = None
     window._current_profile.metadata.pop("brush_size_model", None)
@@ -1424,6 +1428,8 @@ def test_quality_presets_cap_at_the_signs_measured_resolution(
     """
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 128.0) for size in (60, 30, 12)]
@@ -1458,6 +1464,8 @@ def test_max_quality_plans_one_cell_per_measured_texel(
     """
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 130.5) for size in (60, 30, 12)]
@@ -1490,6 +1498,8 @@ def test_presets_the_sign_cannot_hold_are_greyed_out(
         return flags is None or bool(flags & Qt.ItemFlag.ItemIsEnabled)
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(10, 10, 1299, 1085)
     window.quality_combo.setCurrentText("High")
     # Nothing measured yet: every preset is still worth offering.
@@ -1589,6 +1599,8 @@ def test_max_quality_without_a_measurement_plans_the_screen_grid(
     """
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
     window._current_profile.metadata.pop("brush_size_model", None)
     window._refresh_profile_ui()
@@ -1626,6 +1638,8 @@ def test_plan_summary_announces_a_capped_resolution(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(10, 10, 200, 100)
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 128.0) for size in (60, 30, 12)]
@@ -2220,6 +2234,9 @@ def test_prepare_color_chart_configures_raw_chart_job(
     profile.canvas = ScreenRect(10, 10, 800, 400)
     profile.color_box = ScreenRect(820, 10, 120, 120)
     profile.hue_bar = ScreenRect(950, 10, 20, 120)
+    profile.brush_size_box = ScreenRect(980, 10, 60, 24)
+    profile.circle_brush_button = ScreenRect(1050, 10, 24, 24)
+    profile.square_brush_button = ScreenRect(1080, 10, 24, 24)
     profile.metadata["color_correction"] = {
         "schemaVersion": 1,
         "forwardMatrix": [
@@ -2261,6 +2278,9 @@ def test_measure_painted_chart_saves_profile_correction(
     profile.canvas = ScreenRect(10, 10, 800, 400)
     profile.color_box = ScreenRect(820, 10, 120, 120)
     profile.hue_bar = ScreenRect(950, 10, 20, 120)
+    profile.brush_size_box = ScreenRect(980, 10, 60, 24)
+    profile.circle_brush_button = ScreenRect(1050, 10, 24, 24)
+    profile.square_brush_button = ScreenRect(1080, 10, 24, 24)
     window.focus_guard_check.setChecked(False)
     monkeypatch.setattr(
         "app.screen.get_virtual_screen",
@@ -3671,6 +3691,9 @@ def test_disabled_start_button_names_the_blocker(window: MainWindow) -> None:
     # A greyed-out START with no explanation reads as a broken app.  Both common
     # blockers are user-fixable, so each has to say so.
     window.dry_run_check.setChecked(False)
+    window._original_image = None
+    window._plan = None
+    window._update_start_availability()
 
     assert not window.start_button.isEnabled()
     assert "Load an image" in window.start_button.toolTip()
@@ -3704,7 +3727,8 @@ def test_start_names_the_rectangles_automatic_sizing_still_needs(
 
     tooltip = window.start_button.toolTip()
     assert not window.start_button.isEnabled()
-    assert "Size value box and clear button" in tooltip
+    assert "Size value box" in tooltip
+    assert "clear button" in tooltip
 
     window._current_profile.brush_size_box = Rect(200, 0, 40, 20)
     window._current_profile.clear_button = Rect(250, 0, 20, 20)
@@ -4228,6 +4252,9 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     profile.canvas = ScreenRect(10, 10, 200, 100)
     profile.color_box = ScreenRect(300, 10, 100, 100)
     profile.hue_bar = ScreenRect(420, 10, 12, 100)
+    profile.brush_size_box = ScreenRect(450, 10, 60, 24)
+    profile.circle_brush_button = ScreenRect(520, 10, 24, 24)
+    profile.square_brush_button = ScreenRect(550, 10, 24, 24)
     window.apply_brush_check.setChecked(False)
     window.dry_run_check.setChecked(True)
     window._update_start_availability()
@@ -4237,6 +4264,12 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     window.dry_run_check.setChecked(False)
     window._hotkeys_ready = True
     window._hotkeys = type("LiveHotkeys", (), {"running": True})()
+    qtbot.waitUntil(
+        lambda: window._plan is not None
+        and not window._plan_pending
+        and not window._plan_processing,
+        timeout=5000,
+    )
     window._update_start_availability()
     assert not window.start_button.isEnabled()
     assert "Save button" in window.start_button.toolTip()
@@ -4281,6 +4314,8 @@ def test_the_resolution_cap_comes_from_rusts_sign_table_when_the_grid_is_unread(
     height rather than the rectangle's rounding of it."""
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(69, 200, 2079, 1041)
     window._current_profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 649.0) for size in (24, 5.25, 2.5, 1.25, 1)]
@@ -4310,6 +4345,8 @@ def test_the_resolution_boxes_apply_on_enter_not_per_keystroke(window: MainWindo
     from PySide6.QtTest import QTest
 
     assert window._current_profile is not None
+    window._current_profile.metadata.pop("sign_texture_size", None)
+    window._current_profile.metadata.pop("sign_catalog_id", None)
     window._current_profile.canvas = ScreenRect(69, 200, 2079, 1041)
     window._refresh_profile_ui()
     window.quality_combo.setCurrentText("Custom")

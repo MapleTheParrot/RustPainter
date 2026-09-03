@@ -45,10 +45,10 @@ def _complete_profile() -> Profile:
         color_box=Rect(1680, 610, 254, 252),
         hue_bar=Rect(1937, 610, 40, 252),
         brush_size_box=Rect(1760, 392, 62, 26),
+        circle_brush_button=Rect(1660, 392, 30, 30),
+        square_brush_button=Rect(1725, 392, 30, 30),
         clear_button=Rect(1690, 392, 30, 30),
         save_button=Rect(1840, 900, 120, 36),
-        hunger=Rect(2260, 1290, 55, 28),
-        thirst=Rect(2260, 1320, 55, 28),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -75,10 +75,10 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "color_box": True,
         "hue_bar": True,
         "brush_size_box": True,
+        "circle_brush_button": True,
+        "square_brush_button": True,
         "clear_button": True,
         "save_button": True,
-        "hunger": True,
-        "thirst": True,
         "download_button": False,
     }
     assert restored.display is not None
@@ -143,8 +143,6 @@ def test_fixed_ui_calibrations_are_shared_without_sharing_the_sign(tmp_path) -> 
         hue_bar=Rect(1310, 400, 25, 300),
         brush_size_box=Rect(900, 250, 60, 24),
         clear_button=Rect(850, 250, 30, 30),
-        hunger=Rect(1800, 900, 50, 24),
-        thirst=Rect(1800, 930, 50, 24),
         download_button=Rect(1400, 250, 30, 30),
         save_button=Rect(1500, 850, 120, 36),
     )
@@ -158,8 +156,6 @@ def test_fixed_ui_calibrations_are_shared_without_sharing_the_sign(tmp_path) -> 
         "hue_bar",
         "brush_size_box",
         "clear_button",
-        "hunger",
-        "thirst",
         "download_button",
     ):
         assert getattr(second, field) == getattr(first, field)

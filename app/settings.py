@@ -136,7 +136,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "painting": {
         "brush_size": 0.15,
-        "apply_brush_size": False,
+        "apply_brush_size": True,
         # Reuse a saved brush/grid measurement when a passive edge check proves
         # the same sign is still aligned. Any doubt falls back to full probes.
         "reuse_calibration": True,

@@ -967,6 +967,9 @@ class _SignCatalogDialog(QDialog):
         self.list.setIconSize(QSize(68, 68))
         self.list.setSpacing(3)
         self.list.setAlternatingRowColors(True)
+        self.list.setStyleSheet(
+            f"QListWidget::item:selected {{ border: 2px solid {WARNING}; }}"
+        )
         self.list.itemDoubleClicked.connect(lambda _item: self._accept_selection())
         self.search_edit.textChanged.connect(self._refresh_results)
 
@@ -992,11 +995,6 @@ class _SignCatalogDialog(QDialog):
 
     @Slot(str)
     def _refresh_results(self, query: str) -> None:
-        selected_id = (
-            self.list.currentItem().data(Qt.ItemDataRole.UserRole)
-            if self.list.currentItem() is not None
-            else None
-        )
         self.list.clear()
         for entry in search_catalog(query):
             item = QListWidgetItem(
@@ -1011,10 +1009,13 @@ class _SignCatalogDialog(QDialog):
             if icon_path.exists():
                 item.setIcon(QIcon(str(icon_path)))
             self.list.addItem(item)
-            if entry.id == selected_id:
-                self.list.setCurrentItem(item)
-        if self.list.currentItem() is None and self.list.count():
+        if self.list.count():
             self.list.setCurrentRow(0)
+        current = self.list.currentItem()
+        if current is not None:
+            self.list.scrollToItem(
+                current, QAbstractItemView.ScrollHint.PositionAtTop
+            )
         self.ok_button.setEnabled(self.list.currentItem() is not None)
 
     def _accept_selection(self) -> None:
@@ -1161,7 +1162,6 @@ class MainWindow(QMainWindow):
         self._rust_monitor_timer.setInterval(5000)
         self._rust_monitor_timer.timeout.connect(self._check_rust_monitor)
         self._timelapse_recorder: Any = None
-        self._survival_alerts: tuple[str, ...] = ()
         self._run_report: Any = None
         # Where the running job has got to, on disk, so the job can be
         # picked up again after a server restart takes the sign away.
@@ -1633,6 +1633,7 @@ class MainWindow(QMainWindow):
             "Screen pixels between cursor events on a drag.  On a long drag\n"
             "the step is never wider than one sign texel, whatever is set here."
         )
+        advanced_layout.addRow("", self.apply_brush_check)
         advanced_layout.addRow("Logical spacing", self.pixel_spacing_spin)
         advanced_layout.addRow("Stroke speed", self.stroke_speed_spin)
         advanced_layout.addRow("Dot hold", self.dot_duration_spin)
@@ -1953,19 +1954,6 @@ class MainWindow(QMainWindow):
         heading.addWidget(title)
         heading.addStretch(1)
         heading.addWidget(self.preview_hint_label)
-        # The plan has one color per cell, and the tab has to blow those cells
-        # up to fill itself.  Rust filters the sign's texture when it draws
-        # it, so filtered scaling is the honest guess at the finished sign;
-        # hard-edged cells exaggerate the grid but show exactly what each
-        # stroke will paint.  Both views have a use, so it is a switch.
-        self.smooth_preview_check = QCheckBox("Smooth")
-        self.smooth_preview_check.setChecked(True)
-        self.smooth_preview_check.setToolTip(
-            "Scale the Rust preview the way the game draws the sign's texture, "
-            "blending between cells.  Off shows every planned cell as a hard "
-            "square, closer to the painter's own view of the plan."
-        )
-        heading.addWidget(self.smooth_preview_check)
         # What the painter promises to put on the sign, as a file: the only
         # way to hold it next to a screenshot of what it actually put there.
         self.export_preview_button = self._icon_button(
@@ -2402,6 +2390,15 @@ class MainWindow(QMainWindow):
             "An even backdrop — a white product shot, a flat logo field — is\n"
             "usually most of the strokes, so skipping it saves a lot of time."
         )
+        # Rust filters the sign texture in game. Smooth is the default preview
+        # and lives with the other image-result switches it complements.
+        self.smooth_preview_check = QCheckBox("Smooth")
+        self.smooth_preview_check.setChecked(True)
+        self.smooth_preview_check.setToolTip(
+            "Scale the Rust preview the way the game draws the sign's texture, "
+            "blending between cells. Off shows every planned cell as a hard "
+            "square, closer to the painter's own view of the plan."
+        )
         for column, (label, control) in enumerate(
             (("Scaling", self.scale_mode_combo), ("Quality", self.quality_combo))
         ):
@@ -2421,7 +2418,7 @@ class MainWindow(QMainWindow):
             quick_grid.addWidget(QLabel(label), 4, column)
             quick_grid.addWidget(control, 5, column)
         for column, checkbox in enumerate(
-            (self.remove_background_check, self.dither_check)
+            (self.smooth_preview_check, self.remove_background_check, self.dither_check)
         ):
             quick_grid.addWidget(
                 checkbox,
@@ -2446,7 +2443,7 @@ class MainWindow(QMainWindow):
         cap_layout.addWidget(self.resolution_cap_icon, 0, Qt.AlignmentFlag.AlignTop)
         cap_layout.addWidget(self.resolution_cap_label, 1)
         self.resolution_cap_panel.setVisible(False)
-        quick_grid.addWidget(self.resolution_cap_panel, 7, 0, 1, 2)
+        quick_grid.addWidget(self.resolution_cap_panel, 7, 0, 1, 3)
 
         # A source can always be enlarged, but that cannot reveal pixels a
         # screenshot never captured.  Keep this beside Quality, where a user
@@ -2469,7 +2466,7 @@ class MainWindow(QMainWindow):
         )
         readiness_layout.addWidget(self.image_readiness_button, 0, Qt.AlignmentFlag.AlignVCenter)
         self.image_readiness_panel.setVisible(False)
-        quick_grid.addWidget(self.image_readiness_panel, 8, 0, 1, 2)
+        quick_grid.addWidget(self.image_readiness_panel, 8, 0, 1, 3)
 
         self.custom_resolution_panel = QFrame()
         self.custom_resolution_panel.setObjectName("inlinePanel")
@@ -2499,7 +2496,7 @@ class MainWindow(QMainWindow):
         custom_layout.addWidget(self.logical_width_spin)
         custom_layout.addWidget(QLabel("×"))
         custom_layout.addWidget(self.logical_height_spin)
-        quick_grid.addWidget(self.custom_resolution_panel, 9, 0, 1, 2)
+        quick_grid.addWidget(self.custom_resolution_panel, 9, 0, 1, 3)
 
         self.background_removal_panel = QFrame()
         self.background_removal_panel.setObjectName("inlinePanel")
@@ -2563,9 +2560,10 @@ class MainWindow(QMainWindow):
         removal_grid.setColumnStretch(1, 1)
         removal_grid.setColumnStretch(2, 1)
         self.background_removal_panel.setVisible(False)
-        quick_grid.addWidget(self.background_removal_panel, 9, 0, 1, 2)
+        quick_grid.addWidget(self.background_removal_panel, 9, 0, 1, 3)
         quick_grid.setColumnStretch(0, 1)
         quick_grid.setColumnStretch(1, 1)
+        quick_grid.setColumnStretch(2, 1)
         custom_image_layout.addLayout(quick_grid)
 
         # Text is edited on the Source tab and only there, so its controls
@@ -2824,7 +2822,7 @@ class MainWindow(QMainWindow):
         self.setup_summary_icon = _glyph_label("target", 18)
         setup_summary_text = QVBoxLayout()
         setup_summary_text.setSpacing(1)
-        self.setup_state_label = QLabel("3 required areas remaining")
+        self.setup_state_label = QLabel("4 required areas remaining")
         self.setup_state_label.setObjectName("readinessTitle")
         self.setup_hint_label = QLabel(
             "Set each area once. RustPainter remembers it for this sign profile."
@@ -2851,15 +2849,11 @@ class MainWindow(QMainWindow):
         self.canvas_status = CalibrationStatus("Canvas")
         self.color_box_status = CalibrationStatus("Color box")
         self.hue_bar_status = CalibrationStatus("Hue bar")
-        self.brush_size_box_status = CalibrationStatus(
-            "Size value box (recommended)", optional=True
-        )
+        self.brush_size_box_status = CalibrationStatus("Size value box")
         self.circle_brush_button_status = CalibrationStatus("Circle brush", optional=True)
         self.square_brush_button_status = CalibrationStatus("Square brush", optional=True)
         self.clear_button_status = CalibrationStatus("Clear button", optional=True)
         self.save_button_status = CalibrationStatus("Save button", optional=True)
-        self.hunger_status = CalibrationStatus("Hunger number", optional=True)
-        self.thirst_status = CalibrationStatus("Thirst number", optional=True)
         self.download_button_status = CalibrationStatus(
             "Download button (recommended)", optional=True
         )
@@ -2871,8 +2865,6 @@ class MainWindow(QMainWindow):
         self.calibrate_square_brush_button = QPushButton("Set area")
         self.calibrate_clear_button = QPushButton("Set area")
         self.calibrate_save_button = QPushButton("Set area")
-        self.calibrate_hunger_button = QPushButton("Set area")
-        self.calibrate_thirst_button = QPushButton("Set area")
         self.calibrate_download_button = QPushButton("Set area")
         entries = (
             (
@@ -2897,9 +2889,9 @@ class MainWindow(QMainWindow):
                 "brush_size_box",
                 self.brush_size_box_status,
                 self.calibrate_brush_button,
-                "Recommended for accurate painting: calibrate the numeric Size field "
-                "beside Rust's size slider. It enables Automatic brush sizing, "
-                "which measures and sets the brush precisely for each sign.",
+                "Calibrate the numeric Size field beside Rust's size slider. "
+                "It is required so automatic brush sizing can measure and set "
+                "the brush precisely for each sign.",
             ),
             (
                 "circle_brush_button",
@@ -2926,20 +2918,6 @@ class MainWindow(QMainWindow):
                 self.calibrate_save_button,
                 "Calibrate Rust's Save changes button, which the anti-AFK break "
                 "clicks to leave the painting UI before it jumps",
-            ),
-            (
-                "hunger",
-                self.hunger_status,
-                self.calibrate_hunger_button,
-                "Calibrate only the hunger digits shown on Rust's HUD. During "
-                "each anti-AFK break, values at or below 50 show STARVING.",
-            ),
-            (
-                "thirst",
-                self.thirst_status,
-                self.calibrate_thirst_button,
-                "Calibrate only the thirst digits shown on Rust's HUD. During "
-                "each anti-AFK break, values at or below 50 show THIRSTY.",
             ),
             (
                 "download_button",
@@ -2975,7 +2953,7 @@ class MainWindow(QMainWindow):
         required_grid.setVerticalSpacing(6)
         required_grid.setHorizontalSpacing(8)
         required_grid.setColumnStretch(0, 1)
-        for row, (_field, status, button, _tooltip) in enumerate(entries[:3]):
+        for row, (_field, status, button, _tooltip) in enumerate(entries[:4]):
             required_grid.addWidget(status, row, 0)
             required_grid.addWidget(button, row, 1)
         required_layout.addLayout(required_grid)
@@ -2995,10 +2973,8 @@ class MainWindow(QMainWindow):
         optional_layout.setContentsMargins(10, 9, 10, 9)
         optional_layout.setSpacing(8)
         optional_note = QLabel(
-            "Recommended for accurate painting: set the Size value box for "
-            "automatic brush sizing and Download button for exact texel "
-            "verification. Other controls add automation and overlays. Basic "
-            "painting still only needs the required setup above."
+            "The Download button enables exact texel verification. Other "
+            "controls add automation and overlays."
         )
         optional_note.setObjectName("muted")
         optional_note.setWordWrap(True)
@@ -3008,17 +2984,14 @@ class MainWindow(QMainWindow):
         optional_grid.setHorizontalSpacing(8)
         optional_grid.setColumnStretch(0, 1)
         optional_labels = {
-            "brush_size_box": "Size value box (recommended)",
             "circle_brush_button": "Circle brush",
             "square_brush_button": "Square brush",
             "clear_button": "Clear button",
             "save_button": "Save button",
-            "hunger": "Hunger number",
-            "thirst": "Thirst number",
             "download_button": "Download button (recommended)",
         }
         self._optional_calibration_clear_buttons: dict[str, QPushButton] = {}
-        for row, (field, status, button, _tooltip) in enumerate(entries[3:]):
+        for row, (field, status, button, _tooltip) in enumerate(entries[4:]):
             clear_button = QPushButton("×")
             clear_button.setObjectName("flat")
             clear_button.setFixedWidth(28)
@@ -3038,6 +3011,7 @@ class MainWindow(QMainWindow):
         optional_layout.addLayout(optional_grid)
 
         self.apply_brush_check = QCheckBox("Automatic brush sizing")
+        self.apply_brush_check.setChecked(True)
         self.apply_brush_check.setToolTip(
             "Types the Size number that paints exactly one logical image cell.\n"
             "Every paint job measures this sign's brush first and wipes the "
@@ -3045,13 +3019,13 @@ class MainWindow(QMainWindow):
             "only needs the Size value box and the clear button calibrated."
         )
         self.show_calibration_check = QCheckBox("Show boxes on screen")
+        self.show_calibration_check.setChecked(True)
         self.show_calibration_check.setToolTip(
             "Draws labeled red outlines over every calibrated region so you can\n"
             "confirm they still line up with Rust's painting UI. Hover an edge\n"
             "or corner and drag to resize it; the interiors stay click-through.\n"
             "The boxes cannot be edited while a paint job is active."
         )
-        optional_layout.addWidget(self.apply_brush_check)
         self.reuse_calibration_check = QCheckBox(
             "Fast startup when the saved measurement still matches"
         )
@@ -3803,6 +3777,7 @@ class MainWindow(QMainWindow):
         afk_group = QGroupBox("Anti-AFK")
         afk_form = QFormLayout(afk_group)
         self.anti_afk_check = QCheckBox("Jump every so often so the server does not kick an idle player")
+        self.anti_afk_check.setChecked(True)
         self.anti_afk_check.setToolTip(
             "Every interval the painter clicks Rust's Save button to leave the\n"
             "painting UI, presses Space to jump, waits a second, clicks to open\n"
@@ -6675,12 +6650,6 @@ class MainWindow(QMainWindow):
                 "save_button", "Save changes button that closes the painting UI"
             )
         )
-        self.calibrate_hunger_button.clicked.connect(
-            lambda: self._begin_calibration("hunger", "hunger number on Rust's HUD")
-        )
-        self.calibrate_thirst_button.clicked.connect(
-            lambda: self._begin_calibration("thirst", "thirst number on Rust's HUD")
-        )
         self.calibrate_download_button.clicked.connect(
             lambda: self._begin_calibration(
                 "download_button", "download icon that writes the sign's texture to the desktop"
@@ -7054,7 +7023,7 @@ class MainWindow(QMainWindow):
             self.interpolation_spin.setValue(
                 float(painting.get("stroke_interpolation_step_pixels", 4.0))
             )
-            self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", False)))
+            self.apply_brush_check.setChecked(bool(painting.get("apply_brush_size", True)))
             self.reuse_calibration_check.setChecked(
                 bool(painting.get("reuse_calibration", True))
             )
@@ -7337,7 +7306,19 @@ class MainWindow(QMainWindow):
         try:
             profiles = self._profile_store.list_profiles()
             if not profiles:
-                profiles = [self._profile_store.ensure_default_profile("Large Wooden Sign")]
+                entry = catalog_entry("wood-large")
+                if entry is None:
+                    profiles = [self._profile_store.ensure_default_profile("Large Wooden Sign")]
+                else:
+                    profile = Profile.new(
+                        entry.name,
+                        metadata={
+                            "sign_catalog_id": entry.id,
+                            "sign_item_shortname": entry.item_shortname,
+                            "sign_texture_size": [entry.width, entry.height],
+                        },
+                    )
+                    profiles = [self._profile_store.save(profile, make_default=True)]
         except Exception as exc:
             LOGGER.exception("Could not load profiles")
             QMessageBox.critical(self, "Could not load profiles", str(exc))
@@ -7393,13 +7374,10 @@ class MainWindow(QMainWindow):
         self.canvas_status.set_calibrated(bool(status.get("canvas")))
         self.color_box_status.set_calibrated(bool(status.get("color_box")))
         self.hue_bar_status.set_calibrated(bool(status.get("hue_bar")))
-        # Automatic sizing validates or measures the brush at startup and
-        # clears any probe paint, so it needs both the Size field and Clear;
-        # with it off, neither is used.
+        # The Size field is part of every complete setup. Automatic sizing
+        # uses it to measure and apply the correct brush for the chosen sign.
+        self.brush_size_box_status.set_calibrated(bool(status.get("brush_size_box")))
         brush_optional = not self.apply_brush_check.isChecked()
-        self.brush_size_box_status.set_calibrated(
-            bool(status.get("brush_size_box")), brush_optional
-        )
         self.clear_button_status.set_calibrated(
             bool(status.get("clear_button")), brush_optional
         )
@@ -7414,8 +7392,6 @@ class MainWindow(QMainWindow):
         self.save_button_status.set_calibrated(
             bool(status.get("save_button")), not self.anti_afk_check.isChecked()
         )
-        self.hunger_status.set_calibrated(bool(status.get("hunger")), True)
-        self.thirst_status.set_calibrated(bool(status.get("thirst")), True)
         self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
         for field, button in self._optional_calibration_clear_buttons.items():
             button.setEnabled(bool(status.get(field)))
@@ -7484,13 +7460,14 @@ class MainWindow(QMainWindow):
     def _required_setup_missing(self) -> list[str]:
         profile = self._current_profile
         if profile is None:
-            return ["canvas", "color box", "hue bar"]
+            return ["canvas", "color box", "hue bar", "size value box"]
         return [
             label
             for label, rectangle in (
                 ("canvas", profile.canvas),
                 ("color box", profile.color_box),
                 ("hue bar", profile.hue_bar),
+                ("size value box", profile.brush_size_box),
             )
             if rectangle is None
         ]
@@ -7510,8 +7487,6 @@ class MainWindow(QMainWindow):
         else:
             profile = self._current_profile
             recommendations: list[str] = []
-            if profile is not None and profile.brush_size_box is None:
-                recommendations.append("Size value box for automatic brush sizing")
             if profile is not None and profile.download_button is None:
                 recommendations.append("Download button for exact texel verification")
             if recommendations:
@@ -7573,8 +7548,6 @@ class MainWindow(QMainWindow):
                     "brush_size_box",
                     "clear_button",
                     "save_button",
-                    "hunger",
-                    "thirst",
                     "download_button",
                 ):
                     setattr(candidate, field, getattr(source, field, None))
@@ -7928,8 +7901,6 @@ class MainWindow(QMainWindow):
                 "brush_size_box",
                 "clear_button",
                 "save_button",
-                "hunger",
-                "thirst",
                 "download_button",
             ):
                 if other != field:
@@ -8088,8 +8059,6 @@ class MainWindow(QMainWindow):
             "brush_size_box",
             "clear_button",
             "save_button",
-            "hunger",
-            "thirst",
             "download_button",
         ):
             rect = getattr(candidate, name, None)
@@ -8137,8 +8106,6 @@ class MainWindow(QMainWindow):
         "Square brush": "square_brush_button",
         "Clear button": "clear_button",
         "Save button": "save_button",
-        "Hunger number": "hunger",
-        "Thirst number": "thirst",
         "Download button": "download_button",
     }
 
@@ -8211,8 +8178,6 @@ class MainWindow(QMainWindow):
                     ("Square brush", getattr(profile, "square_brush_button", None)),
                     ("Clear button", getattr(profile, "clear_button", None)),
                     ("Save button", getattr(profile, "save_button", None)),
-                    ("Hunger number", getattr(profile, "hunger", None)),
-                    ("Thirst number", getattr(profile, "thirst", None)),
                     ("Download button", getattr(profile, "download_button", None)),
                 )
                 if rect is not None
@@ -8247,8 +8212,7 @@ class MainWindow(QMainWindow):
         # An overlay that quietly decides not to appear is indistinguishable
         # from a broken one, so every change of mind is logged with what
         # decided it.  Only changes: this runs on every progress update.
-        alerts = self._survival_alerts if show_status else ()
-        decision = (show_boxes, show_status, status, alerts)
+        decision = (show_boxes, show_status, status)
         if decision != self._calibration_overlay_decision:
             self._calibration_overlay_decision = decision
             LOGGER.info(
@@ -8282,9 +8246,6 @@ class MainWindow(QMainWindow):
             self._calibration_preview.set_status(
                 (status, canvas) if show_status else None
             )
-            set_alerts = getattr(self._calibration_preview, "set_alerts", None)
-            if callable(set_alerts):
-                set_alerts(alerts)
             if not self._calibration_preview.isVisible():
                 self._calibration_preview.show_overlay()
         except Exception:
@@ -9075,11 +9036,15 @@ class MainWindow(QMainWindow):
                     ("canvas", self._current_profile.canvas is not None),
                     ("color box", self._current_profile.color_box is not None),
                     ("hue bar", self._current_profile.hue_bar is not None),
+                    ("Size value box", self._current_profile.brush_size_box is not None),
                     ("circle brush", self._current_profile.circle_brush_button is not None),
                     ("square brush", self._current_profile.square_brush_button is not None),
                 )
                 if self._current_profile is not None and not done
             ]
+            for label in self._missing_sizing_rectangles():
+                if label not in missing:
+                    missing.append(label)
             if missing:
                 return "Calibrate the " + ", ".join(missing) + " before painting."
             sizing = self._missing_sizing_rectangles()
@@ -9205,8 +9170,6 @@ class MainWindow(QMainWindow):
             self.calibrate_brush_button,
             self.calibrate_clear_button,
             self.calibrate_save_button,
-            self.calibrate_hunger_button,
-            self.calibrate_thirst_button,
             self.calibrate_download_button,
             self.detect_setup_button,
             self.countdown_spin,
@@ -9378,7 +9341,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Calibration incomplete",
-                "Real painting requires a calibrated canvas, color box, and hue bar.",
+                "Real painting requires a calibrated canvas, color box, hue bar, "
+                "Size value box, and brush buttons.",
             )
             return
         if not self.dry_run_check.isChecked():
@@ -9538,7 +9502,7 @@ class MainWindow(QMainWindow):
         if apply_brush_size:
             names.extend(("brush_size_box", "clear_button"))
         if anti_afk:
-            names.extend(("save_button", "hunger", "thirst"))
+            names.append("save_button")
         required = {
             "save_button": (
                 "The anti-AFK break leaves the painting UI through Rust's Save "
@@ -9635,7 +9599,7 @@ class MainWindow(QMainWindow):
                     pending.profile,
                     apply_brush_size=bool(
                         pending.settings.get("painting", {}).get(
-                            "apply_brush_size", False
+                            "apply_brush_size", True
                         )
                     ),
                     anti_afk=bool(
@@ -9848,6 +9812,8 @@ class MainWindow(QMainWindow):
             color_box=ScreenRect(0, 0, 101, 101),
             hue_bar=ScreenRect(102, 0, 7, 360),
             brush_size_box=None,
+            circle_brush_button=ScreenRect(110, 0, 1, 1),
+            square_brush_button=ScreenRect(112, 0, 1, 1),
             metadata={},
             hue_direction="bottom_to_top",
             saturation_direction="left_low",
@@ -9896,10 +9862,6 @@ class MainWindow(QMainWindow):
         percent = min(max(float(progress.percent), 0.0), 100.0)
         self.paint_progress.setValue(round(percent * 10))
         self.progress_state_label.setText(str(progress.message or progress.state.value))
-        alerts = tuple(str(value) for value in getattr(progress, "alerts", ()) if value)
-        if alerts != self._survival_alerts:
-            self._survival_alerts = alerts
-            self._update_calibration_overlay()
         remaining = (
             f" • {self._format_duration(progress.estimated_remaining_seconds)} remaining"
             if progress.estimated_remaining_seconds is not None

@@ -72,6 +72,11 @@ def test_default_settings_returns_independent_documents() -> None:
     assert second["execution"]["dry_run"] is False
     assert second["ui"]["tutorial_version_seen"] == 0
     assert second["painting"]["reuse_calibration"] is True
+    assert second["painting"]["apply_brush_size"] is True
+    assert second["ui"]["show_calibration_overlay"] is True
+    assert second["ui"]["smooth_rust_preview"] is True
+    assert second["safety"]["anti_afk_enabled"] is True
+    assert second["safety"]["anti_afk_interval_minutes"] == 30
     assert second["image"]["text_overlay"] == {
         "layers": [
             {

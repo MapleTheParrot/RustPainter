@@ -28,7 +28,6 @@ from .brush_calibration import (
     measure_stroke_band,
 )
 from .color_calibration import ColorCorrectionModel
-from .digit_reader import read_number
 from .color_mapping import picker_click_plan, rgb_to_hsv
 from .color_swatch import LOCATOR_COLOR, SwatchReading, locate_swatch, read_swatch
 from .coordinates import RectangleLike, clamp_to_rect, logical_stroke_to_screen, normalized_point
@@ -245,8 +244,6 @@ class PaintingTarget:
     square_brush_button: RectangleLike | None = None
     clear_button: RectangleLike | None = None
     save_button: RectangleLike | None = None
-    hunger: RectangleLike | None = None
-    thirst: RectangleLike | None = None
     download_button: RectangleLike | None = None
     picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
@@ -337,8 +334,6 @@ class PaintingTarget:
             square_brush_button=getattr(profile, "square_brush_button", None),
             clear_button=getattr(profile, "clear_button", None),
             save_button=getattr(profile, "save_button", None),
-            hunger=getattr(profile, "hunger", None),
-            thirst=getattr(profile, "thirst", None),
             download_button=getattr(profile, "download_button", None),
             picker_directions=PickerDirections(
                 hue="bottom_to_top",
@@ -667,8 +662,7 @@ class PaintProgress:
     # document a run - a timelapse recorder above all - use this to start when
     # the picture starts rather than when the worker does.
     phase: str = "paint"
-    # Survival warnings sampled during the latest anti-AFK break.  They stay
-    # present until a later sample proves that stat has recovered.
+    # Reserved for concise run warnings supplied by future checks.
     alerts: tuple[str, ...] = ()
 
     @property
@@ -943,7 +937,6 @@ class Painter:
         # When the job last proved to the server it was not idle: the start
         # of the job, and then every anti-AFK break.
         self._last_anti_afk_at = 0.0
-        self._survival_values: dict[str, int] = {}
         # The painting UI's fingerprint, taken as the job reaches the sign.
         # Suspended through the anti-AFK break, which closes the UI itself.
         self._ui_guard: PaintingUiGuard | None = None
@@ -1107,7 +1100,6 @@ class Painter:
             self._abort_event.clear()
             self._pause_event.clear()
             self._pause_generation = 0
-            self._survival_values = {}
             self._state_before_pause = PainterState.RUNNING
             self._progress = PaintProgress(
                 PainterState.READY,
@@ -1425,7 +1417,6 @@ class Painter:
             self._paint_phase_timing = None
             self._timing_retuned = False
             self._last_anti_afk_at = self._started_at
-            self._survival_values = {}
             self._ui_guard = None
             self._ui_guard_suspended = False
             self._last_ui_check = 0.0
@@ -1655,9 +1646,6 @@ class Painter:
                 )
             if target.save_button.width <= 0 or target.save_button.height <= 0:
                 raise ValueError("Save button calibration must have positive dimensions")
-            for label, rect in (("Hunger", target.hunger), ("Thirst", target.thirst)):
-                if rect is not None and (rect.width <= 0 or rect.height <= 0):
-                    raise ValueError(f"{label} calibration must have positive dimensions")
         # A dry run only visualizes the plan, so it may carry brush metadata
         # that real input could not honor with the current calibration.
         if getattr(self.input, "emits_real_input", True):
@@ -5459,7 +5447,6 @@ class Painter:
             self._interruptible_sleep(
                 self._AFK_SAVE_SETTLE_SECONDS, epoch=epoch, check_focus=True
             )
-            self._read_survival_status(job)
             self._checkpoint(epoch=epoch, check_focus=True)
             self.input.press_key("SPACE", hold_seconds=self._AFK_JUMP_HOLD_SECONDS)
             self._interruptible_sleep(
@@ -5488,41 +5475,6 @@ class Painter:
             self.pause(self._UI_NOT_REOPENED_REASON)
             self._checkpoint(check_focus=True)
         self._update_progress_state(PainterState.RUNNING, "Painting", phase="paint")
-
-    _SURVIVAL_WARNING_THRESHOLD = 50
-
-    def _read_survival_status(self, job: _Job) -> None:
-        """Read optional HUD stats while Save has exposed the game HUD."""
-
-        changed = False
-        for name, rect in (("STARVING", job.target.hunger), ("THIRSTY", job.target.thirst)):
-            if rect is None:
-                continue
-            try:
-                value = read_number(self._screen_capture(rect))
-            except Exception:
-                LOGGER.warning("Could not capture the %s HUD number", name.lower(), exc_info=True)
-                continue
-            if value is None:
-                LOGGER.warning("Could not read the %s HUD number", name.lower())
-                continue
-            self._survival_values[name] = value
-            changed = True
-            LOGGER.info("Anti-AFK survival check: %s=%d", name.lower(), value)
-        if changed:
-            self._update_progress_state(
-                PainterState.RUNNING,
-                "Keeping the player awake: checking hunger and thirst",
-                phase="anti_afk",
-            )
-
-    def _survival_alerts(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name in ("STARVING", "THIRSTY")
-            if self._survival_values.get(name, self._SURVIVAL_WARNING_THRESHOLD + 1)
-            <= self._SURVIVAL_WARNING_THRESHOLD
-        )
 
     # How long after the interact key the painting UI may take to be drawn
     # again before the break gives up waiting for it, and how often it looks.
@@ -7749,7 +7701,7 @@ class Painter:
                 remaining,
                 message,
                 self._progress.phase,
-                self._survival_alerts(),
+                self._progress.alerts,
             )
         self._emit_progress(force=completed_strokes == total_strokes)
 
@@ -7776,7 +7728,7 @@ class Painter:
                 old.estimated_remaining_seconds,
                 message,
                 old.phase if phase is None else phase,
-                self._survival_alerts(),
+                old.alerts,
             )
         self._emit_progress(force=True)
 

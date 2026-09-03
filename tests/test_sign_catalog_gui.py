@@ -56,7 +56,20 @@ def test_premade_profile_picker_fuzzy_filters_with_icons(window: MainWindow) -> 
     assert first.data(Qt.ItemDataRole.UserRole) == "artist-xxl"
     assert "1024×512" in first.text()
     assert not first.icon().isNull()
+    assert dialog.list.currentItem() is first
+    assert dialog.list.visualItemRect(first).top() >= 0
+    assert dialog.list.verticalScrollBar().value() == dialog.list.verticalScrollBar().minimum()
+    assert "border: 2px solid" in dialog.list.styleSheet()
     dialog.close()
+
+
+def test_fresh_install_starts_with_the_catalog_large_wooden_sign(
+    window: MainWindow,
+) -> None:
+    assert window.profile_combo.count() == 1
+    assert window._current_profile is not None
+    assert window._current_profile.metadata["sign_catalog_id"] == "wood-large"
+    assert window._current_profile.metadata["sign_texture_size"] == [512, 256]
 
 
 def test_premade_profile_supplies_its_aspect_before_canvas_calibration(
