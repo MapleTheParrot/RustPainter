@@ -1293,6 +1293,8 @@ def test_new_user_presets_drive_expert_controls(
     """Presets drive the detailed controls without hiding them."""
 
     assert window.experience_combo.currentText() == "Best quality"
+    assert window.speed_preset_combo.currentText() == "Turbo"
+    assert not window.timelapse_check.isChecked()
     assert not window.customize_image_panel.isHidden()
     assert not window.optional_setup_panel.isHidden()
     assert not window.required_setup_panel.isHidden()

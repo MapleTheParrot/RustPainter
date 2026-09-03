@@ -77,6 +77,15 @@ def test_default_settings_returns_independent_documents() -> None:
     assert second["ui"]["smooth_rust_preview"] is True
     assert second["safety"]["anti_afk_enabled"] is True
     assert second["safety"]["anti_afk_interval_minutes"] == 30
+    assert second["timelapse"]["enabled"] is False
+    assert second["painting"]["stroke_speed_pixels_per_second"] == 2200.0
+    assert second["painting"]["mouse_down_duration_seconds"] == pytest.approx(0.07)
+    assert second["painting"]["delay_after_hue_seconds"] == pytest.approx(0.07)
+    assert second["painting"]["delay_after_saturation_value_seconds"] == pytest.approx(0.07)
+    assert second["painting"]["delay_after_brush_seconds"] == pytest.approx(0.07)
+    assert second["painting"]["delay_between_strokes_seconds"] == pytest.approx(0.02)
+    assert second["painting"]["delay_between_colors_seconds"] == pytest.approx(0.07)
+    assert second["painting"]["stroke_interpolation_step_pixels"] == pytest.approx(8.0)
     assert second["image"]["text_overlay"] == {
         "layers": [
             {

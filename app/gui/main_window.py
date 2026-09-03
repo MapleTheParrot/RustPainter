@@ -355,7 +355,7 @@ EXPERIENCE_PRESETS: dict[str, dict[str, Any]] = {
         "colors": DEFAULT_COLOR_COUNT,
         "sharpen": SharpenMode.LIGHT.value,
         "dither": False,
-        "speed": "Standard",
+        "speed": "Turbo",
     },
 }
 
@@ -1588,7 +1588,7 @@ class MainWindow(QMainWindow):
         speed_form = QFormLayout(speed_group)
         self.speed_preset_combo = NoWheelComboBox()
         self.speed_preset_combo.addItems([*SPEED_PRESETS.keys(), "Custom"])
-        self.speed_preset_combo.setCurrentText("Standard")
+        self.speed_preset_combo.setCurrentText("Turbo")
         self.speed_preset_combo.setToolTip(
             "One-click timing profiles.  Every hold and settle has a floor of\n"
             "one game frame that no preset goes under, and long drags are\n"
