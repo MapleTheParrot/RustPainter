@@ -116,23 +116,23 @@ def test_optional_calibration_remove_button_clears_only_its_target(window: MainW
     profile = window._profile_store.save(
         Profile.new(
             "Optional controls",
-            download_button=ScreenRect(800, 100, 40, 20),
-            save_button=ScreenRect(850, 100, 40, 20),
+            circle_brush_button=ScreenRect(800, 100, 40, 20),
+            square_brush_button=ScreenRect(850, 100, 40, 20),
         )
     )
     window._current_profile = profile
     window._refresh_profile_ui()
 
-    assert window.clear_download_button_calibration_button.isEnabled()
-    assert window.clear_save_button_calibration_button.isEnabled()
-    window.clear_download_button_calibration_button.click()
+    assert window.clear_circle_brush_button_calibration_button.isEnabled()
+    assert window.clear_square_brush_button_calibration_button.isEnabled()
+    window.clear_circle_brush_button_calibration_button.click()
 
     assert window._current_profile is not None
-    assert window._current_profile.download_button is None
-    assert window._current_profile.save_button == ScreenRect(850, 100, 40, 20)
-    assert not window.clear_download_button_calibration_button.isEnabled()
-    assert window.clear_save_button_calibration_button.isEnabled()
-    assert window._profile_store.require(profile.id).download_button is None
+    assert window._current_profile.circle_brush_button is None
+    assert window._current_profile.square_brush_button == ScreenRect(850, 100, 40, 20)
+    assert not window.clear_circle_brush_button_calibration_button.isEnabled()
+    assert window.clear_square_brush_button_calibration_button.isEnabled()
+    assert window._profile_store.require(profile.id).circle_brush_button is None
 
 
 def test_rust_session_ui_scale_controls_round_trip(window: MainWindow) -> None:
@@ -1326,18 +1326,20 @@ def test_required_setup_summary_names_progress_in_plain_language(
     profile.hue_bar = None
     profile.brush_size_box = None
     window._refresh_profile_ui()
-    assert window.setup_state_label.text() == "4 required areas remaining"
+    assert window.setup_state_label.text() == "7 required areas remaining"
     assert "canvas" in window.setup_hint_label.text()
 
     profile.canvas = ScreenRect(10, 10, 400, 200)
     profile.color_box = ScreenRect(600, 100, 120, 120)
     profile.hue_bar = ScreenRect(730, 100, 20, 120)
     window._refresh_profile_ui()
-    assert window.setup_state_label.text() == "1 required area remaining"
+    assert window.setup_state_label.text() == "4 required areas remaining"
     assert "size value box" in window.setup_hint_label.text()
     assert window.setup_summary.property("state") == "attention"
 
     profile.brush_size_box = ScreenRect(760, 100, 60, 24)
+    profile.clear_button = ScreenRect(800, 100, 24, 24)
+    profile.save_button = ScreenRect(830, 130, 90, 30)
     profile.download_button = ScreenRect(830, 100, 24, 24)
     window._refresh_profile_ui()
     assert window.setup_state_label.text() == "Rust setup complete"
@@ -1371,7 +1373,7 @@ def test_detected_setup_populates_required_and_common_optional_regions(
     assert window.setup_state_label.text() == "Rust setup complete"
 
 
-def test_size_box_is_always_required_and_sizing_also_requires_clear(
+def test_size_box_and_clear_button_are_always_required(
     window: MainWindow,
 ) -> None:
     window._current_profile.brush_size_box = None
@@ -1379,10 +1381,8 @@ def test_size_box_is_always_required_and_sizing_also_requires_clear(
     window.apply_brush_check.setChecked(False)
     window._refresh_profile_ui()
     assert window.brush_size_box_status._value.text() == "Needed"
-    assert window.clear_button_status._value.text() == "Optional"
+    assert window.clear_button_status._value.text() == "Needed"
 
-    # Sizing measures the brush on the sign every run, so the control that
-    # wipes the measurement off is as required as the Size field itself.
     window.apply_brush_check.setChecked(True)
     assert window.brush_size_box_status._value.text() == "Needed"
     assert window.clear_button_status._value.text() == "Needed"
@@ -2374,6 +2374,9 @@ def test_size_value_box_is_required_only_when_brush_application_is_enabled(
         canvas=ScreenRect(10, 10, 200, 100),
         color_box=ScreenRect(220, 10, 100, 100),
         hue_bar=ScreenRect(325, 10, 10, 100),
+        clear_button=ScreenRect(350, 10, 24, 24),
+        save_button=ScreenRect(380, 10, 90, 30),
+        download_button=ScreenRect(480, 10, 24, 24),
     )
     monkeypatch.setattr(
         "app.screen.get_virtual_screen",
@@ -2387,11 +2390,45 @@ def test_size_value_box_is_required_only_when_brush_application_is_enabled(
     # Sizing measures the brush on the sign, so it also needs the control that
     # wipes the measurement off before the artwork goes down.
     profile.brush_size_box = ScreenRect(220, 120, 60, 24)
+    profile.clear_button = None
     with pytest.raises(ValueError, match="clear button"):
         window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
 
     profile.clear_button = ScreenRect(300, 120, 24, 24)
     window._validate_profile_on_virtual_screen(profile, apply_brush_size=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("clear_button", "clear button"),
+        ("save_button", "Save button"),
+        ("download_button", "Download button"),
+    ),
+)
+def test_action_buttons_are_always_required(
+    window: MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    message: str,
+) -> None:
+    profile = Profile.new(
+        "Missing mandatory button",
+        canvas=ScreenRect(10, 10, 200, 100),
+        color_box=ScreenRect(220, 10, 100, 100),
+        hue_bar=ScreenRect(325, 10, 10, 100),
+        clear_button=ScreenRect(350, 10, 24, 24),
+        save_button=ScreenRect(380, 10, 90, 30),
+        download_button=ScreenRect(480, 10, 24, 24),
+    )
+    setattr(profile, field, None)
+    monkeypatch.setattr(
+        "app.screen.get_virtual_screen",
+        lambda: VirtualScreen(0, 0, 800, 600),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        window._validate_profile_on_virtual_screen(profile)
 
 
 def _profile_with_full_calibration(display: DisplayMetadata) -> Profile:
@@ -4226,21 +4263,20 @@ def test_a_paused_job_leaves_the_timing_controls_live_and_retunes_on_resume(
     assert window.stroke_delay_spin.isEnabled()
 
 
-def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
+def test_save_button_stays_mandatory_and_anti_afk_reaches_the_painter(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:
     """The break leaves the painting UI through Save, so Save must be known.
 
-    With the switch on, the Save button turns from optional to needed and an
-    uncalibrated one blocks Start with a reason; the switch and its interval
-    are saved, and reach the painter in seconds.
+    Save remains required even with the switch off. The anti-AFK switch and
+    its interval are saved and reach the painter in seconds.
     """
 
     assert window.anti_afk_check.isChecked()
     window._current_profile.save_button = None
     window.anti_afk_check.setChecked(False)
     window._refresh_profile_ui()
-    assert window.save_button_status._value.text() == "Optional"
+    assert window.save_button_status._value.text() == "Needed"
 
     window.anti_afk_check.setChecked(True)
     window.anti_afk_interval_spin.setValue(12)
@@ -4257,6 +4293,8 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     profile.brush_size_box = ScreenRect(450, 10, 60, 24)
     profile.circle_brush_button = ScreenRect(520, 10, 24, 24)
     profile.square_brush_button = ScreenRect(550, 10, 24, 24)
+    profile.clear_button = ScreenRect(580, 10, 24, 24)
+    profile.download_button = ScreenRect(610, 10, 24, 24)
     window.apply_brush_check.setChecked(False)
     window.dry_run_check.setChecked(True)
     window._update_start_availability()
@@ -4297,12 +4335,12 @@ def test_anti_afk_needs_the_save_button_and_reaches_the_painter(
     assert settings.anti_afk_interval_seconds == 12 * 60
     assert window._painter_settings(document, dry_run=True).anti_afk_enabled is False
 
-    # Off again, the button is optional and Start no longer asks for it.
+    # Off again, the button remains mandatory and Start still asks for it.
     window.anti_afk_check.setChecked(False)
     profile.save_button = None
     window._refresh_profile_ui()
-    assert window.save_button_status._value.text() == "Optional"
-    assert window.start_button.isEnabled()
+    assert window.save_button_status._value.text() == "Needed"
+    assert not window.start_button.isEnabled()
 
 
 def test_the_resolution_cap_comes_from_rusts_sign_table_when_the_grid_is_unread(

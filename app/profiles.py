@@ -375,6 +375,9 @@ class CalibrationProfile:
             and self.brush_size_box is not None
             and self.circle_brush_button is not None
             and self.square_brush_button is not None
+            and self.clear_button is not None
+            and self.save_button is not None
+            and self.download_button is not None
         )
 
     @property

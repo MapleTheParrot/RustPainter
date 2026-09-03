@@ -49,6 +49,7 @@ def _complete_profile() -> Profile:
         square_brush_button=Rect(1725, 392, 30, 30),
         clear_button=Rect(1690, 392, 30, 30),
         save_button=Rect(1840, 900, 120, 36),
+        download_button=Rect(1640, 392, 30, 30),
         hue_direction="bottom_to_top",
         saturation_direction="left_high",
         value_direction="top_dark",
@@ -79,7 +80,7 @@ def test_profile_serialization_round_trip_preserves_complete_calibration() -> No
         "square_brush_button": True,
         "clear_button": True,
         "save_button": True,
-        "download_button": False,
+        "download_button": True,
     }
     assert restored.display is not None
     assert restored.display.virtual_screen == Rect(-1920, 0, 4480, 1440)

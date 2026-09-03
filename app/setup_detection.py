@@ -34,7 +34,16 @@ class SetupDetection:
     @property
     def missing_required(self) -> tuple[str, ...]:
         return tuple(
-            name for name in ("canvas", "color_box", "hue_bar") if name not in self.regions
+            name
+            for name in (
+                "canvas",
+                "color_box",
+                "hue_bar",
+                "clear_button",
+                "save_button",
+                "download_button",
+            )
+            if name not in self.regions
         )
 
 

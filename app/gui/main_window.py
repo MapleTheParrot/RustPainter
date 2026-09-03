@@ -2822,7 +2822,7 @@ class MainWindow(QMainWindow):
         self.setup_summary_icon = _glyph_label("target", 18)
         setup_summary_text = QVBoxLayout()
         setup_summary_text.setSpacing(1)
-        self.setup_state_label = QLabel("4 required areas remaining")
+        self.setup_state_label = QLabel("7 required areas remaining")
         self.setup_state_label.setObjectName("readinessTitle")
         self.setup_hint_label = QLabel(
             "Set each area once. RustPainter remembers it for this sign profile."
@@ -2852,11 +2852,9 @@ class MainWindow(QMainWindow):
         self.brush_size_box_status = CalibrationStatus("Size value box")
         self.circle_brush_button_status = CalibrationStatus("Circle brush", optional=True)
         self.square_brush_button_status = CalibrationStatus("Square brush", optional=True)
-        self.clear_button_status = CalibrationStatus("Clear button", optional=True)
-        self.save_button_status = CalibrationStatus("Save button", optional=True)
-        self.download_button_status = CalibrationStatus(
-            "Download button (recommended)", optional=True
-        )
+        self.clear_button_status = CalibrationStatus("Clear button")
+        self.save_button_status = CalibrationStatus("Save button")
+        self.download_button_status = CalibrationStatus("Download button")
         self.calibrate_canvas_button = QPushButton("Set area")
         self.calibrate_color_box_button = QPushButton("Set area")
         self.calibrate_hue_bar_button = QPushButton("Set area")
@@ -2923,7 +2921,7 @@ class MainWindow(QMainWindow):
                 "download_button",
                 self.download_button_status,
                 self.calibrate_download_button,
-                "Recommended for accurate painting: calibrate Rust's download icon "
+                "Calibrate Rust's download icon "
                 "(second in the toolbar), which "
                 "writes the sign's texture to the desktop.  With it set, the "
                 "probes and the touch-up pass read every texel exactly instead "
@@ -2953,7 +2951,22 @@ class MainWindow(QMainWindow):
         required_grid.setVerticalSpacing(6)
         required_grid.setHorizontalSpacing(8)
         required_grid.setColumnStretch(0, 1)
-        for row, (_field, status, button, _tooltip) in enumerate(entries[:4]):
+        required_fields = {
+            "canvas",
+            "color_box",
+            "hue_bar",
+            "brush_size_box",
+            "clear_button",
+            "save_button",
+            "download_button",
+        }
+        required_entries = tuple(
+            entry for entry in entries if entry[0] in required_fields
+        )
+        optional_entries = tuple(
+            entry for entry in entries if entry[0] not in required_fields
+        )
+        for row, (_field, status, button, _tooltip) in enumerate(required_entries):
             required_grid.addWidget(status, row, 0)
             required_grid.addWidget(button, row, 1)
         required_layout.addLayout(required_grid)
@@ -2972,10 +2985,7 @@ class MainWindow(QMainWindow):
         optional_layout = QVBoxLayout(self.optional_setup_panel)
         optional_layout.setContentsMargins(10, 9, 10, 9)
         optional_layout.setSpacing(8)
-        optional_note = QLabel(
-            "The Download button enables exact texel verification. Other "
-            "controls add automation and overlays."
-        )
+        optional_note = QLabel("These controls select the matching brush automatically.")
         optional_note.setObjectName("muted")
         optional_note.setWordWrap(True)
         optional_layout.addWidget(optional_note)
@@ -2986,12 +2996,9 @@ class MainWindow(QMainWindow):
         optional_labels = {
             "circle_brush_button": "Circle brush",
             "square_brush_button": "Square brush",
-            "clear_button": "Clear button",
-            "save_button": "Save button",
-            "download_button": "Download button (recommended)",
         }
         self._optional_calibration_clear_buttons: dict[str, QPushButton] = {}
-        for row, (field, status, button, _tooltip) in enumerate(entries[4:]):
+        for row, (field, status, button, _tooltip) in enumerate(optional_entries):
             clear_button = QPushButton("×")
             clear_button.setObjectName("flat")
             clear_button.setFixedWidth(28)
@@ -7377,22 +7384,15 @@ class MainWindow(QMainWindow):
         # The Size field is part of every complete setup. Automatic sizing
         # uses it to measure and apply the correct brush for the chosen sign.
         self.brush_size_box_status.set_calibrated(bool(status.get("brush_size_box")))
-        brush_optional = not self.apply_brush_check.isChecked()
-        self.clear_button_status.set_calibrated(
-            bool(status.get("clear_button")), brush_optional
-        )
+        self.clear_button_status.set_calibrated(bool(status.get("clear_button")))
         self.circle_brush_button_status.set_calibrated(
             bool(status.get("circle_brush_button")), False
         )
         self.square_brush_button_status.set_calibrated(
             bool(status.get("square_brush_button")), False
         )
-        # The anti-AFK break leaves the painting UI through Save; with the
-        # break off, the button is never clicked.
-        self.save_button_status.set_calibrated(
-            bool(status.get("save_button")), not self.anti_afk_check.isChecked()
-        )
-        self.download_button_status.set_calibrated(bool(status.get("download_button")), True)
+        self.save_button_status.set_calibrated(bool(status.get("save_button")))
+        self.download_button_status.set_calibrated(bool(status.get("download_button")))
         for field, button in self._optional_calibration_clear_buttons.items():
             button.setEnabled(bool(status.get(field)))
         self._refresh_setup_summary()
@@ -7460,7 +7460,15 @@ class MainWindow(QMainWindow):
     def _required_setup_missing(self) -> list[str]:
         profile = self._current_profile
         if profile is None:
-            return ["canvas", "color box", "hue bar", "size value box"]
+            return [
+                "canvas",
+                "color box",
+                "hue bar",
+                "size value box",
+                "clear button",
+                "Save button",
+                "Download button",
+            ]
         return [
             label
             for label, rectangle in (
@@ -7468,6 +7476,9 @@ class MainWindow(QMainWindow):
                 ("color box", profile.color_box),
                 ("hue bar", profile.hue_bar),
                 ("size value box", profile.brush_size_box),
+                ("clear button", profile.clear_button),
+                ("Save button", profile.save_button),
+                ("Download button", profile.download_button),
             )
             if rectangle is None
         ]
@@ -7485,22 +7496,10 @@ class MainWindow(QMainWindow):
             self.setup_summary_icon.setPixmap(tinted_pixmap("target", WARNING, 32))
             self._set_card_state(self.setup_summary, "attention")
         else:
-            profile = self._current_profile
-            recommendations: list[str] = []
-            if profile is not None and profile.download_button is None:
-                recommendations.append("Download button for exact texel verification")
-            if recommendations:
-                self.setup_state_label.setText("Basic Rust setup complete")
-                self.setup_hint_label.setText(
-                    "Recommended for accurate painting: set "
-                    + " and ".join(recommendations)
-                    + "."
-                )
-            else:
-                self.setup_state_label.setText("Rust setup complete")
-                self.setup_hint_label.setText(
-                    "Automatic brush sizing and exact texel verification are available."
-                )
+            self.setup_state_label.setText("Rust setup complete")
+            self.setup_hint_label.setText(
+                "Automatic brush sizing and exact texel verification are available."
+            )
             self.setup_summary_icon.setPixmap(tinted_pixmap("check", SUCCESS, 32))
             self._set_card_state(self.setup_summary, "ready")
 
@@ -9039,6 +9038,9 @@ class MainWindow(QMainWindow):
                     ("Size value box", self._current_profile.brush_size_box is not None),
                     ("circle brush", self._current_profile.circle_brush_button is not None),
                     ("square brush", self._current_profile.square_brush_button is not None),
+                    ("clear button", self._current_profile.clear_button is not None),
+                    ("Save button", self._current_profile.save_button is not None),
+                    ("Download button", self._current_profile.download_button is not None),
                 )
                 if self._current_profile is not None and not done
             ]
@@ -9342,7 +9344,8 @@ class MainWindow(QMainWindow):
                 self,
                 "Calibration incomplete",
                 "Real painting requires a calibrated canvas, color box, hue bar, "
-                "Size value box, and brush buttons.",
+                "Size value box, brush buttons, Clear button, Save button, and "
+                "Download button.",
             )
             return
         if not self.dry_run_check.isChecked():
@@ -9498,24 +9501,29 @@ class MainWindow(QMainWindow):
         from app.screen import get_virtual_screen
 
         desktop = get_virtual_screen()
-        names = ["canvas", "color_box", "hue_bar"]
+        names = [
+            "canvas",
+            "color_box",
+            "hue_bar",
+            "clear_button",
+            "save_button",
+            "download_button",
+        ]
         if apply_brush_size:
-            names.extend(("brush_size_box", "clear_button"))
-        if anti_afk:
-            names.append("save_button")
+            names.append("brush_size_box")
         required = {
             "save_button": (
-                "The anti-AFK break leaves the painting UI through Rust's Save "
-                "button, so it requires the Save button to be calibrated."
+                "Rust's Save button must be calibrated before painting."
+            ),
+            "download_button": (
+                "Rust's Download button must be calibrated before painting."
             ),
             "brush_size_box": (
                 "Automatic brush sizing requires Rust's numeric Size field to be "
                 "calibrated."
             ),
             "clear_button": (
-                "Automatic brush sizing measures the brush on the sign before "
-                "painting, so it requires Rust's clear button to be calibrated - "
-                "that is what wipes the measurement off again."
+                "Rust's clear button must be calibrated before painting."
             ),
         }
         for name in names:

@@ -65,7 +65,14 @@ def test_basic_palette_does_not_produce_confident_setup() -> None:
     image = Image.new("RGB", (800, 600), (35, 35, 35))
     result = detect_painting_setup(image, ScreenRect(0, 0, 800, 600))
     assert result.regions == {}
-    assert result.missing_required == ("canvas", "color_box", "hue_bar")
+    assert result.missing_required == (
+        "canvas",
+        "color_box",
+        "hue_bar",
+        "clear_button",
+        "save_button",
+        "download_button",
+    )
 
 
 def test_canvas_is_still_proposed_when_the_palette_cannot_be_found() -> None:
@@ -77,7 +84,13 @@ def test_canvas_is_still_proposed_when_the_palette_cannot_be_found() -> None:
     )
 
     assert set(result.regions) == {"canvas"}
-    assert result.missing_required == ("color_box", "hue_bar")
+    assert result.missing_required == (
+        "color_box",
+        "hue_bar",
+        "clear_button",
+        "save_button",
+        "download_button",
+    )
 
 
 def test_detects_a_small_palette_after_a_high_resolution_capture_is_reduced() -> None:
