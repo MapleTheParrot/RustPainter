@@ -31,6 +31,8 @@ def _profile(*, canvas_width: int = 400) -> CalibrationProfile:
         canvas=ScreenRect(100, 100, canvas_width, 80),
         color_box=ScreenRect(600, 100, 100, 100),
         hue_bar=ScreenRect(720, 100, 12, 100),
+        circle_brush_button=ScreenRect(760, 100, 20, 20),
+        square_brush_button=ScreenRect(790, 100, 20, 20),
     )
 
 
@@ -240,6 +242,8 @@ def _sized_profile(name: str, *, sign_rows: int = 320) -> CalibrationProfile:
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
+        circle_brush_button=ScreenRect(900, 100, 20, 20),
+        square_brush_button=ScreenRect(930, 100, 20, 20),
     )
     profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / sign_rows) for size in (60, 30, 12)]
@@ -592,8 +596,8 @@ def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
     painter = Painter(input_controller)
     profile = _profile()
     profile.save_button = ScreenRect(600, 300, 100, 30)
-    # Four strokes 0.3 s apart with a 0.5 s interval: the break falls once,
-    # before the third stroke, and the interval counts afresh from its end.
+    # Four strokes 0.3 s apart with a 0.7 s interval: the break falls once,
+    # before the fourth stroke, and the interval counts afresh from its end.
     painter.start(
         _dot_plan(4),
         profile,
@@ -601,7 +605,7 @@ def test_anti_afk_break_saves_jumps_reopens_and_reselects_the_color() -> None:
             mouse_down_duration_seconds=0.004,
             delay_between_strokes_seconds=0.3,
             anti_afk_enabled=True,
-            anti_afk_interval_seconds=0.5,
+            anti_afk_interval_seconds=0.7,
         ),
     )
     assert painter.wait(_t(15.0))
@@ -1209,6 +1213,8 @@ def _calibrating_profile(name: str) -> CalibrationProfile:
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
         clear_button=ScreenRect(880, 100, 24, 24),
+        circle_brush_button=ScreenRect(920, 100, 20, 20),
+        square_brush_button=ScreenRect(950, 100, 20, 20),
     )
 
 
@@ -1427,6 +1433,8 @@ def test_brush_measurement_fits_the_sign_it_probes() -> None:
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
+        circle_brush_button=ScreenRect(900, 100, 20, 20),
+        square_brush_button=ScreenRect(930, 100, 20, 20),
     )
     painter = Painter(
         controller,
@@ -1463,6 +1471,8 @@ def test_brush_measurement_probes_around_the_brush_the_plan_needs() -> None:
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
+        circle_brush_button=ScreenRect(900, 100, 20, 20),
+        square_brush_button=ScreenRect(930, 100, 20, 20),
     )
     painter = Painter(
         controller,
@@ -1502,6 +1512,8 @@ def test_brush_measurement_reports_a_size_field_that_ignores_typing() -> None:
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
+        circle_brush_button=ScreenRect(900, 100, 20, 20),
+        square_brush_button=ScreenRect(930, 100, 20, 20),
     )
     canvas = profile.canvas
 
@@ -1701,6 +1713,8 @@ def test_measured_rendering_bias_shifts_artwork_strokes_the_other_way() -> None:
         color_box=ScreenRect(600, 500, 100, 100),
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
+        circle_brush_button=ScreenRect(900, 100, 20, 20),
+        square_brush_button=ScreenRect(930, 100, 20, 20),
     )
     profile.metadata["brush_size_model"] = fit_brush_size_model(
         [(size, size / 320.0) for size in (60, 30, 12)],
@@ -1899,9 +1913,9 @@ def test_a_long_drag_at_top_speed_is_paced_by_the_texel() -> None:
     ((drag, _),) = _canvas_presses(controller)
     # 399 px at the capped 250 texels/s, not at 2200 px/s.
     assert drag >= 399 / LONG_DRAG_MAX_TEXELS_PER_SECOND * 0.9
-    # The canvas press is the third (two picker clicks come first), and the
+    # The canvas press is the fourth (brush and two picker clicks come first), and the
     # 8 px step was brought down to the texel.
-    moves = _moves_during_press(controller, 2)
+    moves = _moves_during_press(controller, 3)
     assert len(moves) >= 399
     assert all(abs(b[0] - a[0]) <= 1 for a, b in zip(moves, moves[1:]))
     assert moves[-1][0] - moves[0][0] >= 398
@@ -1921,7 +1935,7 @@ def test_delays_under_the_frame_floor_are_run_at_the_floor() -> None:
     assert painter.wait(_t(5.0))
     assert painter.state is PainterState.COMPLETED
 
-    hue, saturation_value, first_dab, second_dab = controller.presses
+    _brush, hue, saturation_value, first_dab, second_dab = controller.presses
     assert saturation_value[0] - hue[2] >= SETTLE_FLOOR_SECONDS * 0.9
     assert first_dab[0] - saturation_value[2] >= SETTLE_FLOOR_SECONDS * 0.9
     assert second_dab[0] - first_dab[2] >= STROKE_GAP_FLOOR_SECONDS * 0.9

@@ -24,6 +24,8 @@ def _profile() -> CalibrationProfile:
         hue_bar=ScreenRect(720, 500, 12, 100),
         brush_size_box=ScreenRect(800, 100, 60, 24),
         clear_button=ScreenRect(880, 100, 24, 24),
+        circle_brush_button=ScreenRect(920, 100, 20, 20),
+        square_brush_button=ScreenRect(950, 100, 20, 20),
     )
 
 
@@ -508,6 +510,8 @@ def _wide_profile() -> CalibrationProfile:
         hue_bar=ScreenRect(1220, 500, 12, 100),
         brush_size_box=ScreenRect(1300, 100, 60, 24),
         clear_button=ScreenRect(1380, 100, 24, 24),
+        circle_brush_button=ScreenRect(1420, 100, 20, 20),
+        square_brush_button=ScreenRect(1450, 100, 20, 20),
     )
 
 

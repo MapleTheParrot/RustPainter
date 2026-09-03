@@ -1761,7 +1761,12 @@ class Painter:
             self._apply_session_ui_scale(job)
             self._confirm_painting_ui(job)
             job.target = self._measured_picker_target(job.target)
-            self._select_brush(job)
+            while True:
+                try:
+                    self._select_brush(job)
+                    break
+                except _RetryAction:
+                    LOGGER.info("Brush selection was interrupted; selecting it again")
             self._locate_color_swatch(job)
             if job.mode == "measure_brush":
                 measured = self._measure_brush_size_model(job)

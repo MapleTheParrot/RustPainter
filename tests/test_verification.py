@@ -153,6 +153,8 @@ def test_verification_repaints_exactly_the_cells_that_came_out_wrong() -> None:
         canvas=canvas,
         color_box=ScreenRect(1700, 150, 200, 200),
         hue_bar=ScreenRect(1950, 150, 20, 200),
+        circle_brush_button=ScreenRect(1980, 150, 20, 20),
+        square_brush_button=ScreenRect(2010, 150, 20, 20),
     )
     corrupted = {(5, 5), (6, 5), (40, 40)}  # logical (x, y)
 
@@ -234,6 +236,8 @@ def test_final_export_refuses_success_while_a_required_texel_is_untouched() -> N
         color_box=ScreenRect(1100, 150, 200, 200),
         hue_bar=ScreenRect(1350, 150, 20, 200),
         download_button=ScreenRect(1400, 400, 30, 30),
+        circle_brush_button=ScreenRect(1440, 400, 20, 20),
+        square_brush_button=ScreenRect(1470, 400, 20, 20),
     )
     rgb = np.empty((6, 8, 3), dtype=np.float32)
     rgb[:3] = RED

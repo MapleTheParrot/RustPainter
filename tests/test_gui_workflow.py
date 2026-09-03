@@ -2268,6 +2268,9 @@ def test_prepare_color_chart_configures_raw_chart_job(
     profile.brush_size_box = ScreenRect(980, 10, 60, 24)
     profile.circle_brush_button = ScreenRect(1050, 10, 24, 24)
     profile.square_brush_button = ScreenRect(1080, 10, 24, 24)
+    profile.clear_button = ScreenRect(10, 430, 60, 24)
+    profile.save_button = ScreenRect(80, 430, 60, 24)
+    profile.download_button = ScreenRect(150, 430, 60, 24)
     profile.metadata["color_correction"] = {
         "schemaVersion": 1,
         "forwardMatrix": [
@@ -2312,6 +2315,9 @@ def test_measure_painted_chart_saves_profile_correction(
     profile.brush_size_box = ScreenRect(980, 10, 60, 24)
     profile.circle_brush_button = ScreenRect(1050, 10, 24, 24)
     profile.square_brush_button = ScreenRect(1080, 10, 24, 24)
+    profile.clear_button = ScreenRect(10, 430, 60, 24)
+    profile.save_button = ScreenRect(80, 430, 60, 24)
+    profile.download_button = ScreenRect(150, 430, 60, 24)
     window.focus_guard_check.setChecked(False)
     monkeypatch.setattr(
         "app.screen.get_virtual_screen",
