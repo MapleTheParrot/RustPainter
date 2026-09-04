@@ -1222,6 +1222,8 @@ class _PainterBridge(QObject):
     pause_screenshot = Signal(int, str, str, str)
     start_requested = Signal()
     abort_requested = Signal()
+    anti_afk_requested = Signal()
+    movement_detected = Signal()
     hotkey_error = Signal(str)
     debug_finished = Signal(str, str)
     game_setup_finished = Signal(str, str, object)
@@ -1323,6 +1325,10 @@ class MainWindow(QMainWindow):
         self._status_overlay_linger.setSingleShot(True)
         self._status_overlay_linger.setInterval(self._STATUS_OVERLAY_LINGER_MS)
         self._status_overlay_linger.timeout.connect(self._update_calibration_overlay)
+        self._anti_afk_status_linger = QTimer(self)
+        self._anti_afk_status_linger.setSingleShot(True)
+        self._anti_afk_status_linger.setInterval(3000)
+        self._anti_afk_status_linger.timeout.connect(self._update_calibration_overlay)
         # While a job is paused the resume slider is lent out as a
         # viewfinder; what the notice said and where the slider stood are
         # kept so the resume offer comes back as it was.
@@ -1405,6 +1411,8 @@ class MainWindow(QMainWindow):
         self._painter_bridge.start_requested.connect(self._start_or_resume)
         self._painter_bridge.pause_screenshot.connect(self._on_pause_screenshot)
         self._painter_bridge.abort_requested.connect(self._abort_painting)
+        self._painter_bridge.anti_afk_requested.connect(self._toggle_anti_afk)
+        self._painter_bridge.movement_detected.connect(self._cancel_anti_afk_for_movement)
         self._painter_bridge.hotkey_error.connect(self._on_hotkey_error)
         self._painter_bridge.debug_finished.connect(self._on_debug_finished)
         self._painter_bridge.game_setup_finished.connect(self._on_game_setup_finished)
@@ -3884,6 +3892,7 @@ class MainWindow(QMainWindow):
         )
         self.start_hotkey_combo = self._hotkey_edit("CTRL+ALT+S")
         self.abort_hotkey_combo = self._hotkey_edit("CTRL+ALT+X")
+        self.anti_afk_hotkey_combo = self._hotkey_edit("CTRL+ALT+K")
         safety_form.addRow("Countdown", self.countdown_spin)
         safety_form.addRow("Focus guard", self.focus_guard_check)
         safety_form.addRow("Focus recovery", self.auto_focus_resume_check)
@@ -3894,6 +3903,7 @@ class MainWindow(QMainWindow):
         safety_form.addRow("UI guard", self.ui_guard_check)
         safety_form.addRow("Start / pause", self.start_hotkey_combo)
         safety_form.addRow("Stop", self.abort_hotkey_combo)
+        safety_form.addRow("Toggle Anti-AFK", self.anti_afk_hotkey_combo)
         layout.addWidget(safety_group)
 
         # A server that kicks idle players watches for movement, and a player
@@ -6762,9 +6772,7 @@ class MainWindow(QMainWindow):
             )
         )
         # Whether the Save button is needed follows the switch.
-        self.anti_afk_check.toggled.connect(
-            lambda _checked: self._refresh_profile_ui()
-        )
+        self.anti_afk_check.toggled.connect(self._on_anti_afk_toggled)
         self.prepare_color_chart_button.clicked.connect(self._prepare_color_chart)
         self.measure_color_chart_button.clicked.connect(self._measure_color_chart)
         self.clear_color_correction_button.clicked.connect(self._clear_color_correction)
@@ -6870,6 +6878,7 @@ class MainWindow(QMainWindow):
             self.anti_afk_interval_spin,
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
+            self.anti_afk_hotkey_combo,
             self.brush_shape_combo,
             self.manage_ui_scale_check,
             self.painting_ui_scale_spin,
@@ -6890,7 +6899,11 @@ class MainWindow(QMainWindow):
             elif isinstance(control, ColorButton):
                 control.colorChanged.connect(self._schedule_settings_save)
 
-        for hotkey_edit in (self.start_hotkey_combo, self.abort_hotkey_combo):
+        for hotkey_edit in (
+            self.start_hotkey_combo,
+            self.abort_hotkey_combo,
+            self.anti_afk_hotkey_combo,
+        ):
             hotkey_edit.captureStarted.connect(self._suspend_hotkeys_for_capture)
             hotkey_edit.captureCancelled.connect(self._register_hotkeys)
             hotkey_edit.bindingCommitted.connect(self._register_hotkeys)
@@ -7213,6 +7226,9 @@ class MainWindow(QMainWindow):
             self.abort_hotkey_combo.setCurrentText(
                 str(hotkeys.get("abort", "CTRL+ALT+X"))
             )
+            self.anti_afk_hotkey_combo.setCurrentText(
+                str(hotkeys.get("anti_afk", "CTRL+ALT+K"))
+            )
             brush_shape = str(settings.get("painting", {}).get("brush_shape", "auto"))
             index = self.brush_shape_combo.findData(brush_shape)
             self.brush_shape_combo.setCurrentIndex(max(0, index))
@@ -7327,6 +7343,7 @@ class MainWindow(QMainWindow):
         current["hotkeys"] = {
             "start_resume": self.start_hotkey_combo.currentText(),
             "abort": self.abort_hotkey_combo.currentText(),
+            "anti_afk": self.anti_afk_hotkey_combo.currentText(),
         }
         current["safety"] = {
             **current.get("safety", {}),
@@ -8359,8 +8376,11 @@ class MainWindow(QMainWindow):
     }
     _STATUS_OVERLAY_IDLE = "IDLE"
     _STATUS_OVERLAY_LINGER_MS = 4000
+    _STATUS_OVERLAY_ANTI_AFK_CANCELLED = "ANTI-AFK Cancelled due to movement input"
 
     def _status_overlay_text(self) -> str | None:
+        if self._anti_afk_status_linger.isActive():
+            return self._STATUS_OVERLAY_ANTI_AFK_CANCELLED
         painter = self._painter
         if self._countdown is not None and self._countdown.isVisible():
             return self._STATUS_OVERLAY_WORDS["countdown"]
@@ -8839,13 +8859,14 @@ class MainWindow(QMainWindow):
         requested = (
             self.start_hotkey_combo.currentText(),
             self.abort_hotkey_combo.currentText(),
+            self.anti_afk_hotkey_combo.currentText(),
         )
         if len({value.upper() for value in requested}) != len(requested):
             self._restore_last_hotkey_selection()
             self._hotkeys_ready = bool(
                 self._hotkeys is not None and getattr(self._hotkeys, "running", False)
             )
-            self._on_hotkey_error("Start/pause and stop hotkeys must be different.")
+            self._on_hotkey_error("Start/pause, stop, and Anti-AFK hotkeys must be different.")
             self._update_start_availability()
             return
         previous = self._hotkeys
@@ -8855,10 +8876,13 @@ class MainWindow(QMainWindow):
             bindings = HotkeyBindings(
                 start_resume=requested[0],
                 abort=requested[1],
+                anti_afk=requested[2],
             )
             candidate = GlobalHotkeyManager(
                 on_start_resume=self._hotkey_toggle_immediate,
                 on_abort=self._hotkey_abort_immediate,
+                on_anti_afk=self._hotkey_toggle_anti_afk_immediate,
+                on_movement=self._hotkey_movement_immediate,
                 bindings=bindings,
                 on_error=self._hotkey_failure_immediate,
             )
@@ -8897,6 +8921,7 @@ class MainWindow(QMainWindow):
         combos = (
             self.start_hotkey_combo,
             self.abort_hotkey_combo,
+            self.anti_afk_hotkey_combo,
         )
         for combo, value in zip(combos, self._last_hotkey_bindings, strict=True):
             combo.blockSignals(True)
@@ -8935,6 +8960,44 @@ class MainWindow(QMainWindow):
             self._painter_bridge.abort_requested.emit()
         except Exception:
             LOGGER.exception("Could not queue emergency-stop UI update")
+
+    def _hotkey_toggle_anti_afk_immediate(self) -> None:
+        """Queue the Anti-AFK switch; Qt widgets stay on the GUI thread."""
+
+        self._painter_bridge.anti_afk_requested.emit()
+
+    def _hotkey_movement_immediate(self) -> None:
+        """A real W/A/S/D press cancels Anti-AFK without consuming movement."""
+
+        self._painter_bridge.movement_detected.emit()
+
+    @Slot()
+    def _toggle_anti_afk(self) -> None:
+        enabled = not self.anti_afk_check.isChecked()
+        self.anti_afk_check.setChecked(enabled)
+        self._anti_afk_status_linger.stop()
+        self.statusBar().showMessage(
+            "ANTI-AFK mode" if enabled else "ANTI-AFK mode disabled", 3000
+        )
+        self._update_calibration_overlay()
+
+    @Slot()
+    def _cancel_anti_afk_for_movement(self) -> None:
+        if not self.anti_afk_check.isChecked():
+            return
+        self.anti_afk_check.setChecked(False)
+        self._anti_afk_status_linger.start()
+        self.statusBar().showMessage(self._STATUS_OVERLAY_ANTI_AFK_CANCELLED, 3000)
+        self._update_calibration_overlay()
+
+    @Slot(bool)
+    def _on_anti_afk_toggled(self, enabled: bool) -> None:
+        self._refresh_profile_ui()
+        if not self._anti_afk_status_linger.isActive():
+            self.statusBar().showMessage(
+                "ANTI-AFK mode" if enabled else "ANTI-AFK mode disabled", 3000
+            )
+        self._update_calibration_overlay()
 
     def _hotkey_failure_immediate(self, error: BaseException) -> None:
         """Fail closed on the hotkey thread before its Qt warning is handled."""

@@ -132,6 +132,7 @@ def test_stop_timeout_marks_emergency_hotkeys_unhealthy() -> None:
 def test_default_hotkeys_do_not_require_function_keys() -> None:
     assert DEFAULT_HOTKEYS.start_resume == "CTRL+ALT+S"
     assert DEFAULT_HOTKEYS.abort == "CTRL+ALT+X"
+    assert DEFAULT_HOTKEYS.anti_afk == "CTRL+ALT+K"
 
 
 @pytest.mark.parametrize(

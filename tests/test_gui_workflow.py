@@ -2759,6 +2759,26 @@ def test_start_hotkey_toggles_a_running_job_to_paused(window: MainWindow) -> Non
     assert paused == ["global start/pause hotkey"]
 
 
+def test_anti_afk_hotkey_and_movement_input_update_the_status(window: MainWindow, qtbot) -> None:
+    assert window.anti_afk_hotkey_combo.currentText() == "CTRL+ALT+K"
+    assert window.anti_afk_check.isChecked()
+
+    window._hotkey_toggle_anti_afk_immediate()
+    qtbot.waitUntil(lambda: not window.anti_afk_check.isChecked())
+    assert window._status_overlay_text() == "IDLE"
+
+    window._hotkey_toggle_anti_afk_immediate()
+    qtbot.waitUntil(window.anti_afk_check.isChecked)
+    assert window.statusBar().currentMessage() == "ANTI-AFK mode"
+
+    window._hotkey_movement_immediate()
+    qtbot.waitUntil(lambda: not window.anti_afk_check.isChecked())
+    assert window._status_overlay_text() == "ANTI-AFK Cancelled due to movement input"
+    assert window._anti_afk_status_linger.interval() == 3000
+    window._anti_afk_status_linger.stop()
+    assert window._status_overlay_text() == "IDLE"
+
+
 def test_plan_recalculation_shows_pending_feedback(
     window: MainWindow, tmp_path: Path, qtbot
 ) -> None:

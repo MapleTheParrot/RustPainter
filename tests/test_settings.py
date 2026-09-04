@@ -214,6 +214,7 @@ def test_hotkey_defaults_work_without_a_function_key_row() -> None:
     assert DEFAULT_SETTINGS["hotkeys"] == {
         "start_resume": "CTRL+ALT+S",
         "abort": "CTRL+ALT+X",
+        "anti_afk": "CTRL+ALT+K",
     }
 
 
@@ -259,6 +260,7 @@ def test_settings_accept_user_recorded_hotkeys(
     )
 
     assert saved["hotkeys"]["abort"] == "CTRL+ALT+X"
+    assert saved["hotkeys"]["anti_afk"] == "CTRL+ALT+K"
     assert store.load()["hotkeys"]["start_resume"] == "CTRL+ALT+Q"
 
 

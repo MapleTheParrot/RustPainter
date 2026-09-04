@@ -200,6 +200,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "hotkeys": {
         "start_resume": "CTRL+ALT+S",
         "abort": "CTRL+ALT+X",
+        "anti_afk": "CTRL+ALT+K",
     },
     "safety": {
         "countdown_seconds": 3,
@@ -601,16 +602,17 @@ def _validate(settings: Mapping[str, Any]) -> None:
         )
 
     assert isinstance(hotkeys, Mapping)
-    for key in ("start_resume", "abort"):
+    for key in ("start_resume", "abort", "anti_afk"):
         if not isinstance(hotkeys.get(key), str) or not str(hotkeys[key]).strip():
             raise SettingsError(f"hotkeys.{key} must be a non-empty string")
         if not is_supported_hotkey(hotkeys[key]):
             raise SettingsError(f"hotkeys.{key} is not a supported keyboard shortcut")
     normalized_hotkeys = {
-        normalize_hotkey(hotkeys[key]) for key in ("start_resume", "abort")
+        normalize_hotkey(hotkeys[key])
+        for key in ("start_resume", "abort", "anti_afk")
     }
-    if len(normalized_hotkeys) != 2:
-        raise SettingsError("Start/pause and abort hotkeys must be different")
+    if len(normalized_hotkeys) != 3:
+        raise SettingsError("Start/pause, abort, and Anti-AFK hotkeys must be different")
 
     assert isinstance(safety, Mapping)
     countdown = safety.get("countdown_seconds")
