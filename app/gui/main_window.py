@@ -1223,7 +1223,6 @@ class _PainterBridge(QObject):
     start_requested = Signal()
     abort_requested = Signal()
     anti_afk_requested = Signal()
-    movement_detected = Signal()
     hotkey_error = Signal(str)
     debug_finished = Signal(str, str)
     game_setup_finished = Signal(str, str, object)
@@ -1325,10 +1324,6 @@ class MainWindow(QMainWindow):
         self._status_overlay_linger.setSingleShot(True)
         self._status_overlay_linger.setInterval(self._STATUS_OVERLAY_LINGER_MS)
         self._status_overlay_linger.timeout.connect(self._update_calibration_overlay)
-        self._anti_afk_status_linger = QTimer(self)
-        self._anti_afk_status_linger.setSingleShot(True)
-        self._anti_afk_status_linger.setInterval(3000)
-        self._anti_afk_status_linger.timeout.connect(self._update_calibration_overlay)
         # While a job is paused the resume slider is lent out as a
         # viewfinder; what the notice said and where the slider stood are
         # kept so the resume offer comes back as it was.
@@ -1412,7 +1407,6 @@ class MainWindow(QMainWindow):
         self._painter_bridge.pause_screenshot.connect(self._on_pause_screenshot)
         self._painter_bridge.abort_requested.connect(self._abort_painting)
         self._painter_bridge.anti_afk_requested.connect(self._toggle_anti_afk)
-        self._painter_bridge.movement_detected.connect(self._cancel_anti_afk_for_movement)
         self._painter_bridge.hotkey_error.connect(self._on_hotkey_error)
         self._painter_bridge.debug_finished.connect(self._on_debug_finished)
         self._painter_bridge.game_setup_finished.connect(self._on_game_setup_finished)
@@ -8376,11 +8370,7 @@ class MainWindow(QMainWindow):
     }
     _STATUS_OVERLAY_IDLE = "IDLE"
     _STATUS_OVERLAY_LINGER_MS = 4000
-    _STATUS_OVERLAY_ANTI_AFK_CANCELLED = "ANTI-AFK Cancelled due to movement input"
-
     def _status_overlay_text(self) -> str | None:
-        if self._anti_afk_status_linger.isActive():
-            return self._STATUS_OVERLAY_ANTI_AFK_CANCELLED
         painter = self._painter
         if self._countdown is not None and self._countdown.isVisible():
             return self._STATUS_OVERLAY_WORDS["countdown"]
@@ -8882,7 +8872,6 @@ class MainWindow(QMainWindow):
                 on_start_resume=self._hotkey_toggle_immediate,
                 on_abort=self._hotkey_abort_immediate,
                 on_anti_afk=self._hotkey_toggle_anti_afk_immediate,
-                on_movement=self._hotkey_movement_immediate,
                 bindings=bindings,
                 on_error=self._hotkey_failure_immediate,
             )
@@ -8966,40 +8955,21 @@ class MainWindow(QMainWindow):
 
         self._painter_bridge.anti_afk_requested.emit()
 
-    def _hotkey_movement_immediate(self) -> None:
-        """A real W/A/S/D press cancels Anti-AFK without consuming movement."""
-
-        self._painter_bridge.movement_detected.emit()
-
     @Slot()
     def _toggle_anti_afk(self) -> None:
         enabled = not self.anti_afk_check.isChecked()
         self.anti_afk_check.setChecked(enabled)
-        self._anti_afk_status_linger.stop()
         self.statusBar().showMessage(
             "ANTI-AFK mode" if enabled else "ANTI-AFK mode disabled", 3000
         )
         self._update_calibration_overlay()
 
-    @Slot()
-    def _cancel_anti_afk_for_movement(self) -> None:
-        # Anti-AFK only has work to cancel during an active paint job.  The
-        # global listener is otherwise deliberately silent, so walking around
-        # Rust after starting the app cannot look like a cancelled mode.
-        if not self.anti_afk_check.isChecked() or not self._painter_is_active():
-            return
-        self.anti_afk_check.setChecked(False)
-        self._anti_afk_status_linger.start()
-        self.statusBar().showMessage(self._STATUS_OVERLAY_ANTI_AFK_CANCELLED, 3000)
-        self._update_calibration_overlay()
-
     @Slot(bool)
     def _on_anti_afk_toggled(self, enabled: bool) -> None:
         self._refresh_profile_ui()
-        if not self._anti_afk_status_linger.isActive():
-            self.statusBar().showMessage(
-                "ANTI-AFK mode" if enabled else "ANTI-AFK mode disabled", 3000
-            )
+        self.statusBar().showMessage(
+            "ANTI-AFK mode" if enabled else "ANTI-AFK mode disabled", 3000
+        )
         self._update_calibration_overlay()
 
     def _hotkey_failure_immediate(self, error: BaseException) -> None:

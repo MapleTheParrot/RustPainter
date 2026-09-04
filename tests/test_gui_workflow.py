@@ -2759,8 +2759,8 @@ def test_start_hotkey_toggles_a_running_job_to_paused(window: MainWindow) -> Non
     assert paused == ["global start/pause hotkey"]
 
 
-def test_anti_afk_hotkey_and_movement_input_update_the_status(
-    window: MainWindow, qtbot, monkeypatch: pytest.MonkeyPatch
+def test_anti_afk_hotkey_does_not_turn_off_anti_afk_for_movement(
+    window: MainWindow, qtbot
 ) -> None:
     assert window.anti_afk_hotkey_combo.currentText() == "CTRL+ALT+K"
     assert window.anti_afk_check.isChecked()
@@ -2773,17 +2773,10 @@ def test_anti_afk_hotkey_and_movement_input_update_the_status(
     qtbot.waitUntil(window.anti_afk_check.isChecked)
     assert window.statusBar().currentMessage() == "ANTI-AFK mode"
 
-    # Movement only cancels a real, active paint session.
-    window._hotkey_movement_immediate()
-    qtbot.wait(10)
+    # Player movement never changes the preference. The input listener that
+    # used to disable it is intentionally absent.
+    assert not hasattr(window, "_hotkey_movement_immediate")
     assert window.anti_afk_check.isChecked()
-    monkeypatch.setattr(window, "_painter_is_active", lambda: True)
-    window._hotkey_movement_immediate()
-    qtbot.waitUntil(lambda: not window.anti_afk_check.isChecked())
-    assert window._status_overlay_text() == "ANTI-AFK Cancelled due to movement input"
-    assert window._anti_afk_status_linger.interval() == 3000
-    window._anti_afk_status_linger.stop()
-    assert window._status_overlay_text() == "IDLE"
 
 
 def test_plan_recalculation_shows_pending_feedback(

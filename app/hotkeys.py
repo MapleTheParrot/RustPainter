@@ -156,16 +156,6 @@ if os.name == "nt":
             ("lPrivate", wintypes.DWORD),
         )
 
-    class _KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = (
-            ("vkCode", wintypes.DWORD),
-            ("scanCode", wintypes.DWORD),
-            ("flags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.c_size_t),
-        )
-
-
 class GlobalHotkeyManager:
     """Own a small Win32 message-loop thread for start/pause and abort hotkeys.
 
@@ -180,7 +170,6 @@ class GlobalHotkeyManager:
         on_start_resume: Callable[[], None] | None = None,
         on_abort: Callable[[], None] | None = None,
         on_anti_afk: Callable[[], None] | None = None,
-        on_movement: Callable[[], None] | None = None,
         *,
         bindings: HotkeyBindings | Mapping[str, int | str | HotkeySpec] | None = None,
         on_error: Callable[[BaseException], None] | None = None,
@@ -197,7 +186,6 @@ class GlobalHotkeyManager:
             "abort": on_abort,
             "anti_afk": on_anti_afk,
         }
-        self._on_movement = on_movement
         self._on_error = on_error
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
@@ -320,43 +308,6 @@ class GlobalHotkeyManager:
         current_thread_id.argtypes = ()
         current_thread_id.restype = wintypes.DWORD
 
-        hook = None
-        hook_proc = None
-        unhook = None
-        # RegisterHotKey deliberately consumes its combination; W/A/S/D must
-        # remain ordinary Rust movement input, so observe them with a passive
-        # low-level hook instead.  It never returns a non-zero value.
-        if hasattr(user32, "SetWindowsHookExW") and hasattr(user32, "CallNextHookEx"):
-            set_hook = user32.SetWindowsHookExW
-            set_hook.argtypes = (ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD)
-            set_hook.restype = wintypes.HHOOK
-            call_next = user32.CallNextHookEx
-            call_next.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-            call_next.restype = ctypes.c_long
-            unhook = getattr(user32, "UnhookWindowsHookEx", None)
-            if unhook is not None:
-                unhook.argtypes = (wintypes.HHOOK,)
-                unhook.restype = wintypes.BOOL
-            hook_callback_type = ctypes.WINFUNCTYPE(
-                ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
-            )
-
-            @hook_callback_type
-            def movement_hook(code, w_param, l_param):
-                if code >= 0 and int(w_param) in (0x0100, 0x0104):  # key down / system key down
-                    event = ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-                    if event.vkCode in (0x57, 0x41, 0x53, 0x44):  # W, A, S, D
-                        callback = self._on_movement
-                        if callback is not None:
-                            try:
-                                callback()
-                            except Exception:
-                                LOGGER.exception("Movement callback failed")
-                return call_next(hook, code, w_param, l_param)
-
-            hook_proc = movement_hook  # Keep the ctypes callback alive.
-            hook = set_hook(13, hook_proc, None, 0)  # WH_KEYBOARD_LL
-
         registered_ids: list[int] = []
         by_id = {identifier: name for name, identifier in self._IDS.items()}
         try:
@@ -421,8 +372,6 @@ class GlobalHotkeyManager:
             )
             for identifier in registered_ids:
                 unregister(None, identifier)
-            if hook and unhook is not None:
-                unhook(hook)
             with self._lock:
                 self._running = False
                 self._thread_id = None
