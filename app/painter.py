@@ -6893,10 +6893,14 @@ class Painter:
             epoch,
             hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
         )
-        # The displayed value is #RRGGBB.  Clear both sides of the caret as
-        # the Size writer does, then type only the six editable hex digits.
-        for key in ("BACKSPACE",) * 7 + ("DELETE",) * 7:
-            self._press_field_key(key, epoch)
+        # Clicking Rust's hex field arms it to replace the existing value with
+        # the next six digits. Deleting first feeds incomplete values through
+        # the live parser and can leave a completely different color selected.
+        self._interruptible_sleep(
+            self._settle(settings.delay_after_saturation_value_seconds),
+            epoch=epoch,
+            check_focus=True,
+        )
         for char in f"{picker_color[0]:02X}{picker_color[1]:02X}{picker_color[2]:02X}":
             self._press_field_key(char, epoch)
         self._interruptible_sleep(

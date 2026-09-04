@@ -286,7 +286,7 @@ def test_hex_color_field_updates_without_enter() -> None:
     painter._select_color((30, 144, 255), target, _settings(), 0)
 
     keys = [event.value for event in controller.events if event.kind == "key_down"]
-    assert keys == ["BACKSPACE"] * 7 + ["DELETE"] * 7 + list("1E90FF")
+    assert keys == list("1E90FF")
 
 
 def test_automatic_brush_size_types_the_number_for_one_logical_cell() -> None:
