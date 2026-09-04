@@ -203,15 +203,12 @@ class PaintingUiGuard:
     def for_target(cls, target: Any) -> "PaintingUiGuard | None":
         """The guard for a painting target, or None if it has nothing to watch.
 
-        The colour box and hue bar are always calibrated; the Clear and
-        Save buttons join when they are.  The Size field is left out: the
-        painter types into it, so its contents are expected to change.
+        The Clear and Save buttons provide stable UI fingerprints. Text
+        fields are deliberately left out because the painter changes them.
         """
 
         regions: list[WatchedRegion] = []
         for name, hue_invariant, is_hue_bar in (
-            ("color_box", True, False),
-            ("hue_bar", False, True),
             ("clear_button", False, False),
             ("save_button", False, False),
         ):

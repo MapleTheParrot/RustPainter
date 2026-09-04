@@ -20,8 +20,7 @@ from app.setup_detection import SetupDetection
 
 _LABELS = {
     "canvas": "Canvas",
-    "color_box": "Colour box",
-    "hue_bar": "Hue bar",
+    "hex_color_box": "Hex color box",
     "brush_size_box": "Size value",
     "clear_button": "Clear",
     "save_button": "Save",

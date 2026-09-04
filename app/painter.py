@@ -237,15 +237,13 @@ class PickerDirections:
 @dataclass(frozen=True, slots=True)
 class PaintingTarget:
     canvas: RectangleLike
-    color_box: RectangleLike
-    hue_bar: RectangleLike
+    hex_color_box: RectangleLike
     brush_size_box: RectangleLike | None = None
     circle_brush_button: RectangleLike | None = None
     square_brush_button: RectangleLike | None = None
     clear_button: RectangleLike | None = None
     save_button: RectangleLike | None = None
     download_button: RectangleLike | None = None
-    picker_directions: PickerDirections = PickerDirections()
     color_correction: ColorCorrectionModel | None = None
     brush_size_model: BrushSizeModel | None = None
     # The texel grid an earlier job measured on this profile's sign.  A paint
@@ -268,10 +266,9 @@ class PaintingTarget:
     @classmethod
     def from_profile(cls, profile: object) -> "PaintingTarget":
         canvas = getattr(profile, "canvas", None)
-        color_box = getattr(profile, "color_box", None)
-        hue_bar = getattr(profile, "hue_bar", None)
-        if canvas is None or color_box is None or hue_bar is None:
-            raise ValueError("Profile needs canvas, color box, and hue bar calibration")
+        hex_color_box = getattr(profile, "hex_color_box", None)
+        if canvas is None or hex_color_box is None:
+            raise ValueError("Profile needs canvas and hex color box calibration")
 
         metadata = getattr(profile, "metadata", {})
         correction_value = (
@@ -327,19 +324,13 @@ class PaintingTarget:
 
         return cls(
             canvas=canvas,
-            color_box=color_box,
-            hue_bar=hue_bar,
+            hex_color_box=hex_color_box,
             brush_size_box=getattr(profile, "brush_size_box", None),
             circle_brush_button=getattr(profile, "circle_brush_button", None),
             square_brush_button=getattr(profile, "square_brush_button", None),
             clear_button=getattr(profile, "clear_button", None),
             save_button=getattr(profile, "save_button", None),
             download_button=getattr(profile, "download_button", None),
-            picker_directions=PickerDirections(
-                hue="bottom_to_top",
-                saturation="left_low",
-                value="top_bright",
-            ),
             color_correction=correction,
             brush_size_model=brush_size_model,
             texel_grid=texel_grid,
@@ -1033,12 +1024,10 @@ class Painter:
         *,
         target: PaintingTarget | None = None,
         canvas: RectangleLike | None = None,
-        color_box: RectangleLike | None = None,
-        hue_bar: RectangleLike | None = None,
+        hex_color_box: RectangleLike | None = None,
         brush_size_box: RectangleLike | None = None,
         clear_button: RectangleLike | None = None,
         brush_size_model: BrushSizeModel | None = None,
-        picker_directions: PickerDirections | None = None,
         start_stroke: int = 0,
     ) -> None:
         """Prepare a job without starting it, suitable for a hotkey callback.
@@ -1053,15 +1042,13 @@ class Painter:
             if profile is not None:
                 target = PaintingTarget.from_profile(profile)
             else:
-                if canvas is None or color_box is None or hue_bar is None:
+                if canvas is None or hex_color_box is None:
                     raise ValueError("Provide a calibrated profile or all required rectangles")
                 target = PaintingTarget(
                     canvas=canvas,
-                    color_box=color_box,
-                    hue_bar=hue_bar,
+                    hex_color_box=hex_color_box,
                     brush_size_box=brush_size_box,
                     clear_button=clear_button,
-                    picker_directions=picker_directions or PickerDirections(),
                     brush_size_model=brush_size_model,
                 )
         resolved_settings = (
@@ -1605,11 +1592,7 @@ class Painter:
     ) -> None:
         if plan.width <= 0 or plan.height <= 0:
             raise ValueError("Paint plan dimensions must be positive")
-        for label, rect in (
-            ("canvas", target.canvas),
-            ("color box", target.color_box),
-            ("hue bar", target.hue_bar),
-        ):
+        for label, rect in (("canvas", target.canvas), ("hex color box", target.hex_color_box)):
             if rect.width <= 0 or rect.height <= 0:
                 raise ValueError(f"{label} calibration must have positive dimensions")
         if settings.apply_brush_size:
@@ -1760,14 +1743,12 @@ class Painter:
             self._checkpoint(check_focus=True)
             self._apply_session_ui_scale(job)
             self._confirm_painting_ui(job)
-            job.target = self._measured_picker_target(job.target)
             while True:
                 try:
                     self._select_brush(job)
                     break
                 except _RetryAction:
                     LOGGER.info("Brush selection was interrupted; selecting it again")
-            self._locate_color_swatch(job)
             if job.mode == "measure_brush":
                 measured = self._measure_brush_size_model(job)
                 with self._condition:
@@ -4453,7 +4434,7 @@ class Painter:
         return self._screen_capture(canvas)
 
     def _measured_picker_target(self, target: PaintingTarget) -> PaintingTarget:
-        """Shrink the picker rectangles to the widgets Rust is really drawing.
+        """Return the target unchanged; colors now use the text field.
 
         A rectangle dragged one pixel wide sends saturation 0 and hue 0 degrees
         onto the panel behind the widget, where the click does nothing at all
@@ -4463,35 +4444,7 @@ class Painter:
         run.  Any failure leaves the calibration exactly as the user drew it.
         """
 
-        if not getattr(self.input, "emits_real_input", True):
-            return target
-        measured: dict[str, ScreenRect] = {}
-        for name in ("color_box", "hue_bar"):
-            rect = getattr(target, name)
-            region = ScreenRect(rect.left, rect.top, rect.width, rect.height)
-            try:
-                trimmed = trim_to_widget(self._screen_capture(region), region)
-            except Exception:
-                LOGGER.warning(
-                    "Could not measure the %s; using it as calibrated", name, exc_info=True
-                )
-                continue
-            if trimmed == region:
-                continue
-            LOGGER.info(
-                "Trimmed %s to the drawn widget: %d,%d %dx%d -> %d,%d %dx%d",
-                name,
-                region.left,
-                region.top,
-                region.width,
-                region.height,
-                trimmed.left,
-                trimmed.top,
-                trimmed.width,
-                trimmed.height,
-            )
-            measured[name] = trimmed
-        return replace(target, **measured) if measured else target
+        return target
 
     def _stroke_timing(self, settings: PainterSettings) -> StrokeTiming:
         probes = bool(settings.measure_press_hold)
@@ -6912,6 +6865,45 @@ class Painter:
         self._swatch = None
         with self._condition:
             self._color_pick_summary = replace(self._color_pick_summary, skipped_reason=reason)
+
+    def _select_color(
+        self,
+        color: RGBColor,
+        target: PaintingTarget,
+        settings: PainterSettings,
+        epoch: int,
+        *,
+        apply_correction: bool = True,
+    ) -> None:
+        """Type a six-digit color into Rust's live hex field.
+
+        Rust updates the selected color as soon as the sixth digit arrives;
+        Enter is intentionally not sent, because it is not required and can
+        steal focus from the painting UI on some layouts.
+        """
+
+        picker_color = (
+            target.color_correction.correct(color)
+            if apply_correction and target.color_correction is not None
+            else color
+        )
+        box = target.hex_color_box
+        self._safe_click(
+            normalized_point(box, 0.5, 0.5),
+            epoch,
+            hold_floor=self._PICKER_CLICK_HOLD_SECONDS,
+        )
+        # The displayed value is #RRGGBB.  Clear both sides of the caret as
+        # the Size writer does, then type only the six editable hex digits.
+        for key in ("BACKSPACE",) * 7 + ("DELETE",) * 7:
+            self._press_field_key(key, epoch)
+        for char in f"{picker_color[0]:02X}{picker_color[1]:02X}{picker_color[2]:02X}":
+            self._press_field_key(char, epoch)
+        self._interruptible_sleep(
+            self._settle(settings.delay_after_saturation_value_seconds),
+            epoch=epoch,
+            check_focus=True,
+        )
 
     def _execute_stroke(
         self,

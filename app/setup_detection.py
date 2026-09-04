@@ -385,6 +385,16 @@ def detect_painting_setup(image: Image.Image, screen: ScreenRect) -> SetupDetect
     if hue is not None:
         color_box = _picker_box(image, hue.rect, screen)
         regions.update({"hue_bar": hue, "color_box": color_box})
+        regions["hex_color_box"] = DetectedRegion(
+            ScreenRect(
+                hue.rect.left + hue.rect.width + 2,
+                hue.rect.top + round(hue.rect.height * 1.025),
+                max(1, round(hue.rect.height * 0.51)),
+                max(1, round(hue.rect.height * 0.167)),
+            ),
+            0.58,
+            "current Rust UI layout beneath the swatch",
+        )
         picker_left = color_box.rect.left
     canvas = _detect_canvas(working, scale, screen, picker_left)
     if canvas is not None:

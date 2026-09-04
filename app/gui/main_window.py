@@ -2974,8 +2974,7 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(self.detect_setup_button)
 
         self.canvas_status = CalibrationStatus("Canvas")
-        self.color_box_status = CalibrationStatus("Color box")
-        self.hue_bar_status = CalibrationStatus("Hue bar")
+        self.hex_color_box_status = CalibrationStatus("Hex color box")
         self.brush_size_box_status = CalibrationStatus("Size value box")
         self.circle_brush_button_status = CalibrationStatus("Circle brush", optional=True)
         self.square_brush_button_status = CalibrationStatus("Square brush", optional=True)
@@ -2983,8 +2982,7 @@ class MainWindow(QMainWindow):
         self.save_button_status = CalibrationStatus("Save button")
         self.download_button_status = CalibrationStatus("Download button")
         self.calibrate_canvas_button = QPushButton("Set area")
-        self.calibrate_color_box_button = QPushButton("Set area")
-        self.calibrate_hue_bar_button = QPushButton("Set area")
+        self.calibrate_hex_color_box_button = QPushButton("Set area")
         self.calibrate_brush_button = QPushButton("Set area")
         self.calibrate_circle_brush_button = QPushButton("Set area")
         self.calibrate_square_brush_button = QPushButton("Set area")
@@ -2999,16 +2997,10 @@ class MainWindow(QMainWindow):
                 "Calibrate canvas",
             ),
             (
-                "color_box",
-                self.color_box_status,
-                self.calibrate_color_box_button,
-                "Calibrate color box",
-            ),
-            (
-                "hue_bar",
-                self.hue_bar_status,
-                self.calibrate_hue_bar_button,
-                "Calibrate hue bar",
+                "hex_color_box",
+                self.hex_color_box_status,
+                self.calibrate_hex_color_box_button,
+                "Calibrate Rust's hex color field. RustPainter types each six-digit color here; it takes effect immediately.",
             ),
             (
                 "brush_size_box",
@@ -3080,8 +3072,7 @@ class MainWindow(QMainWindow):
         required_grid.setColumnStretch(0, 1)
         required_fields = {
             "canvas",
-            "color_box",
-            "hue_bar",
+            "hex_color_box",
             "brush_size_box",
             "clear_button",
             "save_button",
@@ -6218,18 +6209,9 @@ class MainWindow(QMainWindow):
         raw picker response, so its colors must not be pre-snapped.
         """
 
-        if self._painting_calibration_chart():
-            return None
-        profile = self._current_profile
-        if profile is None or profile.hue_bar is None or profile.color_box is None:
-            return None
-        return _PickerGeometry(
-            hue_bar=profile.hue_bar,
-            color_box=profile.color_box,
-            hue_direction=profile.hue_direction,
-            saturation_direction=profile.saturation_direction,
-            value_direction=profile.value_direction,
-        )
+        # Hex entry reaches every RGB color exactly; there is no finite
+        # gradient raster to quantize the palette against.
+        return None
 
     def _color_correction_model(self) -> ColorCorrectionModel | None:
         """The active profile's measured sign response, when it is usable."""
@@ -6750,11 +6732,8 @@ class MainWindow(QMainWindow):
         self.calibrate_canvas_button.clicked.connect(
             lambda: self._begin_calibration("canvas", "sign paintable canvas")
         )
-        self.calibrate_color_box_button.clicked.connect(
-            lambda: self._begin_calibration("color_box", "saturation / value box")
-        )
-        self.calibrate_hue_bar_button.clicked.connect(
-            lambda: self._begin_calibration("hue_bar", "vertical hue bar")
+        self.calibrate_hex_color_box_button.clicked.connect(
+            lambda: self._begin_calibration("hex_color_box", "hex color field")
         )
         self.calibrate_brush_button.clicked.connect(
             lambda: self._begin_calibration(
@@ -7507,8 +7486,7 @@ class MainWindow(QMainWindow):
         profile = self._current_profile
         status = profile.calibration_status if profile else {}
         self.canvas_status.set_calibrated(bool(status.get("canvas")))
-        self.color_box_status.set_calibrated(bool(status.get("color_box")))
-        self.hue_bar_status.set_calibrated(bool(status.get("hue_bar")))
+        self.hex_color_box_status.set_calibrated(bool(status.get("hex_color_box")))
         # The Size field is part of every complete setup. Automatic sizing
         # uses it to measure and apply the correct brush for the chosen sign.
         self.brush_size_box_status.set_calibrated(bool(status.get("brush_size_box")))
@@ -7590,8 +7568,7 @@ class MainWindow(QMainWindow):
         if profile is None:
             return [
                 "canvas",
-                "color box",
-                "hue bar",
+                "hex color box",
                 "size value box",
                 "clear button",
                 "Save button",
@@ -7601,8 +7578,7 @@ class MainWindow(QMainWindow):
             label
             for label, rectangle in (
                 ("canvas", profile.canvas),
-                ("color box", profile.color_box),
-                ("hue bar", profile.hue_bar),
+                ("hex color box", profile.hex_color_box),
                 ("size value box", profile.brush_size_box),
                 ("clear button", profile.clear_button),
                 ("Save button", profile.save_button),
@@ -7670,8 +7646,7 @@ class MainWindow(QMainWindow):
                 candidate = Profile.from_dict(profile.to_dict())
                 for field in (
                     "canvas",
-                    "color_box",
-                    "hue_bar",
+                    "hex_color_box",
                     "brush_size_box",
                     "clear_button",
                     "save_button",
@@ -7943,11 +7918,9 @@ class MainWindow(QMainWindow):
         try:
             candidate = Profile.from_dict(profile.to_dict())
             previous_canvas = candidate.canvas
-            previous_picker = (candidate.color_box, candidate.hue_bar)
             for field in (
                 "canvas",
-                "color_box",
-                "hue_bar",
+                "hex_color_box",
                 "brush_size_box",
                 "clear_button",
                 "save_button",
@@ -7968,8 +7941,6 @@ class MainWindow(QMainWindow):
                 ):
                     candidate.metadata.pop("brush_size_model", None)
                     candidate.metadata.pop("calibration_performance", None)
-            if (candidate.color_box, candidate.hue_bar) != previous_picker:
-                candidate.metadata.pop("color_correction", None)
             candidate.metadata["auto_setup_confidence"] = {
                 name: round(float(region.confidence), 3)
                 for name, region in detection.regions.items()
@@ -8026,8 +7997,7 @@ class MainWindow(QMainWindow):
             # targets still point at the previous monitor arrangement.
             for other in (
                 "canvas",
-                "color_box",
-                "hue_bar",
+                "hex_color_box",
                 "brush_size_box",
                 "clear_button",
                 "save_button",
@@ -8042,9 +8012,7 @@ class MainWindow(QMainWindow):
                 self.painting_ui_scale_spin.value(), 2
             )
         removed_reference: Any = None
-        if field in {"color_box", "hue_bar"}:
-            removed_reference = candidate.metadata.pop("ui_reference", None)
-        if field in {"canvas", "color_box", "hue_bar"}:
+        if field == "canvas":
             candidate.metadata.pop("color_correction", None)
         if field == "canvas" and self._canvas_shape_changed(rectangle):
             # The brush model is a fraction of the sign, so re-framing the same
@@ -8184,8 +8152,7 @@ class MainWindow(QMainWindow):
         moved: list[str] = []
         for name in (
             "canvas",
-            "color_box",
-            "hue_bar",
+            "hex_color_box",
             "brush_size_box",
             "clear_button",
             "save_button",
@@ -8229,8 +8196,7 @@ class MainWindow(QMainWindow):
 
     _CALIBRATION_LABEL_FIELDS = {
         "Canvas": "canvas",
-        "Color box": "color_box",
-        "Hue bar": "hue_bar",
+        "Hex color box": "hex_color_box",
         "Size value box": "brush_size_box",
         "Circle brush": "circle_brush_button",
         "Square brush": "square_brush_button",
@@ -8259,9 +8225,7 @@ class MainWindow(QMainWindow):
 
         candidate = Profile.from_dict(profile.to_dict())
         setattr(candidate, field, rectangle)
-        if field in {"color_box", "hue_bar"}:
-            candidate.metadata.pop("ui_reference", None)
-        if field in {"canvas", "color_box", "hue_bar"}:
+        if field == "canvas":
             candidate.metadata.pop("color_correction", None)
         if field == "canvas" and self._canvas_shape_changed(rectangle):
             candidate.metadata.pop("brush_size_model", None)
@@ -8301,8 +8265,7 @@ class MainWindow(QMainWindow):
                 (label, rect)
                 for label, rect in (
                     ("Canvas", getattr(profile, "canvas", None)),
-                    ("Color box", getattr(profile, "color_box", None)),
-                    ("Hue bar", getattr(profile, "hue_bar", None)),
+                    ("Hex color box", getattr(profile, "hex_color_box", None)),
                     ("Size value box", getattr(profile, "brush_size_box", None)),
                     ("Circle brush", getattr(profile, "circle_brush_button", None)),
                     ("Square brush", getattr(profile, "square_brush_button", None)),
@@ -8428,11 +8391,11 @@ class MainWindow(QMainWindow):
             )
             return
         profile = self._current_profile
-        if profile is None or profile.color_box is None or profile.hue_bar is None:
+        if profile is None or profile.hex_color_box is None:
             QMessageBox.information(
                 self,
                 "Calibrate the picker",
-                "Calibrate the color box and hue bar before capturing a UI reference.",
+                "Calibrate the hex color box before capturing a UI reference.",
             )
             return
         QMessageBox.information(
@@ -8454,12 +8417,12 @@ class MainWindow(QMainWindow):
         if self._pending_start_cancelled or self._closing:
             return
         profile = self._current_profile
-        if profile is None or profile.color_box is None or profile.hue_bar is None:
+        if profile is None or profile.hex_color_box is None:
             return
         try:
             from app.screen import save_reference
 
-            rectangle = self._union_rect(profile.color_box, profile.hue_bar)
+            rectangle = profile.hex_color_box
             target = self._local_data_directory() / "references" / f"{profile.id}_picker.png"
             save_reference(rectangle, target)
             candidate = Profile.from_dict(profile.to_dict())
@@ -9173,8 +9136,7 @@ class MainWindow(QMainWindow):
                 label
                 for label, done in (
                     ("canvas", self._current_profile.canvas is not None),
-                    ("color box", self._current_profile.color_box is not None),
-                    ("hue bar", self._current_profile.hue_bar is not None),
+                    ("hex color box", self._current_profile.hex_color_box is not None),
                     ("Size value box", self._current_profile.brush_size_box is not None),
                     ("circle brush", self._current_profile.circle_brush_button is not None),
                     ("square brush", self._current_profile.square_brush_button is not None),
@@ -9307,8 +9269,7 @@ class MainWindow(QMainWindow):
             self.rename_profile_button,
             self.delete_profile_button,
             self.calibrate_canvas_button,
-            self.calibrate_color_box_button,
-            self.calibrate_hue_bar_button,
+            self.calibrate_hex_color_box_button,
             self.calibrate_brush_button,
             self.calibrate_clear_button,
             self.calibrate_save_button,
@@ -9483,7 +9444,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Calibration incomplete",
-                "Real painting requires a calibrated canvas, color box, hue bar, "
+                "Real painting requires a calibrated canvas and hex color box, "
                 "Size value box, brush buttons, Clear button, Save button, and "
                 "Download button.",
             )
@@ -9643,8 +9604,7 @@ class MainWindow(QMainWindow):
         desktop = get_virtual_screen()
         names = [
             "canvas",
-            "color_box",
-            "hue_bar",
+            "hex_color_box",
             "clear_button",
             "save_button",
             "download_button",
@@ -9957,8 +9917,7 @@ class MainWindow(QMainWindow):
 
         return SimpleNamespace(
             canvas=ScreenRect(0, 0, max(1, plan.width), max(1, plan.height)),
-            color_box=ScreenRect(0, 0, 101, 101),
-            hue_bar=ScreenRect(102, 0, 7, 360),
+            hex_color_box=ScreenRect(0, 0, 80, 24),
             brush_size_box=None,
             circle_brush_button=ScreenRect(110, 0, 1, 1),
             square_brush_button=ScreenRect(112, 0, 1, 1),

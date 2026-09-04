@@ -42,7 +42,7 @@ you will need Windows 10 or 11 and Rust running in borderless or windowed mode.
 
 ## Use it
 
-1. In RustPainter, calibrate the **canvas**, **color box**, and **hue bar** by dragging just inside each matching area in Rust's paint UI.
+1. In RustPainter, calibrate the **canvas** and **hex color box** by dragging tightly around each matching area in Rust's paint UI. RustPainter types colors directly into the hex box.
 2. Drag an image into RustPainter, or click **Choose image**.
 3. Check the preview and start with a small, low-color image so you can make sure your calibration is right.
 4. Focus Rust during the countdown, then start painting.

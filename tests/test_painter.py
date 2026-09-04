@@ -273,6 +273,22 @@ def _typed_values(controller: MockInputController) -> list[str]:
     return values
 
 
+def test_hex_color_field_updates_without_enter() -> None:
+    controller = MockInputController()
+    painter = Painter(controller)
+    painter._KEY_HOLD_SECONDS = 0.0
+    painter._KEY_GAP_SECONDS = 0.0
+    target = PaintingTarget(
+        canvas=ScreenRect(100, 100, 20, 20),
+        hex_color_box=ScreenRect(200, 100, 80, 24),
+    )
+
+    painter._select_color((30, 144, 255), target, _settings(), 0)
+
+    keys = [event.value for event in controller.events if event.kind == "key_down"]
+    assert keys == ["BACKSPACE"] * 7 + ["DELETE"] * 7 + list("1E90FF")
+
+
 def test_automatic_brush_size_types_the_number_for_one_logical_cell() -> None:
     controller = MockInputController()
     profile = _sized_profile("Auto brush")

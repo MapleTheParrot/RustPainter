@@ -41,8 +41,7 @@ Rect = ScreenRect
 # but the store keeps them synchronized so switching signs never asks for the
 # same fixed widget to be calibrated again.
 SHARED_CALIBRATION_FIELDS: tuple[str, ...] = (
-    "color_box",
-    "hue_bar",
+    "hex_color_box",
     "brush_size_box",
     "circle_brush_button",
     "square_brush_button",
@@ -312,8 +311,9 @@ class CalibrationProfile:
     id: str
     name: str
     canvas: Rect | None = None
-    color_box: Rect | None = None
-    hue_bar: Rect | None = None
+    # Rust applies a complete six-digit hex value as it is typed.  This is
+    # substantially more exact and robust than clicking the gradient picker.
+    hex_color_box: Rect | None = None
     brush_size_box: Rect | None = None
     # The two solid brush buttons in Rust's painting UI.  RustPainter clicks
     # these instead of relying on fragile console variables.
@@ -370,8 +370,7 @@ class CalibrationProfile:
     def is_ready(self) -> bool:
         return (
             self.canvas is not None
-            and self.color_box is not None
-            and self.hue_bar is not None
+            and self.hex_color_box is not None
             and self.brush_size_box is not None
             and self.circle_brush_button is not None
             and self.square_brush_button is not None
@@ -388,8 +387,7 @@ class CalibrationProfile:
     def calibration_status(self) -> dict[str, bool]:
         return {
             "canvas": self.canvas is not None,
-            "color_box": self.color_box is not None,
-            "hue_bar": self.hue_bar is not None,
+            "hex_color_box": self.hex_color_box is not None,
             "brush_size_box": self.brush_size_box is not None,
             "circle_brush_button": self.circle_brush_button is not None,
             "square_brush_button": self.square_brush_button is not None,
@@ -422,8 +420,7 @@ class CalibrationProfile:
             "id": self.id,
             "name": self.name,
             "canvas": _rect_dict(self.canvas),
-            "colorBox": _rect_dict(self.color_box),
-            "hueBar": _rect_dict(self.hue_bar),
+            "hexColorBox": _rect_dict(self.hex_color_box),
             "brushSizeBox": _rect_dict(self.brush_size_box),
             "circleBrushButton": _rect_dict(self.circle_brush_button),
             "squareBrushButton": _rect_dict(self.square_brush_button),
@@ -452,10 +449,11 @@ class CalibrationProfile:
             id=str(value.get("id") or value.get("profile_id") or uuid.uuid4().hex),
             name=_nonempty_text(value.get("name"), "profile name"),
             canvas=_rect_from(value.get("canvas"), "canvas", optional=True),
-            color_box=_rect_from(
-                _first(value, "colorBox", "color_box"), "color box", optional=True
+            hex_color_box=_rect_from(
+                _first(value, "hexColorBox", "hex_color_box"),
+                "hex color box",
+                optional=True,
             ),
-            hue_bar=_rect_from(_first(value, "hueBar", "hue_bar"), "hue bar", optional=True),
             brush_size_box=_rect_from(
                 _first(value, "brushSizeBox", "brush_size_box"),
                 "brush size box",
