@@ -8983,7 +8983,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _cancel_anti_afk_for_movement(self) -> None:
-        if not self.anti_afk_check.isChecked():
+        # Anti-AFK only has work to cancel during an active paint job.  The
+        # global listener is otherwise deliberately silent, so walking around
+        # Rust after starting the app cannot look like a cancelled mode.
+        if not self.anti_afk_check.isChecked() or not self._painter_is_active():
             return
         self.anti_afk_check.setChecked(False)
         self._anti_afk_status_linger.start()
